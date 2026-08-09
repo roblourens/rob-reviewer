@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/roblourens/rob-reviewer/internal/config"
 	reviewcopilot "github.com/roblourens/rob-reviewer/internal/copilot"
@@ -134,10 +135,74 @@ func (app *App) ReviewPullRequest(ctx context.Context, number int, publish bool)
 	if !strings.EqualFold(pull.State, "open") {
 		return review.Result{}, fmt.Errorf("pull request %d is not open", number)
 	}
+	if !pull.IsTeamAuthored() {
+		return review.Result{}, fmt.Errorf(
+			"pull request %d was opened by %q with author association %q; only team-authored PRs are eligible",
+			number,
+			pull.AuthorLogin,
+			pull.AuthorAssociation,
+		)
+	}
 	if pull.Draft {
 		return review.Result{}, fmt.Errorf("pull request %d is still a draft", number)
 	}
 	return app.reviewOne(ctx, pull, publish)
+}
+
+func (app *App) ReviewHistoricalPullRequest(ctx context.Context, number int) (review.Result, error) {
+	if number < 1 {
+		return review.Result{}, errors.New("pull request number must be positive")
+	}
+	pull, err := app.reviewClient.GetPullRequest(ctx, app.config.Target.Owner, app.config.Target.Repo, number)
+	if err != nil {
+		return review.Result{}, fmt.Errorf("get historical pull request %d: %w", number, err)
+	}
+	if !pull.IsTeamAuthored() {
+		return review.Result{}, fmt.Errorf(
+			"historical pull request %d was opened by %q with author association %q; only team-authored PRs are eligible",
+			number,
+			pull.AuthorLogin,
+			pull.AuthorAssociation,
+		)
+	}
+	if pull.Draft {
+		return review.Result{}, fmt.Errorf("historical pull request %d is still a draft", number)
+	}
+
+	result, err := app.analyze(ctx, pull)
+	if err != nil {
+		return review.Result{}, err
+	}
+	premiumRequests, premiumRequestsReported := statsPremiumRequests(result.Stats)
+	app.logger.Info(
+		"historical pull request review complete",
+		"pr", pull.Number,
+		"head", pull.HeadSHA,
+		"findings", len(result.Findings),
+		"published", false,
+		"model", result.Stats.Model,
+		"actualModels", result.Stats.ActualModels,
+		"reasoningEffort", result.Stats.ReasoningEffort,
+		"actualReasoningEfforts", result.Stats.ActualReasoningEfforts,
+		"apiEndpoints", result.Stats.APIEndpoints,
+		"wallClockMilliseconds", result.Stats.WallClockMilliseconds,
+		"modelCalls", result.Stats.ModelCalls,
+		"inputTokens", result.Stats.InputTokens,
+		"outputTokens", result.Stats.OutputTokens,
+		"totalTokens", result.Stats.TotalTokens,
+		"reasoningTokens", result.Stats.ReasoningTokens,
+		"cacheReadTokens", result.Stats.CacheReadTokens,
+		"cacheWriteTokens", result.Stats.CacheWriteTokens,
+		"billingTokensByType", result.Stats.BillingTokensByType,
+		"apiDurationMilliseconds", result.Stats.APIDurationMilliseconds,
+		"toolCalls", result.Stats.ToolCalls,
+		"nanoAIUnits", result.Stats.NanoAIUnits,
+		"modelBillingMultipliers", result.Stats.ModelBillingMultipliers,
+		"premiumRequestsReported", premiumRequestsReported,
+		"premiumRequests", premiumRequests,
+		"costNote", result.Stats.CostNote,
+	)
+	return result, nil
 }
 
 func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish bool) (_ review.Result, returnErr error) {
@@ -151,6 +216,49 @@ func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish 
 		return review.Result{PullRequest: pull}, nil
 	}
 
+	result, err := app.analyze(ctx, pull)
+	if err != nil {
+		return review.Result{}, err
+	}
+	publisher := review.NewPublisher(app.reviewClient, app.config.Target.Owner, app.config.Target.Repo)
+	published, err := publisher.Publish(ctx, result, !publish)
+	if err != nil {
+		return review.Result{}, err
+	}
+	premiumRequests, premiumRequestsReported := statsPremiumRequests(result.Stats)
+	app.logger.Info(
+		"pull request review complete",
+		"pr", pull.Number,
+		"head", pull.HeadSHA,
+		"findings", len(result.Findings),
+		"published", published,
+		"model", result.Stats.Model,
+		"actualModels", result.Stats.ActualModels,
+		"reasoningEffort", result.Stats.ReasoningEffort,
+		"actualReasoningEfforts", result.Stats.ActualReasoningEfforts,
+		"apiEndpoints", result.Stats.APIEndpoints,
+		"wallClockMilliseconds", result.Stats.WallClockMilliseconds,
+		"modelCalls", result.Stats.ModelCalls,
+		"inputTokens", result.Stats.InputTokens,
+		"outputTokens", result.Stats.OutputTokens,
+		"totalTokens", result.Stats.TotalTokens,
+		"reasoningTokens", result.Stats.ReasoningTokens,
+		"cacheReadTokens", result.Stats.CacheReadTokens,
+		"cacheWriteTokens", result.Stats.CacheWriteTokens,
+		"billingTokensByType", result.Stats.BillingTokensByType,
+		"apiDurationMilliseconds", result.Stats.APIDurationMilliseconds,
+		"toolCalls", result.Stats.ToolCalls,
+		"nanoAIUnits", result.Stats.NanoAIUnits,
+		"modelBillingMultipliers", result.Stats.ModelBillingMultipliers,
+		"premiumRequestsReported", premiumRequestsReported,
+		"premiumRequests", premiumRequests,
+		"costNote", result.Stats.CostNote,
+	)
+	return result, nil
+}
+
+func (app *App) analyze(ctx context.Context, pull review.PullRequest) (_ review.Result, returnErr error) {
+	startedAt := time.Now()
 	checkout, err := workspace.New(ctx, app.config.Target.Owner, app.config.Target.Repo, pull)
 	if err != nil {
 		return review.Result{}, err
@@ -173,24 +281,15 @@ func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish 
 	if err != nil {
 		return review.Result{}, err
 	}
-	findings, err := runner.Review(ctx, reviewSource)
+	findings, analysis, stats, err := runner.Review(ctx, reviewSource)
 	if err != nil {
 		return review.Result{}, err
 	}
-	result := review.Result{PullRequest: pull, Findings: findings}
-	publisher := review.NewPublisher(app.reviewClient, app.config.Target.Owner, app.config.Target.Repo)
-	published, err := publisher.Publish(ctx, result, !publish)
-	if err != nil {
-		return review.Result{}, err
-	}
-	app.logger.Info(
-		"pull request review complete",
-		"pr", pull.Number,
-		"head", pull.HeadSHA,
-		"findings", len(findings),
-		"published", published,
-	)
-	return result, nil
+	completedAt := time.Now()
+	stats.StartedAt = startedAt.UTC()
+	stats.CompletedAt = completedAt.UTC()
+	stats.WallClockMilliseconds = completedAt.Sub(startedAt).Milliseconds()
+	return review.Result{PullRequest: pull, Findings: findings, Analysis: analysis, Stats: stats}, nil
 }
 
 func (app *App) getRunner(ctx context.Context) (*reviewcopilot.Runner, error) {
@@ -224,6 +323,86 @@ func PrintResult(result review.Result) error {
 	return nil
 }
 
+func PrintResultMarkdown(result review.Result) error {
+	if _, err := fmt.Fprint(os.Stdout, FormatResultMarkdown(result)); err != nil {
+		return fmt.Errorf("print Markdown review result: %w", err)
+	}
+	return nil
+}
+
+func FormatResultMarkdown(result review.Result) string {
+	var output strings.Builder
+	fmt.Fprintf(&output, "# Performance review: %s\n\n", singleLineMarkdown(result.PullRequest.Title))
+	fmt.Fprintf(&output, "[PR #%d](%s) at `%s`\n\n", result.PullRequest.Number, result.PullRequest.URL, result.PullRequest.HeadSHA)
+	if len(result.Findings) == 0 {
+		output.WriteString("## Findings\n\nNo high-confidence performance findings.\n")
+	} else {
+		fmt.Fprintf(&output, "## Findings (%d)\n\n", len(result.Findings))
+		for index, finding := range result.Findings {
+			fmt.Fprintf(
+				&output,
+				"### %d. [%s] %s\n\n**Location:** <code>%s:%d</code> (<code>%s</code>)  \n**Confidence:** %.2f — %s\n\n%s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n",
+				index+1,
+				finding.Severity,
+				singleLineMarkdown(finding.Title),
+				review.SanitizeMarkdownText(finding.Path),
+				finding.Line,
+				finding.Side,
+				finding.Confidence,
+				review.SanitizeMarkdownText(finding.ConfidenceRationale),
+				review.SanitizeMarkdownText(finding.Impact),
+				review.SanitizeMarkdownText(finding.Evidence),
+				review.SanitizeMarkdownText(finding.Recommendation),
+			)
+		}
+	}
+	if len(result.Analysis.Scenarios) > 0 {
+		output.WriteString("\n<details>\n<summary>Reviewer scenario analysis</summary>\n\n")
+		if len(result.Analysis.RelevantIssueFamilies) > 0 {
+			fmt.Fprintf(&output, "**Relevant issue families:** %s\n\n", review.SanitizeMarkdownText(strings.Join(result.Analysis.RelevantIssueFamilies, ", ")))
+		}
+		for index, scenario := range result.Analysis.Scenarios {
+			fmt.Fprintf(&output, "### Scenario %d: %s\n\n", index+1, singleLineMarkdown(scenario.Scenario))
+			fmt.Fprintf(&output, "- Critical path: %s\n", review.SanitizeMarkdownText(scenario.CriticalPath))
+			fmt.Fprintf(&output, "- Scaling input: %s\n", review.SanitizeMarkdownText(scenario.ScalingInput))
+			fmt.Fprintf(&output, "- Effective concurrency: %s\n", review.SanitizeMarkdownText(scenario.EffectiveConcurrency))
+			fmt.Fprintf(&output, "- Cache behavior: %s\n", review.SanitizeMarkdownText(scenario.CacheBehavior))
+			fmt.Fprintf(&output, "- Mechanism confidence: %s\n", review.SanitizeMarkdownText(scenario.MechanismConfidence))
+			fmt.Fprintf(&output, "- Magnitude uncertainty: %s\n", review.SanitizeMarkdownText(scenario.MagnitudeUncertainty))
+			if len(scenario.ExpensiveBoundaries) == 0 {
+				output.WriteString("- Expensive boundaries: none found\n")
+			} else {
+				output.WriteString("- Expensive boundaries:\n")
+				for _, boundary := range scenario.ExpensiveBoundaries {
+					fmt.Fprintf(
+						&output,
+						"  - %s at <code>%s</code>: %s; cardinality: %s\n",
+						review.SanitizeMarkdownText(boundary.Kind),
+						review.SanitizeMarkdownText(boundary.Location),
+						review.SanitizeMarkdownText(boundary.Operation),
+						review.SanitizeMarkdownText(boundary.Cardinality),
+					)
+					fmt.Fprintf(
+						&output,
+						"    - Introduced by diff: %t; previous behavior: %s; critical-path effect: %s\n",
+						boundary.IntroducedByDiff,
+						review.SanitizeMarkdownText(boundary.PreviousBehavior),
+						review.SanitizeMarkdownText(boundary.CriticalPathEffect),
+					)
+				}
+			}
+			fmt.Fprintf(&output, "- Verdict: %s\n\n", review.SanitizeMarkdownText(scenario.Verdict))
+		}
+		fmt.Fprintf(&output, "**Summary:** %s\n\n</details>\n", review.SanitizeMarkdownText(result.Analysis.Summary))
+	}
+	fmt.Fprintf(&output, "\n%s\n", review.FormatStatsMarkdown(result.Stats))
+	return output.String()
+}
+
+func singleLineMarkdown(value string) string {
+	return strings.ReplaceAll(review.SanitizeMarkdownText(value), "\n", " ")
+}
+
 func parseRepository(value string) (string, string, error) {
 	parts := strings.Split(value, "/")
 	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
@@ -238,4 +417,11 @@ func ParsePullRequestNumber(value string) (int, error) {
 		return 0, fmt.Errorf("invalid pull request number %q", value)
 	}
 	return number, nil
+}
+
+func statsPremiumRequests(stats review.Stats) (float64, bool) {
+	if stats.PremiumRequests == nil {
+		return 0, false
+	}
+	return *stats.PremiumRequests, true
 }

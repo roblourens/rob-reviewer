@@ -14,7 +14,7 @@ func TestListPullRequestsMapsResponseAndPagination(t *testing.T) {
 			t.Fatalf("path = %q", request.URL.Path)
 		}
 		writer.Header().Set("Link", `<https://api.github.com/resource?page=2>; rel="next"`)
-		fmt.Fprint(writer, `[{"number":7,"title":"Improve","body":"Body","state":"open","draft":false,"html_url":"https://example.test/7","base":{"ref":"main","sha":"base"},"head":{"ref":"feature","sha":"head"},"created_at":"2026-08-01T00:00:00Z"}]`)
+		fmt.Fprint(writer, `[{"number":7,"title":"Improve","body":"Body","state":"open","draft":false,"html_url":"https://example.test/7","author_association":"MEMBER","user":{"login":"teammate"},"base":{"ref":"main","sha":"base"},"head":{"ref":"feature","sha":"head"},"created_at":"2026-08-01T00:00:00Z"}]`)
 	}))
 	defer server.Close()
 
@@ -23,7 +23,8 @@ func TestListPullRequestsMapsResponseAndPagination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasNext || len(pulls) != 1 || pulls[0].Number != 7 || pulls[0].HeadSHA != "head" {
+	if !hasNext || len(pulls) != 1 || pulls[0].Number != 7 || pulls[0].HeadSHA != "head" ||
+		pulls[0].AuthorLogin != "teammate" || pulls[0].AuthorAssociation != "MEMBER" {
 		t.Fatalf("pulls = %+v, hasNext = %v", pulls, hasNext)
 	}
 }

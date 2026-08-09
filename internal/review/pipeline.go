@@ -90,6 +90,9 @@ func (pipeline *Pipeline) validate(finding Finding) error {
 	if finding.Confidence < 0 || finding.Confidence > 1 {
 		return errors.New("confidence must be between 0 and 1")
 	}
+	if finding.ConfidenceRationale == "" || len(finding.ConfidenceRationale) > maxFindingSectionLength {
+		return fmt.Errorf("confidence rationale must contain 1-%d characters", maxFindingSectionLength)
+	}
 	if finding.Title == "" || len(finding.Title) > maxTitleLength {
 		return fmt.Errorf("title must contain 1-%d characters", maxTitleLength)
 	}
@@ -109,6 +112,7 @@ func normalizeFinding(finding Finding) Finding {
 	finding.Focus = strings.TrimSpace(finding.Focus)
 	finding.Path = strings.TrimSpace(strings.TrimPrefix(finding.Path, "./"))
 	finding.Title = strings.TrimSpace(finding.Title)
+	finding.ConfidenceRationale = strings.TrimSpace(finding.ConfidenceRationale)
 	finding.Impact = strings.TrimSpace(finding.Impact)
 	finding.Evidence = strings.TrimSpace(finding.Evidence)
 	finding.Recommendation = strings.TrimSpace(finding.Recommendation)

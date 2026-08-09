@@ -70,14 +70,18 @@ func NewClientWithBaseURL(httpClient *http.Client, token, baseURL string) *Clien
 }
 
 type pullResponse struct {
-	Number    int       `json:"number"`
-	Title     string    `json:"title"`
-	Body      string    `json:"body"`
-	HTMLURL   string    `json:"html_url"`
-	State     string    `json:"state"`
-	Draft     bool      `json:"draft"`
-	CreatedAt time.Time `json:"created_at"`
-	Base      struct {
+	Number            int       `json:"number"`
+	Title             string    `json:"title"`
+	Body              string    `json:"body"`
+	HTMLURL           string    `json:"html_url"`
+	State             string    `json:"state"`
+	Draft             bool      `json:"draft"`
+	CreatedAt         time.Time `json:"created_at"`
+	AuthorAssociation string    `json:"author_association"`
+	User              struct {
+		Login string `json:"login"`
+	} `json:"user"`
+	Base struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
 	} `json:"base"`
@@ -126,17 +130,19 @@ func (client *Client) GetPullRequest(ctx context.Context, owner, repo string, nu
 
 func (pull pullResponse) toReviewPullRequest() review.PullRequest {
 	return review.PullRequest{
-		Number:    pull.Number,
-		Title:     pull.Title,
-		Body:      pull.Body,
-		URL:       pull.HTMLURL,
-		State:     pull.State,
-		Draft:     pull.Draft,
-		BaseRef:   pull.Base.Ref,
-		BaseSHA:   pull.Base.SHA,
-		HeadRef:   pull.Head.Ref,
-		HeadSHA:   pull.Head.SHA,
-		CreatedAt: pull.CreatedAt,
+		Number:            pull.Number,
+		Title:             pull.Title,
+		Body:              pull.Body,
+		URL:               pull.HTMLURL,
+		State:             pull.State,
+		Draft:             pull.Draft,
+		AuthorLogin:       pull.User.Login,
+		AuthorAssociation: pull.AuthorAssociation,
+		BaseRef:           pull.Base.Ref,
+		BaseSHA:           pull.Base.SHA,
+		HeadRef:           pull.Head.Ref,
+		HeadSHA:           pull.Head.SHA,
+		CreatedAt:         pull.CreatedAt,
 	}
 }
 

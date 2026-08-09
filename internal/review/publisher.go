@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 )
 
 const generatedDisclosure = "(Written by Copilot)"
@@ -87,12 +88,14 @@ func buildReviewRequest(result Result, marker string) ReviewRequest {
 			Line: finding.Line,
 			Side: finding.Side,
 			Body: fmt.Sprintf(
-				"**[%s] %s**\n\n%s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n%s",
+				"**[%s] %s**\n\n%s\n\n**Confidence:** %.2f — %s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n%s",
 				finding.Severity,
-				sanitizeMarkdownText(finding.Title),
-				sanitizeMarkdownText(finding.Impact),
-				sanitizeMarkdownText(finding.Evidence),
-				sanitizeMarkdownText(finding.Recommendation),
+				SanitizeMarkdownText(finding.Title),
+				SanitizeMarkdownText(finding.Impact),
+				finding.Confidence,
+				SanitizeMarkdownText(finding.ConfidenceRationale),
+				SanitizeMarkdownText(finding.Evidence),
+				SanitizeMarkdownText(finding.Recommendation),
 				generatedDisclosure,
 			),
 		})
@@ -109,7 +112,7 @@ func buildReviewRequest(result Result, marker string) ReviewRequest {
 	for _, focus := range sortedMapKeys(focusCounts) {
 		fmt.Fprintf(&summary, "- `%s`: %d\n", focus, focusCounts[focus])
 	}
-	fmt.Fprintf(&summary, "\n%s\n\n%s", generatedDisclosure, marker)
+	fmt.Fprintf(&summary, "\n%s\n\n%s\n\n%s", FormatStatsMarkdown(result.Stats), generatedDisclosure, marker)
 
 	return ReviewRequest{
 		CommitID: result.PullRequest.HeadSHA,
@@ -119,7 +122,70 @@ func buildReviewRequest(result Result, marker string) ReviewRequest {
 	}
 }
 
+func FormatStatsMarkdown(stats Stats) string {
+	var output strings.Builder
+	output.WriteString("<details>\n<summary>Review statistics</summary>\n\n")
+	fmt.Fprintf(&output, "- Model: `%s`\n", stats.Model)
+	if len(stats.ActualModels) > 0 {
+		fmt.Fprintf(&output, "- Actual model calls: `%s`\n", strings.Join(stats.ActualModels, "`, `"))
+	}
+	fmt.Fprintf(&output, "- Reasoning effort: `%s`\n", stats.ReasoningEffort)
+	if len(stats.ActualReasoningEfforts) > 0 {
+		fmt.Fprintf(&output, "- Actual reasoning effort: `%s`\n", strings.Join(stats.ActualReasoningEfforts, "`, `"))
+	}
+	if len(stats.APIEndpoints) > 0 {
+		fmt.Fprintf(&output, "- Model API endpoint: `%s`\n", strings.Join(stats.APIEndpoints, "`, `"))
+	}
+	fmt.Fprintf(&output, "- Wall-clock time: %s\n", formatDuration(stats.WallClockMilliseconds))
+	fmt.Fprintf(&output, "- Model calls: %d\n", stats.ModelCalls)
+	fmt.Fprintf(
+		&output,
+		"- Tokens: %d input, %d output, %d total; %d reasoning; %d cache read, %d cache write\n",
+		stats.InputTokens,
+		stats.OutputTokens,
+		stats.TotalTokens,
+		stats.ReasoningTokens,
+		stats.CacheReadTokens,
+		stats.CacheWriteTokens,
+	)
+	fmt.Fprintf(&output, "- Aggregate model API time: %s\n", formatDuration(stats.APIDurationMilliseconds))
+	fmt.Fprintf(&output, "- Model-returned tool calls: %d\n", stats.ToolCalls)
+	fmt.Fprintf(&output, "- Copilot usage: %.3f nano-AI units", stats.NanoAIUnits)
+	if len(stats.ModelBillingMultipliers) > 0 {
+		output.WriteString("; model billing multiplier")
+		if len(stats.ModelBillingMultipliers) > 1 {
+			output.WriteString("s")
+		}
+		output.WriteString(": ")
+		for index, multiplier := range stats.ModelBillingMultipliers {
+			if index > 0 {
+				output.WriteString(", ")
+			}
+			fmt.Fprintf(&output, "%.3f", multiplier)
+		}
+	}
+	if stats.PremiumRequests != nil {
+		fmt.Fprintf(&output, "; %.3f premium requests", *stats.PremiumRequests)
+	}
+	output.WriteString("\n")
+	output.WriteString("- USD cost: unavailable; the Copilot SDK does not expose a dollar conversion.\n")
+	output.WriteString("\n</details>")
+	return output.String()
+}
+
+func formatDuration(milliseconds int64) string {
+	return (time.Duration(milliseconds) * time.Millisecond).Round(time.Millisecond).String()
+}
+
 func validatePublicationTarget(analyzed, current PullRequest) error {
+	if !current.IsTeamAuthored() {
+		return fmt.Errorf(
+			"pull request %d is no longer team-authored (author %q, association %q)",
+			analyzed.Number,
+			current.AuthorLogin,
+			current.AuthorAssociation,
+		)
+	}
 	if !strings.EqualFold(current.State, "open") {
 		return fmt.Errorf("pull request %d became %s during review", analyzed.Number, current.State)
 	}
@@ -135,7 +201,7 @@ func validatePublicationTarget(analyzed, current PullRequest) error {
 	return nil
 }
 
-func sanitizeMarkdownText(value string) string {
+func SanitizeMarkdownText(value string) string {
 	var clean strings.Builder
 	clean.Grow(len(value))
 	for _, character := range value {

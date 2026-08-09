@@ -39,14 +39,16 @@ type Source struct {
 }
 
 type PRContext struct {
-	Number  int    `json:"number"`
-	Title   string `json:"title"`
-	Body    string `json:"body"`
-	URL     string `json:"url"`
-	BaseRef string `json:"baseRef"`
-	BaseSHA string `json:"baseSha"`
-	HeadRef string `json:"headRef"`
-	HeadSHA string `json:"headSha"`
+	Number            int    `json:"number"`
+	Title             string `json:"title"`
+	Body              string `json:"body"`
+	URL               string `json:"url"`
+	AuthorLogin       string `json:"authorLogin"`
+	AuthorAssociation string `json:"authorAssociation"`
+	BaseRef           string `json:"baseRef"`
+	BaseSHA           string `json:"baseSha"`
+	HeadRef           string `json:"headRef"`
+	HeadSHA           string `json:"headSha"`
 }
 
 type FileContent struct {
@@ -104,14 +106,16 @@ func New(root string, pull review.PullRequest, parsedDiff *diff.Diff, focuses *f
 
 func (source *Source) PullRequestContext() PRContext {
 	return PRContext{
-		Number:  source.pull.Number,
-		Title:   source.pull.Title,
-		Body:    source.pull.Body,
-		URL:     source.pull.URL,
-		BaseRef: source.pull.BaseRef,
-		BaseSHA: source.pull.BaseSHA,
-		HeadRef: source.pull.HeadRef,
-		HeadSHA: source.pull.HeadSHA,
+		Number:            source.pull.Number,
+		Title:             source.pull.Title,
+		Body:              source.pull.Body,
+		URL:               source.pull.URL,
+		AuthorLogin:       source.pull.AuthorLogin,
+		AuthorAssociation: source.pull.AuthorAssociation,
+		BaseRef:           source.pull.BaseRef,
+		BaseSHA:           source.pull.BaseSHA,
+		HeadRef:           source.pull.HeadRef,
+		HeadSHA:           source.pull.HeadSHA,
 	}
 }
 

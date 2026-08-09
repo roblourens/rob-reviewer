@@ -1,6 +1,11 @@
 package app
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/roblourens/rob-reviewer/internal/review"
+)
 
 func TestParseRepository(t *testing.T) {
 	owner, repo, err := parseRepository("owner/repo")
@@ -19,5 +24,44 @@ func TestParsePullRequestNumber(t *testing.T) {
 	}
 	if _, err := ParsePullRequestNumber("0"); err == nil {
 		t.Fatal("expected invalid pull request number error")
+	}
+}
+
+func TestFormatResultMarkdownSanitizesUntrustedContent(t *testing.T) {
+	result := review.Result{
+		PullRequest: review.PullRequest{
+			Number:  7,
+			Title:   "@team <script>\nheading",
+			URL:     "https://github.com/microsoft/vscode/pull/7",
+			HeadSHA: "abc",
+		},
+		Findings: []review.Finding{{
+			Path:                "src/`file`.ts",
+			Side:                review.SideRight,
+			Line:                12,
+			Severity:            review.SeverityHigh,
+			Confidence:          0.95,
+			ConfidenceRationale: "@team traced <details>",
+			Title:               "Avoid ![image](url)",
+			Impact:              "<img src=x>",
+			Evidence:            "**bold**",
+			Recommendation:      "`code`",
+		}},
+		Stats: review.Stats{
+			Model:           "claude-opus-5",
+			ReasoningEffort: "high",
+		},
+	}
+
+	formatted := FormatResultMarkdown(result)
+	for _, forbidden := range []string{"@team", "<script>", "<img", "![image]", "**bold**"} {
+		if strings.Contains(formatted, forbidden) {
+			t.Fatalf("formatted Markdown contains %q: %s", forbidden, formatted)
+		}
+	}
+	for _, expected := range []string{"&#64;team", "&lt;script&gt;", "\\!\\[image\\]", "Review statistics"} {
+		if !strings.Contains(formatted, expected) {
+			t.Fatalf("formatted Markdown missing %q: %s", expected, formatted)
+		}
 	}
 }

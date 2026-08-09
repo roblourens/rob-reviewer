@@ -85,6 +85,10 @@ func (poller *Poller) Run(ctx context.Context) (result Result, returnErr error) 
 			return result, fmt.Errorf("refresh deferred draft PR %d: %w", number, err)
 		}
 		switch {
+		case !pull.IsTeamAuthored():
+			current.RemovePendingDraft(number)
+			dirty = true
+			result.Skipped = append(result.Skipped, number)
 		case !strings.EqualFold(pull.State, "open"):
 			current.RemovePendingDraft(number)
 			dirty = true
@@ -113,6 +117,8 @@ func (poller *Poller) Run(ctx context.Context) (result Result, returnErr error) 
 			break
 		}
 		switch {
+		case !pull.IsTeamAuthored():
+			result.Skipped = append(result.Skipped, pull.Number)
 		case !strings.EqualFold(pull.State, "open"):
 			result.Skipped = append(result.Skipped, pull.Number)
 		case pull.Draft:

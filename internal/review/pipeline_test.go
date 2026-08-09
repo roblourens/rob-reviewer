@@ -20,16 +20,17 @@ func anchor(path string, side Side, line int) string {
 
 func validFinding(title string, confidence float64, line int) Finding {
 	return Finding{
-		Focus:          "performance-review",
-		Path:           "src/file.ts",
-		Side:           SideRight,
-		Line:           line,
-		Severity:       SeverityHigh,
-		Confidence:     confidence,
-		Title:          title,
-		Impact:         "Blocks the renderer on every scroll event.",
-		Evidence:       "The changed loop executes once for each historical item.",
-		Recommendation: "Batch the presentation update after reconstruction.",
+		Focus:               "performance-review",
+		Path:                "src/file.ts",
+		Side:                SideRight,
+		Line:                line,
+		Severity:            SeverityHigh,
+		Confidence:          confidence,
+		ConfidenceRationale: "The changed loop is directly reachable from the scroll callback and scales with history.",
+		Title:               title,
+		Impact:              "Blocks the renderer on every scroll event.",
+		Evidence:            "The changed loop executes once for each historical item.",
+		Recommendation:      "Batch the presentation update after reconstruction.",
 	}
 }
 

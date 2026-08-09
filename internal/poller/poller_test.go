@@ -31,9 +31,9 @@ func TestRunScansEntireBoundaryPage(t *testing.T) {
 	client := &fakePullClient{
 		pages: map[int][]review.PullRequest{
 			1: {
-				{Number: 9, State: "closed", CreatedAt: boundary},
-				{Number: 11, State: "open", CreatedAt: boundary},
-				{Number: 8, State: "closed", CreatedAt: boundary.Add(-time.Second)},
+				{Number: 9, State: "closed", AuthorAssociation: "MEMBER", CreatedAt: boundary},
+				{Number: 11, State: "open", AuthorAssociation: "MEMBER", CreatedAt: boundary},
+				{Number: 8, State: "closed", AuthorAssociation: "MEMBER", CreatedAt: boundary.Add(-time.Second)},
 			},
 		},
 	}
@@ -60,7 +60,7 @@ func TestRunSavesCompletedDeferredWorkOnLaterFailure(t *testing.T) {
 	current.PendingDrafts = []int{18}
 	client := &fakePullClient{
 		pulls: map[int]review.PullRequest{
-			18: {Number: 18, State: "open"},
+			18: {Number: 18, State: "open", AuthorAssociation: "MEMBER"},
 		},
 		listError: expected,
 	}
@@ -102,7 +102,7 @@ func (store *fakeStateStore) Save(_ context.Context, current state.State, _ stri
 func TestRunBootstrapsWithoutReviewing(t *testing.T) {
 	client := &fakePullClient{
 		pages: map[int][]review.PullRequest{
-			1: {{Number: 123, State: "open"}},
+			1: {{Number: 123, State: "open", AuthorAssociation: "MEMBER"}},
 		},
 	}
 	store := &fakeStateStore{}
@@ -128,13 +128,14 @@ func TestRunReviewsReadyAndDefersDraft(t *testing.T) {
 	client := &fakePullClient{
 		pages: map[int][]review.PullRequest{
 			1: {
-				{Number: 13, State: "open"},
-				{Number: 12, State: "open", Draft: true},
-				{Number: 11, State: "closed"},
-				{Number: 10, State: "open"},
+				{Number: 13, State: "open", AuthorAssociation: "MEMBER"},
+				{Number: 12, State: "open", Draft: true, AuthorAssociation: "MEMBER"},
+				{Number: 11, State: "closed", AuthorAssociation: "MEMBER"},
+				{Number: 10, State: "open", AuthorAssociation: "MEMBER"},
 			},
 		},
 	}
+
 	store := &fakeStateStore{exists: true, current: state.New(10)}
 	var reviewed []int
 	poller := New(client, store, "microsoft", "vscode", 5, func(_ context.Context, pull review.PullRequest) error {
@@ -157,11 +158,78 @@ func TestRunReviewsReadyAndDefersDraft(t *testing.T) {
 	}
 }
 
+func TestRunSkipsNonTeamPullRequestsWithoutDeferringDrafts(t *testing.T) {
+	client := &fakePullClient{
+		pages: map[int][]review.PullRequest{
+			1: {
+				{Number: 13, State: "open", Draft: true, AuthorLogin: "external", AuthorAssociation: "CONTRIBUTOR"},
+				{Number: 12, State: "open", AuthorLogin: "outside-collaborator", AuthorAssociation: "COLLABORATOR"},
+				{Number: 11, State: "open", AuthorLogin: "teammate", AuthorAssociation: "MEMBER"},
+				{Number: 10, State: "open", AuthorAssociation: "MEMBER"},
+			},
+		},
+	}
+	store := &fakeStateStore{exists: true, current: state.New(10)}
+	var reviewed []int
+	poller := New(client, store, "microsoft", "vscode", 5, func(_ context.Context, pull review.PullRequest) error {
+		reviewed = append(reviewed, pull.Number)
+		return nil
+	})
+
+	result, err := poller.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(reviewed, []int{11}) {
+		t.Fatalf("reviewed = %v", reviewed)
+	}
+	if !slices.Equal(result.Skipped, []int{12, 13}) {
+		t.Fatalf("skipped = %v", result.Skipped)
+	}
+	if len(result.Deferred) != 0 || len(store.current.PendingDrafts) != 0 {
+		t.Fatalf("deferred = %v, pending drafts = %v", result.Deferred, store.current.PendingDrafts)
+	}
+	if store.current.HighWaterMark != 13 {
+		t.Fatalf("high water mark = %d, want 13", store.current.HighWaterMark)
+	}
+}
+
+func TestRunRemovesDeferredDraftThatIsNotTeamAuthored(t *testing.T) {
+	client := &fakePullClient{
+		pages: map[int][]review.PullRequest{1: {{Number: 20, AuthorAssociation: "MEMBER"}}},
+		pulls: map[int]review.PullRequest{
+			18: {
+				Number:            18,
+				State:             "open",
+				Draft:             true,
+				AuthorLogin:       "external",
+				AuthorAssociation: "CONTRIBUTOR",
+			},
+		},
+	}
+	current := state.New(20)
+	current.PendingDrafts = []int{18}
+	store := &fakeStateStore{exists: true, current: current}
+	reviewCalls := 0
+	poller := New(client, store, "microsoft", "vscode", 5, func(context.Context, review.PullRequest) error {
+		reviewCalls++
+		return nil
+	})
+
+	result, err := poller.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reviewCalls != 0 || !slices.Equal(result.Skipped, []int{18}) || len(store.current.PendingDrafts) != 0 {
+		t.Fatalf("review calls = %d, result = %+v, state = %+v", reviewCalls, result, store.current)
+	}
+}
+
 func TestRunReviewsDraftWhenReady(t *testing.T) {
 	client := &fakePullClient{
-		pages: map[int][]review.PullRequest{1: {{Number: 20}}},
+		pages: map[int][]review.PullRequest{1: {{Number: 20, AuthorAssociation: "MEMBER"}}},
 		pulls: map[int]review.PullRequest{
-			18: {Number: 18, State: "open", Draft: false},
+			18: {Number: 18, State: "open", Draft: false, AuthorAssociation: "MEMBER"},
 		},
 	}
 	current := state.New(20)
@@ -184,9 +252,9 @@ func TestRunDoesNotAdvanceFailedReview(t *testing.T) {
 	client := &fakePullClient{
 		pages: map[int][]review.PullRequest{
 			1: {
-				{Number: 12, State: "open"},
-				{Number: 11, State: "open"},
-				{Number: 10, State: "open"},
+				{Number: 12, State: "open", AuthorAssociation: "MEMBER"},
+				{Number: 11, State: "open", AuthorAssociation: "MEMBER"},
+				{Number: 10, State: "open", AuthorAssociation: "MEMBER"},
 			},
 		},
 	}

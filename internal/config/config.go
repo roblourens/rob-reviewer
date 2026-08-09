@@ -13,7 +13,7 @@ import (
 
 const (
 	CurrentVersion       = 1
-	DefaultModel         = "claude-sonnet-4.6"
+	DefaultModel         = "claude-opus-5"
 	DefaultStateBranch   = "reviewer-state"
 	DefaultStatePath     = ".rob-reviewer/state.json"
 	DefaultMaxPerRun     = 5

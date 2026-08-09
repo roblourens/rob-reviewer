@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -24,7 +25,7 @@ var toolNames = []string{
 	"get_review_context",
 	"list_changed_files",
 	"read_diff",
-	"read_file",
+	"read_repository_file",
 	"search_repository",
 	"read_focus_document",
 	"report_finding",
@@ -106,9 +107,7 @@ func NewRunner(ctx context.Context, options Options) (*Runner, error) {
 func (runner *Runner) Close() error {
 	var closeErrors []error
 	if runner.client != nil {
-		if err := runner.client.Stop(); err != nil {
-			closeErrors = append(closeErrors, fmt.Errorf("stop Copilot SDK: %w", err))
-		}
+		runner.client.ForceStop()
 	}
 	if runner.baseDirectory != "" {
 		if err := os.RemoveAll(runner.baseDirectory); err != nil {
@@ -118,7 +117,11 @@ func (runner *Runner) Close() error {
 	return errors.Join(closeErrors...)
 }
 
-func (runner *Runner) Review(ctx context.Context, reviewSource ReviewSource) (_ []review.Finding, returnErr error) {
+func (runner *Runner) Review(ctx context.Context, reviewSource ReviewSource) (_ []review.Finding, analysis review.Analysis, stats review.Stats, returnErr error) {
+	stats.Model = runner.options.Model
+	stats.ReasoningEffort = runner.options.ReasoningEffort
+	stats.BillingTokensByType = make(map[string]int64)
+	stats.CostNote = "Copilot SDK reports nano-AI units, model billing multipliers, and premium-request units; it does not provide a USD conversion."
 	pipeline := review.NewPipeline(
 		runner.options.FocusNames,
 		runner.options.MinConfidence,
@@ -167,27 +170,117 @@ func (runner *Runner) Review(ctx context.Context, reviewSource ReviewSource) (_ 
 		SkillDirectories: []string{runner.options.FocusRoot},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create Copilot review session: %w", err)
+		return nil, analysis, stats, fmt.Errorf("create Copilot review session: %w", err)
 	}
 	defer func() {
-		if err := session.Disconnect(); err != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("disconnect Copilot review session: %w", err))
+		deleteContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := runner.client.DeleteSession(deleteContext, session.SessionID); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("delete Copilot review session: %w", err))
 		}
 	}()
+	usage := newUsageAccumulator(&stats)
+	unsubscribe := session.On(usage.onEvent)
+	defer unsubscribe()
 
 	reviewContext, cancel := context.WithTimeout(ctx, reviewTimeout)
 	defer cancel()
 	if _, err := session.SendPromptAndWait(reviewContext, reviewPrompt(runner.options.FocusNames)); err != nil {
-		return nil, fmt.Errorf("run Copilot review: %w", err)
+		return nil, analysis, stats, fmt.Errorf("run Copilot review: %w", err)
 	}
 	if err := collector.completionError(); err != nil {
-		return nil, err
+		return nil, analysis, stats, err
 	}
 	findings, err := pipeline.Process(collector.findingsSnapshot())
 	if err != nil {
-		return nil, fmt.Errorf("validate collected findings: %w", err)
+		return nil, analysis, stats, fmt.Errorf("validate collected findings: %w", err)
 	}
-	return findings, nil
+	usage.finish()
+	return findings, collector.analysisSnapshot(), stats, nil
+}
+
+type usageAccumulator struct {
+	mutex                 sync.Mutex
+	stats                 *review.Stats
+	models                map[string]struct{}
+	reasoningEfforts      map[string]struct{}
+	apiEndpoints          map[string]struct{}
+	modelMultipliers      map[float64]struct{}
+	eventNanoAIUnits      float64
+	checkpointNanoAIUnits *float64
+}
+
+func newUsageAccumulator(stats *review.Stats) *usageAccumulator {
+	return &usageAccumulator{
+		stats:            stats,
+		models:           make(map[string]struct{}),
+		reasoningEfforts: make(map[string]struct{}),
+		apiEndpoints:     make(map[string]struct{}),
+		modelMultipliers: make(map[float64]struct{}),
+	}
+}
+
+func (usage *usageAccumulator) onEvent(event sdk.SessionEvent) {
+	usage.mutex.Lock()
+	defer usage.mutex.Unlock()
+
+	switch data := event.Data.(type) {
+	case *sdk.AssistantUsageData:
+		usage.stats.ModelCalls++
+		if data.Model != "" {
+			usage.models[data.Model] = struct{}{}
+		}
+		if data.ReasoningEffort != nil && *data.ReasoningEffort != "" {
+			usage.reasoningEfforts[*data.ReasoningEffort] = struct{}{}
+		}
+		if data.APIEndpoint != nil {
+			usage.apiEndpoints[string(*data.APIEndpoint)] = struct{}{}
+		}
+		usage.stats.InputTokens += valueOrZero(data.InputTokens)
+		usage.stats.OutputTokens += valueOrZero(data.OutputTokens)
+		usage.stats.ReasoningTokens += valueOrZero(data.ReasoningTokens)
+		usage.stats.CacheReadTokens += valueOrZero(data.CacheReadTokens)
+		usage.stats.CacheWriteTokens += valueOrZero(data.CacheWriteTokens)
+		usage.stats.APIDurationMilliseconds += valueOrZero(data.Duration)
+		usage.stats.ToolCalls += valueOrZero(data.NumToolCalls)
+		if data.Cost != nil {
+			usage.modelMultipliers[*data.Cost] = struct{}{}
+		}
+		if data.CopilotUsage != nil {
+			usage.eventNanoAIUnits += data.CopilotUsage.TotalNanoAiu
+			for _, detail := range data.CopilotUsage.TokenDetails {
+				usage.stats.BillingTokensByType[detail.TokenType] += detail.TokenCount
+			}
+		}
+	case *sdk.SessionUsageCheckpointData:
+		value := data.TotalNanoAiu
+		usage.checkpointNanoAIUnits = &value
+		if data.TotalPremiumRequests != nil {
+			premiumRequests := *data.TotalPremiumRequests
+			usage.stats.PremiumRequests = &premiumRequests
+		}
+	}
+}
+
+func (usage *usageAccumulator) finish() {
+	usage.mutex.Lock()
+	defer usage.mutex.Unlock()
+	usage.stats.TotalTokens = usage.stats.InputTokens + usage.stats.OutputTokens
+	usage.stats.ActualModels = slices.Sorted(maps.Keys(usage.models))
+	usage.stats.ActualReasoningEfforts = slices.Sorted(maps.Keys(usage.reasoningEfforts))
+	usage.stats.APIEndpoints = slices.Sorted(maps.Keys(usage.apiEndpoints))
+	usage.stats.ModelBillingMultipliers = slices.Sorted(maps.Keys(usage.modelMultipliers))
+	usage.stats.NanoAIUnits = usage.eventNanoAIUnits
+	if usage.checkpointNanoAIUnits != nil {
+		usage.stats.NanoAIUnits = *usage.checkpointNanoAIUnits
+	}
+}
+
+func valueOrZero(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func (runner *Runner) validateModel(ctx context.Context) error {
@@ -240,21 +333,46 @@ type focusDocumentParams struct {
 }
 
 type reportFindingParams struct {
-	Focus          string          `json:"focus" jsonschema:"Enabled focus skill that found the issue"`
-	Path           string          `json:"path" jsonschema:"Repository-relative changed file path"`
-	Side           review.Side     `json:"side" jsonschema:"LEFT for a deleted line or RIGHT for an added line"`
-	Line           int             `json:"line" jsonschema:"One-based changed line number"`
-	Severity       review.Severity `json:"severity" jsonschema:"low, medium, high, or critical"`
-	Confidence     float64         `json:"confidence" jsonschema:"Confidence from 0 through 1"`
-	Title          string          `json:"title" jsonschema:"Concise actionable title"`
-	Impact         string          `json:"impact" jsonschema:"Concrete user-visible impact and trigger"`
-	Evidence       string          `json:"evidence" jsonschema:"Mechanism and code evidence proving the regression"`
-	Recommendation string          `json:"recommendation" jsonschema:"Bounded fix direction preserving behavior"`
+	Focus               string          `json:"focus" jsonschema:"Enabled focus skill that found the issue"`
+	Path                string          `json:"path" jsonschema:"Repository-relative changed file path"`
+	Side                review.Side     `json:"side" jsonschema:"LEFT for a deleted line or RIGHT for an added line"`
+	Line                int             `json:"line" jsonschema:"One-based changed line number"`
+	Severity            review.Severity `json:"severity" jsonschema:"low, medium, high, or critical"`
+	Confidence          float64         `json:"confidence" jsonschema:"Confidence from 0 through 1"`
+	ConfidenceRationale string          `json:"confidenceRationale" jsonschema:"Concise explanation of the traced evidence that justifies this confidence"`
+	Title               string          `json:"title" jsonschema:"Concise actionable title"`
+	Impact              string          `json:"impact" jsonschema:"Concrete user-visible impact and trigger"`
+	Evidence            string          `json:"evidence" jsonschema:"Mechanism and code evidence proving the regression"`
+	Recommendation      string          `json:"recommendation" jsonschema:"Bounded fix direction preserving behavior"`
 }
 
 type completeReviewParams struct {
-	Focuses []string `json:"focuses" jsonschema:"Every enabled focus reviewed exactly once"`
-	Summary string   `json:"summary" jsonschema:"Brief internal summary of the completed passes"`
+	Focuses               []string                 `json:"focuses" jsonschema:"Every enabled focus reviewed exactly once"`
+	RelevantIssueFamilies []string                 `json:"relevantIssueFamilies" jsonschema:"Performance issue families considered relevant after inspecting the changed hunks"`
+	Scenarios             []scenarioAnalysisParams `json:"scenarios" jsonschema:"Important product scenarios touched by the change; provide at least one scenario"`
+	Summary               string                   `json:"summary" jsonschema:"Brief internal summary of the completed passes"`
+}
+
+type scenarioAnalysisParams struct {
+	Scenario             string                   `json:"scenario" jsonschema:"Important product workflow or scenario touched by the change"`
+	CriticalPath         string                   `json:"criticalPath" jsonschema:"What must complete before the scenario can make progress; state when the work is off the critical path"`
+	ExpensiveBoundaries  []boundaryAnalysisParams `json:"expensiveBoundaries" jsonschema:"Changed or transitively reached subprocess, IPC, filesystem, database, or network calls; empty only after checking"`
+	ScalingInput         string                   `json:"scalingInput" jsonschema:"Realistic input or collection controlling multiplicity, including effective cardinality after deduplication"`
+	EffectiveConcurrency string                   `json:"effectiveConcurrency" jsonschema:"Actual parallelism, serialization, limiter, sequencer, mutex, queue, or backpressure behavior"`
+	CacheBehavior        string                   `json:"cacheBehavior" jsonschema:"Cold and warm cache behavior, cache keys, coalescing, and negative-cache behavior"`
+	MechanismConfidence  string                   `json:"mechanismConfidence" jsonschema:"Confidence that the changed mechanism and critical-path reachability are real, independent of uncertainty in magnitude"`
+	MagnitudeUncertainty string                   `json:"magnitudeUncertainty" jsonschema:"What remains uncertain about prevalence, input size, or measured duration; use severity rather than silence when only magnitude is uncertain"`
+	Verdict              string                   `json:"verdict" jsonschema:"Why this scenario does or does not introduce a reportable performance regression"`
+}
+
+type boundaryAnalysisParams struct {
+	Kind               string `json:"kind" jsonschema:"subprocess, IPC, filesystem, database, network, serialization, or other expensive boundary"`
+	Location           string `json:"location" jsonschema:"Repository-relative path and symbol or line"`
+	Operation          string `json:"operation" jsonschema:"Concrete operation performed across the boundary"`
+	Cardinality        string `json:"cardinality" jsonschema:"How many calls occur for realistic input, including grouping and cache effects"`
+	IntroducedByDiff   bool   `json:"introducedByDiff" jsonschema:"Whether this boundary operation or its placement on this scenario path is introduced by the diff"`
+	PreviousBehavior   string `json:"previousBehavior" jsonschema:"What the same scenario did before the diff, especially prior boundary-call count"`
+	CriticalPathEffect string `json:"criticalPathEffect" jsonschema:"How this boundary affects or does not affect scenario progress"`
 }
 
 func createTools(ctx context.Context, reviewSource ReviewSource, collector *findingCollector) []sdk.Tool {
@@ -270,7 +388,7 @@ func createTools(ctx context.Context, reviewSource ReviewSource, collector *find
 		func(params readDiffParams, _ sdk.ToolInvocation) (source.DiffContent, error) {
 			return reviewSource.ReadDiff(params.Path, params.Offset, params.MaxBytes)
 		})
-	readFile := sdk.DefineTool("read_file", "Read a bounded line range from a repository file without executing it.",
+	readFile := sdk.DefineTool("read_repository_file", "Read a bounded line range from a repository file without executing it.",
 		func(params readFileParams, _ sdk.ToolInvocation) (source.FileContent, error) {
 			return reviewSource.ReadFile(params.Path, params.StartLine, params.EndLine)
 		})
@@ -288,7 +406,7 @@ func createTools(ctx context.Context, reviewSource ReviewSource, collector *find
 		})
 	completeReview := sdk.DefineTool("complete_review", "Mark all enabled focus passes complete after submitting every finding.",
 		func(params completeReviewParams, _ sdk.ToolInvocation) (string, error) {
-			return collector.complete(params.Focuses, params.Summary)
+			return collector.complete(params)
 		})
 
 	tools := []sdk.Tool{
@@ -315,6 +433,7 @@ type findingCollector struct {
 	findings  []review.Finding
 	completed bool
 	summary   string
+	analysis  review.Analysis
 }
 
 func newCollector(focuses []string, pipeline *review.Pipeline) *findingCollector {
@@ -341,24 +460,79 @@ func (collector *findingCollector) report(finding review.Finding) (string, error
 	return "Finding accepted.", nil
 }
 
-func (collector *findingCollector) complete(focuses []string, summary string) (string, error) {
+func (collector *findingCollector) complete(params completeReviewParams) (string, error) {
 	collector.mutex.Lock()
 	defer collector.mutex.Unlock()
 	if collector.completed {
 		return "", errors.New("complete_review may be called only once")
 	}
 	expected := slices.Clone(collector.focuses)
-	actual := slices.Clone(focuses)
+	actual := slices.Clone(params.Focuses)
 	slices.Sort(expected)
 	slices.Sort(actual)
 	if !slices.Equal(expected, actual) {
 		return "", fmt.Errorf("completed focuses %v do not match enabled focuses %v", actual, expected)
 	}
-	if strings.TrimSpace(summary) == "" {
+	if len(params.RelevantIssueFamilies) == 0 {
+		return "", errors.New("at least one relevant issue family or 'none' is required")
+	}
+	if len(params.Scenarios) == 0 {
+		return "", errors.New("at least one important product scenario analysis is required")
+	}
+	scenarios := make([]review.ScenarioAnalysis, 0, len(params.Scenarios))
+	for index, scenario := range params.Scenarios {
+		if strings.TrimSpace(scenario.Scenario) == "" ||
+			strings.TrimSpace(scenario.CriticalPath) == "" ||
+			strings.TrimSpace(scenario.ScalingInput) == "" ||
+			strings.TrimSpace(scenario.EffectiveConcurrency) == "" ||
+			strings.TrimSpace(scenario.CacheBehavior) == "" ||
+			strings.TrimSpace(scenario.MechanismConfidence) == "" ||
+			strings.TrimSpace(scenario.MagnitudeUncertainty) == "" ||
+			strings.TrimSpace(scenario.Verdict) == "" {
+			return "", fmt.Errorf("scenario %d must complete every analysis field", index+1)
+		}
+		boundaries := make([]review.BoundaryAnalysis, 0, len(scenario.ExpensiveBoundaries))
+		for boundaryIndex, boundary := range scenario.ExpensiveBoundaries {
+			if strings.TrimSpace(boundary.Kind) == "" ||
+				strings.TrimSpace(boundary.Location) == "" ||
+				strings.TrimSpace(boundary.Operation) == "" ||
+				strings.TrimSpace(boundary.Cardinality) == "" ||
+				strings.TrimSpace(boundary.PreviousBehavior) == "" ||
+				strings.TrimSpace(boundary.CriticalPathEffect) == "" {
+				return "", fmt.Errorf("scenario %d boundary %d must complete every field", index+1, boundaryIndex+1)
+			}
+			boundaries = append(boundaries, review.BoundaryAnalysis{
+				Kind:               strings.TrimSpace(boundary.Kind),
+				Location:           strings.TrimSpace(boundary.Location),
+				Operation:          strings.TrimSpace(boundary.Operation),
+				Cardinality:        strings.TrimSpace(boundary.Cardinality),
+				IntroducedByDiff:   boundary.IntroducedByDiff,
+				PreviousBehavior:   strings.TrimSpace(boundary.PreviousBehavior),
+				CriticalPathEffect: strings.TrimSpace(boundary.CriticalPathEffect),
+			})
+		}
+		scenarios = append(scenarios, review.ScenarioAnalysis{
+			Scenario:             strings.TrimSpace(scenario.Scenario),
+			CriticalPath:         strings.TrimSpace(scenario.CriticalPath),
+			ExpensiveBoundaries:  boundaries,
+			ScalingInput:         strings.TrimSpace(scenario.ScalingInput),
+			EffectiveConcurrency: strings.TrimSpace(scenario.EffectiveConcurrency),
+			CacheBehavior:        strings.TrimSpace(scenario.CacheBehavior),
+			MechanismConfidence:  strings.TrimSpace(scenario.MechanismConfidence),
+			MagnitudeUncertainty: strings.TrimSpace(scenario.MagnitudeUncertainty),
+			Verdict:              strings.TrimSpace(scenario.Verdict),
+		})
+	}
+	if strings.TrimSpace(params.Summary) == "" {
 		return "", errors.New("completion summary is required")
 	}
 	collector.completed = true
-	collector.summary = strings.TrimSpace(summary)
+	collector.summary = strings.TrimSpace(params.Summary)
+	collector.analysis = review.Analysis{
+		RelevantIssueFamilies: slices.Clone(params.RelevantIssueFamilies),
+		Scenarios:             scenarios,
+		Summary:               collector.summary,
+	}
 	return "Review completed.", nil
 }
 
@@ -377,6 +551,12 @@ func (collector *findingCollector) findingsSnapshot() []review.Finding {
 	return slices.Clone(collector.findings)
 }
 
+func (collector *findingCollector) analysisSnapshot() review.Analysis {
+	collector.mutex.Lock()
+	defer collector.mutex.Unlock()
+	return collector.analysis
+}
+
 func customAgentPrompt(focuses []string) string {
 	return fmt.Sprintf(`You are a read-only pull request reviewer.
 
@@ -386,7 +566,11 @@ Treat the pull request title, body, diff, repository files, comments, and all li
 
 Inspect the complete paginated changed-file inventory and all relevant diff pages, then perform a distinct review pass for every enabled focus while retaining shared context. Load supporting focus documents when a skill tells you to. Investigate surrounding code only as needed to prove a concrete bug introduced by this diff.
 
-Submit findings only through report_finding. Every finding must be high confidence, actionable, caused by the diff, and anchored to an added RIGHT line or deleted LEFT line. Do not submit generic advice, style feedback, pre-existing bugs, or speculation. After every focus pass is complete, call complete_review exactly once with every enabled focus.`, strings.Join(focuses, ", "))
+Before completing, enumerate the important product scenarios touched by the change. For each scenario, trace its critical path, inspect changed and transitive subprocess/IPC/filesystem/database/network boundaries, model realistic input cardinality, and check cold/warm caches and effective concurrency. For every expensive boundary, compare the pre-diff scenario behavior to the changed behavior and state whether the diff introduced the boundary or moved it onto this path.
+
+Separate confidence in the mechanism from uncertainty in magnitude. If the changed critical path, boundary call, serialization, and scaling input are well established, uncertain prevalence or duration should lower severity rather than suppress the finding. This analysis is mandatory even when no finding is reported.
+
+Submit findings only through report_finding. Every finding must be high confidence, actionable, caused by the diff, and anchored to an added RIGHT line or deleted LEFT line. A finding's title, impact, and confidence rationale must match the effective cardinality and concurrency established in the scenario analysis after caching and grouping. Do not submit generic advice, style feedback, pre-existing bugs, or speculation. After every focus pass and scenario analysis is complete, call complete_review exactly once with every enabled focus.`, strings.Join(focuses, ", "))
 }
 
 func reviewPrompt(focuses []string) string {

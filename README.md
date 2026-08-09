@@ -8,7 +8,8 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 
 - A GitHub Actions workflow polls every ten minutes.
 - The first poll records the current highest PR number and does not review the existing backlog.
-- Newly opened draft PRs are deferred until they become ready for review.
+- Only PRs whose GitHub `author_association` is `MEMBER` or `OWNER` are eligible. Outside collaborators, contributors, bots, and other non-team authors are skipped.
+- Newly opened team-authored draft PRs are deferred until they become ready for review. Non-team drafts are skipped rather than persisted.
 - Each eligible PR is reviewed once. New pushes to an already handled PR are not reviewed in version 1.
 - A clean review is silent.
 - A review with findings posts one non-blocking `COMMENT` review with at most ten inline comments.
@@ -45,7 +46,7 @@ target:
 poll:
   maxPerRun: 5
 review:
-  model: claude-sonnet-4.6
+  model: claude-opus-5
   reasoningEffort: high
   minConfidence: 0.85
   maxFindings: 10
@@ -91,6 +92,20 @@ go run ./cmd/rob-reviewer review --pr 123456
 
 The dry-run result is written as JSON. Add `--publish` only when a public review is intended.
 
+Use `--format markdown` for a readable local report. Both JSON and Markdown output include review statistics at the end: configured and actual model, configured and actual reasoning effort, model API endpoint, wall-clock time, model-call count, input/output/reasoning/cache token usage, aggregate model API time, tool-call count, Copilot nano-AI units, model billing multipliers, and premium-request units when the SDK reports them. The SDK does not expose a reliable USD conversion, so reports state that dollar cost is unavailable.
+
+Scheduled reviews emit the same fields as structured workflow logs even when a clean review remains silent on GitHub. Reviews with findings include a collapsed statistics footer in the GitHub review summary.
+
+Replay a closed or merged team-authored PR for regression testing:
+
+```bash
+REVIEW_GITHUB_TOKEN=... \
+COPILOT_GITHUB_TOKEN=... \
+go run ./cmd/rob-reviewer review --pr 123456 --historical
+```
+
+Historical mode bypasses existing-review marker lookup and open-state publication checks so the original PR diff is analyzed again. It can never be combined with `--publish`.
+
 Run the production poller:
 
 ```bash
@@ -101,7 +116,7 @@ COPILOT_GITHUB_TOKEN=... \
 go run ./cmd/rob-reviewer poll
 ```
 
-The manual workflow supports the same modes: leave `pr_number` empty to poll, provide a number for a dry run, or explicitly enable `publish`.
+The manual workflow supports the same modes: leave `pr_number` empty to poll, provide a number for a dry run, or explicitly enable `publish`. Manual review also enforces the team-author policy and refuses PRs whose author association is not `MEMBER` or `OWNER`.
 
 ## Adding a review focus
 
@@ -128,7 +143,7 @@ Put stable reviewer behavior in `SKILL.md`. Put evolving examples, incident evid
 
 Add the skill name, not the directory name, to `review.focuses`. The framework validates every configured name, preloads all enabled skills into one custom agent, and requires the agent to complete every focus pass exactly once.
 
-The starter [`performance-review` skill](reviewers/performance/SKILL.md) is backed by [verified recent VS Code regression evidence](reviewers/performance/references/vscode-regressions.md). It uses those incidents as a mechanism library, not as a syntactic checklist.
+The starter [`performance-review` skill](reviewers/performance/SKILL.md) loads a generic [performance review guide](reviewers/performance/references/performance-review-guide.md) covering scaling, hot paths, rendering, memory, caching, I/O, concurrency, startup, scheduling, and evidence standards. [External research foundations](reviewers/performance/references/research-foundations.md) record the LLM-review and browser/Electron sources behind the workflow, while short [VS Code regression case notes](reviewers/performance/references/vscode-regressions.md) preserve project-specific provenance rather than serving as the review checklist.
 
 ## Testing
 
@@ -141,7 +156,7 @@ go vet ./...
 go build ./cmd/rob-reviewer
 ```
 
-Tests cover configuration, focus loading, polling/bootstrap/deferred drafts, state persistence, safe checkout behavior, diff parsing and changed-line anchors, path containment, bounded tools, finding validation/ranking, stale-head rejection, idempotency, and review formatting. Synthetic fixtures model known performance failure mechanisms without copying VS Code source.
+Tests cover configuration, focus loading, team-author eligibility, polling/bootstrap/deferred drafts, state persistence, safe checkout behavior, diff parsing and changed-line anchors, path containment, bounded tools, finding validation/ranking, stale-head rejection, idempotency, and review formatting. Synthetic fixtures model known performance failure mechanisms without copying VS Code source.
 
 Use a manual dry-run workflow for the real SDK smoke test. Publishing is a separate explicit input.
 

@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/roblourens/rob-reviewer/internal/app"
+	"github.com/roblourens/rob-reviewer/internal/review"
 )
 
 func main() {
@@ -62,12 +63,20 @@ func run(logger *slog.Logger) (returnErr error) {
 		configPath := flags.String("config", "reviewer.yaml", "path to reviewer configuration")
 		pullRequest := flags.String("pr", "", "pull request number")
 		publish := flags.Bool("publish", false, "publish the review instead of running safely in dry-run mode")
+		historical := flags.Bool("historical", false, "review a closed/merged PR without any publication or marker lookup")
+		outputFormat := flags.String("format", "json", "local output format: json or markdown")
 		if err := flags.Parse(os.Args[2:]); err != nil {
 			return err
 		}
 		number, err := app.ParsePullRequestNumber(*pullRequest)
 		if err != nil {
 			return err
+		}
+		if *historical && *publish {
+			return errors.New("--historical cannot be combined with --publish")
+		}
+		if *outputFormat != "json" && *outputFormat != "markdown" {
+			return fmt.Errorf("--format must be json or markdown, got %q", *outputFormat)
 		}
 		reviewer, err := newApp(*configPath, logger)
 		if err != nil {
@@ -76,12 +85,23 @@ func run(logger *slog.Logger) (returnErr error) {
 		defer func() {
 			returnErr = errors.Join(returnErr, reviewer.Close())
 		}()
-		result, err := reviewer.ReviewPullRequest(ctx, number, *publish)
+		var result review.Result
+		if *historical {
+			result, err = reviewer.ReviewHistoricalPullRequest(ctx, number)
+		} else {
+			result, err = reviewer.ReviewPullRequest(ctx, number, *publish)
+		}
 		if err != nil {
 			return err
 		}
-		if err := app.PrintResult(result); err != nil {
-			return err
+		var printErr error
+		if *outputFormat == "markdown" {
+			printErr = app.PrintResultMarkdown(result)
+		} else {
+			printErr = app.PrintResult(result)
+		}
+		if printErr != nil {
+			return printErr
 		}
 		return nil
 

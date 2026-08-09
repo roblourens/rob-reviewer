@@ -35,22 +35,42 @@ func (client *fakePublisherClient) PublishReview(_ context.Context, _, _ string,
 }
 
 func TestPublisherCreatesCommentReview(t *testing.T) {
-	pull := PullRequest{Number: 7, HeadSHA: "head", State: "open"}
+	pull := PullRequest{Number: 7, HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
 	client := &fakePublisherClient{current: pull}
 	publisher := NewPublisher(client, "microsoft", "vscode")
 	result := Result{
 		PullRequest: pull,
+		Stats: Stats{
+			Model:                   "claude-opus-5",
+			ActualModels:            []string{"claude-opus-5"},
+			ReasoningEffort:         "high",
+			ActualReasoningEfforts:  []string{"high"},
+			APIEndpoints:            []string{"/v1/messages"},
+			WallClockMilliseconds:   12_345,
+			ModelCalls:              3,
+			InputTokens:             10_000,
+			OutputTokens:            2_000,
+			TotalTokens:             12_000,
+			ReasoningTokens:         500,
+			CacheReadTokens:         4_000,
+			CacheWriteTokens:        1_000,
+			APIDurationMilliseconds: 10_500,
+			ToolCalls:               7,
+			NanoAIUnits:             123.456,
+			ModelBillingMultipliers: []float64{15},
+		},
 		Findings: []Finding{{
-			Focus:          "performance-review",
-			Path:           "src/file.ts",
-			Side:           SideRight,
-			Line:           12,
-			Severity:       SeverityHigh,
-			Confidence:     0.98,
-			Title:          "Batch repeated work",
-			Impact:         "The loop blocks scrolling.",
-			Evidence:       "It runs for every historical item.",
-			Recommendation: "Flush one update after reconstruction.",
+			Focus:               "performance-review",
+			Path:                "src/file.ts",
+			Side:                SideRight,
+			Line:                12,
+			Severity:            SeverityHigh,
+			Confidence:          0.98,
+			ConfidenceRationale: "The changed call is directly inside the repeated reconstruction loop.",
+			Title:               "Batch repeated work",
+			Impact:              "The loop blocks scrolling.",
+			Evidence:            "It runs for every historical item.",
+			Recommendation:      "Flush one update after reconstruction.",
 		}},
 	}
 
@@ -70,10 +90,24 @@ func TestPublisherCreatesCommentReview(t *testing.T) {
 	if !strings.Contains(client.request.Comments[0].Body, generatedDisclosure) {
 		t.Fatal("inline comment is missing generated-content disclosure")
 	}
+	for _, expected := range []string{
+		"Review statistics",
+		"`claude-opus-5`",
+		"`high`",
+		"12.345s",
+		"10000 input, 2000 output, 12000 total",
+		"123.456 nano-AI units",
+		"model billing multiplier: 15.000",
+		"USD cost: unavailable",
+	} {
+		if !strings.Contains(client.request.Body, expected) {
+			t.Fatalf("review body missing %q: %s", expected, client.request.Body)
+		}
+	}
 }
 
 func TestPublisherRejectsStaleHead(t *testing.T) {
-	client := &fakePublisherClient{current: PullRequest{Number: 7, HeadSHA: "new", State: "open"}}
+	client := &fakePublisherClient{current: PullRequest{Number: 7, HeadSHA: "new", State: "open", AuthorAssociation: "MEMBER"}}
 	publisher := NewPublisher(client, "microsoft", "vscode")
 
 	_, err := publisher.Publish(context.Background(), Result{
@@ -86,7 +120,7 @@ func TestPublisherRejectsStaleHead(t *testing.T) {
 }
 
 func TestPublisherSkipsCleanAndDuplicateReviews(t *testing.T) {
-	client := &fakePublisherClient{current: PullRequest{Number: 7, HeadSHA: "head", State: "open"}, markerExists: true}
+	client := &fakePublisherClient{current: PullRequest{Number: 7, HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}, markerExists: true}
 	publisher := NewPublisher(client, "microsoft", "vscode")
 
 	published, err := publisher.Publish(context.Background(), Result{PullRequest: client.current}, false)
@@ -104,7 +138,7 @@ func TestPublisherSkipsCleanAndDuplicateReviews(t *testing.T) {
 }
 
 func TestPublisherRejectsStaleHeadForCleanResult(t *testing.T) {
-	client := &fakePublisherClient{current: PullRequest{Number: 7, HeadSHA: "new", State: "open"}}
+	client := &fakePublisherClient{current: PullRequest{Number: 7, HeadSHA: "new", State: "open", AuthorAssociation: "MEMBER"}}
 	publisher := NewPublisher(client, "microsoft", "vscode")
 
 	_, err := publisher.Publish(context.Background(), Result{
@@ -116,7 +150,7 @@ func TestPublisherRejectsStaleHeadForCleanResult(t *testing.T) {
 }
 
 func TestSanitizeMarkdownTextNeutralizesActiveContent(t *testing.T) {
-	result := sanitizeMarkdownText("@team ![image](https://example.test/x) <details>\x00")
+	result := SanitizeMarkdownText("@team ![image](https://example.test/x) <details>\x00")
 	for _, forbidden := range []string{"@team", "![", "<details>", "\x00"} {
 		if strings.Contains(result, forbidden) {
 			t.Fatalf("sanitized text %q contains %q", result, forbidden)
@@ -125,11 +159,54 @@ func TestSanitizeMarkdownTextNeutralizesActiveContent(t *testing.T) {
 }
 
 func TestPublisherRevalidatesImmediatelyBeforePost(t *testing.T) {
-	analyzed := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head", State: "open"}
+	analyzed := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
 	client := &fakePublisherClient{
 		currents: []PullRequest{
 			analyzed,
-			{Number: 7, BaseSHA: "base", HeadSHA: "new-head", State: "open"},
+			{Number: 7, BaseSHA: "base", HeadSHA: "new-head", State: "open", AuthorAssociation: "MEMBER"},
+		},
+	}
+
+	publisher := NewPublisher(client, "microsoft", "vscode")
+	_, err := publisher.Publish(context.Background(), Result{
+		PullRequest: analyzed,
+		Findings: []Finding{{
+			Focus:          "performance-review",
+			Path:           "src/file.ts",
+			Side:           SideRight,
+			Line:           1,
+			Severity:       SeverityHigh,
+			Title:          "Finding",
+			Impact:         "Impact",
+			Evidence:       "Evidence",
+			Recommendation: "Recommendation",
+		}},
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "head changed") || client.published {
+		t.Fatalf("error = %v, published = %v", err, client.published)
+	}
+}
+
+func TestPublisherRejectsNonTeamAuthorBeforePost(t *testing.T) {
+	analyzed := PullRequest{
+		Number:            7,
+		BaseSHA:           "base",
+		HeadSHA:           "head",
+		State:             "open",
+		AuthorLogin:       "teammate",
+		AuthorAssociation: "MEMBER",
+	}
+	client := &fakePublisherClient{
+		currents: []PullRequest{
+			analyzed,
+			{
+				Number:            7,
+				BaseSHA:           "base",
+				HeadSHA:           "head",
+				State:             "open",
+				AuthorLogin:       "former-teammate",
+				AuthorAssociation: "CONTRIBUTOR",
+			},
 		},
 	}
 	publisher := NewPublisher(client, "microsoft", "vscode")
@@ -147,7 +224,7 @@ func TestPublisherRevalidatesImmediatelyBeforePost(t *testing.T) {
 			Recommendation: "Recommendation",
 		}},
 	}, false)
-	if err == nil || !strings.Contains(err.Error(), "head changed") || client.published {
+	if err == nil || !strings.Contains(err.Error(), "no longer team-authored") || client.published {
 		t.Fatalf("error = %v, published = %v", err, client.published)
 	}
 }
