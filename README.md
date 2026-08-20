@@ -72,7 +72,7 @@ The first scheduled poll creates `reviewer-state` from the default branch when n
 
 ## Commands
 
-Go 1.24 or later is required.
+Go 1.24 or later and `rg` (ripgrep) are required. The GitHub Actions workflows install ripgrep explicitly.
 
 The Go SDK CLI bundler is pinned as a Go tool. Run it before building so the resulting application carries the matching Copilot CLI:
 
