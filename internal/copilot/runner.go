@@ -121,7 +121,7 @@ func (runner *Runner) Review(ctx context.Context, reviewSource ReviewSource) (_ 
 	stats.Model = runner.options.Model
 	stats.ReasoningEffort = runner.options.ReasoningEffort
 	stats.BillingTokensByType = make(map[string]int64)
-	stats.CostNote = "Copilot SDK reports nano-AI units, model billing multipliers, and premium-request units; it does not provide a USD conversion."
+	stats.CostNote = "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
 	pipeline := review.NewPipeline(
 		runner.options.FocusNames,
 		runner.options.MinConfidence,
@@ -255,10 +255,6 @@ func (usage *usageAccumulator) onEvent(event sdk.SessionEvent) {
 	case *sdk.SessionUsageCheckpointData:
 		value := data.TotalNanoAiu
 		usage.checkpointNanoAIUnits = &value
-		if data.TotalPremiumRequests != nil {
-			premiumRequests := *data.TotalPremiumRequests
-			usage.stats.PremiumRequests = &premiumRequests
-		}
 	}
 }
 
@@ -340,6 +336,14 @@ type reportFindingParams struct {
 	Severity            review.Severity `json:"severity" jsonschema:"low, medium, high, or critical"`
 	Confidence          float64         `json:"confidence" jsonschema:"Confidence from 0 through 1"`
 	ConfidenceRationale string          `json:"confidenceRationale" jsonschema:"Concise explanation of the traced evidence that justifies this confidence"`
+	PerformanceCategory string          `json:"performanceCategory" jsonschema:"One of latency, throughput, cpu, memory, gc, io, ipc, subprocess, rendering, layout, startup, or network"`
+	PerformanceResource string          `json:"performanceResource" jsonschema:"Concrete expensive or retained resource: CPU work, bytes, objects, DOM nodes, IPC calls, subprocesses, filesystem operations, or similar"`
+	PerformanceScaling  string          `json:"performanceScaling" jsonschema:"How performance cost grows with realistic input, frequency, collection size, lifetime, or concurrency"`
+	PerformanceOutcome  string          `json:"performanceOutcome" jsonschema:"Concrete performance degradation such as increased latency, blocked critical path, CPU/GC pressure, retained memory, excessive I/O, lower throughput, or dropped frames"`
+	ChangeCausality     string          `json:"changeCausality" jsonschema:"One of introduced, materially-amplified, or pre-existing-critical"`
+	PreviousBehavior    string          `json:"previousBehavior" jsonschema:"What the reviewed scenario did before the PR, including the prior performance cost or absence of this work"`
+	ChangedBehavior     string          `json:"changedBehavior" jsonschema:"What the changed lines now do differently and how that changes performance cost"`
+	CausalDiffEvidence  string          `json:"causalDiffEvidence" jsonschema:"Specific changed-line evidence proving this PR introduced or materially amplified the performance mechanism"`
 	Title               string          `json:"title" jsonschema:"Concise actionable title"`
 	Impact              string          `json:"impact" jsonschema:"Concrete user-visible impact and trigger"`
 	Evidence            string          `json:"evidence" jsonschema:"Mechanism and code evidence proving the regression"`
@@ -570,7 +574,13 @@ Before completing, enumerate the important product scenarios touched by the chan
 
 Separate confidence in the mechanism from uncertainty in magnitude. If the changed critical path, boundary call, serialization, and scaling input are well established, uncertain prevalence or duration should lower severity rather than suppress the finding. This analysis is mandatory even when no finding is reported.
 
-Submit findings only through report_finding. Every finding must be high confidence, actionable, caused by the diff, and anchored to an added RIGHT line or deleted LEFT line. A finding's title, impact, and confidence rationale must match the effective cardinality and concurrency established in the scenario analysis after caching and grouping. Do not submit generic advice, style feedback, pre-existing bugs, or speculation. After every focus pass and scenario analysis is complete, call complete_review exactly once with every enabled focus.`, strings.Join(focuses, ", "))
+Submit findings only through report_finding. Report performance problems only. Never submit stale UI, wrong state, missing events, error handling, security, accessibility, functional behavior, or other correctness issues unless the same changed mechanism independently causes a concrete performance regression that meets the performance schema.
+
+Every finding must be high confidence, actionable, caused by the diff, and anchored to an added RIGHT line or deleted LEFT line. It must name the performance category, expensive or retained resource, scaling relationship, and performance outcome.
+
+Prove PR causality with an explicit before/after comparison. A changed line that merely exposes, preserves metadata for, or passes through an existing expensive path is not enough. Classify the issue as introduced or materially-amplified only when the PR adds the expensive work, moves it onto a hotter path, increases its frequency/cardinality, defeats an optimization, or retains substantially more state. A pre-existing issue may be reported only as pre-existing-critical, only at critical severity, and only when the changed code creates a direct, review-relevant catastrophic risk; otherwise omit it to avoid expanding PR scope.
+
+A finding's title, impact, confidence rationale, and causal evidence must match the effective cardinality and concurrency established in the scenario analysis after caching and grouping. Do not submit generic advice, style feedback, nearby pre-existing bugs, correctness-only bugs, or speculation. After every focus pass and scenario analysis is complete, call complete_review exactly once with every enabled focus.`, strings.Join(focuses, ", "))
 }
 
 func reviewPrompt(focuses []string) string {

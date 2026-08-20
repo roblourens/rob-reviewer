@@ -88,12 +88,20 @@ func buildReviewRequest(result Result, marker string) ReviewRequest {
 			Line: finding.Line,
 			Side: finding.Side,
 			Body: fmt.Sprintf(
-				"**[%s] %s**\n\n%s\n\n**Confidence:** %.2f — %s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n%s",
+				"**[%s] %s**\n\n%s\n\n**Performance mechanism:** `%s`; %s; scales as %s; outcome: %s\n\n**PR causality:** `%s` — before: %s; after: %s\n\n**Confidence:** %.2f — %s\n\n**Causal diff evidence:** %s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n%s",
 				finding.Severity,
 				SanitizeMarkdownText(finding.Title),
 				SanitizeMarkdownText(finding.Impact),
+				SanitizeMarkdownText(finding.PerformanceCategory),
+				SanitizeMarkdownText(finding.PerformanceResource),
+				SanitizeMarkdownText(finding.PerformanceScaling),
+				SanitizeMarkdownText(finding.PerformanceOutcome),
+				SanitizeMarkdownText(finding.ChangeCausality),
+				SanitizeMarkdownText(finding.PreviousBehavior),
+				SanitizeMarkdownText(finding.ChangedBehavior),
 				finding.Confidence,
 				SanitizeMarkdownText(finding.ConfidenceRationale),
+				SanitizeMarkdownText(finding.CausalDiffEvidence),
 				SanitizeMarkdownText(finding.Evidence),
 				SanitizeMarkdownText(finding.Recommendation),
 				generatedDisclosure,
@@ -163,9 +171,6 @@ func FormatStatsMarkdown(stats Stats) string {
 			}
 			fmt.Fprintf(&output, "%.3f", multiplier)
 		}
-	}
-	if stats.PremiumRequests != nil {
-		fmt.Fprintf(&output, "; %.3f premium requests", *stats.PremiumRequests)
 	}
 	output.WriteString("\n")
 	output.WriteString("- USD cost: unavailable; the Copilot SDK does not expose a dollar conversion.\n")

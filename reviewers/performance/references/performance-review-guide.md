@@ -2,6 +2,32 @@
 
 Use this guide to identify concrete performance bugs introduced by a change. It is not a requirement to comment on every potentially inefficient construct. Report only when the changed code creates a plausible regression mechanism on a realistic execution path and the proposed correction is compatible with the surrounding behavior.
 
+## Scope: performance only
+
+Do not report correctness-only defects. Stale UI, missing events, wrong state, bad error handling, security, accessibility, functional behavior, and maintainability are outside this review.
+
+A finding is reportable only when it establishes all three:
+
+1. a concrete expensive or retained resource;
+2. a realistic scaling or frequency relationship;
+3. a performance outcome such as latency, blocked progress, CPU/GC pressure, retained memory, excessive I/O, lower throughput, or dropped frames.
+
+Correctness and performance can coexist. A listener leak that retains disposed models is performance-relevant memory growth. A listener that simply fails to update a button is not.
+
+## Scope: caused by this PR
+
+Report only performance mechanisms introduced or materially amplified by the reviewed diff.
+
+For every candidate, compare:
+
+- what the scenario did before the change;
+- what changed lines now do;
+- which performance resource, frequency, cardinality, critical-path placement, or lifetime became worse.
+
+Do not report an existing expensive helper merely because the PR passes richer metadata to it, exposes another call site, or makes the existing issue easier to notice. Prove that the new metadata or call site actually increases cost.
+
+A pre-existing issue is outside PR scope unless it is critical and the changed code creates a direct catastrophic risk. This exception should be rare; ordinary low/medium optimization opportunities must be omitted.
+
 Performance is the interaction of:
 
 - **cost per operation**;

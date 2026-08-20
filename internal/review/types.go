@@ -46,6 +46,14 @@ type Finding struct {
 	Severity            Severity
 	Confidence          float64
 	ConfidenceRationale string
+	PerformanceCategory string
+	PerformanceResource string
+	PerformanceScaling  string
+	PerformanceOutcome  string
+	ChangeCausality     string
+	PreviousBehavior    string
+	ChangedBehavior     string
+	CausalDiffEvidence  string
 	Title               string
 	Impact              string
 	Evidence            string
@@ -107,7 +115,6 @@ type Stats struct {
 	ToolCalls               int64
 	NanoAIUnits             float64
 	ModelBillingMultipliers []float64
-	PremiumRequests         *float64
 	BillingTokensByType     map[string]int64
 	USDollars               *float64
 	CostNote                string

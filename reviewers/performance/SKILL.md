@@ -7,6 +7,10 @@ description: Review a code diff for concrete, newly introduced performance bugs 
 
 Review only the supplied diff. Report an issue only when the change introduces an actionable performance regression with a concrete mechanism and a realistic trigger.
 
+This reviewer reports **performance issues only**. Do not report correctness, stale UI, missing events, security, accessibility, functional behavior, error handling, or maintainability issues unless the same changed mechanism independently establishes a concrete performance regression.
+
+This reviewer reports issues introduced or materially amplified by the PR. Do not report nearby pre-existing performance opportunities merely because the changed code reaches or reveals them. A pre-existing issue is in scope only when it is critical and the changed code creates a direct catastrophic risk.
+
 ## Prepare
 
 1. Read [references/performance-review-guide.md](references/performance-review-guide.md). Use its issue families and evidence standard to guide the review.
@@ -27,6 +31,10 @@ For each candidate, prove all of the following:
 - **Impact:** connect the mechanism to a user-visible outcome such as jank, blocked startup, GC pressure, memory growth, stale layout, or excessive I/O.
 - **Evidence:** cite changed code and corroborating call-flow, invariant, test, trace, benchmark, or established repository pattern. Do not infer a regression from an API name alone.
 - **Confidence rationale:** state which traced facts justify the confidence score and which material assumptions remain.
+- **Performance resource:** identify the CPU work, retained memory, allocation, bytes, DOM/layout work, IPC/process/I/O calls, or other resource that becomes more expensive.
+- **Scaling relationship:** explain how that performance cost grows with realistic input size, event frequency, history, lifetime, cache misses, or concurrency.
+- **Performance outcome:** state the resulting latency, blocked critical path, CPU/GC pressure, retained memory, excessive I/O, reduced throughput, or dropped frames.
+- **PR causality:** compare the scenario before and after the diff. Identify the changed line that adds the work, moves it onto a hotter path, increases its frequency/cardinality, defeats an optimization, or materially increases retained state.
 - **Actionability:** describe a bounded correction that preserves required ordering and semantics.
 
 Check batching and deferred work for flush, ordering, rotation, cancellation, and error semantics. Check caches/maps/diagnostics for removal and lazy allocation. Check render suppression and deduplication for state committed before the authoritative consumer is notified.
@@ -43,6 +51,10 @@ Use this format:
 > Explain the trigger, repeated/retained work, concrete impact, confidence rationale, and why the changed code causes it. State the bounded fix direction.
 
 Keep findings self-contained and concise. If evidence is insufficient, investigate further or omit the finding. Return no findings when the diff has no high-confidence performance bug.
+
+A broken event that leaves UI stale is correctness-only. A missing disposal that retains objects is performance-relevant memory growth. An unnecessary await is performance-relevant only when it delays an important scenario on a realistically slow or scaling operation. Classify by the changed mechanism's performance effect, not by whether the code looks inefficient or buggy.
+
+Passing richer metadata into an existing renderer, serializer, file widget, IPC helper, or cache does not by itself prove a performance regression. Establish that the metadata changes the expensive work performed, its frequency, its scale, or its lifetime. Otherwise omit the suggestion as pre-existing scope expansion.
 
 Confidence measures whether the changed mechanism, call path, and scaling relationship are real. Uncertainty about how many users reach the largest input or exactly how many milliseconds it costs should normally affect severity, not erase an otherwise well-proven finding.
 

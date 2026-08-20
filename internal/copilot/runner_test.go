@@ -38,6 +38,14 @@ func TestCollectorAcceptsValidFinding(t *testing.T) {
 		Severity:            review.SeverityHigh,
 		Confidence:          0.95,
 		ConfidenceRationale: "The changed loop is directly called once per historical child.",
+		PerformanceCategory: "latency",
+		PerformanceResource: "Synchronous Markdown and presentation CPU work.",
+		PerformanceScaling:  "One update per historical child.",
+		PerformanceOutcome:  "Blocked scrolling and dropped frames.",
+		ChangeCausality:     "introduced",
+		PreviousBehavior:    "Historical children did not trigger per-child title rendering.",
+		ChangedBehavior:     "The diff renders a title once for every historical child.",
+		CausalDiffEvidence:  "The changed loop adds the per-child title update.",
 		Title:               "Batch repeated updates",
 		Impact:              "Scrolling blocks while hidden history is rebuilt.",
 		Evidence:            "The changed loop updates presentation once per child.",
@@ -80,7 +88,15 @@ func validCompletion(focuses []string) completeReviewParams {
 
 func TestAgentPromptTreatsContentAsUntrusted(t *testing.T) {
 	prompt := customAgentPrompt([]string{"performance-review"})
-	for _, expected := range []string{"untrusted data", "distinct review pass", "complete_review exactly once"} {
+	for _, expected := range []string{
+		"untrusted data",
+		"distinct review pass",
+		"Report performance problems only",
+		"correctness-only bugs",
+		"explicit before/after comparison",
+		"nearby pre-existing bugs",
+		"complete_review exactly once",
+	} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("prompt missing %q", expected)
 		}
@@ -93,7 +109,7 @@ func TestUsageAccumulatorAggregatesSDKEvents(t *testing.T) {
 	reasoningEffort := "high"
 	apiEndpoint := sdk.AssistantUsageAPIEndpointV1Messages
 	usage.onEvent(sdk.SessionEvent{Data: &sdk.AssistantUsageData{
-		Model:           "claude-opus-5",
+		Model:           "gpt-5.6-sol",
 		ReasoningEffort: &reasoningEffort,
 		APIEndpoint:     &apiEndpoint,
 		InputTokens:     int64Pointer(1_000),
@@ -112,7 +128,7 @@ func TestUsageAccumulatorAggregatesSDKEvents(t *testing.T) {
 		},
 	}})
 	usage.onEvent(sdk.SessionEvent{Data: &sdk.AssistantUsageData{
-		Model:            "claude-opus-5",
+		Model:            "gpt-5.6-sol",
 		InputTokens:      int64Pointer(500),
 		OutputTokens:     int64Pointer(100),
 		CacheWriteTokens: int64Pointer(75),
@@ -127,8 +143,7 @@ func TestUsageAccumulatorAggregatesSDKEvents(t *testing.T) {
 		},
 	}})
 	usage.onEvent(sdk.SessionEvent{Data: &sdk.SessionUsageCheckpointData{
-		TotalNanoAiu:         70,
-		TotalPremiumRequests: float64Pointer(3.0),
+		TotalNanoAiu: 70,
 	}})
 	usage.finish()
 
@@ -147,10 +162,7 @@ func TestUsageAccumulatorAggregatesSDKEvents(t *testing.T) {
 	if len(stats.ModelBillingMultipliers) != 1 || stats.ModelBillingMultipliers[0] != 1.5 {
 		t.Fatalf("model billing multipliers = %v", stats.ModelBillingMultipliers)
 	}
-	if stats.PremiumRequests == nil || *stats.PremiumRequests != 3 {
-		t.Fatalf("premium requests = %v", stats.PremiumRequests)
-	}
-	if len(stats.ActualModels) != 1 || stats.ActualModels[0] != "claude-opus-5" {
+	if len(stats.ActualModels) != 1 || stats.ActualModels[0] != "gpt-5.6-sol" {
 		t.Fatalf("actual models = %v", stats.ActualModels)
 	}
 	if len(stats.ActualReasoningEfforts) != 1 || stats.ActualReasoningEfforts[0] != "high" {

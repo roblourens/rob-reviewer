@@ -13,7 +13,7 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 - Each eligible PR is reviewed once. New pushes to an already handled PR are not reviewed in version 1.
 - A clean review is silent.
 - A review with findings posts one non-blocking `COMMENT` review with at most ten inline comments.
-- Findings must be caused by the diff, high confidence, and anchored to an added or deleted line.
+- Findings must be performance-only, high confidence, anchored to an added or deleted line, and explicitly prove through before/after evidence that the PR introduced or materially amplified the performance mechanism. Pre-existing non-critical optimization opportunities are rejected.
 - State is committed to a dedicated `reviewer-state` branch, including silent clean results and deferred drafts.
 
 Scheduled workflows are eventually consistent: GitHub may delay cron jobs. GitHub also disables scheduled workflows in an inactive public repository after 60 days, so keep the repository active or re-enable the workflow when needed.
@@ -46,7 +46,7 @@ target:
 poll:
   maxPerRun: 5
 review:
-  model: claude-opus-5
+  model: gpt-5.6-sol
   reasoningEffort: high
   minConfidence: 0.85
   maxFindings: 10
@@ -92,7 +92,7 @@ go run ./cmd/rob-reviewer review --pr 123456
 
 The dry-run result is written as JSON. Add `--publish` only when a public review is intended.
 
-Use `--format markdown` for a readable local report. Both JSON and Markdown output include review statistics at the end: configured and actual model, configured and actual reasoning effort, model API endpoint, wall-clock time, model-call count, input/output/reasoning/cache token usage, aggregate model API time, tool-call count, Copilot nano-AI units, model billing multipliers, and premium-request units when the SDK reports them. The SDK does not expose a reliable USD conversion, so reports state that dollar cost is unavailable.
+Use `--format markdown` for a readable local report. Both JSON and Markdown output include review statistics at the end: configured and actual model, configured and actual reasoning effort, model API endpoint, wall-clock time, model-call count, input/output/reasoning/cache token usage, aggregate model API time, tool-call count, Copilot nano-AI units, and model billing multipliers. The SDK does not expose a reliable USD conversion, so reports state that dollar cost is unavailable.
 
 Scheduled reviews emit the same fields as structured workflow logs even when a clean review remains silent on GitHub. Reviews with findings include a collapsed statistics footer in the GitHub review summary.
 

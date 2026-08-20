@@ -93,13 +93,41 @@ func (pipeline *Pipeline) validate(finding Finding) error {
 	if finding.ConfidenceRationale == "" || len(finding.ConfidenceRationale) > maxFindingSectionLength {
 		return fmt.Errorf("confidence rationale must contain 1-%d characters", maxFindingSectionLength)
 	}
+	if !slices.Contains([]string{
+		"latency",
+		"throughput",
+		"cpu",
+		"memory",
+		"gc",
+		"io",
+		"ipc",
+		"subprocess",
+		"rendering",
+		"layout",
+		"startup",
+		"network",
+	}, finding.PerformanceCategory) {
+		return fmt.Errorf("unsupported performance category %q", finding.PerformanceCategory)
+	}
+	if !slices.Contains([]string{"introduced", "materially-amplified", "pre-existing-critical"}, finding.ChangeCausality) {
+		return fmt.Errorf("unsupported change causality %q", finding.ChangeCausality)
+	}
+	if finding.ChangeCausality == "pre-existing-critical" && finding.Severity != SeverityCritical {
+		return errors.New("pre-existing issues may be reported only at critical severity")
+	}
 	if finding.Title == "" || len(finding.Title) > maxTitleLength {
 		return fmt.Errorf("title must contain 1-%d characters", maxTitleLength)
 	}
 	for name, value := range map[string]string{
-		"impact":         finding.Impact,
-		"evidence":       finding.Evidence,
-		"recommendation": finding.Recommendation,
+		"performance resource": finding.PerformanceResource,
+		"performance scaling":  finding.PerformanceScaling,
+		"performance outcome":  finding.PerformanceOutcome,
+		"previous behavior":    finding.PreviousBehavior,
+		"changed behavior":     finding.ChangedBehavior,
+		"causal diff evidence": finding.CausalDiffEvidence,
+		"impact":               finding.Impact,
+		"evidence":             finding.Evidence,
+		"recommendation":       finding.Recommendation,
 	} {
 		if value == "" || len(value) > maxFindingSectionLength {
 			return fmt.Errorf("%s must contain 1-%d characters", name, maxFindingSectionLength)
@@ -113,6 +141,14 @@ func normalizeFinding(finding Finding) Finding {
 	finding.Path = strings.TrimSpace(strings.TrimPrefix(finding.Path, "./"))
 	finding.Title = strings.TrimSpace(finding.Title)
 	finding.ConfidenceRationale = strings.TrimSpace(finding.ConfidenceRationale)
+	finding.PerformanceCategory = strings.ToLower(strings.TrimSpace(finding.PerformanceCategory))
+	finding.PerformanceResource = strings.TrimSpace(finding.PerformanceResource)
+	finding.PerformanceScaling = strings.TrimSpace(finding.PerformanceScaling)
+	finding.PerformanceOutcome = strings.TrimSpace(finding.PerformanceOutcome)
+	finding.ChangeCausality = strings.ToLower(strings.TrimSpace(finding.ChangeCausality))
+	finding.PreviousBehavior = strings.TrimSpace(finding.PreviousBehavior)
+	finding.ChangedBehavior = strings.TrimSpace(finding.ChangedBehavior)
+	finding.CausalDiffEvidence = strings.TrimSpace(finding.CausalDiffEvidence)
 	finding.Impact = strings.TrimSpace(finding.Impact)
 	finding.Evidence = strings.TrimSpace(finding.Evidence)
 	finding.Recommendation = strings.TrimSpace(finding.Recommendation)

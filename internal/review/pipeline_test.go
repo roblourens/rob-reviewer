@@ -27,6 +27,14 @@ func validFinding(title string, confidence float64, line int) Finding {
 		Severity:            SeverityHigh,
 		Confidence:          confidence,
 		ConfidenceRationale: "The changed loop is directly reachable from the scroll callback and scales with history.",
+		PerformanceCategory: "latency",
+		PerformanceResource: "Synchronous renderer CPU work.",
+		PerformanceScaling:  "One expensive update per historical item per row reconstruction.",
+		PerformanceOutcome:  "Scroll latency and dropped frames.",
+		ChangeCausality:     "introduced",
+		PreviousBehavior:    "The row did not render a title for each historical child.",
+		ChangedBehavior:     "The diff renders an expensive title for every historical child.",
+		CausalDiffEvidence:  "The added loop calls the title renderer once per historical child.",
 		Title:               title,
 		Impact:              "Blocks the renderer on every scroll event.",
 		Evidence:            "The changed loop executes once for each historical item.",
@@ -73,5 +81,42 @@ func TestPipelineRejectsInvalidAnchor(t *testing.T) {
 	_, err := pipeline.Process([]Finding{validFinding("Invalid anchor", 0.99, 5)})
 	if err == nil || !strings.Contains(err.Error(), "not a changed diff line") {
 		t.Fatalf("expected changed line error, got %v", err)
+	}
+}
+
+func TestPipelineRejectsCorrectnessOnlyFindingWithoutPerformanceMechanism(t *testing.T) {
+	finding := validFinding("Stale button state", 0.99, 5)
+	finding.PerformanceCategory = ""
+	finding.PerformanceResource = ""
+	finding.PerformanceScaling = ""
+	finding.PerformanceOutcome = ""
+	finding.Impact = "The button does not update after a visibility event."
+	pipeline := NewPipeline(
+		[]string{"performance-review"},
+		0.85,
+		10,
+		anchorSet{anchor("src/file.ts", SideRight, 5): {}},
+	)
+
+	_, err := pipeline.Process([]Finding{finding})
+	if err == nil || !strings.Contains(err.Error(), "performance category") {
+		t.Fatalf("expected performance-only validation error, got %v", err)
+	}
+}
+
+func TestPipelineRejectsPreExistingNonCriticalIssue(t *testing.T) {
+	finding := validFinding("Existing file stats", 0.99, 5)
+	finding.ChangeCausality = "pre-existing-critical"
+	finding.Severity = SeverityLow
+	pipeline := NewPipeline(
+		[]string{"performance-review"},
+		0.85,
+		10,
+		anchorSet{anchor("src/file.ts", SideRight, 5): {}},
+	)
+
+	_, err := pipeline.Process([]Finding{finding})
+	if err == nil || !strings.Contains(err.Error(), "only at critical severity") {
+		t.Fatalf("expected PR-scope validation error, got %v", err)
 	}
 }

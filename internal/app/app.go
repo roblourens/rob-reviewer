@@ -173,7 +173,6 @@ func (app *App) ReviewHistoricalPullRequest(ctx context.Context, number int) (re
 	if err != nil {
 		return review.Result{}, err
 	}
-	premiumRequests, premiumRequestsReported := statsPremiumRequests(result.Stats)
 	app.logger.Info(
 		"historical pull request review complete",
 		"pr", pull.Number,
@@ -198,8 +197,6 @@ func (app *App) ReviewHistoricalPullRequest(ctx context.Context, number int) (re
 		"toolCalls", result.Stats.ToolCalls,
 		"nanoAIUnits", result.Stats.NanoAIUnits,
 		"modelBillingMultipliers", result.Stats.ModelBillingMultipliers,
-		"premiumRequestsReported", premiumRequestsReported,
-		"premiumRequests", premiumRequests,
 		"costNote", result.Stats.CostNote,
 	)
 	return result, nil
@@ -225,7 +222,6 @@ func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish 
 	if err != nil {
 		return review.Result{}, err
 	}
-	premiumRequests, premiumRequestsReported := statsPremiumRequests(result.Stats)
 	app.logger.Info(
 		"pull request review complete",
 		"pr", pull.Number,
@@ -250,8 +246,6 @@ func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish 
 		"toolCalls", result.Stats.ToolCalls,
 		"nanoAIUnits", result.Stats.NanoAIUnits,
 		"modelBillingMultipliers", result.Stats.ModelBillingMultipliers,
-		"premiumRequestsReported", premiumRequestsReported,
-		"premiumRequests", premiumRequests,
 		"costNote", result.Stats.CostNote,
 	)
 	return result, nil
@@ -341,15 +335,23 @@ func FormatResultMarkdown(result review.Result) string {
 		for index, finding := range result.Findings {
 			fmt.Fprintf(
 				&output,
-				"### %d. [%s] %s\n\n**Location:** <code>%s:%d</code> (<code>%s</code>)  \n**Confidence:** %.2f — %s\n\n%s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n",
+				"### %d. [%s] %s\n\n**Location:** <code>%s:%d</code> (<code>%s</code>)  \n**Performance category:** <code>%s</code>  \n**Resource:** %s  \n**Scaling:** %s  \n**Outcome:** %s  \n**PR causality:** <code>%s</code>  \n**Previous behavior:** %s  \n**Changed behavior:** %s  \n**Confidence:** %.2f — %s\n\n**Causal diff evidence:** %s\n\n%s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n",
 				index+1,
 				finding.Severity,
 				singleLineMarkdown(finding.Title),
 				review.SanitizeMarkdownText(finding.Path),
 				finding.Line,
 				finding.Side,
+				review.SanitizeMarkdownText(finding.PerformanceCategory),
+				review.SanitizeMarkdownText(finding.PerformanceResource),
+				review.SanitizeMarkdownText(finding.PerformanceScaling),
+				review.SanitizeMarkdownText(finding.PerformanceOutcome),
+				review.SanitizeMarkdownText(finding.ChangeCausality),
+				review.SanitizeMarkdownText(finding.PreviousBehavior),
+				review.SanitizeMarkdownText(finding.ChangedBehavior),
 				finding.Confidence,
 				review.SanitizeMarkdownText(finding.ConfidenceRationale),
+				review.SanitizeMarkdownText(finding.CausalDiffEvidence),
 				review.SanitizeMarkdownText(finding.Impact),
 				review.SanitizeMarkdownText(finding.Evidence),
 				review.SanitizeMarkdownText(finding.Recommendation),
@@ -417,11 +419,4 @@ func ParsePullRequestNumber(value string) (int, error) {
 		return 0, fmt.Errorf("invalid pull request number %q", value)
 	}
 	return number, nil
-}
-
-func statsPremiumRequests(stats review.Stats) (float64, bool) {
-	if stats.PremiumRequests == nil {
-		return 0, false
-	}
-	return *stats.PremiumRequests, true
 }

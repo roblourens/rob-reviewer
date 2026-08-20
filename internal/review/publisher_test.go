@@ -41,8 +41,8 @@ func TestPublisherCreatesCommentReview(t *testing.T) {
 	result := Result{
 		PullRequest: pull,
 		Stats: Stats{
-			Model:                   "claude-opus-5",
-			ActualModels:            []string{"claude-opus-5"},
+			Model:                   "gpt-5.6-sol",
+			ActualModels:            []string{"gpt-5.6-sol"},
 			ReasoningEffort:         "high",
 			ActualReasoningEfforts:  []string{"high"},
 			APIEndpoints:            []string{"/v1/messages"},
@@ -67,6 +67,14 @@ func TestPublisherCreatesCommentReview(t *testing.T) {
 			Severity:            SeverityHigh,
 			Confidence:          0.98,
 			ConfidenceRationale: "The changed call is directly inside the repeated reconstruction loop.",
+			PerformanceCategory: "latency",
+			PerformanceResource: "Synchronous renderer CPU work.",
+			PerformanceScaling:  "One expensive update per historical item.",
+			PerformanceOutcome:  "Scroll latency and dropped frames.",
+			ChangeCausality:     "introduced",
+			PreviousBehavior:    "The prior renderer did not repeat this work for each child.",
+			ChangedBehavior:     "The diff repeats the work for every historical child.",
+			CausalDiffEvidence:  "The added changed line is called inside the child loop.",
 			Title:               "Batch repeated work",
 			Impact:              "The loop blocks scrolling.",
 			Evidence:            "It runs for every historical item.",
@@ -92,7 +100,7 @@ func TestPublisherCreatesCommentReview(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"Review statistics",
-		"`claude-opus-5`",
+		"`gpt-5.6-sol`",
 		"`high`",
 		"12.345s",
 		"10000 input, 2000 output, 12000 total",
