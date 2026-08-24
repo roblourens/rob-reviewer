@@ -4,42 +4,56 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/roblourens/rob-reviewer/internal/github"
 )
 
-const CurrentVersion = 1
+const CurrentVersion = 2
 
 type State struct {
-	Version            int       `json:"version"`
-	HighWaterMark      int       `json:"highWaterMark"`
-	HighWaterCreatedAt time.Time `json:"highWaterCreatedAt"`
-	PendingDrafts      []int     `json:"pendingDrafts"`
-	UpdatedAt          time.Time `json:"updatedAt"`
+	Version      int                      `json:"version"`
+	Initialized  bool                     `json:"initialized"`
+	PullRequests map[int]PullRequestState `json:"pullRequests"`
+	Daily        DailyState               `json:"daily"`
+	UpdatedAt    time.Time                `json:"updatedAt"`
 }
 
-func New(highWaterMark int) State {
+type PullRequestState struct {
+	ReviewedHeadSHA string    `json:"reviewedHeadSha,omitempty"`
+	PendingHeadSHA  string    `json:"pendingHeadSha,omitempty"`
+	PendingSince    time.Time `json:"pendingSince,omitempty"`
+	State           string    `json:"state"`
+	Draft           bool      `json:"draft"`
+	UpdatedAt       time.Time `json:"updatedAt,omitempty"`
+}
+
+type DailyState struct {
+	Date         string `json:"date,omitempty"`
+	Reviews      int    `json:"reviews"`
+	Publications int    `json:"publications"`
+}
+
+func New() State {
 	return State{
-		Version:       CurrentVersion,
-		HighWaterMark: highWaterMark,
-		PendingDrafts: []int{},
-		UpdatedAt:     time.Now().UTC(),
+		Version:      CurrentVersion,
+		PullRequests: make(map[int]PullRequestState),
+		UpdatedAt:    time.Now().UTC(),
 	}
 }
 
-func (state *State) AddPendingDraft(number int) {
-	if !slices.Contains(state.PendingDrafts, number) {
-		state.PendingDrafts = append(state.PendingDrafts, number)
-		slices.Sort(state.PendingDrafts)
+func (state *State) ResetDaily(now time.Time) {
+	date := now.UTC().Format(time.DateOnly)
+	if state.Daily.Date != date {
+		state.Daily = DailyState{Date: date}
 	}
 }
 
-func (state *State) RemovePendingDraft(number int) {
-	state.PendingDrafts = slices.DeleteFunc(state.PendingDrafts, func(candidate int) bool {
-		return candidate == number
-	})
+func (state *State) normalize() {
+	state.Version = CurrentVersion
+	if state.PullRequests == nil {
+		state.PullRequests = make(map[int]PullRequestState)
+	}
 }
 
 type ContentClient interface {
@@ -74,23 +88,30 @@ func (store *Store) Load(ctx context.Context) (State, string, bool, error) {
 	if !exists {
 		return State{}, "", false, nil
 	}
+	var header struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(content.Content, &header); err != nil {
+		return State{}, "", false, fmt.Errorf("decode reviewer state: %w", err)
+	}
+	if header.Version == 1 {
+		result := New()
+		return result, content.SHA, true, nil
+	}
+	if header.Version != CurrentVersion {
+		return State{}, "", false, fmt.Errorf("unsupported reviewer state version %d", header.Version)
+	}
 	var result State
 	if err := json.Unmarshal(content.Content, &result); err != nil {
 		return State{}, "", false, fmt.Errorf("decode reviewer state: %w", err)
 	}
-	if result.Version != CurrentVersion {
-		return State{}, "", false, fmt.Errorf("unsupported reviewer state version %d", result.Version)
-	}
-	slices.Sort(result.PendingDrafts)
-	result.PendingDrafts = slices.Compact(result.PendingDrafts)
+	result.normalize()
 	return result, content.SHA, true, nil
 }
 
 func (store *Store) Save(ctx context.Context, state State, sha string) error {
-	state.Version = CurrentVersion
+	state.normalize()
 	state.UpdatedAt = time.Now().UTC()
-	slices.Sort(state.PendingDrafts)
-	state.PendingDrafts = slices.Compact(state.PendingDrafts)
 	content, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode reviewer state: %w", err)

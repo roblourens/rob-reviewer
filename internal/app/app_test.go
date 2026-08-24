@@ -1,11 +1,28 @@
 package app
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
+	"github.com/roblourens/rob-reviewer/internal/config"
 	"github.com/roblourens/rob-reviewer/internal/review"
 )
+
+func TestPollIsNoOpWhenAutomationDisabled(t *testing.T) {
+	app := &App{
+		config: config.Config{
+			Automation: config.AutomationConfig{Enabled: false},
+		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	result, err := app.Poll(context.Background(), "", "")
+	if err != nil || len(result.Reviews) != 0 || len(result.Poll.Reviewed) != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
 
 func TestParseRepository(t *testing.T) {
 	owner, repo, err := parseRepository("owner/repo")

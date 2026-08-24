@@ -1,6 +1,10 @@
 package review
 
-import "time"
+import (
+	"slices"
+	"strings"
+	"time"
+)
 
 type PullRequest struct {
 	Number            int
@@ -16,10 +20,23 @@ type PullRequest struct {
 	HeadRef           string
 	HeadSHA           string
 	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	Labels            []string
 }
 
 func (pull PullRequest) IsTeamAuthored() bool {
 	return pull.AuthorAssociation == "MEMBER" || pull.AuthorAssociation == "OWNER"
+}
+
+func (pull PullRequest) HasAnyLabel(labels []string) bool {
+	for _, configured := range labels {
+		if slices.ContainsFunc(pull.Labels, func(label string) bool {
+			return strings.EqualFold(label, configured)
+		}) {
+			return true
+		}
+	}
+	return false
 }
 
 type Side string

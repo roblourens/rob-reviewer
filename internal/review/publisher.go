@@ -16,6 +16,8 @@ const (
 	experimentalReviewPrefix = "**[Experimental performance review bot]**"
 )
 
+var ErrPublicationSuppressed = errors.New("review publication suppressed")
+
 type ReviewRequest struct {
 	CommitID string
 	Event    string
@@ -39,18 +41,38 @@ type ExistingReview struct {
 type PublisherClient interface {
 	GetPullRequest(ctx context.Context, owner, repo string, number int) (PullRequest, error)
 	FindReviewMarker(ctx context.Context, owner, repo string, number int, marker string) (*ExistingReview, error)
+	FindPendingReview(ctx context.Context, owner, repo string, number int) (*ExistingReview, error)
 	CreatePendingReview(ctx context.Context, owner, repo string, number int, request ReviewRequest) (int64, error)
 	SubmitPendingReview(ctx context.Context, owner, repo string, number int, reviewID int64) error
+	DeletePendingReview(ctx context.Context, owner, repo string, number int, reviewID int64) error
 }
 
 type Publisher struct {
-	client PublisherClient
-	owner  string
-	repo   string
+	client      PublisherClient
+	owner       string
+	repo        string
+	skipLabels  []string
+	allowClosed bool
 }
 
-func NewPublisher(client PublisherClient, owner, repo string) *Publisher {
-	return &Publisher{client: client, owner: owner, repo: repo}
+func NewPublisher(client PublisherClient, owner, repo string, skipLabels ...string) *Publisher {
+	return &Publisher{
+		client:      client,
+		owner:       owner,
+		repo:        repo,
+		skipLabels:  slices.Clone(skipLabels),
+		allowClosed: true,
+	}
+}
+
+func NewAutomaticPublisher(client PublisherClient, owner, repo string, skipLabels ...string) *Publisher {
+	return &Publisher{
+		client:      client,
+		owner:       owner,
+		repo:        repo,
+		skipLabels:  slices.Clone(skipLabels),
+		allowClosed: false,
+	}
 }
 
 func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun bool) (bool, error) {
@@ -58,7 +80,8 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 	if err != nil {
 		return false, fmt.Errorf("refresh pull request before publication: %w", err)
 	}
-	if err := validatePublicationTarget(result.PullRequest, current); err != nil {
+
+	if err := publisher.validatePublicationTarget(result.PullRequest, current); err != nil {
 		return false, err
 	}
 	if len(result.Findings) == 0 {
@@ -85,7 +108,7 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 	if err != nil {
 		return false, fmt.Errorf("refresh pull request immediately before publication: %w", err)
 	}
-	if err := validatePublicationTarget(result.PullRequest, current); err != nil {
+	if err := publisher.validatePublicationTarget(result.PullRequest, current); err != nil {
 		return false, err
 	}
 	if existing != nil {
@@ -124,6 +147,66 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 		return false, fmt.Errorf("submit pending performance review %d: %w", pendingReviewID, err)
 	}
 	return true, nil
+}
+
+func (publisher *Publisher) ResumePending(
+	ctx context.Context,
+	analyzed PullRequest,
+	reviewID int64,
+) error {
+	current, err := publisher.client.GetPullRequest(ctx, publisher.owner, publisher.repo, analyzed.Number)
+	if err != nil {
+		return fmt.Errorf("refresh pull request before resuming pending review: %w", err)
+	}
+	if err := publisher.validatePublicationTarget(analyzed, current); err != nil {
+		if errors.Is(err, ErrPublicationSuppressed) {
+			if deleteErr := publisher.client.DeletePendingReview(
+				ctx,
+				publisher.owner,
+				publisher.repo,
+				analyzed.Number,
+				reviewID,
+			); deleteErr != nil {
+				return errors.Join(err, fmt.Errorf("delete suppressed pending review %d: %w", reviewID, deleteErr))
+			}
+		}
+		return err
+	}
+	if err := publisher.client.SubmitPendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number, reviewID); err != nil {
+		return fmt.Errorf("resume pending performance review %d: %w", reviewID, err)
+	}
+	return nil
+}
+
+func (publisher *Publisher) PrepareAutomaticReview(
+	ctx context.Context,
+	analyzed PullRequest,
+) (*ExistingReview, error) {
+	marker := fmt.Sprintf("<!-- rob-reviewer:v1 pr=%d head=%s -->", analyzed.Number, analyzed.HeadSHA)
+	pending, err := publisher.client.FindPendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number)
+	if err != nil {
+		return nil, fmt.Errorf("find pending automatic review: %w", err)
+	}
+	if pending != nil && !strings.Contains(pending.Body, marker) {
+		if err := publisher.client.DeletePendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number, pending.ID); err != nil {
+			return nil, fmt.Errorf("delete stale pending review %d: %w", pending.ID, err)
+		}
+	}
+	existing, err := publisher.client.FindReviewMarker(ctx, publisher.owner, publisher.repo, analyzed.Number, marker)
+	if err != nil {
+		return nil, fmt.Errorf("find automatic review marker: %w", err)
+	}
+	return existing, nil
+}
+
+func (publisher *Publisher) validatePublicationTarget(analyzed, current PullRequest) error {
+	if current.HasAnyLabel(publisher.skipLabels) {
+		return fmt.Errorf("%w: pull request %d has a configured label", ErrPublicationSuppressed, analyzed.Number)
+	}
+	if strings.EqualFold(current.State, "closed") && !publisher.allowClosed {
+		return fmt.Errorf("%w: pull request %d is closed", ErrPublicationSuppressed, analyzed.Number)
+	}
+	return validatePublicationTarget(analyzed, current)
 }
 
 func publicationApprovalMarker(result Result) string {

@@ -77,6 +77,7 @@ type pullResponse struct {
 	State             string    `json:"state"`
 	Draft             bool      `json:"draft"`
 	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 	AuthorAssociation string    `json:"author_association"`
 	User              struct {
 		Login string `json:"login"`
@@ -89,12 +90,32 @@ type pullResponse struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
 	} `json:"head"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
 }
 
 func (client *Client) ListPullRequests(ctx context.Context, owner, repo string, page int) ([]review.PullRequest, bool, error) {
+	return client.listPullRequests(ctx, owner, repo, page, "all", "created")
+}
+
+func (client *Client) ListOpenPullRequests(ctx context.Context, owner, repo string, page int) ([]review.PullRequest, bool, error) {
+	return client.listPullRequests(ctx, owner, repo, page, "open", "created")
+}
+
+func (client *Client) ListUpdatedPullRequests(ctx context.Context, owner, repo string, page int) ([]review.PullRequest, bool, error) {
+	return client.listPullRequests(ctx, owner, repo, page, "all", "updated")
+}
+
+func (client *Client) listPullRequests(
+	ctx context.Context,
+	owner, repo string,
+	page int,
+	state, sortBy string,
+) ([]review.PullRequest, bool, error) {
 	values := url.Values{
-		"state":     {"all"},
-		"sort":      {"created"},
+		"state":     {state},
+		"sort":      {sortBy},
 		"direction": {"desc"},
 		"per_page":  {"100"},
 		"page":      {strconv.Itoa(page)},
@@ -129,6 +150,10 @@ func (client *Client) GetPullRequest(ctx context.Context, owner, repo string, nu
 }
 
 func (pull pullResponse) toReviewPullRequest() review.PullRequest {
+	labels := make([]string, 0, len(pull.Labels))
+	for _, label := range pull.Labels {
+		labels = append(labels, label.Name)
+	}
 	return review.PullRequest{
 		Number:            pull.Number,
 		Title:             pull.Title,
@@ -143,6 +168,8 @@ func (pull pullResponse) toReviewPullRequest() review.PullRequest {
 		HeadRef:           pull.Head.Ref,
 		HeadSHA:           pull.Head.SHA,
 		CreatedAt:         pull.CreatedAt,
+		UpdatedAt:         pull.UpdatedAt,
+		Labels:            labels,
 	}
 }
 

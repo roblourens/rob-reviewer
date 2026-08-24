@@ -53,6 +53,7 @@ func (publisher *SavedReportPublisher) Publish(
 		publisher.client,
 		publisher.config.Target.Owner,
 		publisher.config.Target.Repo,
+		publisher.config.Automation.SkipLabels...,
 	).Publish(ctx, selected, false)
 	if err != nil {
 		return review.Result{}, false, err

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/roblourens/rob-reviewer/internal/review"
@@ -18,7 +19,10 @@ func TestListPullRequestsMapsResponseAndPagination(t *testing.T) {
 		}
 
 		writer.Header().Set("Link", `<https://api.github.com/resource?page=2>; rel="next"`)
-		fmt.Fprint(writer, `[{"number":7,"title":"Improve","body":"Body","state":"open","draft":false,"html_url":"https://example.test/7","author_association":"MEMBER","user":{"login":"teammate"},"base":{"ref":"main","sha":"base"},"head":{"ref":"feature","sha":"head"},"created_at":"2026-08-01T00:00:00Z"}]`)
+		if request.URL.Query().Get("state") != "all" || request.URL.Query().Get("sort") != "created" {
+			t.Fatalf("query = %q", request.URL.RawQuery)
+		}
+		fmt.Fprint(writer, `[{"number":7,"title":"Improve","body":"Body","state":"open","draft":false,"html_url":"https://example.test/7","author_association":"MEMBER","user":{"login":"teammate"},"base":{"ref":"main","sha":"base"},"head":{"ref":"feature","sha":"head"},"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z","labels":[{"name":"performance-reviewer:skip"}]}]`)
 	}))
 	defer server.Close()
 
@@ -29,8 +33,32 @@ func TestListPullRequestsMapsResponseAndPagination(t *testing.T) {
 	}
 
 	if !hasNext || len(pulls) != 1 || pulls[0].Number != 7 || pulls[0].HeadSHA != "head" ||
-		pulls[0].AuthorLogin != "teammate" || pulls[0].AuthorAssociation != "MEMBER" {
+		pulls[0].AuthorLogin != "teammate" || pulls[0].AuthorAssociation != "MEMBER" ||
+		!pulls[0].HasAnyLabel([]string{"PERFORMANCE-REVIEWER:SKIP"}) {
 		t.Fatalf("pulls = %+v, hasNext = %v", pulls, hasNext)
+	}
+}
+
+func TestListUpdatedAndOpenPullRequestsUseExpectedQueries(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		queries = append(queries, request.URL.Query().Encode())
+		fmt.Fprint(writer, `[]`)
+	}))
+	defer server.Close()
+	client := NewClientWithBaseURL(server.Client(), "token", server.URL)
+
+	if _, _, err := client.ListOpenPullRequests(context.Background(), "microsoft", "vscode", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := client.ListUpdatedPullRequests(context.Background(), "microsoft", "vscode", 2); err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 2 ||
+		!strings.Contains(queries[0], "state=open") || !strings.Contains(queries[0], "sort=created") ||
+		!strings.Contains(queries[1], "state=all") || !strings.Contains(queries[1], "sort=updated") ||
+		!strings.Contains(queries[1], "page=2") {
+		t.Fatalf("queries = %v", queries)
 	}
 }
 
@@ -39,6 +67,7 @@ func TestCreateAndSubmitPendingReview(t *testing.T) {
 	var submitted struct {
 		Event string `json:"event"`
 	}
+	deleted := false
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
 		case request.Method == http.MethodPost && request.URL.Path == "/repos/microsoft/vscode/pulls/7/reviews":
@@ -52,6 +81,9 @@ func TestCreateAndSubmitPendingReview(t *testing.T) {
 				t.Fatal(err)
 			}
 			fmt.Fprint(writer, `{}`)
+		case request.Method == http.MethodDelete && request.URL.Path == "/repos/microsoft/vscode/pulls/7/reviews/99":
+			deleted = true
+			writer.WriteHeader(http.StatusNoContent)
 		default:
 			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
 		}
@@ -75,6 +107,12 @@ func TestCreateAndSubmitPendingReview(t *testing.T) {
 	}
 	if submitted.Event != "COMMENT" {
 		t.Fatalf("submitted event = %q", submitted.Event)
+	}
+	if err := client.DeletePendingReview(context.Background(), "microsoft", "vscode", 7, reviewID); err != nil {
+		t.Fatal(err)
+	}
+	if !deleted {
+		t.Fatal("pending review was not deleted")
 	}
 }
 

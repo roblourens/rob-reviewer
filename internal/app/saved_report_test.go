@@ -16,6 +16,7 @@ type fakeSavedReportClient struct {
 	pull      review.PullRequest
 	published review.ReviewRequest
 	submitted int64
+	deleted   int64
 }
 
 func (client *fakeSavedReportClient) GetPullRequest(context.Context, string, string, int) (review.PullRequest, error) {
@@ -28,6 +29,15 @@ func (client *fakeSavedReportClient) FindReviewMarker(
 	string,
 	int,
 	string,
+) (*review.ExistingReview, error) {
+	return nil, nil
+}
+
+func (client *fakeSavedReportClient) FindPendingReview(
+	context.Context,
+	string,
+	string,
+	int,
 ) (*review.ExistingReview, error) {
 	return nil, nil
 }
@@ -49,6 +59,16 @@ func (client *fakeSavedReportClient) SubmitPendingReview(
 	reviewID int64,
 ) error {
 	client.submitted = reviewID
+	return nil
+}
+
+func (client *fakeSavedReportClient) DeletePendingReview(
+	_ context.Context,
+	_, _ string,
+	_ int,
+	reviewID int64,
+) error {
+	client.deleted = reviewID
 	return nil
 }
 

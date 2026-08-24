@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,10 @@ func (app *App) Close() error {
 }
 
 func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory string) (PollResult, error) {
+	if !app.config.Automation.Enabled {
+		app.logger.Info("automatic reviewer is disabled by configuration")
+		return PollResult{}, nil
+	}
 	stateOwner, stateRepo, err := parseRepository(stateRepository)
 	if err != nil {
 		return PollResult{}, err
@@ -122,22 +127,72 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 	prPoller := poller.New(
 		app.reviewClient,
 		store,
-		app.config.Target.Owner,
-		app.config.Target.Repo,
-		app.config.Poll.MaxPerRun,
-		func(reviewContext context.Context, pull review.PullRequest) error {
+		poller.Options{
+			Owner:         app.config.Target.Owner,
+			Repo:          app.config.Target.Repo,
+			MaxPerRun:     app.config.Poll.MaxPerRun,
+			MaxPerDay:     app.config.Poll.MaxPerDay,
+			QuietPeriod:   time.Duration(app.config.Poll.QuietMinutes) * time.Minute,
+			ScanWindow:    time.Duration(app.config.Poll.ScanWindowHours) * time.Hour,
+			MaxPendingAge: time.Duration(app.config.Poll.MaxPendingHours) * time.Hour,
+			SkipLabels:    slices.Clone(app.config.Automation.SkipLabels),
+		},
+		func(reviewContext context.Context, pull review.PullRequest) (poller.ReviewOutcome, error) {
+			if app.config.Publication.Mode == "automatic" {
+				automaticPublisher := review.NewAutomaticPublisher(
+					app.reviewClient,
+					app.config.Target.Owner,
+					app.config.Target.Repo,
+					app.config.Automation.SkipLabels...,
+				)
+				existing, err := automaticPublisher.PrepareAutomaticReview(
+					reviewContext,
+					pull,
+				)
+				if err != nil {
+					return poller.ReviewOutcome{}, fmt.Errorf("check automatic review marker: %w", err)
+				}
+				if existing != nil {
+					if strings.EqualFold(existing.State, "PENDING") {
+						err := automaticPublisher.ResumePending(reviewContext, pull, existing.ID)
+						if err != nil {
+							if errors.Is(err, review.ErrPublicationSuppressed) {
+								return poller.ReviewOutcome{}, nil
+							}
+							return poller.ReviewOutcome{}, err
+						}
+						return poller.ReviewOutcome{Published: true}, nil
+					}
+					return poller.ReviewOutcome{}, nil
+				}
+			}
 			result, analyzed, err := app.reviewOne(reviewContext, pull, false)
 			if err != nil {
-				return err
+				return poller.ReviewOutcome{}, err
 			}
 			if !analyzed {
-				return nil
+				return poller.ReviewOutcome{}, nil
 			}
 			if _, err := WriteResultFiles(outputDirectory, result); err != nil {
-				return fmt.Errorf("persist dry-run report for PR %d: %w", pull.Number, err)
+				return poller.ReviewOutcome{}, fmt.Errorf("persist dry-run report for PR %d: %w", pull.Number, err)
 			}
 			reviews = append(reviews, result)
-			return nil
+			if app.config.Publication.Mode != "automatic" || len(result.Findings) == 0 {
+				return poller.ReviewOutcome{}, nil
+			}
+			published, err := review.NewAutomaticPublisher(
+				app.reviewClient,
+				app.config.Target.Owner,
+				app.config.Target.Repo,
+				app.config.Automation.SkipLabels...,
+			).Publish(reviewContext, result, false)
+			if err != nil {
+				if errors.Is(err, review.ErrPublicationSuppressed) {
+					return poller.ReviewOutcome{}, nil
+				}
+				return poller.ReviewOutcome{}, err
+			}
+			return poller.ReviewOutcome{Published: published}, nil
 		},
 	)
 	pollResult, err := prPoller.Run(ctx)
@@ -227,11 +282,11 @@ func (app *App) ReviewHistoricalPullRequest(ctx context.Context, number int) (re
 
 func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish bool) (_ review.Result, analyzed bool, returnErr error) {
 	marker := github.ReviewMarker(pull.Number, pull.HeadSHA)
-	exists, err := app.reviewClient.HasReviewMarker(ctx, app.config.Target.Owner, app.config.Target.Repo, pull.Number, marker)
+	existing, err := app.reviewClient.FindReviewMarker(ctx, app.config.Target.Owner, app.config.Target.Repo, pull.Number, marker)
 	if err != nil {
 		return review.Result{}, false, fmt.Errorf("check review idempotency marker: %w", err)
 	}
-	if exists {
+	if existing != nil && !strings.EqualFold(existing.State, "PENDING") {
 		app.logger.Info("pull request already reviewed", "pr", pull.Number, "head", pull.HeadSHA)
 		return review.Result{PullRequest: pull}, false, nil
 	}
@@ -240,7 +295,12 @@ func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish 
 	if err != nil {
 		return review.Result{}, false, err
 	}
-	publisher := review.NewPublisher(app.reviewClient, app.config.Target.Owner, app.config.Target.Repo)
+	publisher := review.NewPublisher(
+		app.reviewClient,
+		app.config.Target.Owner,
+		app.config.Target.Repo,
+		app.config.Automation.SkipLabels...,
+	)
 	published, err := publisher.Publish(ctx, result, !publish)
 	if err != nil {
 		return review.Result{}, false, err

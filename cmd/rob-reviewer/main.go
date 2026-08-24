@@ -55,6 +55,7 @@ func run(logger *slog.Logger) (returnErr error) {
 			"poll complete",
 			"bootstrapped", result.Poll.Bootstrapped,
 			"reviewed", result.Poll.Reviewed,
+			"published", result.Poll.Published,
 			"deferred", result.Poll.Deferred,
 			"skipped", result.Poll.Skipped,
 			"reports", len(result.Reviews),

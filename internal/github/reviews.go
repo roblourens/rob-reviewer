@@ -66,6 +66,42 @@ func (client *Client) FindReviewMarker(
 	}
 }
 
+func (client *Client) FindPendingReview(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+) (*review.ExistingReview, error) {
+	authenticatedLogin, err := client.authenticatedLogin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for page := 1; ; page++ {
+		values := url.Values{
+			"per_page": {"100"},
+			"page":     {strconv.Itoa(page)},
+		}
+		path := fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews?%s", url.PathEscape(owner), url.PathEscape(repo), number, values.Encode())
+		responseBody, headers, err := client.do(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+		var reviews []reviewResponse
+		if err := json.Unmarshal(responseBody, &reviews); err != nil {
+			return nil, fmt.Errorf("decode pending pull request reviews: %w", err)
+		}
+		for _, candidate := range reviews {
+			if strings.EqualFold(candidate.User.Login, authenticatedLogin) &&
+				strings.EqualFold(candidate.State, "PENDING") &&
+				strings.Contains(candidate.Body, "<!-- rob-reviewer:v1 ") {
+				return &review.ExistingReview{ID: candidate.ID, State: candidate.State, Body: candidate.Body}, nil
+			}
+		}
+		if !strings.Contains(headers.Get("Link"), `rel="next"`) {
+			return nil, nil
+		}
+	}
+}
+
 type ReviewComment struct {
 	Path string      `json:"path"`
 	Line int         `json:"line"`
@@ -134,6 +170,7 @@ func (client *Client) SubmitPendingReview(
 	if err != nil {
 		return fmt.Errorf("encode pending review submission: %w", err)
 	}
+
 	path := fmt.Sprintf(
 		"/repos/%s/%s/pulls/%d/reviews/%d/events",
 		url.PathEscape(owner),
@@ -143,6 +180,25 @@ func (client *Client) SubmitPendingReview(
 	)
 	if _, _, err := client.do(ctx, http.MethodPost, path, body); err != nil {
 		return fmt.Errorf("submit pending pull request review: %w", err)
+	}
+	return nil
+}
+
+func (client *Client) DeletePendingReview(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	reviewID int64,
+) error {
+	path := fmt.Sprintf(
+		"/repos/%s/%s/pulls/%d/reviews/%d",
+		url.PathEscape(owner),
+		url.PathEscape(repo),
+		number,
+		reviewID,
+	)
+	if _, _, err := client.do(ctx, http.MethodDelete, path, nil); err != nil {
+		return fmt.Errorf("delete pending pull request review: %w", err)
 	}
 	return nil
 }

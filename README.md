@@ -1,22 +1,26 @@
 # rob-reviewer
 
-`rob-reviewer` is a focused pull request review framework built with the [GitHub Copilot SDK for Go](https://github.com/github/copilot-sdk/tree/main/go). Its first production configuration polls newly opened [`microsoft/vscode`](https://github.com/microsoft/vscode) pull requests and looks for concrete, high-confidence performance regressions.
+`rob-reviewer` is a focused pull request review framework built with the [GitHub Copilot SDK for Go](https://github.com/github/copilot-sdk/tree/main/go). Its first production configuration is prepared to poll recently changed [`microsoft/vscode`](https://github.com/microsoft/vscode) pull requests and look for concrete, high-confidence performance regressions.
 
 The framework runs one Copilot session per pull request. All enabled review-focus skills share that session, checkout, diff, and repository context. A custom reviewer agent performs a distinct pass for every focus and submits findings through typed host tools instead of returning prose that must be parsed.
 
 ## Behavior
 
-- A GitHub Actions workflow polls every ten minutes.
-- The first poll records the current highest PR number and does not review the existing backlog.
+- A GitHub Actions workflow has a five-minute cron, but its job is skipped unless the `ROB_REVIEWER_ENABLED` repository variable is `true`. Checked-in configuration also has `automation.enabled: false`, so the automatic reviewer is currently off behind two independent switches.
+- The first enabled poll records every current open team PR and its current head without reviewing that backlog.
 - Only PRs whose GitHub `author_association` is `MEMBER` or `OWNER` are eligible. Outside collaborators, contributors, bots, and other non-team authors are skipped.
-- Newly opened team-authored draft PRs are deferred until they become ready for review. Non-team drafts are skipped rather than persisted.
-- Each eligible PR is reviewed once. New pushes to an already handled PR are not reviewed in version 1.
-- Scheduled and manual analysis is dry-run only. It writes JSON and Markdown reports and never posts automatically.
+- The poller detects newly opened PRs, drafts becoming ready, reopened PRs, and new head SHAs on existing PRs by scanning recently updated PRs.
+- Every new head waits through a five-minute quiet period. Another push resets the clock, so rapid update bursts produce one review of the stable head.
+- The same head is reviewed at most once. State is keyed by PR number and exact head SHA rather than only by PR number.
+- `publication.mode: approval` writes JSON and Markdown reports for human selection. `publication.mode: automatic` publishes every validated finding after the report is durable. The checked-in mode is `approval`.
+- Automatic publication requires the PR to remain open, non-draft, unsuppressed, team-authored, and on the reviewed base/head at the final GitHub refresh. Explicitly approved saved reports may still be published to a closed or merged PR when the reviewed head matches.
+- Per-run and per-UTC-day review caps bound model usage. A pending head older than the configured maximum age is skipped rather than producing a surprising late review.
+- Adding the configured `performance-reviewer:skip` label suppresses that head.
 - Every finding has a stable `PERF-...` ID. A human explicitly approves IDs from a saved JSON report before publication.
 - One approved publication posts a non-blocking `COMMENT` review with only the selected inline comments.
 - Published summaries and inline comments begin with **Experimental performance review bot**.
 - Findings must be performance-only, high confidence, anchored to an added or deleted line, and explicitly prove through before/after evidence that the PR introduced or materially amplified the performance mechanism. Pre-existing non-critical optimization opportunities are rejected.
-- State is committed to a dedicated `reviewer-state` branch, including silent clean results and deferred drafts.
+- State is committed to a dedicated `reviewer-state` branch, including reviewed and pending heads plus daily review/publication counters.
 
 Scheduled workflows are eventually consistent: GitHub may delay cron jobs. GitHub also disables scheduled workflows in an inactive public repository after 60 days, so keep the repository active or re-enable the workflow when needed.
 
@@ -32,13 +36,13 @@ Pull requests are untrusted input.
 - It receives no shell, network, write, arbitrary MCP, or repository-execution tool.
 - Paths are resolved inside the checkout, symlink escapes are rejected, search and read output are capped, and inline anchors are validated against actual added/deleted diff lines.
 - The head SHA is checked again after analysis. A changed head fails the run instead of advancing state or publishing a stale result.
-- Model-authored review text is rendered as escaped plain Markdown text: mentions, HTML, images, control characters, and formatting delimiters cannot become active GitHub content.
+- Model-authored review text is sanitized before publication: mentions, HTML, images, controls, bidi formatting, and active Markdown are neutralized. Human-approved, well-formed inline code spans are retained.
 
 The checkout layer keeps a persistent blobless bare cache under the user cache directory and creates a disposable shared checkout for each PR. Git history and objects are therefore amortized across PRs without sharing writable worktrees. The Actions workflow caches this directory between runs. Git stdout/stderr is bounded, and a unified diff over 32 MiB or 200,000 lines fails explicitly instead of exhausting runner memory.
 
 ## Repository configuration
 
-[`reviewer.yaml`](reviewer.yaml) controls the target, model, confidence threshold, finding cap, poll batch size, state location, and enabled focuses:
+[`reviewer.yaml`](reviewer.yaml) controls the target, model, confidence threshold, finding cap, automation gates, polling limits, publication mode, state location, and enabled focuses:
 
 ```yaml
 version: 1
@@ -47,6 +51,16 @@ target:
   repo: vscode
 poll:
   maxPerRun: 5
+  maxPerDay: 25
+  quietPeriodMinutes: 5
+  scanWindowHours: 168
+  maxPendingAgeHours: 24
+automation:
+  enabled: false
+  skipLabels:
+    - performance-reviewer:skip
+publication:
+  mode: approval
 review:
   model: gpt-5.6-sol
   reasoningEffort: high
@@ -70,7 +84,27 @@ Configure two Actions secrets:
 
 The workflow-provided `GITHUB_TOKEN` is used only for the state branch in this repository and has `contents: write`. Keep the Copilot and review credentials separate even if one user owns both. Workflow actions are pinned to immutable commits, checkout credentials are not persisted, and the review/Copilot secrets are scoped only to the application steps.
 
-The first scheduled poll creates `reviewer-state` from the default branch when needed, writes the bootstrap high-water mark, and exits. Branch protection must allow the workflow token to update that branch.
+The first enabled scheduled poll creates `reviewer-state` from the default branch when needed, upgrades any version-1 high-water state, snapshots current open heads, and exits. Branch protection must allow the workflow token to update that branch.
+
+## Enabling automatic operation
+
+The repository is intentionally committed in an off state. To start analysis without public comments:
+
+1. Configure `COPILOT_GITHUB_TOKEN` and `REVIEW_GITHUB_TOKEN`.
+2. Set `automation.enabled: true`.
+3. Keep `publication.mode: approval`.
+4. Set the `ROB_REVIEWER_ENABLED` repository variable to `true`.
+
+The first scheduled run bootstraps state and reviews no existing non-draft backlog. Later runs analyze new stable heads and upload reports for approval.
+
+After the approval-mode false-positive rate is acceptable, change only `publication.mode` to `automatic`. Automatic mode still writes the report atomically before it creates a GitHub review.
+
+Either switch is a kill switch:
+
+- set `ROB_REVIEWER_ENABLED` to anything other than `true` to skip scheduled jobs immediately without a code change;
+- set `automation.enabled: false` to make the poll command a no-op even if a workflow is dispatched.
+
+Manual one-PR `review` and `publish-report` commands remain available while automation is disabled.
 
 ## Commands
 
@@ -130,7 +164,7 @@ COPILOT_GITHUB_TOKEN=... \
 go run ./cmd/rob-reviewer poll --output-dir review-results
 ```
 
-The manual workflow supports the same dry-run modes: leave `pr_number` empty to poll or provide a number for one review. It uploads reports as an artifact and never publishes. Manual review also enforces the team-author policy and refuses PRs whose author association is not `MEMBER` or `OWNER`.
+The manual workflow supports the same modes: leave `pr_number` empty to invoke the configured poller or provide a number for one dry review. One-PR manual review never publishes. Polling follows `automation.enabled` and `publication.mode`. Manual review also enforces the team-author policy and refuses PRs whose author association is not `MEMBER` or `OWNER`.
 
 ## Adding a review focus
 
@@ -170,15 +204,19 @@ go vet ./...
 go build ./cmd/rob-reviewer
 ```
 
-Tests cover configuration, focus loading, team-author eligibility, polling/bootstrap/deferred drafts, state persistence, safe checkout behavior, diff parsing and changed-line anchors, path containment, bounded tools, finding validation/ranking, stale-head rejection, idempotency, and review formatting. Synthetic fixtures model known performance failure mechanisms without copying VS Code source.
+Tests cover safe configuration defaults, state migration, open-head bootstrap, new heads, quiet-period resets, drafts becoming ready, reopened PRs, failed-head retries, daily caps, stale-head expiration, suppression labels, focus loading, safe checkout behavior, diff parsing and changed-line anchors, path containment, bounded tools, finding validation/ranking, stale-head rejection, publication idempotency, and review formatting. Synthetic fixtures model known performance failure mechanisms without copying VS Code source.
 
 Use a manual dry-run workflow for the real SDK smoke test. Publishing happens separately from an approved saved report.
 
 ## Failure and retry behavior
 
-- Processing stops at the first failed PR. Polling requires `--output-dir`, and both the authoritative JSON report and its Markdown rendering are atomically replaced inside the per-PR polling callback. The high-water mark advances only after those files are durable, or after an entry is intentionally skipped.
+- Processing stops at the first failed PR. Polling requires `--output-dir`, and both the authoritative JSON report and its Markdown rendering are atomically replaced inside the per-PR polling callback. A head is marked reviewed only after report persistence and, in automatic mode, successful publication.
 - Reports completed before a later PR fails remain in the output directory and are uploaded by the workflow's `always()` artifact step. A later poll retries the failed PR.
+- Pending heads are refreshed directly even after they leave the updated-PR scan window, so transient model/GitHub failures retry. Heads older than `maxPendingAgeHours` are deliberately skipped.
+- If state persistence fails after a public review succeeds, the retry sees the authenticated PR/head marker, avoids duplicate comments, and then records the head as complete.
+- If GitHub created a pending bot review but submission failed, the next automatic run resumes that review without rerunning the model. A newer head deletes the bot's stale pending review before proceeding; adding a suppression label deletes the current pending review instead of leaving it to block future heads.
 - Publication has a separate lifecycle from polling state. Submitted reviews contain a hidden PR/head marker, while pending reviews bind to a digest of the approved finding set without exposing finding IDs. Only markers authored by the authenticated review identity count.
 - Creating a pending review claims publication for that GitHub identity and PR. If submission fails, retrying the same approved IDs resumes that pending review; different IDs are rejected. Once submitted, later publication attempts for that PR/head are no-ops.
 - Clean dry-run reports are persisted and advance polling state without creating any public marker or comment.
+- UTC daily counters reset on date change. The per-day cap is persisted with the state branch, so separate workflow runs share one budget.
 - Authentication, unavailable models, SDK startup, invalid tool submissions, incomplete focus passes, checkout errors, stale heads, and GitHub API errors fail explicitly; none are converted into clean reviews.

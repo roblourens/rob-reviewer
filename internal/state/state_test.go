@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/roblourens/rob-reviewer/internal/github"
@@ -34,18 +35,22 @@ func TestStoreCreatesBranchForNewState(t *testing.T) {
 	client := &fakeContentClient{}
 	store := NewStore(client, "owner", "repo", "reviewer-state", "state.json")
 
-	if err := store.Save(context.Background(), New(42), ""); err != nil {
+	if err := store.Save(context.Background(), New(), ""); err != nil {
 		t.Fatal(err)
 	}
-	if !client.ensuredBranch {
-		t.Fatal("expected branch initialization")
+	if !client.ensuredBranch || client.savedSHA != "" {
+		t.Fatalf("ensured=%v saved SHA=%q", client.ensuredBranch, client.savedSHA)
 	}
-	if client.savedSHA != "" {
-		t.Fatalf("saved SHA = %q, want empty", client.savedSHA)
+	var saved State
+	if err := json.Unmarshal(client.saved, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.Version != CurrentVersion || saved.PullRequests == nil {
+		t.Fatalf("saved state = %+v", saved)
 	}
 }
 
-func TestStoreLoadsAndNormalizesPendingDrafts(t *testing.T) {
+func TestStoreMigratesVersionOneByRequiringBootstrap(t *testing.T) {
 	client := &fakeContentClient{
 		exists: true,
 		content: github.FileContent{
@@ -59,10 +64,31 @@ func TestStoreLoadsAndNormalizesPendingDrafts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !exists || sha != "content-sha" {
-		t.Fatalf("exists = %v, sha = %q", exists, sha)
+	if !exists || sha != "content-sha" || loaded.Version != CurrentVersion || loaded.Initialized {
+		t.Fatalf("loaded=%+v exists=%v sha=%q", loaded, exists, sha)
 	}
-	if len(loaded.PendingDrafts) != 2 || loaded.PendingDrafts[0] != 3 || loaded.PendingDrafts[1] != 9 {
-		t.Fatalf("pending drafts = %v", loaded.PendingDrafts)
+}
+
+func TestStoreLoadsVersionTwoState(t *testing.T) {
+	client := &fakeContentClient{
+		exists: true,
+		content: github.FileContent{
+			SHA: "content-sha",
+			Content: []byte(`{
+				"version":2,
+				"initialized":true,
+				"pullRequests":{"7":{"reviewedHeadSha":"head","state":"open","draft":false}},
+				"daily":{"date":"2026-08-24","reviews":3,"publications":1}
+			}`),
+		},
+	}
+	store := NewStore(client, "owner", "repo", "reviewer-state", "state.json")
+
+	loaded, _, _, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Initialized || loaded.PullRequests[7].ReviewedHeadSHA != "head" || loaded.Daily.Reviews != 3 {
+		t.Fatalf("loaded state = %+v", loaded)
 	}
 }

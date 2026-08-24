@@ -8,17 +8,19 @@ import (
 )
 
 type fakePublisherClient struct {
-	current      PullRequest
-	currents     []PullRequest
-	refreshCount int
-	markerExists bool
-	markerReview *ExistingReview
-	request      ReviewRequest
-	pendingID    int64
-	submittedID  int64
-	published    bool
-	createErr    error
-	submitErr    error
+	current       PullRequest
+	currents      []PullRequest
+	refreshCount  int
+	markerExists  bool
+	markerReview  *ExistingReview
+	pendingReview *ExistingReview
+	request       ReviewRequest
+	pendingID     int64
+	submittedID   int64
+	published     bool
+	createErr     error
+	submitErr     error
+	deletedID     int64
 }
 
 func (client *fakePublisherClient) GetPullRequest(context.Context, string, string, int) (PullRequest, error) {
@@ -34,10 +36,15 @@ func (client *fakePublisherClient) FindReviewMarker(context.Context, string, str
 	if client.markerReview != nil {
 		return client.markerReview, nil
 	}
+
 	if !client.markerExists {
 		return nil, nil
 	}
 	return &ExistingReview{ID: 7, State: "COMMENTED"}, nil
+}
+
+func (client *fakePublisherClient) FindPendingReview(context.Context, string, string, int) (*ExistingReview, error) {
+	return client.pendingReview, nil
 }
 
 func (client *fakePublisherClient) CreatePendingReview(
@@ -63,8 +70,19 @@ func (client *fakePublisherClient) SubmitPendingReview(
 	if client.submitErr != nil {
 		return client.submitErr
 	}
+
 	client.submittedID = reviewID
 	client.published = true
+	return nil
+}
+
+func (client *fakePublisherClient) DeletePendingReview(
+	_ context.Context,
+	_, _ string,
+	_ int,
+	reviewID int64,
+) error {
+	client.deletedID = reviewID
 	return nil
 }
 
@@ -280,6 +298,75 @@ func TestPublisherAllowsClosedPullRequestWithAdvancedBase(t *testing.T) {
 	}, false)
 	if err != nil || !published || !client.published {
 		t.Fatalf("published=%v client.published=%v err=%v", published, client.published, err)
+	}
+}
+
+func TestPublisherRejectsSuppressionLabelAndResumesPendingReview(t *testing.T) {
+	pull := PullRequest{
+		Number:            7,
+		BaseSHA:           "base",
+		HeadSHA:           "head",
+		State:             "open",
+		AuthorAssociation: "MEMBER",
+		Labels:            []string{"performance-reviewer:skip"},
+	}
+	client := &fakePublisherClient{current: pull}
+	publisher := NewPublisher(client, "microsoft", "vscode", "performance-reviewer:skip")
+	if _, err := publisher.Publish(context.Background(), Result{
+		PullRequest: pull,
+		Findings:    []Finding{{ID: "PERF-1234567890AB"}},
+	}, false); err == nil || !errors.Is(err, ErrPublicationSuppressed) {
+		t.Fatalf("expected suppression error, got %v", err)
+	}
+
+	pull.Labels = nil
+	client.current = pull
+	if err := publisher.ResumePending(context.Background(), pull, 77); err != nil {
+		t.Fatal(err)
+	}
+	if client.submittedID != 77 {
+		t.Fatalf("submitted review = %d", client.submittedID)
+	}
+
+	pull.Labels = []string{"performance-reviewer:skip"}
+	client.current = pull
+	if err := publisher.ResumePending(context.Background(), pull, 88); !errors.Is(err, ErrPublicationSuppressed) {
+		t.Fatalf("expected suppressed pending review, got %v", err)
+	}
+	if client.deletedID != 88 {
+		t.Fatalf("deleted review = %d", client.deletedID)
+	}
+}
+
+func TestAutomaticPublisherRejectsClosedPRAndDeletesStalePendingReview(t *testing.T) {
+	closed := PullRequest{
+		Number:            7,
+		BaseSHA:           "base",
+		HeadSHA:           "new-head",
+		State:             "closed",
+		AuthorAssociation: "MEMBER",
+	}
+	client := &fakePublisherClient{
+		current: closed,
+		pendingReview: &ExistingReview{
+			ID:    91,
+			State: "PENDING",
+			Body:  "<!-- rob-reviewer:v1 pr=7 head=old-head -->",
+		},
+	}
+	publisher := NewAutomaticPublisher(client, "microsoft", "vscode")
+	existing, err := publisher.PrepareAutomaticReview(context.Background(), closed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing != nil || client.deletedID != 91 {
+		t.Fatalf("existing=%+v deleted=%d", existing, client.deletedID)
+	}
+	if _, err := publisher.Publish(context.Background(), Result{
+		PullRequest: closed,
+		Findings:    []Finding{{ID: "PERF-1234567890AB"}},
+	}, false); !errors.Is(err, ErrPublicationSuppressed) {
+		t.Fatalf("expected closed automatic suppression, got %v", err)
 	}
 }
 
