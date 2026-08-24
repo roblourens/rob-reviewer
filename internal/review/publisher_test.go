@@ -292,6 +292,20 @@ func TestSanitizeMarkdownTextNeutralizesActiveContent(t *testing.T) {
 	}
 }
 
+func TestSanitizeMarkdownTextWithCodeSpansPreservesOnlyInlineCode(t *testing.T) {
+	result := SanitizeMarkdownTextWithCodeSpans(
+		"Call `publicLog2` before @team <script> ![image](url); reject ``fences`` and `multiline\ncode`.",
+	)
+	if !strings.Contains(result, "Call `publicLog2`") {
+		t.Fatalf("sanitized text did not preserve code span: %q", result)
+	}
+	for _, forbidden := range []string{"@team", "<script>", "![image]", "``fences``", "`multiline\ncode`"} {
+		if strings.Contains(result, forbidden) {
+			t.Fatalf("sanitized text %q contains %q", result, forbidden)
+		}
+	}
+}
+
 func TestReviewRequestSanitizesAllDynamicMetadata(t *testing.T) {
 	result := Result{
 		PullRequest: PullRequest{Number: 7, HeadSHA: "head"},
@@ -309,7 +323,7 @@ func TestReviewRequestSanitizesAllDynamicMetadata(t *testing.T) {
 			PerformanceOutcome:  "delay",
 			ChangeCausality:     "introduced",
 			PreviousBehavior:    "before",
-			ChangedBehavior:     "after",
+			ChangedBehavior:     "after `publicLog2`",
 			CausalDiffEvidence:  "changed line",
 			Title:               "title",
 			Impact:              "@impact <script>",
@@ -326,6 +340,9 @@ func TestReviewRequestSanitizesAllDynamicMetadata(t *testing.T) {
 	}
 	request := buildReviewRequest(result, "<!-- marker -->")
 	combined := request.Body + request.Comments[0].Body
+	if !strings.Contains(combined, "`publicLog2`") {
+		t.Fatalf("review content did not preserve code span: %s", combined)
+	}
 	for _, forbidden := range []string{
 		"@focus",
 		"@severity",

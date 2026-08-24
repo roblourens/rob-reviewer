@@ -149,9 +149,9 @@ func buildReviewRequest(result Result, marker string) ReviewRequest {
 			Body: fmt.Sprintf(
 				"%s\n\n%s\n\n%s\n\n**Suggested fix:** %s\n\n%s",
 				experimentalReviewPrefix,
-				SanitizeMarkdownText(finding.ChangedBehavior),
-				SanitizeMarkdownText(finding.Impact),
-				SanitizeMarkdownText(finding.Recommendation),
+				SanitizeMarkdownTextWithCodeSpans(finding.ChangedBehavior),
+				SanitizeMarkdownTextWithCodeSpans(finding.Impact),
+				SanitizeMarkdownTextWithCodeSpans(finding.Recommendation),
 				generatedDisclosure,
 			),
 		})
@@ -259,6 +259,80 @@ func validatePublicationTarget(analyzed, current PullRequest) error {
 }
 
 func SanitizeMarkdownText(value string) string {
+	return strings.NewReplacer(
+		`\`, `\\`,
+		"`", "\\`",
+		"*", `\*`,
+		"_", `\_`,
+		"[", `\[`,
+		"]", `\]`,
+		"<", "&lt;",
+		">", "&gt;",
+		"#", `\#`,
+		"!", `\!`,
+		"|", `\|`,
+		"@", "&#64;",
+	).Replace(stripUnsafeMarkdownCharacters(value))
+}
+
+func SanitizeMarkdownTextWithCodeSpans(value string) string {
+	var output strings.Builder
+	plainStart := 0
+	for cursor := 0; cursor < len(value); {
+		if value[cursor] != '`' {
+			cursor++
+			continue
+		}
+		runEnd := backtickRunEnd(value, cursor)
+		if runEnd-cursor != 1 {
+			cursor = runEnd
+			continue
+		}
+		close := nextSingleBacktick(value, runEnd)
+		if close < 0 {
+			cursor = runEnd
+			continue
+		}
+		code := value[runEnd:close]
+		if code == "" || strings.ContainsAny(code, "\r\n") {
+			cursor = runEnd
+			continue
+		}
+		output.WriteString(SanitizeMarkdownText(value[plainStart:cursor]))
+		output.WriteByte('`')
+		output.WriteString(stripUnsafeMarkdownCharacters(code))
+		output.WriteByte('`')
+		plainStart = close + 1
+		cursor = plainStart
+	}
+	output.WriteString(SanitizeMarkdownText(value[plainStart:]))
+	return output.String()
+}
+
+func nextSingleBacktick(value string, start int) int {
+	for cursor := start; cursor < len(value); {
+		if value[cursor] != '`' {
+			cursor++
+			continue
+		}
+		runEnd := backtickRunEnd(value, cursor)
+		if runEnd-cursor == 1 {
+			return cursor
+		}
+		cursor = runEnd
+	}
+	return -1
+}
+
+func backtickRunEnd(value string, start int) int {
+	end := start
+	for end < len(value) && value[end] == '`' {
+		end++
+	}
+	return end
+}
+
+func stripUnsafeMarkdownCharacters(value string) string {
 	var clean strings.Builder
 	clean.Grow(len(value))
 	for _, character := range value {
@@ -274,18 +348,5 @@ func SanitizeMarkdownText(value string) string {
 		}
 		clean.WriteRune(character)
 	}
-	return strings.NewReplacer(
-		`\`, `\\`,
-		"`", "\\`",
-		"*", `\*`,
-		"_", `\_`,
-		"[", `\[`,
-		"]", `\]`,
-		"<", "&lt;",
-		">", "&gt;",
-		"#", `\#`,
-		"!", `\!`,
-		"|", `\|`,
-		"@", "&#64;",
-	).Replace(clean.String())
+	return clean.String()
 }
