@@ -41,6 +41,10 @@ Check batching and deferred work for flush, ordering, rotation, cancellation, an
 
 When reporting a collection-scaling issue, use the effective cardinality established by the scenario analysis after caching, grouping, and coalescing. Do not say "per item" when one operation serves an entire repository/resource group. Distinguish cold successful fan-out from work repeated only on failures.
 
+Before recommending a narrower SDK/service read or a cache, verify that such an API exists and that the alternative does not require duplicating complex authoritative state. The absence of a narrower API does not excuse a PR that newly invokes the unavoidable expensive operation more often, moves it onto a critical path, or increases its concurrency; in that case, report the changed frequency or scheduling mechanism and prefer rollback, batching, coalescing, or an explicit upstream dependency over shadow state. Do not expand a PR's scope into a new upstream API or shadow-state subsystem unless the changed code creates a severe performance risk and the ownership tradeoff is explicit.
+
+Respect intentional scheduling tradeoffs. If cleanup, migration, or validation moved earlier for correctness, explain that intent and report only when the new placement creates a concrete, realistic performance regression on another important scenario.
+
 ## Report
 
 Anchor every finding to the smallest relevant **changed line or changed-line range** as `path:line`. Do not report file-level or unchanged-line findings.

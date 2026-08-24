@@ -2,10 +2,13 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/roblourens/rob-reviewer/internal/review"
 )
 
 func TestListPullRequestsMapsResponseAndPagination(t *testing.T) {
@@ -13,6 +16,7 @@ func TestListPullRequestsMapsResponseAndPagination(t *testing.T) {
 		if request.URL.Path != "/repos/microsoft/vscode/pulls" {
 			t.Fatalf("path = %q", request.URL.Path)
 		}
+
 		writer.Header().Set("Link", `<https://api.github.com/resource?page=2>; rel="next"`)
 		fmt.Fprint(writer, `[{"number":7,"title":"Improve","body":"Body","state":"open","draft":false,"html_url":"https://example.test/7","author_association":"MEMBER","user":{"login":"teammate"},"base":{"ref":"main","sha":"base"},"head":{"ref":"feature","sha":"head"},"created_at":"2026-08-01T00:00:00Z"}]`)
 	}))
@@ -23,9 +27,54 @@ func TestListPullRequestsMapsResponseAndPagination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !hasNext || len(pulls) != 1 || pulls[0].Number != 7 || pulls[0].HeadSHA != "head" ||
 		pulls[0].AuthorLogin != "teammate" || pulls[0].AuthorAssociation != "MEMBER" {
 		t.Fatalf("pulls = %+v, hasNext = %v", pulls, hasNext)
+	}
+}
+
+func TestCreateAndSubmitPendingReview(t *testing.T) {
+	var created CreateReviewRequest
+	var submitted struct {
+		Event string `json:"event"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/microsoft/vscode/pulls/7/reviews":
+			if err := json.NewDecoder(request.Body).Decode(&created); err != nil {
+				t.Fatal(err)
+			}
+			writer.WriteHeader(http.StatusCreated)
+			fmt.Fprint(writer, `{"id":99}`)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/microsoft/vscode/pulls/7/reviews/99/events":
+			if err := json.NewDecoder(request.Body).Decode(&submitted); err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprint(writer, `{}`)
+		default:
+			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(server.Client(), "token", server.URL)
+	reviewID, err := client.CreatePendingReview(context.Background(), "microsoft", "vscode", 7, review.ReviewRequest{
+		CommitID: "head",
+		Body:     "body",
+		Comments: []review.Comment{{Path: "src/file.ts", Line: 3, Side: review.SideRight, Body: "comment"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reviewID != 99 || created.Event != "" || created.CommitID != "head" || len(created.Comments) != 1 {
+		t.Fatalf("review ID=%d request=%+v", reviewID, created)
+	}
+	if err := client.SubmitPendingReview(context.Background(), "microsoft", "vscode", 7, reviewID); err != nil {
+		t.Fatal(err)
+	}
+	if submitted.Event != "COMMENT" {
+		t.Fatalf("submitted event = %q", submitted.Event)
 	}
 }
 

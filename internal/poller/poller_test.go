@@ -83,20 +83,43 @@ func (client *fakePullClient) GetPullRequest(_ context.Context, _, _ string, num
 }
 
 type fakeStateStore struct {
-	current state.State
-	exists  bool
-	saves   []state.State
+	current        state.State
+	exists         bool
+	saves          []state.State
+	saveContextErr error
 }
 
 func (store *fakeStateStore) Load(context.Context) (state.State, string, bool, error) {
 	return store.current, "state-sha", store.exists, nil
 }
 
-func (store *fakeStateStore) Save(_ context.Context, current state.State, _ string) error {
+func (store *fakeStateStore) Save(ctx context.Context, current state.State, _ string) error {
+	store.saveContextErr = ctx.Err()
 	store.current = current
 	store.exists = true
 	store.saves = append(store.saves, current)
 	return nil
+}
+
+func TestRunPersistsCompletedWorkAfterCancellation(t *testing.T) {
+	client := &fakePullClient{
+		pages: map[int][]review.PullRequest{
+			1: {{Number: 11, State: "open", AuthorAssociation: "MEMBER"}},
+		},
+	}
+	store := &fakeStateStore{exists: true, current: state.New(10)}
+	ctx, cancel := context.WithCancel(context.Background())
+	poller := New(client, store, "microsoft", "vscode", 5, func(context.Context, review.PullRequest) error {
+		cancel()
+		return nil
+	})
+
+	if _, err := poller.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if store.saveContextErr != nil || store.current.HighWaterMark != 11 {
+		t.Fatalf("save context error=%v state=%+v", store.saveContextErr, store.current)
+	}
 }
 
 func TestRunBootstrapsWithoutReviewing(t *testing.T) {

@@ -46,6 +46,11 @@ type Options struct {
 	CopilotToken string
 }
 
+type PollResult struct {
+	Poll    poller.Result
+	Reviews []review.Result
+}
+
 func New(options Options) (*App, error) {
 	if options.Logger == nil {
 		options.Logger = slog.Default()
@@ -95,13 +100,16 @@ func (app *App) Close() error {
 	return err
 }
 
-func (app *App) Poll(ctx context.Context, stateRepository string) (poller.Result, error) {
+func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory string) (PollResult, error) {
 	stateOwner, stateRepo, err := parseRepository(stateRepository)
 	if err != nil {
-		return poller.Result{}, err
+		return PollResult{}, err
 	}
 	if !app.hasStateToken {
-		return poller.Result{}, errors.New("GITHUB_TOKEN is required for polling state")
+		return PollResult{}, errors.New("GITHUB_TOKEN is required for polling state")
+	}
+	if strings.TrimSpace(outputDirectory) == "" {
+		return PollResult{}, errors.New("poll output directory is required so review state cannot advance without durable reports")
 	}
 	store := state.NewStore(
 		app.stateClient,
@@ -110,6 +118,7 @@ func (app *App) Poll(ctx context.Context, stateRepository string) (poller.Result
 		app.config.State.Branch,
 		app.config.State.Path,
 	)
+	var reviews []review.Result
 	prPoller := poller.New(
 		app.reviewClient,
 		store,
@@ -117,26 +126,40 @@ func (app *App) Poll(ctx context.Context, stateRepository string) (poller.Result
 		app.config.Target.Repo,
 		app.config.Poll.MaxPerRun,
 		func(reviewContext context.Context, pull review.PullRequest) error {
-			_, err := app.reviewOne(reviewContext, pull, true)
-			return err
+			result, analyzed, err := app.reviewOne(reviewContext, pull, false)
+			if err != nil {
+				return err
+			}
+			if !analyzed {
+				return nil
+			}
+			if _, err := WriteResultFiles(outputDirectory, result); err != nil {
+				return fmt.Errorf("persist dry-run report for PR %d: %w", pull.Number, err)
+			}
+			reviews = append(reviews, result)
+			return nil
 		},
 	)
-	return prPoller.Run(ctx)
+	pollResult, err := prPoller.Run(ctx)
+	if err != nil {
+		return PollResult{Poll: pollResult, Reviews: reviews}, err
+	}
+	return PollResult{Poll: pollResult, Reviews: reviews}, nil
 }
 
-func (app *App) ReviewPullRequest(ctx context.Context, number int, publish bool) (review.Result, error) {
+func (app *App) ReviewPullRequest(ctx context.Context, number int, publish bool) (review.Result, bool, error) {
 	if number < 1 {
-		return review.Result{}, errors.New("pull request number must be positive")
+		return review.Result{}, false, errors.New("pull request number must be positive")
 	}
 	pull, err := app.reviewClient.GetPullRequest(ctx, app.config.Target.Owner, app.config.Target.Repo, number)
 	if err != nil {
-		return review.Result{}, fmt.Errorf("get pull request %d: %w", number, err)
+		return review.Result{}, false, fmt.Errorf("get pull request %d: %w", number, err)
 	}
 	if !strings.EqualFold(pull.State, "open") {
-		return review.Result{}, fmt.Errorf("pull request %d is not open", number)
+		return review.Result{}, false, fmt.Errorf("pull request %d is not open", number)
 	}
 	if !pull.IsTeamAuthored() {
-		return review.Result{}, fmt.Errorf(
+		return review.Result{}, false, fmt.Errorf(
 			"pull request %d was opened by %q with author association %q; only team-authored PRs are eligible",
 			number,
 			pull.AuthorLogin,
@@ -144,7 +167,7 @@ func (app *App) ReviewPullRequest(ctx context.Context, number int, publish bool)
 		)
 	}
 	if pull.Draft {
-		return review.Result{}, fmt.Errorf("pull request %d is still a draft", number)
+		return review.Result{}, false, fmt.Errorf("pull request %d is still a draft", number)
 	}
 	return app.reviewOne(ctx, pull, publish)
 }
@@ -202,25 +225,25 @@ func (app *App) ReviewHistoricalPullRequest(ctx context.Context, number int) (re
 	return result, nil
 }
 
-func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish bool) (_ review.Result, returnErr error) {
+func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish bool) (_ review.Result, analyzed bool, returnErr error) {
 	marker := github.ReviewMarker(pull.Number, pull.HeadSHA)
 	exists, err := app.reviewClient.HasReviewMarker(ctx, app.config.Target.Owner, app.config.Target.Repo, pull.Number, marker)
 	if err != nil {
-		return review.Result{}, fmt.Errorf("check review idempotency marker: %w", err)
+		return review.Result{}, false, fmt.Errorf("check review idempotency marker: %w", err)
 	}
 	if exists {
 		app.logger.Info("pull request already reviewed", "pr", pull.Number, "head", pull.HeadSHA)
-		return review.Result{PullRequest: pull}, nil
+		return review.Result{PullRequest: pull}, false, nil
 	}
 
 	result, err := app.analyze(ctx, pull)
 	if err != nil {
-		return review.Result{}, err
+		return review.Result{}, false, err
 	}
 	publisher := review.NewPublisher(app.reviewClient, app.config.Target.Owner, app.config.Target.Repo)
 	published, err := publisher.Publish(ctx, result, !publish)
 	if err != nil {
-		return review.Result{}, err
+		return review.Result{}, false, err
 	}
 	app.logger.Info(
 		"pull request review complete",
@@ -248,7 +271,7 @@ func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish 
 		"modelBillingMultipliers", result.Stats.ModelBillingMultipliers,
 		"costNote", result.Stats.CostNote,
 	)
-	return result, nil
+	return result, true, nil
 }
 
 func (app *App) analyze(ctx context.Context, pull review.PullRequest) (_ review.Result, returnErr error) {
@@ -283,7 +306,9 @@ func (app *App) analyze(ctx context.Context, pull review.PullRequest) (_ review.
 	stats.StartedAt = startedAt.UTC()
 	stats.CompletedAt = completedAt.UTC()
 	stats.WallClockMilliseconds = completedAt.Sub(startedAt).Milliseconds()
-	return review.Result{PullRequest: pull, Findings: findings, Analysis: analysis, Stats: stats}, nil
+	result := review.Result{PullRequest: pull, Findings: findings, Analysis: analysis, Stats: stats}
+	review.BindFindingIDs(&result)
+	return result, nil
 }
 
 func (app *App) getRunner(ctx context.Context) (*reviewcopilot.Runner, error) {
@@ -335,10 +360,11 @@ func FormatResultMarkdown(result review.Result) string {
 		for index, finding := range result.Findings {
 			fmt.Fprintf(
 				&output,
-				"### %d. [%s] %s\n\n**Location:** <code>%s:%d</code> (<code>%s</code>)  \n**Performance category:** <code>%s</code>  \n**Resource:** %s  \n**Scaling:** %s  \n**Outcome:** %s  \n**PR causality:** <code>%s</code>  \n**Previous behavior:** %s  \n**Changed behavior:** %s  \n**Confidence:** %.2f — %s\n\n**Causal diff evidence:** %s\n\n%s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n",
+				"### %d. [%s] %s\n\n**Finding ID:** `%s`  \n**Location:** <code>%s:%d</code> (<code>%s</code>)  \n**Performance category:** <code>%s</code>  \n**Resource:** %s  \n**Scaling:** %s  \n**Outcome:** %s  \n**PR causality:** <code>%s</code>  \n**Previous behavior:** %s  \n**Changed behavior:** %s  \n**Confidence:** %.2f — %s\n\n**Causal diff evidence:** %s\n\n%s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n",
 				index+1,
 				finding.Severity,
 				singleLineMarkdown(finding.Title),
+				review.SanitizeMarkdownText(finding.ID),
 				review.SanitizeMarkdownText(finding.Path),
 				finding.Line,
 				finding.Side,

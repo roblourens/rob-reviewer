@@ -11,8 +11,10 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 - Only PRs whose GitHub `author_association` is `MEMBER` or `OWNER` are eligible. Outside collaborators, contributors, bots, and other non-team authors are skipped.
 - Newly opened team-authored draft PRs are deferred until they become ready for review. Non-team drafts are skipped rather than persisted.
 - Each eligible PR is reviewed once. New pushes to an already handled PR are not reviewed in version 1.
-- A clean review is silent.
-- A review with findings posts one non-blocking `COMMENT` review with at most ten inline comments.
+- Scheduled and manual analysis is dry-run only. It writes JSON and Markdown reports and never posts automatically.
+- Every finding has a stable `PERF-...` ID. A human explicitly approves IDs from a saved JSON report before publication.
+- One approved publication posts a non-blocking `COMMENT` review with only the selected inline comments.
+- Published summaries and inline comments begin with **Experimental performance review bot**.
 - Findings must be performance-only, high confidence, anchored to an added or deleted line, and explicitly prove through before/after evidence that the PR introduced or materially amplified the performance mechanism. Pre-existing non-critical optimization opportunities are rejected.
 - State is committed to a dedicated `reviewer-state` branch, including silent clean results and deferred drafts.
 
@@ -82,19 +84,31 @@ go mod download
 go build ./cmd/rob-reviewer
 ```
 
-Run one PR locally without publishing:
+Run one PR locally:
 
 ```bash
 REVIEW_GITHUB_TOKEN=... \
 COPILOT_GITHUB_TOKEN=... \
-go run ./cmd/rob-reviewer review --pr 123456
+go run ./cmd/rob-reviewer review --pr 123456 --output-dir review-results
 ```
 
-The dry-run result is written as JSON. Add `--publish` only when a public review is intended.
+The command writes both JSON and Markdown. Read the Markdown report and note the `PERF-...` IDs you approve.
 
 Use `--format markdown` for a readable local report. Both JSON and Markdown output include review statistics at the end: configured and actual model, configured and actual reasoning effort, model API endpoint, wall-clock time, model-call count, input/output/reasoning/cache token usage, aggregate model API time, tool-call count, Copilot nano-AI units, and model billing multipliers. The SDK does not expose a reliable USD conversion, so reports state that dollar cost is unavailable.
 
-Scheduled reviews emit the same fields as structured workflow logs even when a clean review remains silent on GitHub. Reviews with findings include a collapsed statistics footer in the GitHub review summary.
+Scheduled reviews upload the same JSON and Markdown files as a workflow artifact. They also emit complete statistics in structured logs.
+
+Publish only explicitly approved IDs from the saved JSON report:
+
+```bash
+REVIEW_GITHUB_TOKEN=... \
+go run ./cmd/rob-reviewer publish-report \
+  --report review-results/pr-123456-abcdef123456.json \
+  --finding PERF-1234567890AB \
+  --finding PERF-ABCDEF123456
+```
+
+Publication does not rerun the model or require a Copilot token. It strictly parses the saved report, verifies that every finding ID still matches the complete finding content and the original PR number/base/head identity, selects only the approved IDs, revalidates the publication target, and posts one experimental non-blocking review. Finding IDs, confidence, severity, raw evidence, and model statistics remain local. Each public inline comment gives the local report's level of detail through a clear description of the changed behavior and its concrete impact, followed by the suggested fix. The publisher first creates a pending GitHub review as a concurrency claim and then submits that exact review. A retry resumes only a pending review with the same approved finding set.
 
 Replay a closed or merged team-authored PR for regression testing:
 
@@ -104,7 +118,7 @@ COPILOT_GITHUB_TOKEN=... \
 go run ./cmd/rob-reviewer review --pr 123456 --historical
 ```
 
-Historical mode bypasses existing-review marker lookup and open-state publication checks so the original PR diff is analyzed again. It can never be combined with `--publish`.
+Historical mode bypasses existing-review marker lookup while analyzing the original PR diff. A saved historical report can be published after explicit approval even if the PR has closed or merged. Publication still requires the same team-authored PR and exact reviewed head SHA; for an open PR it also requires the exact base SHA and rejects drafts. A closed PR's base branch may advance after closure, so publication does not compare its current base SHA.
 
 Run the production poller:
 
@@ -113,10 +127,10 @@ GITHUB_REPOSITORY=owner/rob-reviewer \
 GITHUB_TOKEN=... \
 REVIEW_GITHUB_TOKEN=... \
 COPILOT_GITHUB_TOKEN=... \
-go run ./cmd/rob-reviewer poll
+go run ./cmd/rob-reviewer poll --output-dir review-results
 ```
 
-The manual workflow supports the same modes: leave `pr_number` empty to poll, provide a number for a dry run, or explicitly enable `publish`. Manual review also enforces the team-author policy and refuses PRs whose author association is not `MEMBER` or `OWNER`.
+The manual workflow supports the same dry-run modes: leave `pr_number` empty to poll or provide a number for one review. It uploads reports as an artifact and never publishes. Manual review also enforces the team-author policy and refuses PRs whose author association is not `MEMBER` or `OWNER`.
 
 ## Adding a review focus
 
@@ -158,12 +172,13 @@ go build ./cmd/rob-reviewer
 
 Tests cover configuration, focus loading, team-author eligibility, polling/bootstrap/deferred drafts, state persistence, safe checkout behavior, diff parsing and changed-line anchors, path containment, bounded tools, finding validation/ranking, stale-head rejection, idempotency, and review formatting. Synthetic fixtures model known performance failure mechanisms without copying VS Code source.
 
-Use a manual dry-run workflow for the real SDK smoke test. Publishing is a separate explicit input.
+Use a manual dry-run workflow for the real SDK smoke test. Publishing happens separately from an approved saved report.
 
 ## Failure and retry behavior
 
-- Processing stops at the first failed PR. The high-water mark advances only through successful or intentionally skipped entries.
-- A later poll retries the failed PR.
-- Posted reviews contain a hidden PR/head marker. Only markers authored by the authenticated review identity count. If publication succeeded but state persistence failed, the retry sees the marker and does not duplicate comments.
-- Clean reviews have no public marker by design. A rare state-write failure can repeat their analysis, but it cannot create public noise.
+- Processing stops at the first failed PR. Polling requires `--output-dir`, and both the authoritative JSON report and its Markdown rendering are atomically replaced inside the per-PR polling callback. The high-water mark advances only after those files are durable, or after an entry is intentionally skipped.
+- Reports completed before a later PR fails remain in the output directory and are uploaded by the workflow's `always()` artifact step. A later poll retries the failed PR.
+- Publication has a separate lifecycle from polling state. Submitted reviews contain a hidden PR/head marker, while pending reviews bind to a digest of the approved finding set without exposing finding IDs. Only markers authored by the authenticated review identity count.
+- Creating a pending review claims publication for that GitHub identity and PR. If submission fails, retrying the same approved IDs resumes that pending review; different IDs are rejected. Once submitted, later publication attempts for that PR/head are no-ops.
+- Clean dry-run reports are persisted and advance polling state without creating any public marker or comment.
 - Authentication, unavailable models, SDK startup, invalid tool submissions, incomplete focus passes, checkout errors, stale heads, and GitHub API errors fail explicitly; none are converted into clean reviews.

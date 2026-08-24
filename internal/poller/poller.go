@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/roblourens/rob-reviewer/internal/review"
 	"github.com/roblourens/rob-reviewer/internal/state"
@@ -73,7 +74,9 @@ func (poller *Poller) Run(ctx context.Context) (result Result, returnErr error) 
 		if !dirty {
 			return
 		}
-		if err := poller.store.Save(ctx, current, sha); err != nil {
+		saveContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := poller.store.Save(saveContext, current, sha); err != nil {
 			returnErr = errors.Join(returnErr, err)
 		}
 	}()

@@ -2,6 +2,7 @@ package review
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -11,8 +12,13 @@ type fakePublisherClient struct {
 	currents     []PullRequest
 	refreshCount int
 	markerExists bool
+	markerReview *ExistingReview
 	request      ReviewRequest
+	pendingID    int64
+	submittedID  int64
 	published    bool
+	createErr    error
+	submitErr    error
 }
 
 func (client *fakePublisherClient) GetPullRequest(context.Context, string, string, int) (PullRequest, error) {
@@ -24,12 +30,40 @@ func (client *fakePublisherClient) GetPullRequest(context.Context, string, strin
 	return client.current, nil
 }
 
-func (client *fakePublisherClient) HasReviewMarker(context.Context, string, string, int, string) (bool, error) {
-	return client.markerExists, nil
+func (client *fakePublisherClient) FindReviewMarker(context.Context, string, string, int, string) (*ExistingReview, error) {
+	if client.markerReview != nil {
+		return client.markerReview, nil
+	}
+	if !client.markerExists {
+		return nil, nil
+	}
+	return &ExistingReview{ID: 7, State: "COMMENTED"}, nil
 }
 
-func (client *fakePublisherClient) PublishReview(_ context.Context, _, _ string, _ int, request ReviewRequest) error {
+func (client *fakePublisherClient) CreatePendingReview(
+	_ context.Context,
+	_, _ string,
+	_ int,
+	request ReviewRequest,
+) (int64, error) {
+	if client.createErr != nil {
+		return 0, client.createErr
+	}
 	client.request = request
+	client.pendingID = 42
+	return client.pendingID, nil
+}
+
+func (client *fakePublisherClient) SubmitPendingReview(
+	_ context.Context,
+	_, _ string,
+	_ int,
+	reviewID int64,
+) error {
+	if client.submitErr != nil {
+		return client.submitErr
+	}
+	client.submittedID = reviewID
 	client.published = true
 	return nil
 }
@@ -60,6 +94,7 @@ func TestPublisherCreatesCommentReview(t *testing.T) {
 			ModelBillingMultipliers: []float64{15},
 		},
 		Findings: []Finding{{
+			ID:                  "PERF-1234567890AB",
 			Focus:               "performance-review",
 			Path:                "src/file.ts",
 			Side:                SideRight,
@@ -89,8 +124,11 @@ func TestPublisherCreatesCommentReview(t *testing.T) {
 	if !published || !client.published {
 		t.Fatal("expected publication")
 	}
-	if client.request.Event != "COMMENT" || client.request.CommitID != "head" {
+	if client.request.Event != "" || client.request.CommitID != "head" {
 		t.Fatalf("request = %+v", client.request)
+	}
+	if client.pendingID != 42 || client.submittedID != 42 {
+		t.Fatalf("pending=%d submitted=%d", client.pendingID, client.submittedID)
 	}
 	if len(client.request.Comments) != 1 || !strings.Contains(client.request.Body, "rob-reviewer:v1") {
 		t.Fatalf("request = %+v", client.request)
@@ -98,18 +136,33 @@ func TestPublisherCreatesCommentReview(t *testing.T) {
 	if !strings.Contains(client.request.Comments[0].Body, generatedDisclosure) {
 		t.Fatal("inline comment is missing generated-content disclosure")
 	}
+	if !strings.HasPrefix(client.request.Comments[0].Body, experimentalReviewPrefix) {
+		t.Fatal("inline comment is missing experimental bot prefix")
+	}
+	if !strings.HasPrefix(client.request.Body, experimentalReviewPrefix) {
+		t.Fatal("review summary is missing experimental bot prefix")
+	}
 	for _, expected := range []string{
-		"Review statistics",
-		"`gpt-5.6-sol`",
-		"`high`",
-		"12.345s",
-		"10000 input, 2000 output, 12000 total",
-		"123.456 nano-AI units",
-		"model billing multiplier: 15.000",
-		"USD cost: unavailable",
+		"The diff repeats the work for every historical child.",
+		"The loop blocks scrolling.",
+		"**Suggested fix:** Flush one update after reconstruction.",
 	} {
-		if !strings.Contains(client.request.Body, expected) {
-			t.Fatalf("review body missing %q: %s", expected, client.request.Body)
+		if !strings.Contains(client.request.Comments[0].Body, expected) {
+			t.Fatalf("inline comment missing %q: %s", expected, client.request.Comments[0].Body)
+		}
+	}
+	combined := client.request.Body + client.request.Comments[0].Body
+	for _, forbidden := range []string{
+		"PERF-1234567890AB",
+		"Confidence",
+		"Review statistics",
+		"gpt-5.6-sol",
+		"high-confidence",
+		"Causal diff evidence",
+		"Performance mechanism",
+	} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("public review contains %q: %s", forbidden, combined)
 		}
 	}
 }
@@ -124,6 +177,53 @@ func TestPublisherRejectsStaleHead(t *testing.T) {
 	}, false)
 	if err == nil || !strings.Contains(err.Error(), "head changed") {
 		t.Fatalf("expected stale head error, got %v", err)
+	}
+}
+
+func TestPublisherResumesOnlyMatchingPendingReview(t *testing.T) {
+	pull := PullRequest{Number: 7, HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
+	result := Result{
+		PullRequest: pull,
+		Findings:    []Finding{{ID: "PERF-1234567890AB"}},
+	}
+	baseMarker := "<!-- rob-reviewer:v1 pr=7 head=head -->"
+	client := &fakePublisherClient{
+		current: pull,
+		markerReview: &ExistingReview{
+			ID:    77,
+			State: "PENDING",
+			Body:  baseMarker + "\n" + publicationApprovalMarker(result),
+		},
+	}
+	publisher := NewPublisher(client, "microsoft", "vscode")
+
+	published, err := publisher.Publish(context.Background(), result, false)
+	if err != nil || !published || client.submittedID != 77 || client.pendingID != 0 {
+		t.Fatalf("published=%v submitted=%d pending=%d err=%v", published, client.submittedID, client.pendingID, err)
+	}
+
+	client.submittedID = 0
+	client.markerReview.Body = baseMarker + "\n<!-- rob-reviewer-approval:v1 selection=000000000000 -->"
+	if _, err := publisher.Publish(context.Background(), result, false); err == nil ||
+		!strings.Contains(err.Error(), "different approved finding set") {
+		t.Fatalf("expected mismatched pending review error, got %v", err)
+	}
+}
+
+func TestPublisherSurfacesPendingReviewFailures(t *testing.T) {
+	pull := PullRequest{Number: 7, HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
+	result := Result{PullRequest: pull, Findings: []Finding{{ID: "PERF-1234567890AB"}}}
+
+	client := &fakePublisherClient{current: pull, createErr: errors.New("pending conflict")}
+	if _, err := NewPublisher(client, "microsoft", "vscode").Publish(context.Background(), result, false); err == nil ||
+		!strings.Contains(err.Error(), "create pending performance review claim") {
+		t.Fatalf("expected pending creation error, got %v", err)
+	}
+
+	client = &fakePublisherClient{current: pull, submitErr: errors.New("submit failed")}
+	if _, err := NewPublisher(client, "microsoft", "vscode").Publish(context.Background(), result, false); err == nil ||
+		!strings.Contains(err.Error(), "submit pending performance review") {
+		t.Fatalf("expected pending submission error, got %v", err)
 	}
 }
 
@@ -157,11 +257,89 @@ func TestPublisherRejectsStaleHeadForCleanResult(t *testing.T) {
 	}
 }
 
+func TestPublisherAllowsClosedPullRequestWithAdvancedBase(t *testing.T) {
+	analyzed := PullRequest{
+		Number:            7,
+		BaseSHA:           "original-base",
+		HeadSHA:           "head",
+		State:             "open",
+		AuthorAssociation: "MEMBER",
+	}
+	client := &fakePublisherClient{
+		current: PullRequest{
+			Number:            7,
+			BaseSHA:           "advanced-base",
+			HeadSHA:           "head",
+			State:             "closed",
+			AuthorAssociation: "MEMBER",
+		},
+	}
+	published, err := NewPublisher(client, "microsoft", "vscode").Publish(context.Background(), Result{
+		PullRequest: analyzed,
+		Findings:    []Finding{{ID: "PERF-1234567890AB"}},
+	}, false)
+	if err != nil || !published || !client.published {
+		t.Fatalf("published=%v client.published=%v err=%v", published, client.published, err)
+	}
+}
+
 func TestSanitizeMarkdownTextNeutralizesActiveContent(t *testing.T) {
-	result := SanitizeMarkdownText("@team ![image](https://example.test/x) <details>\x00")
-	for _, forbidden := range []string{"@team", "![", "<details>", "\x00"} {
+	result := SanitizeMarkdownText("@team ![image](https://example.test/x) <details>\x00\u202e\u2066\u200b\u0085\u2028")
+	for _, forbidden := range []string{"@team", "![", "<details>", "\x00", "\u202e", "\u2066", "\u200b", "\u0085", "\u2028"} {
 		if strings.Contains(result, forbidden) {
 			t.Fatalf("sanitized text %q contains %q", result, forbidden)
+		}
+	}
+}
+
+func TestReviewRequestSanitizesAllDynamicMetadata(t *testing.T) {
+	result := Result{
+		PullRequest: PullRequest{Number: 7, HeadSHA: "head"},
+		Findings: []Finding{{
+			ID:                  "PERF-1234567890AB",
+			Focus:               "@focus <details>",
+			Path:                "src/file.ts",
+			Side:                SideRight,
+			Line:                1,
+			Severity:            Severity("@severity"),
+			ConfidenceRationale: "rationale",
+			PerformanceCategory: "latency",
+			PerformanceResource: "CPU",
+			PerformanceScaling:  "per item",
+			PerformanceOutcome:  "delay",
+			ChangeCausality:     "introduced",
+			PreviousBehavior:    "before",
+			ChangedBehavior:     "after",
+			CausalDiffEvidence:  "changed line",
+			Title:               "title",
+			Impact:              "@impact <script>",
+			Evidence:            "evidence",
+			Recommendation:      "![fix](url)",
+		}},
+		Stats: Stats{
+			Model:                  "@model <script>",
+			ActualModels:           []string{"![model](url)"},
+			ReasoningEffort:        "@high",
+			ActualReasoningEfforts: []string{"<details>"},
+			APIEndpoints:           []string{"@endpoint"},
+		},
+	}
+	request := buildReviewRequest(result, "<!-- marker -->")
+	combined := request.Body + request.Comments[0].Body
+	for _, forbidden := range []string{
+		"@focus",
+		"@severity",
+		"@model",
+		"<script>",
+		"![model]",
+		"@high",
+		"@endpoint",
+		"@impact",
+		"<script>",
+		"![fix]",
+	} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("review content contains unsanitized %q: %s", forbidden, combined)
 		}
 	}
 }

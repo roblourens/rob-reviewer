@@ -89,6 +89,12 @@ The finding must be caused by the reviewed diff. Check the previous behavior, ex
 
 Performance changes often affect ordering, invalidation, freshness, cancellation, backpressure, error propagation, and lifecycle. Recommend batching only when flush and ordering semantics can be preserved. Recommend caching only when the key, invalidation, size bound, and ownership are understood. Recommend deferral only when the work is not required before first use.
 
+Before recommending a narrower read, lazy materialization, or cache, verify that the existing SDK/service API supports it. If the only supported operation materializes full state and the feature requires that operation, do not report the PR merely for using the available API. However, the PR can still introduce a regression by newly calling that unavoidable operation more frequently, moving it onto a critical path, or increasing concurrent invocations. Report that changed frequency or scheduling mechanism, not the API's pre-existing cost, and prefer rollback, batching, coalescing, or an explicit upstream dependency over inventing shadow state. An upstream API opportunity alone is not an actionable PR regression.
+
+Avoid recommending duplicate shadow state that mirrors SDK- or service-owned state. Additional state requires ownership, invalidation, persistence, lifecycle, and cross-window/process consistency. Prefer a narrower authoritative API, minimal derived metadata with a clear owner, or no finding when the alternative would duplicate complex state.
+
+When a PR deliberately changes scheduling—for example, moving cleanup earlier to improve correctness—identify the intended tradeoff from code comments, tests, or PR behavior. Report it only when the changed scheduling has a concrete performance mechanism and realistic contention with an important scenario. State the intent and the tradeoff rather than presenting the scheduling choice as obviously wrong.
+
 ### 5. Use budgets as evidence, not syntax rules
 
 For Chromium renderer work, useful diagnostic thresholds are:
@@ -486,6 +492,8 @@ Do not report:
 - a collection that is intentionally bounded by a clear owner;
 - asynchronous code merely because it could be parallelized;
 - a cache suggestion without invalidation and ownership;
+- use of an unavoidable full-state SDK API when no narrower authoritative API exists and the PR does not increase its frequency, concurrency, or critical-path placement;
+- an optimization that requires duplicating substantial SDK/service-owned state without a minimal ownership and invalidation design;
 - batching without flush, ordering, and failure semantics;
 - an issue that exists entirely in unchanged code;
 - a benchmark request without a concrete suspected mechanism;

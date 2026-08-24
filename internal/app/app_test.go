@@ -36,6 +36,7 @@ func TestFormatResultMarkdownSanitizesUntrustedContent(t *testing.T) {
 			HeadSHA: "abc",
 		},
 		Findings: []review.Finding{{
+			ID:                  "PERF-1234567890AB",
 			Path:                "src/`file`.ts",
 			Side:                review.SideRight,
 			Line:                12,
@@ -67,7 +68,7 @@ func TestFormatResultMarkdownSanitizesUntrustedContent(t *testing.T) {
 			t.Fatalf("formatted Markdown contains %q: %s", forbidden, formatted)
 		}
 	}
-	for _, expected := range []string{"&#64;team", "&lt;script&gt;", "\\!\\[image\\]", "Review statistics"} {
+	for _, expected := range []string{"&#64;team", "&lt;script&gt;", "\\!\\[image\\]", "PERF-1234567890AB", "Review statistics"} {
 		if !strings.Contains(formatted, expected) {
 			t.Fatalf("formatted Markdown missing %q: %s", expected, formatted)
 		}

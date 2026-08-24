@@ -406,7 +406,7 @@ func createTools(ctx context.Context, reviewSource ReviewSource, collector *find
 		})
 	reportFinding := sdk.DefineTool("report_finding", "Submit one concrete diff-introduced finding anchored to an added or deleted line.",
 		func(params reportFindingParams, _ sdk.ToolInvocation) (string, error) {
-			return collector.report(review.Finding(params))
+			return collector.report(params.finding())
 		})
 	completeReview := sdk.DefineTool("complete_review", "Mark all enabled focus passes complete after submitting every finding.",
 		func(params completeReviewParams, _ sdk.ToolInvocation) (string, error) {
@@ -428,6 +428,30 @@ func createTools(ctx context.Context, reviewSource ReviewSource, collector *find
 		tools[index].Defer = sdk.ToolDeferNever
 	}
 	return tools
+}
+
+func (params reportFindingParams) finding() review.Finding {
+	return review.Finding{
+		Focus:               params.Focus,
+		Path:                params.Path,
+		Side:                params.Side,
+		Line:                params.Line,
+		Severity:            params.Severity,
+		Confidence:          params.Confidence,
+		ConfidenceRationale: params.ConfidenceRationale,
+		PerformanceCategory: params.PerformanceCategory,
+		PerformanceResource: params.PerformanceResource,
+		PerformanceScaling:  params.PerformanceScaling,
+		PerformanceOutcome:  params.PerformanceOutcome,
+		ChangeCausality:     params.ChangeCausality,
+		PreviousBehavior:    params.PreviousBehavior,
+		ChangedBehavior:     params.ChangedBehavior,
+		CausalDiffEvidence:  params.CausalDiffEvidence,
+		Title:               params.Title,
+		Impact:              params.Impact,
+		Evidence:            params.Evidence,
+		Recommendation:      params.Recommendation,
+	}
 }
 
 type findingCollector struct {

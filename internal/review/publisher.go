@@ -2,13 +2,19 @@ package review
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 )
 
-const generatedDisclosure = "(Written by Copilot)"
+const (
+	generatedDisclosure      = "(Written by Copilot)"
+	experimentalReviewPrefix = "**[Experimental performance review bot]**"
+)
 
 type ReviewRequest struct {
 	CommitID string
@@ -24,10 +30,17 @@ type Comment struct {
 	Body string
 }
 
+type ExistingReview struct {
+	ID    int64
+	State string
+	Body  string
+}
+
 type PublisherClient interface {
 	GetPullRequest(ctx context.Context, owner, repo string, number int) (PullRequest, error)
-	HasReviewMarker(ctx context.Context, owner, repo string, number int, marker string) (bool, error)
-	PublishReview(ctx context.Context, owner, repo string, number int, request ReviewRequest) error
+	FindReviewMarker(ctx context.Context, owner, repo string, number int, marker string) (*ExistingReview, error)
+	CreatePendingReview(ctx context.Context, owner, repo string, number int, request ReviewRequest) (int64, error)
+	SubmitPendingReview(ctx context.Context, owner, repo string, number int, reviewID int64) error
 }
 
 type Publisher struct {
@@ -53,15 +66,18 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 	}
 
 	marker := fmt.Sprintf("<!-- rob-reviewer:v1 pr=%d head=%s -->", result.PullRequest.Number, result.PullRequest.HeadSHA)
-	exists, err := publisher.client.HasReviewMarker(ctx, publisher.owner, publisher.repo, result.PullRequest.Number, marker)
+	approvalMarker := publicationApprovalMarker(result)
+	existing, err := publisher.client.FindReviewMarker(ctx, publisher.owner, publisher.repo, result.PullRequest.Number, marker)
 	if err != nil {
 		return false, fmt.Errorf("check existing review marker: %w", err)
 	}
-	if exists {
+	if existing != nil && !strings.EqualFold(existing.State, "PENDING") {
 		return false, nil
 	}
+	if existing != nil && !strings.Contains(existing.Body, approvalMarker) {
+		return false, errors.New("a pending performance review exists with a different approved finding set")
+	}
 
-	request := buildReviewRequest(result, marker)
 	if dryRun {
 		return false, nil
 	}
@@ -72,37 +88,69 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 	if err := validatePublicationTarget(result.PullRequest, current); err != nil {
 		return false, err
 	}
-	if err := publisher.client.PublishReview(ctx, publisher.owner, publisher.repo, result.PullRequest.Number, request); err != nil {
-		return false, err
+	if existing != nil {
+		if err := publisher.client.SubmitPendingReview(
+			ctx,
+			publisher.owner,
+			publisher.repo,
+			result.PullRequest.Number,
+			existing.ID,
+		); err != nil {
+			return false, fmt.Errorf("resume pending performance review %d: %w", existing.ID, err)
+		}
+		return true, nil
+	}
+	request := buildReviewRequest(result, marker+"\n"+approvalMarker)
+	pendingReviewID, err := publisher.client.CreatePendingReview(
+		ctx,
+		publisher.owner,
+		publisher.repo,
+		result.PullRequest.Number,
+		request,
+	)
+	if err != nil {
+		return false, fmt.Errorf("create pending performance review claim: %w", err)
+	}
+	if pendingReviewID == 0 {
+		return false, errors.New("GitHub returned an invalid pending review ID")
+	}
+	if err := publisher.client.SubmitPendingReview(
+		ctx,
+		publisher.owner,
+		publisher.repo,
+		result.PullRequest.Number,
+		pendingReviewID,
+	); err != nil {
+		return false, fmt.Errorf("submit pending performance review %d: %w", pendingReviewID, err)
 	}
 	return true, nil
 }
 
+func publicationApprovalMarker(result Result) string {
+	ids := make([]string, 0, len(result.Findings))
+	for _, finding := range result.Findings {
+		ids = append(ids, finding.ID)
+	}
+	slices.Sort(ids)
+	digest := sha256.Sum256([]byte(strings.Join(ids, "\x00")))
+	return fmt.Sprintf(
+		"<!-- rob-reviewer-approval:v1 selection=%X -->",
+		digest[:6],
+	)
+}
+
 func buildReviewRequest(result Result, marker string) ReviewRequest {
 	comments := make([]Comment, 0, len(result.Findings))
-	focusCounts := make(map[string]int)
 	for _, finding := range result.Findings {
-		focusCounts[finding.Focus]++
 		comments = append(comments, Comment{
 			Path: finding.Path,
 			Line: finding.Line,
 			Side: finding.Side,
 			Body: fmt.Sprintf(
-				"**[%s] %s**\n\n%s\n\n**Performance mechanism:** `%s`; %s; scales as %s; outcome: %s\n\n**PR causality:** `%s` — before: %s; after: %s\n\n**Confidence:** %.2f — %s\n\n**Causal diff evidence:** %s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n%s",
-				finding.Severity,
-				SanitizeMarkdownText(finding.Title),
-				SanitizeMarkdownText(finding.Impact),
-				SanitizeMarkdownText(finding.PerformanceCategory),
-				SanitizeMarkdownText(finding.PerformanceResource),
-				SanitizeMarkdownText(finding.PerformanceScaling),
-				SanitizeMarkdownText(finding.PerformanceOutcome),
-				SanitizeMarkdownText(finding.ChangeCausality),
-				SanitizeMarkdownText(finding.PreviousBehavior),
+				"%s\n\n%s\n\n%s\n\n**Suggested fix:** %s\n\n%s",
+				experimentalReviewPrefix,
 				SanitizeMarkdownText(finding.ChangedBehavior),
-				finding.Confidence,
-				SanitizeMarkdownText(finding.ConfidenceRationale),
-				SanitizeMarkdownText(finding.CausalDiffEvidence),
-				SanitizeMarkdownText(finding.Evidence),
+				SanitizeMarkdownText(finding.Impact),
 				SanitizeMarkdownText(finding.Recommendation),
 				generatedDisclosure,
 			),
@@ -110,21 +158,13 @@ func buildReviewRequest(result Result, marker string) ReviewRequest {
 	}
 
 	var summary strings.Builder
-	fmt.Fprintf(&summary, "Found %d high-confidence review", len(result.Findings))
-	if len(result.Findings) == 1 {
-		summary.WriteString(" finding.")
-	} else {
-		summary.WriteString(" findings.")
-	}
-	summary.WriteString("\n\n")
-	for _, focus := range sortedMapKeys(focusCounts) {
-		fmt.Fprintf(&summary, "- `%s`: %d\n", focus, focusCounts[focus])
-	}
-	fmt.Fprintf(&summary, "\n%s\n\n%s\n\n%s", FormatStatsMarkdown(result.Stats), generatedDisclosure, marker)
+	summary.WriteString(experimentalReviewPrefix)
+	summary.WriteString("\n\nHuman-approved experimental performance review.\n\n")
+	fmt.Fprintf(&summary, "%s\n\n%s", generatedDisclosure, marker)
 
 	return ReviewRequest{
 		CommitID: result.PullRequest.HeadSHA,
-		Event:    "COMMENT",
+		Event:    "",
 		Body:     summary.String(),
 		Comments: comments,
 	}
@@ -133,16 +173,16 @@ func buildReviewRequest(result Result, marker string) ReviewRequest {
 func FormatStatsMarkdown(stats Stats) string {
 	var output strings.Builder
 	output.WriteString("<details>\n<summary>Review statistics</summary>\n\n")
-	fmt.Fprintf(&output, "- Model: `%s`\n", stats.Model)
+	fmt.Fprintf(&output, "- Model: `%s`\n", SanitizeMarkdownText(stats.Model))
 	if len(stats.ActualModels) > 0 {
-		fmt.Fprintf(&output, "- Actual model calls: `%s`\n", strings.Join(stats.ActualModels, "`, `"))
+		fmt.Fprintf(&output, "- Actual model calls: `%s`\n", joinSanitized(stats.ActualModels))
 	}
-	fmt.Fprintf(&output, "- Reasoning effort: `%s`\n", stats.ReasoningEffort)
+	fmt.Fprintf(&output, "- Reasoning effort: `%s`\n", SanitizeMarkdownText(stats.ReasoningEffort))
 	if len(stats.ActualReasoningEfforts) > 0 {
-		fmt.Fprintf(&output, "- Actual reasoning effort: `%s`\n", strings.Join(stats.ActualReasoningEfforts, "`, `"))
+		fmt.Fprintf(&output, "- Actual reasoning effort: `%s`\n", joinSanitized(stats.ActualReasoningEfforts))
 	}
 	if len(stats.APIEndpoints) > 0 {
-		fmt.Fprintf(&output, "- Model API endpoint: `%s`\n", strings.Join(stats.APIEndpoints, "`, `"))
+		fmt.Fprintf(&output, "- Model API endpoint: `%s`\n", joinSanitized(stats.APIEndpoints))
 	}
 	fmt.Fprintf(&output, "- Wall-clock time: %s\n", formatDuration(stats.WallClockMilliseconds))
 	fmt.Fprintf(&output, "- Model calls: %d\n", stats.ModelCalls)
@@ -178,6 +218,14 @@ func FormatStatsMarkdown(stats Stats) string {
 	return output.String()
 }
 
+func joinSanitized(values []string) string {
+	sanitized := make([]string, 0, len(values))
+	for _, value := range values {
+		sanitized = append(sanitized, SanitizeMarkdownText(value))
+	}
+	return strings.Join(sanitized, "`, `")
+}
+
 func formatDuration(milliseconds int64) string {
 	return (time.Duration(milliseconds) * time.Millisecond).Round(time.Millisecond).String()
 }
@@ -191,17 +239,21 @@ func validatePublicationTarget(analyzed, current PullRequest) error {
 			current.AuthorAssociation,
 		)
 	}
-	if !strings.EqualFold(current.State, "open") {
-		return fmt.Errorf("pull request %d became %s during review", analyzed.Number, current.State)
-	}
-	if current.Draft {
-		return fmt.Errorf("pull request %d became a draft during review", analyzed.Number)
-	}
-	if current.BaseSHA != analyzed.BaseSHA {
-		return fmt.Errorf("pull request base changed from %s to %s during review", analyzed.BaseSHA, current.BaseSHA)
-	}
 	if current.HeadSHA != analyzed.HeadSHA {
 		return fmt.Errorf("pull request head changed from %s to %s during review", analyzed.HeadSHA, current.HeadSHA)
+	}
+	switch {
+	case strings.EqualFold(current.State, "open"):
+		if current.Draft {
+			return fmt.Errorf("pull request %d became a draft during review", analyzed.Number)
+		}
+		if current.BaseSHA != analyzed.BaseSHA {
+			return fmt.Errorf("pull request base changed from %s to %s during review", analyzed.BaseSHA, current.BaseSHA)
+		}
+	case strings.EqualFold(current.State, "closed"):
+		// The base branch can advance after a PR closes, while its reviewed head remains immutable.
+	default:
+		return fmt.Errorf("pull request %d has unsupported state %q", analyzed.Number, current.State)
 	}
 	return nil
 }
@@ -210,9 +262,17 @@ func SanitizeMarkdownText(value string) string {
 	var clean strings.Builder
 	clean.Grow(len(value))
 	for _, character := range value {
-		if character == '\n' || character == '\t' || character >= ' ' {
+		if character == '\n' || character == '\t' {
 			clean.WriteRune(character)
+			continue
 		}
+		if unicode.IsControl(character) ||
+			unicode.Is(unicode.Cf, character) ||
+			unicode.Is(unicode.Zl, character) ||
+			unicode.Is(unicode.Zp, character) {
+			continue
+		}
+		clean.WriteRune(character)
 	}
 	return strings.NewReplacer(
 		`\`, `\\`,
@@ -228,13 +288,4 @@ func SanitizeMarkdownText(value string) string {
 		"|", `\|`,
 		"@", "&#64;",
 	).Replace(clean.String())
-}
-
-func sortedMapKeys(values map[string]int) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	return keys
 }

@@ -39,6 +39,7 @@ const (
 )
 
 type Finding struct {
+	ID                  string
 	Focus               string
 	Path                string
 	Side                Side

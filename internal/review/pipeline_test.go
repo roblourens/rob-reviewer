@@ -59,6 +59,14 @@ func TestPipelineFiltersRanksDeduplicatesAndCaps(t *testing.T) {
 	if len(result) != 8 {
 		t.Fatalf("result count = %d, want 8 after threshold and deduplication", len(result))
 	}
+	for _, finding := range result {
+		if !strings.HasPrefix(finding.ID, "PERF-") || len(finding.ID) != len("PERF-")+12 {
+			t.Fatalf("invalid finding ID %q", finding.ID)
+		}
+		if finding.ID != FindingID(finding) {
+			t.Fatalf("finding ID %q is not deterministic", finding.ID)
+		}
+	}
 	confidences := make([]float64, 0, len(result))
 	for _, finding := range result {
 		confidences = append(confidences, finding.Confidence)
@@ -73,6 +81,113 @@ func TestPipelineFiltersRanksDeduplicatesAndCaps(t *testing.T) {
 		return 0
 	}) {
 		t.Fatalf("confidences are not descending: %v", confidences)
+	}
+}
+
+func TestSelectFindingsUsesExplicitIDs(t *testing.T) {
+	pull := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head"}
+	first := validFinding("First issue", 0.99, 5)
+	first.ID = FindingIDForPullRequest(pull, first)
+	second := validFinding("Second issue", 0.98, 6)
+	second.ID = FindingIDForPullRequest(pull, second)
+	result := Result{PullRequest: pull, Findings: []Finding{first, second}}
+
+	selected, err := SelectFindings(result, []string{second.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected.Findings) != 1 || selected.Findings[0].ID != second.ID {
+		t.Fatalf("selected findings = %+v", selected.Findings)
+	}
+}
+
+func TestSelectFindingsRejectsUnknownID(t *testing.T) {
+	pull := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head"}
+	finding := validFinding("Known issue", 0.99, 5)
+	finding.ID = FindingIDForPullRequest(pull, finding)
+	_, err := SelectFindings(Result{PullRequest: pull, Findings: []Finding{finding}}, []string{"PERF-000000000000"})
+	if err == nil || !strings.Contains(err.Error(), "not present") {
+		t.Fatalf("expected unknown finding ID error, got %v", err)
+	}
+}
+
+func TestSelectFindingsRejectsTamperedContentAndDuplicateReportIDs(t *testing.T) {
+	pull := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head"}
+	finding := validFinding("Known issue", 0.99, 5)
+	finding.ID = FindingIDForPullRequest(pull, finding)
+
+	tampered := finding
+	tampered.Evidence = "Changed after approval."
+	if _, err := SelectFindings(Result{PullRequest: pull, Findings: []Finding{tampered}}, []string{finding.ID}); err == nil ||
+		!strings.Contains(err.Error(), "does not match its content") {
+		t.Fatalf("expected tampered content error, got %v", err)
+	}
+
+	nonCanonical := finding
+	nonCanonical.ID = strings.ToLower(nonCanonical.ID)
+	if _, err := SelectFindings(Result{PullRequest: pull, Findings: []Finding{nonCanonical}}, []string{finding.ID}); err == nil ||
+		!strings.Contains(err.Error(), "not canonical uppercase") {
+		t.Fatalf("expected canonical ID error, got %v", err)
+	}
+
+	if _, err := SelectFindings(Result{PullRequest: pull, Findings: []Finding{finding, finding}}, []string{finding.ID}); err == nil ||
+		!strings.Contains(err.Error(), "duplicate finding ID") {
+		t.Fatalf("expected duplicate report ID error, got %v", err)
+	}
+}
+
+func TestTargetBoundFindingIDAuthenticatesPullRequestIdentity(t *testing.T) {
+	finding := validFinding("Known issue", 0.99, 5)
+	pull := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head"}
+	baseID := FindingIDForPullRequest(pull, finding)
+	mutations := map[string]func(*PullRequest){
+		"number":   func(changed *PullRequest) { changed.Number++ },
+		"base SHA": func(changed *PullRequest) { changed.BaseSHA = "other-base" },
+		"head SHA": func(changed *PullRequest) { changed.HeadSHA = "other-head" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			changed := pull
+			mutate(&changed)
+			if changedID := FindingIDForPullRequest(changed, finding); changedID == baseID {
+				t.Fatalf("target mutation did not change finding ID %q", baseID)
+			}
+		})
+	}
+}
+
+func TestFindingIDAuthenticatesPublishedFindingFields(t *testing.T) {
+	base := validFinding("Known issue", 0.99, 5)
+	baseID := FindingID(base)
+	mutations := map[string]func(*Finding){
+		"focus":                func(finding *Finding) { finding.Focus = "other-focus" },
+		"path":                 func(finding *Finding) { finding.Path = "src/other.ts" },
+		"side":                 func(finding *Finding) { finding.Side = SideLeft },
+		"line":                 func(finding *Finding) { finding.Line++ },
+		"severity":             func(finding *Finding) { finding.Severity = SeverityCritical },
+		"confidence":           func(finding *Finding) { finding.Confidence = 0.98 },
+		"confidence rationale": func(finding *Finding) { finding.ConfidenceRationale += " More evidence." },
+		"category":             func(finding *Finding) { finding.PerformanceCategory = "cpu" },
+		"resource":             func(finding *Finding) { finding.PerformanceResource += " CPU" },
+		"scaling":              func(finding *Finding) { finding.PerformanceScaling += " per window" },
+		"outcome":              func(finding *Finding) { finding.PerformanceOutcome += " under load" },
+		"causality":            func(finding *Finding) { finding.ChangeCausality = "materially-amplified" },
+		"previous behavior":    func(finding *Finding) { finding.PreviousBehavior += " Previously." },
+		"changed behavior":     func(finding *Finding) { finding.ChangedBehavior += " Now." },
+		"causal evidence":      func(finding *Finding) { finding.CausalDiffEvidence += " Added call." },
+		"title":                func(finding *Finding) { finding.Title += " now" },
+		"impact":               func(finding *Finding) { finding.Impact += " under load" },
+		"evidence":             func(finding *Finding) { finding.Evidence += " Direct trace." },
+		"recommendation":       func(finding *Finding) { finding.Recommendation += " Coalesce calls." },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			if changedID := FindingID(changed); changedID == baseID {
+				t.Fatalf("field mutation did not change finding ID %q", baseID)
+			}
+		})
 	}
 }
 

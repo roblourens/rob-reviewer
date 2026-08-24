@@ -1,6 +1,9 @@
 package review
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -50,6 +53,7 @@ func (pipeline *Pipeline) Process(candidates []Finding) ([]Finding, error) {
 		if candidate.Confidence < pipeline.minConfidence {
 			continue
 		}
+		candidate.ID = FindingID(candidate)
 		key := fmt.Sprintf("%s\x00%s\x00%d\x00%s", candidate.Path, candidate.Side, candidate.Line, strings.ToLower(candidate.Title))
 		if _, exists := seen[key]; exists {
 			continue
@@ -66,6 +70,98 @@ func (pipeline *Pipeline) Process(candidates []Finding) ([]Finding, error) {
 		result = result[:pipeline.maxFindings]
 	}
 	return result, nil
+}
+
+func FindingID(finding Finding) string {
+	finding.ID = ""
+	content, err := json.Marshal(finding)
+	if err != nil {
+		panic(fmt.Sprintf("marshal finding ID content: %v", err))
+	}
+	digest := sha256.Sum256(content)
+	return "PERF-" + strings.ToUpper(hex.EncodeToString(digest[:6]))
+}
+
+func FindingIDForPullRequest(pull PullRequest, finding Finding) string {
+	finding.ID = ""
+	content, err := json.Marshal(struct {
+		Number  int
+		BaseSHA string
+		HeadSHA string
+		Finding Finding
+	}{
+		Number:  pull.Number,
+		BaseSHA: pull.BaseSHA,
+		HeadSHA: pull.HeadSHA,
+		Finding: finding,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("marshal target-bound finding ID content: %v", err))
+	}
+	digest := sha256.Sum256(content)
+	return "PERF-" + strings.ToUpper(hex.EncodeToString(digest[:6]))
+}
+
+func BindFindingIDs(result *Result) {
+	for index := range result.Findings {
+		result.Findings[index].ID = FindingIDForPullRequest(result.PullRequest, result.Findings[index])
+	}
+}
+
+func SelectFindings(result Result, approvedIDs []string) (Result, error) {
+	if len(approvedIDs) == 0 {
+		return Result{}, errors.New("at least one finding ID must be approved")
+	}
+	approved := make(map[string]struct{}, len(approvedIDs))
+	for _, id := range approvedIDs {
+		id = strings.ToUpper(strings.TrimSpace(id))
+		if id == "" {
+			return Result{}, errors.New("finding IDs cannot be empty")
+		}
+		if _, exists := approved[id]; exists {
+			return Result{}, fmt.Errorf("duplicate approved finding ID %q", id)
+		}
+		approved[id] = struct{}{}
+	}
+
+	if err := ValidateFindingIDs(result); err != nil {
+		return Result{}, err
+	}
+	selected := make([]Finding, 0, len(approved))
+	for _, finding := range result.Findings {
+		normalizedID := strings.ToUpper(finding.ID)
+		if _, exists := approved[normalizedID]; exists {
+			selected = append(selected, finding)
+			delete(approved, normalizedID)
+		}
+	}
+	if len(approved) > 0 {
+		missing := slices.Sorted(maps.Keys(approved))
+		return Result{}, fmt.Errorf("approved finding IDs not present in report: %s", strings.Join(missing, ", "))
+	}
+	result.Findings = selected
+	return result, nil
+}
+
+func ValidateFindingIDs(result Result) error {
+	seen := make(map[string]struct{}, len(result.Findings))
+	for _, finding := range result.Findings {
+		if finding.ID == "" {
+			return errors.New("saved report contains a finding without an ID")
+		}
+		normalizedID := strings.ToUpper(finding.ID)
+		if finding.ID != normalizedID {
+			return fmt.Errorf("saved finding ID %q is not canonical uppercase", finding.ID)
+		}
+		if normalizedID != FindingIDForPullRequest(result.PullRequest, finding) {
+			return fmt.Errorf("saved finding %q does not match its content", finding.ID)
+		}
+		if _, exists := seen[normalizedID]; exists {
+			return fmt.Errorf("saved report contains duplicate finding ID %q", finding.ID)
+		}
+		seen[normalizedID] = struct{}{}
+	}
+	return nil
 }
 
 func (pipeline *Pipeline) validate(finding Finding) error {
