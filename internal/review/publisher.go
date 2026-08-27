@@ -230,8 +230,9 @@ func buildReviewRequest(result Result, marker string) ReviewRequest {
 			Line: finding.Line,
 			Side: finding.Side,
 			Body: fmt.Sprintf(
-				"%s\n\n%s\n\n%s\n\n**Suggested fix:** %s\n\n%s",
+				"%s\n\n**Severity: %s**\n\n%s\n\n%s\n\n**Suggested fix:** %s\n\n%s",
 				experimentalReviewPrefix,
+				SanitizeMarkdownText(string(finding.Severity)),
 				SanitizeMarkdownTextWithCodeSpans(finding.ChangedBehavior),
 				SanitizeMarkdownTextWithCodeSpans(finding.Impact),
 				SanitizeMarkdownTextWithCodeSpans(finding.Recommendation),

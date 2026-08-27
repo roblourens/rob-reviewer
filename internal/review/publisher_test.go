@@ -161,6 +161,7 @@ func TestPublisherCreatesCommentReview(t *testing.T) {
 		t.Fatal("review summary is missing experimental bot prefix")
 	}
 	for _, expected := range []string{
+		"**Severity: high**",
 		"The diff repeats the work for every historical child.",
 		"The loop blocks scrolling.",
 		"**Suggested fix:** Flush one update after reconstruction.",
