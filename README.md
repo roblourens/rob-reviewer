@@ -6,18 +6,18 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 
 ## Behavior
 
-- A GitHub Actions workflow has a five-minute cron, but its job is skipped unless the `ROB_REVIEWER_ENABLED` repository variable is `true`. Checked-in configuration also has `automation.enabled: false`, so the automatic reviewer is currently off behind two independent switches.
+- A GitHub Actions workflow polls every five minutes when the `ROB_REVIEWER_ENABLED` repository variable is `true`. Checked-in configuration also requires `automation.enabled: true`.
 - The first enabled poll records every current open team PR and its current head without reviewing that backlog.
 - Only PRs whose GitHub `author_association` is `MEMBER` or `OWNER` are eligible. Outside collaborators, contributors, bots, and other non-team authors are skipped.
 - The poller detects newly opened PRs, drafts becoming ready, reopened PRs, and new head SHAs on existing PRs by scanning recently updated PRs.
 - Every new head waits through a five-minute quiet period. Another push resets the clock, so rapid update bursts produce one review of the stable head.
 - The same head is reviewed at most once. State is keyed by PR number and exact head SHA rather than only by PR number.
-- `publication.mode: approval` writes JSON and Markdown reports for human selection. `publication.mode: automatic` publishes every validated finding after the report is durable. The checked-in mode is `approval`.
+- `publication.mode: approval` writes JSON and Markdown reports for human selection. `publication.mode: automatic` publishes every validated finding after the report is durable. The checked-in mode is `automatic`.
 - Automatic publication requires the PR to remain open, non-draft, unsuppressed, team-authored, and on the reviewed base/head at the final GitHub refresh. Explicitly approved saved reports may still be published to a closed or merged PR when the reviewed head matches.
 - Per-run and per-UTC-day review caps bound model usage. A pending head older than the configured maximum age is skipped rather than producing a surprising late review.
 - Adding the configured `performance-reviewer:skip` label suppresses that head.
-- Every finding has a stable `PERF-...` ID. A human explicitly approves IDs from a saved JSON report before publication.
-- One approved publication posts a non-blocking `COMMENT` review with only the selected inline comments.
+- Every finding has a stable `PERF-...` ID for local reports and explicit publication. Automatic mode posts all host-validated findings.
+- Publication posts a non-blocking `COMMENT` review with inline comments.
 - Published summaries and inline comments begin with **Experimental performance review bot**.
 - Findings must be performance-only, high confidence, anchored to an added or deleted line, and explicitly prove through before/after evidence that the PR introduced or materially amplified the performance mechanism. Pre-existing non-critical optimization opportunities are rejected.
 - State is committed to a dedicated `reviewer-state` branch, including reviewed and pending heads plus daily review/publication counters.
@@ -36,7 +36,7 @@ Pull requests are untrusted input.
 - It receives no shell, network, write, arbitrary MCP, or repository-execution tool.
 - Paths are resolved inside the checkout, symlink escapes are rejected, search and read output are capped, and inline anchors are validated against actual added/deleted diff lines.
 - The head SHA is checked again after analysis. A changed head fails the run instead of advancing state or publishing a stale result.
-- Model-authored review text is sanitized before publication: mentions, HTML, images, controls, bidi formatting, and active Markdown are neutralized. Human-approved, well-formed inline code spans are retained.
+- Model-authored review text is sanitized before publication: mentions, HTML, images, controls, bidi formatting, and active Markdown are neutralized. Well-formed inline code spans are retained.
 
 The checkout layer keeps a persistent blobless bare cache under the user cache directory and creates a disposable shared checkout for each PR. Git history and objects are therefore amortized across PRs without sharing writable worktrees. The Actions workflow caches this directory between runs. Git stdout/stderr is bounded, and a unified diff over 32 MiB or 200,000 lines fails explicitly instead of exhausting runner memory.
 
@@ -56,11 +56,11 @@ poll:
   scanWindowHours: 168
   maxPendingAgeHours: 24
 automation:
-  enabled: false
+  enabled: true
   skipLabels:
     - performance-reviewer:skip
 publication:
-  mode: approval
+  mode: automatic
 review:
   model: gpt-5.6-sol
   reasoningEffort: high
@@ -86,18 +86,13 @@ The workflow-provided `GITHUB_TOKEN` is used only for the state branch in this r
 
 The first enabled scheduled poll creates `reviewer-state` from the default branch when needed, upgrades any version-1 high-water state, snapshots current open heads, and exits. Branch protection must allow the workflow token to update that branch.
 
-## Enabling automatic operation
+## Automatic operation
 
-The repository is intentionally committed in an off state. To start analysis without public comments:
+The checked-in configuration enables automatic analysis and publication. The two Actions secrets must be configured and the `ROB_REVIEWER_ENABLED` repository variable must be `true` for scheduled runs.
 
-1. Configure `COPILOT_GITHUB_TOKEN` and `REVIEW_GITHUB_TOKEN`.
-2. Set `automation.enabled: true`.
-3. Keep `publication.mode: approval`.
-4. Set the `ROB_REVIEWER_ENABLED` repository variable to `true`.
+The first enabled run bootstraps state and reviews no existing non-draft backlog. Later runs analyze new stable heads, write reports, and publish host-validated findings automatically.
 
-The first scheduled run bootstraps state and reviews no existing non-draft backlog. Later runs analyze new stable heads and upload reports for approval.
-
-After the approval-mode false-positive rate is acceptable, change only `publication.mode` to `automatic`. Automatic mode still writes the report atomically before it creates a GitHub review.
+To return to analysis-only operation, change `publication.mode` to `approval`.
 
 Either switch is a kill switch:
 

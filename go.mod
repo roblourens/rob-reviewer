@@ -3,7 +3,7 @@ module github.com/roblourens/rob-reviewer
 go 1.24.0
 
 require (
-	github.com/github/copilot-sdk/go v1.0.9
+	github.com/github/copilot-sdk/go v1.0.11
 	github.com/klauspost/compress v1.18.3
 	gopkg.in/yaml.v3 v3.0.1
 )
