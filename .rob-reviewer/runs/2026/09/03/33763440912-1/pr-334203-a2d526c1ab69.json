@@ -1,0 +1,116 @@
+{
+  "PullRequest": {
+    "Number": 334203,
+    "Title": "mcp: fix local gateway disposal",
+    "Body": "## Summary\n\nFix local MCP gateway disposal so gateway routes and listeners are released when their owner disposes them.\n\n## Problem\n\nRecent Insiders logs show a gateway being created and then reported as unknown when the workbench disposes it:\n\n```text\n15:04:37.427 [info] [McpGatewayService] Created gateway 01cd3fb5-... with 5 server(s) for client window:2\n15:05:10.087 [info] [McpGateway][Workbench] Disposing local gateway: 01cd3fb5-...\n15:05:10.089 [info] [McpGateway][Channel] Disposing gateway: 01cd3fb5-... for client window:2\n15:05:10.090 [warning] [McpGatewayService] Attempted to dispose unknown gateway: 01cd3fb5-...\n15:07:38.541 [info] [McpGatewayService] Gateway 01cd3fb5-... servers changed: 2 server(s)\n```\n\nThe final line confirms the gateway remained active after disposal was requested. The same sequence occurred for another gateway in the same session.\n\n`ProxyChannel.toService` wraps method arguments in an array, while `McpGatewayChannel` expects the raw gateway ID. Template interpolation made that array look like the correct UUID in the logs, but the array did not match the string key in the gateway map, so cleanup was skipped.\n\nCall the channel directly with the expected argument shape, matching the existing remote disposal path, and report disposal failures.\n\n## Validation\n\n- `npm run compile`\n- `npm run eslint -- src/vs/workbench/contrib/mcp/electron-browser/mcpGatewayService.ts`\n\nFull hygiene was attempted but is blocked on Windows before source checks by an unrelated doubled-drive path (`C:\\C:\\...\\remote\\package.json`).",
+    "URL": "https://github.com/microsoft/vscode/pull/334203",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "fd97f530dbf6d5c554391d384052ad301138b8f1",
+    "HeadRef": "agents/scan-my-logs-from-recent-code-insiders-sessions-47ff401a",
+    "HeadSHA": "a2d526c1ab69b145beeb08d94183b1f8696dc322",
+    "CreatedAt": "2026-09-03T08:34:34Z",
+    "UpdatedAt": "2026-09-03T10:19:48Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/mcp/electron-browser/mcpGatewayService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 65,
+      "BasePath": "src/vs/workbench/contrib/mcp/electron-browser/mcpGatewayService.ts",
+      "BaseLine": 67,
+      "IntroducingPath": "src/vs/workbench/contrib/mcp/electron-browser/mcpGatewayService.ts",
+      "IntroducingCommit": "6e029c339f143aaac2a3c27ec58028ede04d6a26",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "memory",
+      "Mechanism": "Each local gateway disposal previously sent `[gatewayId]` to a channel expecting `gatewayId`, causing cleanup to miss every string-keyed entry. One route and its event/session state remained per configured MCP server, and the HTTP listener could remain open until client disconnect or process shutdown; repeated create/dispose cycles accumulated this retained state.",
+      "Symptom": "Disposed local gateways retained per-server routes, sessions and event listeners and continued processing server-change events; the gateway HTTP server also remained alive when these leaked routes were the last routes.",
+      "FixedBehavior": "The changed line calls the channel directly with the scalar gateway ID expected by McpGatewayChannel, allowing it to dispose the per-gateway event forwarder, remove client tracking, clean all per-server routes and sessions/listeners, and stop the shared HTTP server when the last route is gone.",
+      "Evidence": "The base line invokes disposeGateway through ProxyChannel.toService. ProxyChannel.toService sends method arguments as an array (`channel.call(propKey, methodArgs)`), while McpGatewayChannel's manual `call` implementation casts its raw `args` to `string`. The resulting one-element array does not equal the string key used by `_gatewayDisposables`, `_clientGateways`, or McpGatewayService's `_gatewayRoutes`, so the service returns as an unknown gateway without running `_cleanupGateway`. The extension-host API reaches this path whenever a locally created McpGateway is disposed, via ExtHostMcp.dispose -\u003e MainThreadMcp.$disposeMcpGateway -\u003e result.dispose.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "boundary-fanout",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "An extension disposes a locally created MCP gateway, including disposal during extension-host/MainThreadMcp teardown.",
+        "CriticalPath": "McpGateway.dispose synchronously removes extension-host state and sends $disposeMcpGateway; MainThreadMcp disposes its store and WorkbenchMcpGatewayService issues one asynchronous main-process IPC call. The caller does not await server cleanup, so cleanup is off the user-facing disposal critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/mcp/electron-browser/mcpGatewayService.ts:65, WorkbenchMcpGatewayService._createLocalGateway dispose callback",
+            "Operation": "Send `disposeGateway` with the gateway UUID from the renderer/workbench to the main-process McpGatewayChannel.",
+            "Cardinality": "Exactly one IPC call per gateway disposal; it is not per MCP server, route, or session, and there is no cache or grouping that changes this cardinality.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one IPC call was attempted through ProxyChannel, but its payload was `[gatewayId]`; the manual channel expects the scalar string, so the call could not identify or clean the gateway. The diff corrects the payload shape without increasing IPC count.",
+            "CriticalPathEffect": "Fire-and-forget from the disposal caller; main-process cleanup proceeds asynchronously and does not block the caller."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/mcp/node/mcpGatewayService.ts:225-239, McpGatewayService.disposeGateway",
+            "Operation": "Dispose all HTTP routes and active MCP sessions for the gateway, then close the localhost HTTP server when no routes remain.",
+            "Cardinality": "Cleanup visits one route per effective configured MCP server for that gateway and each route disposes its active sessions; server close occurs once only when the global remaining-route count reaches zero.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The cleanup and server-close operations already defined disposal semantics, but the malformed local IPC argument prevented this scenario from reaching them. The diff restores their intended reachability and releases retained resources.",
+            "CriticalPathEffect": "Transitively follows the asynchronous IPC and remains off the synchronous extension disposal path."
+          }
+        ],
+        "ScalingInput": "The released state scales with the number of configured MCP servers/routes in the gateway and active sessions per route. Repeated local gateway create/dispose cycles previously accumulated gateways until client disconnect; after the diff each cycle cleans its own state.",
+        "EffectiveConcurrency": "Each gateway disposal emits one independent asynchronous IPC request. There is no newly added loop, burst, sequencer, or fan-out; server cleanup is handled once by the channel for that gateway.",
+        "CacheBehavior": "No cache participates. Gateway, route, client-ownership, and disposable maps are authoritative lifecycle state keyed by UUID; the corrected scalar key permits immediate deletion. Cold and warm behavior have the same one-call disposal cardinality.",
+        "MechanismConfidence": "High: ProxyChannel's array argument construction, the manual channel's scalar cast, all string-keyed maps, the extension-to-workbench disposal path, and route/session/server cleanup are directly visible in code.",
+        "MagnitudeUncertainty": "The exact number of gateways, configured servers, and active sessions in typical extension workflows is not established in repository code, but the prior lifetime growth and cleanup reachability are deterministic.",
+        "Verdict": "No reportable regression. The diff fixes a deterministic cleanup-lifecycle leak and does not add boundary fan-out, synchronous critical-path work, cache growth, or concurrency."
+      }
+    ],
+    "Summary": "Completed the performance pass over the full one-file diff and traced local gateway disposal from the extension API through renderer-main IPC to route/session/listener and HTTP-server cleanup. No performance finding was introduced by the PR. Recorded the verified cleanup-lifecycle regression fix and its introducing commit."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-03T13:59:46.243920345Z",
+    "CompletedAt": "2026-09-03T14:00:55.162178996Z",
+    "WallClockMilliseconds": 68918,
+    "ModelCalls": 9,
+    "InputTokens": 205071,
+    "OutputTokens": 3619,
+    "TotalTokens": 208690,
+    "ReasoningTokens": 931,
+    "CacheReadTokens": 170532,
+    "CacheWriteTokens": 34512,
+    "APIDurationMilliseconds": 56565,
+    "ToolCalls": 34,
+    "NanoAIUnits": 15663040000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 170532,
+      "cache_write": 34512,
+      "input": 27,
+      "output": 3619
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
