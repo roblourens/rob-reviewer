@@ -1,0 +1,131 @@
+{
+  "PullRequest": {
+    "Number": 333365,
+    "Title": "Fix macOS Pinyin English candidate insertion",
+    "Body": "Fixes #333366\r\n\r\n## Summary\r\n\r\n- keep the native EditContext input state synchronized before model content listeners run\r\n- ignore composition-only selection updates that move beyond unchanged replacement text\r\n- add focused browser coverage for normal updates, English candidate commits, and non-composition selection changes\r\n\r\n## Reproduction\r\n\r\n1. Enter `1234` and place the caret before `1`.\r\n2. Switch to the macOS system Pinyin input method.\r\n3. Type `revie`, then type `w` so the English candidate appears.\r\n4. Press Enter to commit the candidate.\r\n\r\nBefore this change, the caret moved after `1` and the result was `revieww234`. After this change, the editor caret remains before `1` while the candidate is pending and the committed result is `review1234`.\r\n\r\n## Root cause\r\n\r\nChromium updates the native EditContext before dispatching `textupdate`. The editor then synchronously changes the model, whose content listener wrote the same update back using stale cached EditContext text. This duplicated trailing content inside EditContext. The English candidate also sends a temporary selection beyond its unchanged replacement text; treating that temporary selection as a model caret move caused the final commit to consume and reinsert the adjacent `w`.\r\n\r\n## Validation\r\n\r\n- `npm run transpile-client`\r\n- `./scripts/test.sh --run src/vs/editor/test/browser/controller/nativeEditContextUtils.test.ts` (`5 passing`)\r\n- Code OSS end-to-end test with the macOS system Pinyin input method: pending `w` kept the model caret stable and Enter produced `review1234`\r\n- staged text structure and diff checks\r\n\r\n`npm run typecheck-client` reaches an unrelated existing dependency error in `src/vs/workbench/contrib/mcp/test/common/mcpSamplingLog.test.ts`: the installed Sinon types do not export `SinonFakeTimersConfig`. The changed files have no editor diagnostics and transpile successfully.\r\n\r\n## Manually test\r\n\r\nBefore: https://github.com/user-attachments/assets/8d8a3873-c175-4f44-9036-dabbb8f6cbae\r\n\r\nAfter: https://github.com/user-attachments/assets/6f303002-65d4-4f3b-b555-0b7dd0e21e9a\r\n\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/333365",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "miku1958",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "9a9257010666f5e886b2e2b095fe9febd5a5c13c",
+    "HeadRef": "fix-macos-pinyin-ime-cursor",
+    "HeadSHA": "a467fdbdf88860851839339a32bc7bb7bb793ad1",
+    "CreatedAt": "2026-08-30T01:01:07Z",
+    "UpdatedAt": "2026-09-03T00:08:41Z",
+    "Labels": []
+  },
+  "Findings": [],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "hot-path CPU and string allocation",
+      "browser/native boundary call frequency",
+      "retained input-state memory",
+      "synchronous input critical-path work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Regular keyboard text insertion through Native EditContext",
+        "CriticalPath": "A browser `textupdate` synchronously applies the update to `NativeEditContextInputState`, dispatches `viewController.type`, mutates the model, and runs the model-content listener before input handling returns.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts:_updateEditContext",
+            "Operation": "Read EditContext text/selection and conditionally call native `EditContext.updateText` / `updateSelection`.",
+            "Cardinality": "One synchronization attempt per relevant synchronous model-content event and cursor-state event; for a normal browser-originated insertion, the changed browser-state comparison generally yields zero `updateText` calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same synchronization ran, but compared against stale JS caches and normally issued one redundant full-range `updateText` after the browser had already applied the textupdate. The diff removes that redundant call.",
+            "CriticalPathEffect": "Runs synchronously on the input path; an actual native update must complete before synchronization returns."
+          }
+        ],
+        "ScalingInput": "The cached EditContext text is the complete line containing a collapsed selection, or all lines spanned by a selection. `applyTextUpdate` performs string work proportional to that window, while realistic source lines are usually short; exceptionally long/minified lines increase cost.",
+        "EffectiveConcurrency": "Single-threaded and serialized in the browser event/model notification stack; no batching or parallel fan-out.",
+        "CacheBehavior": "Each editor retains one current text/selection snapshot. It is refreshed on EditContext/model synchronization; there is no external cache, coalescing, or cold/warm I/O distinction.",
+        "MechanismConfidence": "High confidence in the synchronous call flow and string scaling from the changed handler and model listener; low confidence that added string work outweighs the removed native update for realistic inputs.",
+        "MagnitudeUncertainty": "Very long single lines can make the added reconstruction noticeable, but normal typing previously forced a redundant full native `updateText`, so the inspected change does not establish a net regression on this scenario.",
+        "Verdict": "No reportable regression: the diff adds a JS state reconstruction but removes a redundant native full-text update on the same critical path."
+      },
+      {
+        "Scenario": "macOS Pinyin composition candidate preview and commit",
+        "CriticalPath": "Composition events synchronously synchronize state; each `textupdate` applies the candidate update. A composition-only selection excursion with unchanged replacement text is detected and returned before model editing; the eventual changed candidate commit proceeds through `compositionType` and model synchronization.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts:composition handlers and _updateEditContext",
+            "Operation": "Synchronize full EditContext text/selection with native `EditContext.updateText` / `updateSelection` at composition start/end and after model changes.",
+            "Cardinality": "At most one synchronization attempt at composition start, one per accepted candidate text change via the model listener, and one at composition end; ignored unchanged candidate previews do not trigger model synchronization.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same native synchronization boundary existed. Unchanged candidate previews were forwarded as composition edits and could trigger model/content synchronization; the diff suppresses that downstream work and avoids redundant native text writes by consulting current browser state.",
+            "CriticalPathEffect": "Synchronous with IME event handling; ignored previews now stop before the editor model mutation and its downstream synchronization."
+          }
+        ],
+        "ScalingInput": "Candidate update frequency and EditContext window length (normally one source line). The unchanged-text test may compare a line-sized string, but effective cardinality is one operation per emitted IME update, with no fan-out.",
+        "EffectiveConcurrency": "Strictly serialized composition events on the UI thread; no queue, limiter, or concurrent requests.",
+        "CacheBehavior": "The per-editor input snapshot is warm from `_updateEditContext` at composition start and updated before synchronous model listeners. No external cache or negative-cache behavior exists.",
+        "MechanismConfidence": "High confidence in the event ordering and suppression path, corroborated by the focused tests; insufficient evidence of adverse net performance versus the removed model work.",
+        "MagnitudeUncertainty": "Equal-text candidate previews on unusually long lines perform line-sized JS comparison/reconstruction, but prevalence and cost are limited, and the same branch now avoids a model composition edit and native synchronization work.",
+        "Verdict": "No reportable regression: candidate-preview suppression reduces synchronous downstream work, and the added state calculation does not prove a realistic net slowdown."
+      },
+      {
+        "Scenario": "Cursor movement, selection changes, and external model edits near the active selection",
+        "CriticalPath": "Cursor-state changes or overlapping model-content changes synchronously compute the selected-line text, compare it with native EditContext state, update native text/selection only when different, and refresh the local snapshot.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/editor/browser/controller/editContext/native/nativeEditContext.ts:_updateEditContext",
+            "Operation": "Read native EditContext properties and conditionally update native text or selection.",
+            "Cardinality": "One comparison per cursor-state event or overlapping model-content notification; zero or one text update and zero or one selection update per attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same native updates and full selected-range model read existed, using `_previousEditContextText` and `_previousEditContextSelection` for comparisons. The diff changes the comparison source to authoritative native properties without increasing update cardinality.",
+            "CriticalPathEffect": "Synchronous with cursor/model event delivery; unchanged text avoids `updateText`."
+          }
+        ],
+        "ScalingInput": "Length of the line or multi-line selection returned by `model.getValueInRange`, plus cursor/model event frequency. No collection fan-out or deduplicated groups are involved.",
+        "EffectiveConcurrency": "Serialized on the UI thread with no asynchronous boundary, batching, or parallelism.",
+        "CacheBehavior": "One retained snapshot per editor replaces the prior retained text and selection caches, so steady-state retained cardinality remains constant. No cold/warm external cache behavior applies.",
+        "MechanismConfidence": "High confidence that update cardinality and retained-state cardinality do not increase; uncertain low-level native getter cost is explicitly excluded from findings.",
+        "MagnitudeUncertainty": "Native property-read implementation cost is not established by repository evidence; it cannot support a finding absent proof that reads copy large strings or materially increase latency.",
+        "Verdict": "No reportable regression: retained memory remains one text snapshot per editor and conditional native update count does not increase."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and all diff pages. Traced regular typing, IME composition, and cursor/model synchronization, including synchronous browser/native boundaries, effective cardinality, state lifetime, and concurrency. No high-confidence diff-introduced performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-03T02:35:25.516285436Z",
+    "CompletedAt": "2026-09-03T02:37:28.046749884Z",
+    "WallClockMilliseconds": 122530,
+    "ModelCalls": 6,
+    "InputTokens": 95120,
+    "OutputTokens": 4961,
+    "TotalTokens": 100081,
+    "ReasoningTokens": 2698,
+    "CacheReadTokens": 69187,
+    "CacheWriteTokens": 25915,
+    "APIDurationMilliseconds": 90859,
+    "ToolCalls": 19,
+    "NanoAIUnits": 12827090000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 69187,
+      "cache_write": 25915,
+      "input": 18,
+      "output": 4961
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

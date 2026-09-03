@@ -1,0 +1,137 @@
+{
+  "PullRequest": {
+    "Number": 334151,
+    "Title": "agentHost: drain providers during standalone shutdown",
+    "Body": "Fixes an Agent Host Claude E2E flake where a gracefully restarted standalone host could list sessions before the previous Claude process finished flushing its transcript.\n\nThe standalone WebSocket entry point now:\n- stops and drains protocol ingress;\n- awaits provider shutdown;\n- flushes session and customization persistence; and\n- applies one bounded shutdown deadline before synchronous disposal.\n\nThis mirrors the lifecycle ordering already used by the managed Agent Host process.\n\nValidation:\n- `AgentHostShutdown`: 4 tests passing\n- focused Claude archive/restart E2E: 10/10 passing\n- independent code review: no significant issues\n\nInvestigated failure: https://dev.azure.com/monacotools/Monaco/_build/results?buildId=470473\u0026view=logs\u0026j=15ec5277-fdc6-550c-b203-acb65f44f31c\u0026t=120c9214-43d4-5761-6dc9-d5e173c65e37\n\n(Written by Copilot)",
+    "URL": "https://github.com/microsoft/vscode/pull/334151",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "9a9257010666f5e886b2e2b095fe9febd5a5c13c",
+    "HeadRef": "roblou/agents/investigate-e2e-test-flake",
+    "HeadSHA": "422b01d9c1b181449b9a76fac95a191f95d471f6",
+    "CreatedAt": "2026-09-03T00:10:52Z",
+    "UpdatedAt": "2026-09-03T01:34:06Z",
+    "Labels": []
+  },
+  "Findings": [],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "shutdown critical-path latency",
+      "subprocess and filesystem I/O",
+      "connection lifecycle memory",
+      "batching and concurrency"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Standalone Agent Host graceful shutdown or restart with active protocol requests and provider sessions",
+        "CriticalPath": "Signal/stdin closure synchronously disposes protocol ingress and the WebSocket listener, then waits for tracked protocol requests, provider shutdown, and persistence flushing in that order. The entire asynchronous sequence is capped at 4500 ms; supervising process shutdown is separately capped at 6000 ms. This work is on the shutdown/restart critical path but not interactive steady-state paths.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostServerMain.ts:390 via AgentService.shutdown and provider shutdown",
+            "Operation": "Drain provider activity; Claude aborts live SDK conversations after previously queued per-session work, which can include SDK/process transcript completion.",
+            "Cardinality": "One coalesced provider shutdown per registered provider (normally Copilot and Claude, optionally Codex), with Claude work proportional to currently live chats and concurrent across distinct session IDs.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Standalone signal shutdown did not call or await provider shutdown and proceeded directly to persistence idle checks.",
+            "CriticalPathEffect": "Newly awaited on standalone shutdown so provider transcript/process cleanup can finish before process exit; bounded by the shared 4500 ms deadline."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:6776 reached from src/vs/platform/agentHost/node/agentHostServerMain.ts:390",
+            "Operation": "Close the orchestrator SQLite database after provider shutdown.",
+            "Cardinality": "At most one close operation; the database close implementation memoizes the close promise.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The standalone signal path relied on synchronous disposal/process exit and did not await this close.",
+            "CriticalPathEffect": "Now part of standalone shutdown before persistence flushing; included in the shared deadline."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostServerMain.ts:391 via SessionDataService.whenIdle and AgentHostCustomizationEnablementService.whenIdle",
+            "Operation": "Wait for already queued session SQLite writes, customization session writes, and host-storage file writes to settle.",
+            "Cardinality": "Concurrent across currently live session databases and pending write promises; no new writes are created merely by the idle checks.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two persistence idle checks were awaited immediately after closing the WebSocket listener, with a 3000 ms persistence-only cap.",
+            "CriticalPathEffect": "Already on the shutdown critical path before the PR; now starts after provider shutdown so provider-generated writes are included, while the total sequence remains capped."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:361 and src/vs/platform/agentHost/node/agentHostServerMain.ts:383-384",
+            "Operation": "Close active WebSocket transports and stop the TCP/WebSocket listener before draining requests.",
+            "Cardinality": "One transport disposal per currently active connection plus one listener close; typical cardinality is the number of connected clients, not historical connections.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The listener was closed, but ProtocolServerHandler did not centrally dispose every active or pre-initialize transport before the idle wait.",
+            "CriticalPathEffect": "Synchronous ingress stop precedes asynchronous draining and prevents additional critical-path work from being admitted."
+          }
+        ],
+        "ScalingInput": "Currently in-flight protocol requests, registered providers, live provider chats, active client connections, live session databases, and pending writes at the moment shutdown begins; completed historical work is not retained by the new shutdown helper.",
+        "EffectiveConcurrency": "Tracked protocol requests settle concurrently through Promise.all snapshots; registered providers shut down concurrently after authentication replay settles; Claude live sessions are drained concurrently across per-session sequencer keys while work for the same session remains serialized; session databases and the two persistence services flush concurrently. The phases themselves are intentionally serialized to prevent late writes.",
+        "CacheBehavior": "No result cache is relevant. Shutdown promises are memoized at provider-service and Claude-provider levels, database close is memoized, and idle checks observe only outstanding work. Cold shutdown with no active work resolves quickly; warm/active shutdown drains outstanding work under the same deadline.",
+        "MechanismConfidence": "High: the changed call order, deadline, tracked-request set, provider shutdown fan-out, database close, and persistence idle loops are directly traced in repository code.",
+        "MagnitudeUncertainty": "Exact provider/subprocess drain duration depends on active SDK work and filesystem speed, but the global 4500 ms child deadline and 6000 ms supervisor deadline bound user-visible restart delay.",
+        "Verdict": "No reportable regression. The diff intentionally moves bounded provider and outstanding-request cleanup onto terminal shutdown to preserve transcripts. It does not affect steady-state throughput/startup, fan-out is coalesced and mostly concurrent, and the total wait remains below the supervisor's existing termination budget."
+      },
+      {
+        "Scenario": "WebSocket connection churn and ProtocolServerHandler disposal",
+        "CriticalPath": "Each accepted connection creates a DisposableStore and inserts it into a DisposableMap. Normal close deletes and disposes that single entry; handler shutdown disposes all entries once before process exit. The added map operations are not on request message processing beyond one O(1) insertion per connection.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:425,566 and src/vs/platform/agentHost/node/webSocketTransport.ts:95",
+            "Operation": "Dispose/close the WebSocket transport when its connection store is disposed.",
+            "Cardinality": "One close per active transport; closed transports are removed immediately, so cost and retained objects scale with concurrent connections rather than lifetime connection churn.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Per-connection listeners and initialized-client cleanup used a local store, but the handler did not own stores for bulk shutdown and pre-initialize transports could remain open until server/process teardown.",
+            "CriticalPathEffect": "Normal close cleanup is event-driven and off interactive request critical paths; bulk disposal occurs only during terminal handler shutdown."
+          }
+        ],
+        "ScalingInput": "Concurrent active WebSocket connections; entries are removed on close, so historical connection count does not accumulate.",
+        "EffectiveConcurrency": "Connection callbacks run on the Node event loop. Each close performs one keyed deletion/disposal; final handler disposal iterates only currently active transports. DisposableStore's idempotent disposal makes the onClose re-entrancy bounded.",
+        "CacheBehavior": "No cache. The DisposableMap is lifecycle ownership state keyed by transport and has immediate removal on close.",
+        "MechanismConfidence": "High: insertion, keyed removal, bulk disposal, and DisposableMap/DisposableStore semantics are directly visible.",
+        "MagnitudeUncertainty": "Very high concurrent connection counts are not characterized, but each connection already owned listeners and a transport before this diff; the new incremental retained state is one map entry and store reference per active connection.",
+        "Verdict": "No reportable regression. The added O(1) ownership bookkeeping is bounded by active connections and enables prompt socket/listener cleanup; it does not create unbounded retention or repeated expensive work."
+      }
+    ],
+    "Summary": "Completed the performance pass over all five changed files and traced standalone shutdown, provider/session draining, persistence/database boundaries, supervisor deadlines, and connection lifecycle ownership. No actionable diff-introduced performance regression met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-03T02:39:28.607855243Z",
+    "CompletedAt": "2026-09-03T02:41:16.140579782Z",
+    "WallClockMilliseconds": 107532,
+    "ModelCalls": 11,
+    "InputTokens": 335743,
+    "OutputTokens": 6696,
+    "TotalTokens": 342439,
+    "ReasoningTokens": 2408,
+    "CacheReadTokens": 285080,
+    "CacheWriteTokens": 50630,
+    "APIDurationMilliseconds": 98356,
+    "ToolCalls": 64,
+    "NanoAIUnits": 25061700000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 285080,
+      "cache_write": 50630,
+      "input": 33,
+      "output": 6696
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
