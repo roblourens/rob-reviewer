@@ -39,7 +39,7 @@ func TestWritePollRunFilesRecordsPublishedComments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(paths) != 2 {
+	if len(paths) != 3 || filepath.Base(paths[2]) != "published-comments-1.md" {
 		t.Fatalf("paths = %v", paths)
 	}
 	content, err := os.ReadFile(filepath.Join(directory, "run.json"))
@@ -94,6 +94,50 @@ func TestWritePollRunFilesRecordsPartialFailure(t *testing.T) {
 	}
 	if record.Succeeded || record.Error != expected.Error() || len(record.Reviewed) != 1 {
 		t.Fatalf("record = %+v", record)
+	}
+}
+
+func TestWritePollRunFilesRecordsResumedPublication(t *testing.T) {
+	directory := t.TempDir()
+	pull := savedResult().PullRequest
+	_, err := WritePollRunFiles(directory, PollResult{
+		Poll: poller.Result{Published: []int{pull.Number}},
+		ResumedPublications: []ResumedPublication{{
+			PullRequest: pull,
+			Comments: []review.Comment{{
+				Path: "src/file.ts",
+				Line: 9,
+				Side: review.SideRight,
+				Body: "**Severity: medium**\n\nResumed comment.",
+			}},
+		}},
+	}, nil, PollRunMetadata{
+		RunID:       "resumed-run",
+		RunAttempt:  2,
+		StartedAt:   time.Now().Add(-time.Minute),
+		CompletedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(directory, "run.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record PollRunRecord
+	if err := json.Unmarshal(content, &record); err != nil {
+		t.Fatal(err)
+	}
+	if len(record.Reviews) != 1 || !record.Reviews[0].Published ||
+		len(record.Reviews[0].PublishedComments) != 1 ||
+		record.Reviews[0].PublishedComments[0].Body != "**Severity: medium**\n\nResumed comment." {
+		t.Fatalf("record = %+v", record)
+	}
+	if record.Reviews[0].JSONReport != "" || record.Reviews[0].MarkdownReport != "" {
+		t.Fatalf("resumed record unexpectedly links reports: %+v", record.Reviews[0])
+	}
+	if _, err := os.Stat(filepath.Join(directory, "published-comments-1.md")); err != nil {
+		t.Fatal(err)
 	}
 }
 

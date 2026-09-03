@@ -92,7 +92,7 @@ func WritePollRunFiles(
 	for _, number := range result.Poll.Published {
 		published[number] = struct{}{}
 	}
-	reviews := make([]RunReviewRecord, 0, len(result.Reviews))
+	reviews := make([]RunReviewRecord, 0, len(result.Reviews)+len(result.ResumedPublications))
 	for _, reviewResult := range result.Reviews {
 		stem := fmt.Sprintf("pr-%d-%s", reviewResult.PullRequest.Number, shortSHA(reviewResult.PullRequest.HeadSHA))
 		_, wasPublished := published[reviewResult.PullRequest.Number]
@@ -113,6 +113,22 @@ func WritePollRunFiles(
 			}
 		}
 		reviews = append(reviews, record)
+	}
+	for _, resumed := range result.ResumedPublications {
+		comments := make([]RunCommentRecord, 0, len(resumed.Comments))
+		for _, comment := range resumed.Comments {
+			comments = append(comments, RunCommentRecord(comment))
+		}
+		reviews = append(reviews, RunReviewRecord{
+			Number:            resumed.PullRequest.Number,
+			Title:             resumed.PullRequest.Title,
+			URL:               resumed.PullRequest.URL,
+			BaseSHA:           resumed.PullRequest.BaseSHA,
+			HeadSHA:           resumed.PullRequest.HeadSHA,
+			FindingCount:      len(comments),
+			Published:         true,
+			PublishedComments: comments,
+		})
 	}
 	for _, replay := range result.Learning.Replays {
 		if _, err := WriteResultFiles(directory, replay); err != nil {
@@ -182,7 +198,11 @@ func WritePollRunFiles(
 	if err := writeFileAtomic(markdownPath, []byte(formatPollRunMarkdown(record))); err != nil {
 		return nil, fmt.Errorf("write Markdown poll run record: %w", err)
 	}
-	return []string{jsonPath, markdownPath}, nil
+	commentsPath, err := WritePublishedCommentsFile(directory, record)
+	if err != nil {
+		return nil, err
+	}
+	return []string{jsonPath, markdownPath, commentsPath}, nil
 }
 
 func formatPollRunMarkdown(record PollRunRecord) string {
@@ -214,18 +234,24 @@ func formatPollRunMarkdown(record PollRunRecord) string {
 	for _, reviewed := range record.Reviews {
 		fmt.Fprintf(
 			&output,
-			"\n### [#%d — %s](%s)\n\n- Head: `%s`\n- Findings: %d\n- Published: %t\n- Reports: [%s](%s), [%s](%s)\n",
+			"\n### [#%d — %s](%s)\n\n- Head: `%s`\n- Findings: %d\n- Published: %t\n",
 			reviewed.Number,
 			review.SanitizeMarkdownText(reviewed.Title),
 			reviewed.URL,
 			reviewed.HeadSHA,
 			reviewed.FindingCount,
 			reviewed.Published,
-			reviewed.JSONReport,
-			reviewed.JSONReport,
-			reviewed.MarkdownReport,
-			reviewed.MarkdownReport,
 		)
+		if reviewed.JSONReport != "" && reviewed.MarkdownReport != "" {
+			fmt.Fprintf(
+				&output,
+				"- Reports: [%s](%s), [%s](%s)\n",
+				reviewed.JSONReport,
+				reviewed.JSONReport,
+				reviewed.MarkdownReport,
+				reviewed.MarkdownReport,
+			)
+		}
 		for _, comment := range reviewed.PublishedComments {
 			fmt.Fprintf(
 				&output,

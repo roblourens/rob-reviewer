@@ -8,19 +8,22 @@ import (
 )
 
 type fakePublisherClient struct {
-	current       PullRequest
-	currents      []PullRequest
-	refreshCount  int
-	markerExists  bool
-	markerReview  *ExistingReview
-	pendingReview *ExistingReview
-	request       ReviewRequest
-	pendingID     int64
-	submittedID   int64
-	published     bool
-	createErr     error
-	submitErr     error
-	deletedID     int64
+	current           PullRequest
+	currents          []PullRequest
+	refreshCount      int
+	markerExists      bool
+	markerReview      *ExistingReview
+	markerAfterSubmit *ExistingReview
+	pendingReview     *ExistingReview
+	reviewComments    []Comment
+	request           ReviewRequest
+	pendingID         int64
+	submittedID       int64
+	submitAttempted   bool
+	published         bool
+	createErr         error
+	submitErr         error
+	deletedID         int64
 }
 
 func (client *fakePublisherClient) GetPullRequest(context.Context, string, string, int) (PullRequest, error) {
@@ -36,6 +39,9 @@ func (client *fakePublisherClient) FindReviewMarker(context.Context, string, str
 	if client.markerReview != nil {
 		return client.markerReview, nil
 	}
+	if client.submitAttempted && client.markerAfterSubmit != nil {
+		return client.markerAfterSubmit, nil
+	}
 
 	if !client.markerExists {
 		return nil, nil
@@ -45,6 +51,10 @@ func (client *fakePublisherClient) FindReviewMarker(context.Context, string, str
 
 func (client *fakePublisherClient) FindPendingReview(context.Context, string, string, int) (*ExistingReview, error) {
 	return client.pendingReview, nil
+}
+
+func (client *fakePublisherClient) GetReviewComments(context.Context, string, string, int, int64) ([]Comment, error) {
+	return client.reviewComments, nil
 }
 
 func (client *fakePublisherClient) CreatePendingReview(
@@ -67,6 +77,7 @@ func (client *fakePublisherClient) SubmitPendingReview(
 	_ int,
 	reviewID int64,
 ) error {
+	client.submitAttempted = true
 	if client.submitErr != nil {
 		return client.submitErr
 	}
@@ -246,6 +257,20 @@ func TestPublisherSurfacesPendingReviewFailures(t *testing.T) {
 	}
 }
 
+func TestPublisherConfirmsAmbiguousPendingReviewSubmission(t *testing.T) {
+	pull := PullRequest{Number: 7, HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
+	result := Result{PullRequest: pull, Findings: []Finding{{ID: "PERF-1234567890AB"}}}
+	client := &fakePublisherClient{
+		current:           pull,
+		submitErr:         errors.New("response read failed"),
+		markerAfterSubmit: &ExistingReview{ID: 42, State: "COMMENTED"},
+	}
+	published, err := NewPublisher(client, "microsoft", "vscode").Publish(context.Background(), result, false)
+	if err != nil || !published {
+		t.Fatalf("published=%v err=%v", published, err)
+	}
+}
+
 func TestPublisherSkipsCleanAndDuplicateReviews(t *testing.T) {
 	client := &fakePublisherClient{current: PullRequest{Number: 7, HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}, markerExists: true}
 	publisher := NewPublisher(client, "microsoft", "vscode")
@@ -322,16 +347,25 @@ func TestPublisherRejectsSuppressionLabelAndResumesPendingReview(t *testing.T) {
 
 	pull.Labels = nil
 	client.current = pull
-	if err := publisher.ResumePending(context.Background(), pull, 77); err != nil {
+	client.reviewComments = []Comment{{Path: "src/file.ts", Line: 3, Side: SideRight, Body: "comment"}}
+	comments, err := publisher.ResumePending(context.Background(), pull, 77)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if client.submittedID != 77 {
-		t.Fatalf("submitted review = %d", client.submittedID)
+	if client.submittedID != 77 || len(comments) != 1 || comments[0].Body != "comment" {
+		t.Fatalf("submitted review = %d, comments = %+v", client.submittedID, comments)
+	}
+
+	client.submitErr = errors.New("response read failed")
+	client.markerAfterSubmit = &ExistingReview{ID: 77, State: "COMMENTED"}
+	comments, err = publisher.ResumePending(context.Background(), pull, 77)
+	if err != nil || len(comments) != 1 {
+		t.Fatalf("confirmed comments = %+v, err = %v", comments, err)
 	}
 
 	pull.Labels = []string{"performance-reviewer:skip"}
 	client.current = pull
-	if err := publisher.ResumePending(context.Background(), pull, 88); !errors.Is(err, ErrPublicationSuppressed) {
+	if _, err := publisher.ResumePending(context.Background(), pull, 88); !errors.Is(err, ErrPublicationSuppressed) {
 		t.Fatalf("expected suppressed pending review, got %v", err)
 	}
 	if client.deletedID != 88 {

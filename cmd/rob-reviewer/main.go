@@ -28,7 +28,7 @@ func main() {
 
 func run(logger *slog.Logger) (returnErr error) {
 	if len(os.Args) < 2 {
-		return errors.New("usage: rob-reviewer <poll|review|publish-report|apply-learnings> [options]")
+		return errors.New("usage: rob-reviewer <poll|review|publish-report|apply-learnings|update-published-index> [options]")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -221,8 +221,36 @@ func run(logger *slog.Logger) (returnErr error) {
 		logger.Info("learned performance guidance processed", "changed", changed)
 		return nil
 
+	case "update-published-index":
+		flags := flag.NewFlagSet("update-published-index", flag.ContinueOnError)
+		indexPath := flags.String("index", "", "published review JSON index to create or update")
+		markdownPath := flags.String("markdown", "", "published review Markdown index to create or update")
+		runPath := flags.String("run", "", "single run.json to merge")
+		runsRoot := flags.String("runs-root", "", "run archive tree to reconcile")
+		if err := flags.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		for name, value := range map[string]string{
+			"--index":    *indexPath,
+			"--markdown": *markdownPath,
+		} {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("%s is required", name)
+			}
+		}
+		if strings.TrimSpace(*runPath) == "" && strings.TrimSpace(*runsRoot) == "" {
+			return errors.New("either --run or --runs-root is required")
+		}
+		if strings.TrimSpace(*runPath) != "" && strings.TrimSpace(*runsRoot) != "" {
+			return errors.New("--run and --runs-root are mutually exclusive")
+		}
+		if strings.TrimSpace(*runsRoot) != "" {
+			return app.WritePublishedReviewIndexFromArchive(*indexPath, *markdownPath, *runsRoot)
+		}
+		return app.WritePublishedReviewIndex(*indexPath, *markdownPath, *runPath)
+
 	default:
-		return fmt.Errorf("unknown command %q; use poll, review, publish-report, or apply-learnings", os.Args[1])
+		return fmt.Errorf("unknown command %q; use poll, review, publish-report, apply-learnings, or update-published-index", os.Args[1])
 	}
 }
 

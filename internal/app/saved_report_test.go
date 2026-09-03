@@ -42,6 +42,16 @@ func (client *fakeSavedReportClient) FindPendingReview(
 	return nil, nil
 }
 
+func (client *fakeSavedReportClient) GetReviewComments(
+	context.Context,
+	string,
+	string,
+	int,
+	int64,
+) ([]review.Comment, error) {
+	return nil, nil
+}
+
 func (client *fakeSavedReportClient) CreatePendingReview(
 	_ context.Context,
 	_, _ string,

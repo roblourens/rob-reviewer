@@ -49,9 +49,15 @@ type Options struct {
 }
 
 type PollResult struct {
-	Poll     poller.Result
-	Reviews  []review.Result
-	Learning learning.Evaluation
+	Poll                poller.Result
+	Reviews             []review.Result
+	ResumedPublications []ResumedPublication
+	Learning            learning.Evaluation
+}
+
+type ResumedPublication struct {
+	PullRequest review.PullRequest
+	Comments    []review.Comment
 }
 
 func New(options Options) (*App, error) {
@@ -126,6 +132,7 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 		app.config.State.Path,
 	)
 	var reviews []review.Result
+	var resumedPublications []ResumedPublication
 	var learningEvaluation learning.Evaluation
 	learningReplayCache := make(learning.ReplayCache)
 	prPoller := poller.New(
@@ -158,13 +165,17 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 				}
 				if existing != nil {
 					if strings.EqualFold(existing.State, "PENDING") {
-						err := automaticPublisher.ResumePending(reviewContext, pull, existing.ID)
+						comments, err := automaticPublisher.ResumePending(reviewContext, pull, existing.ID)
 						if err != nil {
 							if errors.Is(err, review.ErrPublicationSuppressed) {
 								return poller.ReviewOutcome{}, nil
 							}
 							return poller.ReviewOutcome{}, err
 						}
+						resumedPublications = append(resumedPublications, ResumedPublication{
+							PullRequest: pull,
+							Comments:    comments,
+						})
 						return poller.ReviewOutcome{Published: true}, nil
 					}
 					return poller.ReviewOutcome{}, nil
@@ -223,9 +234,19 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 	)
 	pollResult, err := prPoller.Run(ctx)
 	if err != nil {
-		return PollResult{Poll: pollResult, Reviews: reviews, Learning: learningEvaluation}, err
+		return PollResult{
+			Poll:                pollResult,
+			Reviews:             reviews,
+			ResumedPublications: resumedPublications,
+			Learning:            learningEvaluation,
+		}, err
 	}
-	return PollResult{Poll: pollResult, Reviews: reviews, Learning: learningEvaluation}, nil
+	return PollResult{
+		Poll:                pollResult,
+		Reviews:             reviews,
+		ResumedPublications: resumedPublications,
+		Learning:            learningEvaluation,
+	}, nil
 }
 
 func (app *App) ReviewPullRequest(ctx context.Context, number int, publish bool) (review.Result, bool, error) {

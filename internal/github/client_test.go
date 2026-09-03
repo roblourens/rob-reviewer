@@ -99,6 +99,8 @@ func TestCreateAndSubmitPendingReview(t *testing.T) {
 				t.Fatal(err)
 			}
 			fmt.Fprint(writer, `{}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/microsoft/vscode/pulls/7/reviews/99/comments":
+			fmt.Fprint(writer, `[{"path":"src/file.ts","line":3,"side":"RIGHT","body":"comment"}]`)
 		case request.Method == http.MethodDelete && request.URL.Path == "/repos/microsoft/vscode/pulls/7/reviews/99":
 			deleted = true
 			writer.WriteHeader(http.StatusNoContent)
@@ -119,6 +121,13 @@ func TestCreateAndSubmitPendingReview(t *testing.T) {
 	}
 	if reviewID != 99 || created.Event != "" || created.CommitID != "head" || len(created.Comments) != 1 {
 		t.Fatalf("review ID=%d request=%+v", reviewID, created)
+	}
+	comments, err := client.GetReviewComments(context.Background(), "microsoft", "vscode", 7, reviewID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 1 || comments[0].Path != "src/file.ts" || comments[0].Body != "comment" {
+		t.Fatalf("comments = %+v", comments)
 	}
 	if err := client.SubmitPendingReview(context.Background(), "microsoft", "vscode", 7, reviewID); err != nil {
 		t.Fatal(err)

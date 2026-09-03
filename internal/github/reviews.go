@@ -109,6 +109,43 @@ type ReviewComment struct {
 	Body string      `json:"body"`
 }
 
+func (client *Client) GetReviewComments(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	reviewID int64,
+) ([]review.Comment, error) {
+	var comments []review.Comment
+	for page := 1; ; page++ {
+		values := url.Values{
+			"per_page": {"100"},
+			"page":     {strconv.Itoa(page)},
+		}
+		path := fmt.Sprintf(
+			"/repos/%s/%s/pulls/%d/reviews/%d/comments?%s",
+			url.PathEscape(owner),
+			url.PathEscape(repo),
+			number,
+			reviewID,
+			values.Encode(),
+		)
+		responseBody, headers, err := client.do(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+		var pageComments []ReviewComment
+		if err := json.Unmarshal(responseBody, &pageComments); err != nil {
+			return nil, fmt.Errorf("decode pull request review comments: %w", err)
+		}
+		for _, comment := range pageComments {
+			comments = append(comments, review.Comment(comment))
+		}
+		if !strings.Contains(headers.Get("Link"), `rel="next"`) {
+			return comments, nil
+		}
+	}
+}
+
 type CreateReviewRequest struct {
 	CommitID string          `json:"commit_id"`
 	Event    string          `json:"event,omitempty"`

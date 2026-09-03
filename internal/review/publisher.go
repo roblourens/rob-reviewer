@@ -44,6 +44,7 @@ type PublisherClient interface {
 	GetPullRequest(ctx context.Context, owner, repo string, number int) (PullRequest, error)
 	FindReviewMarker(ctx context.Context, owner, repo string, number int, marker string) (*ExistingReview, error)
 	FindPendingReview(ctx context.Context, owner, repo string, number int) (*ExistingReview, error)
+	GetReviewComments(ctx context.Context, owner, repo string, number int, reviewID int64) ([]Comment, error)
 	CreatePendingReview(ctx context.Context, owner, repo string, number int, request ReviewRequest) (int64, error)
 	SubmitPendingReview(ctx context.Context, owner, repo string, number int, reviewID int64) error
 	DeletePendingReview(ctx context.Context, owner, repo string, number int, reviewID int64) error
@@ -117,12 +118,11 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 		return false, err
 	}
 	if existing != nil {
-		if err := publisher.client.SubmitPendingReview(
+		if err := publisher.submitPendingReview(
 			ctx,
-			publisher.owner,
-			publisher.repo,
 			result.PullRequest.Number,
 			existing.ID,
+			marker,
 		); err != nil {
 			return false, fmt.Errorf("resume pending performance review %d: %w", existing.ID, err)
 		}
@@ -142,12 +142,11 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 	if pendingReviewID == 0 {
 		return false, errors.New("GitHub returned an invalid pending review ID")
 	}
-	if err := publisher.client.SubmitPendingReview(
+	if err := publisher.submitPendingReview(
 		ctx,
-		publisher.owner,
-		publisher.repo,
 		result.PullRequest.Number,
 		pendingReviewID,
+		marker,
 	); err != nil {
 		return false, fmt.Errorf("submit pending performance review %d: %w", pendingReviewID, err)
 	}
@@ -158,10 +157,10 @@ func (publisher *Publisher) ResumePending(
 	ctx context.Context,
 	analyzed PullRequest,
 	reviewID int64,
-) error {
+) ([]Comment, error) {
 	current, err := publisher.client.GetPullRequest(ctx, publisher.owner, publisher.repo, analyzed.Number)
 	if err != nil {
-		return fmt.Errorf("refresh pull request before resuming pending review: %w", err)
+		return nil, fmt.Errorf("refresh pull request before resuming pending review: %w", err)
 	}
 	if err := publisher.validatePublicationTarget(analyzed, current); err != nil {
 		if errors.Is(err, ErrPublicationSuppressed) {
@@ -172,15 +171,61 @@ func (publisher *Publisher) ResumePending(
 				analyzed.Number,
 				reviewID,
 			); deleteErr != nil {
-				return errors.Join(err, fmt.Errorf("delete suppressed pending review %d: %w", reviewID, deleteErr))
+				return nil, errors.Join(err, fmt.Errorf("delete suppressed pending review %d: %w", reviewID, deleteErr))
 			}
 		}
-		return err
+		return nil, err
 	}
-	if err := publisher.client.SubmitPendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number, reviewID); err != nil {
-		return fmt.Errorf("resume pending performance review %d: %w", reviewID, err)
+	comments, err := publisher.client.GetReviewComments(
+		ctx,
+		publisher.owner,
+		publisher.repo,
+		analyzed.Number,
+		reviewID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load pending performance review %d comments: %w", reviewID, err)
 	}
-	return nil
+	if len(comments) == 0 {
+		return nil, fmt.Errorf("pending performance review %d has no inline comments", reviewID)
+	}
+	marker := fmt.Sprintf("<!-- rob-reviewer:v1 pr=%d head=%s -->", analyzed.Number, analyzed.HeadSHA)
+	if err := publisher.submitPendingReview(ctx, analyzed.Number, reviewID, marker); err != nil {
+		return nil, fmt.Errorf("resume pending performance review %d: %w", reviewID, err)
+	}
+	return comments, nil
+}
+
+func (publisher *Publisher) submitPendingReview(
+	ctx context.Context,
+	number int,
+	reviewID int64,
+	marker string,
+) error {
+	submitErr := publisher.client.SubmitPendingReview(
+		ctx,
+		publisher.owner,
+		publisher.repo,
+		number,
+		reviewID,
+	)
+	if submitErr == nil {
+		return nil
+	}
+	existing, confirmErr := publisher.client.FindReviewMarker(
+		ctx,
+		publisher.owner,
+		publisher.repo,
+		number,
+		marker,
+	)
+	if confirmErr != nil {
+		return errors.Join(submitErr, fmt.Errorf("confirm pending review submission: %w", confirmErr))
+	}
+	if existing != nil && !strings.EqualFold(existing.State, "PENDING") {
+		return nil
+	}
+	return submitErr
 }
 
 func (publisher *Publisher) PrepareAutomaticReview(

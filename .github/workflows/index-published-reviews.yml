@@ -1,0 +1,124 @@
+name: Index published reviews
+
+on:
+  workflow_run:
+    workflows:
+      - Review VS Code pull requests
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: published-review-index
+  cancel-in-progress: false
+
+jobs:
+  index:
+    if: >-
+      ${{
+        github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+          cache-dependency-path: source/go.sum
+      - name: Download trusted reviewer artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          artifact_name="performance-review-reports-${RUN_ID}-${RUN_ATTEMPT}"
+          artifact_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+              --jq ".artifacts[] | select(.name == \"${artifact_name}\") | .id" |
+              head -n 1
+          )"
+          if [[ -z "$artifact_id" ]]; then
+            echo "No reviewer artifact exists for $artifact_name; the source job was skipped."
+            exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > reviewer-artifact.zip
+          mkdir review-results
+          unzip -q reviewer-artifact.zip -d review-results
+      - name: Ensure reviewer history branch
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/reviewer-state" >/dev/null 2>&1; then
+            gh api \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref='refs/heads/reviewer-state' \
+              -f sha="${SOURCE_SHA}"
+          fi
+      - name: Check out reviewer history
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: reviewer-state
+          path: reviewer-history
+          token: ${{ github.token }}
+      - run: go mod download
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        working-directory: source
+      - run: go tool bundler
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        working-directory: source/cmd/rob-reviewer
+      - name: Reconcile archive and published review index
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          completed_at="$(jq -r '.metadata.completedAt' review-results/run.json)"
+          archive_date="$(date -u -d "$completed_at" +'%Y/%m/%d')"
+          destination=".rob-reviewer/runs/${archive_date}/${RUN_ID}-${RUN_ATTEMPT}"
+          if [[ ! -e "reviewer-history/$destination" ]]; then
+            mkdir -p "reviewer-history/$destination"
+            cp -R review-results/. "reviewer-history/$destination/"
+          fi
+          cd source
+          go run ./cmd/rob-reviewer update-published-index \
+            --index ../reviewer-history/.rob-reviewer/published-reviews.json \
+            --markdown ../reviewer-history/.rob-reviewer/published-reviews.md \
+            --runs-root ../reviewer-history/.rob-reviewer/runs
+          cd ..
+          cd reviewer-history
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            "$destination" \
+            .rob-reviewer/published-reviews.json \
+            .rob-reviewer/published-reviews.md
+          if git diff --cached --quiet; then
+            echo "Published review index is already current."
+            exit 0
+          fi
+          git commit \
+            -m "Index published reviews for run ${RUN_ID} attempt ${RUN_ATTEMPT} (Written by Copilot)" \
+            -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:reviewer-state; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              exit 1
+            fi
+            git pull --rebase origin reviewer-state
+          done

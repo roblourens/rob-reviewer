@@ -108,7 +108,24 @@ The workflow first uploads the output as an Actions artifact. It then checks out
 .rob-reviewer/runs/YYYY/MM/DD/<github-run-id>-<attempt>/
 ```
 
-Each workflow run therefore leaves an immutable, Git-browsable record alongside the mutable state file without adding generated reports to `main`. A resumed pending GitHub review is recorded in the run's `published` PR list; its original rendered comments remain in the earlier run record that created the pending review.
+Each workflow run therefore leaves an immutable, Git-browsable record alongside the mutable state file without adding generated reports to `main`. When a retry resumes a pending GitHub review, it retrieves the pending review's exact inline comments before submission and records them in the retry's run archive.
+
+For quick scanning, each run archive also contains a file named:
+
+```text
+published-comments-<count>.md
+```
+
+The comment count is therefore visible in the directory listing. The file contains only comments published by that run.
+
+A separate, rerunnable `Index published reviews` workflow reconciles each immutable run artifact into the archive and maintains cross-run indexes containing only successful publications:
+
+```text
+.rob-reviewer/published-reviews.md
+.rob-reviewer/published-reviews.json
+```
+
+`published-reviews.md` is the easiest place to skim. It retains the newest 200 publications, listed newest first, and includes the PR link, exact head, comment count, run-archive link, locations, severities, and exact public comment bodies. Runs with zero publications do not appear, and complete history remains in the per-run archives. Each update reconciles every archived `run.json`, so a later run repairs an index update that was superseded in the Actions queue. Because indexing also consumes the triggering immutable artifact, rerunning this workflow can recover a publication even if the source workflow failed after submitting its GitHub review.
 
 ## Learning from shipped performance fixes
 
