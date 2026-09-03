@@ -2,6 +2,27 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#333859 — Surface extensions blocked by the marketplace](https://github.com/microsoft/vscode/pull/333859)
+
+- Published comments: **1**
+- Head: `65fb4147de857f64f743dbfbb3a3952d8cea8f56`
+- Completed: `2026-09-03T20:07:09Z`
+- Run: [33799327822 attempt 1](runs/2026/09/03/33799327822-1/run.md)
+
+### `src/vs/platform/extensionManagement/common/extensionGalleryService.ts:1394`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+The added blocked bit makes getValidRawGalleryExtensionVersion reject a version-blocked latest resource result. getLatestGalleryExtension then returns NOT\_COMPATIBLE, getExtensionsUsingResourceApi retries the affected IDs through a latest-only query, and queryGalleryExtensions rejects the same versions again before issuing its all-versions query.
+
+Periodic and manual extension update checks that encounter a version-blocked latest release wait for two serial Marketplace POSTs after the existing resource fetches. On high-latency links this can add multiple round-trip times before VS Code can determine the usable older version and schedule updates.
+
+**Suggested fix:** Propagate a distinct latest-version-is-blocked fallback result and batch those IDs directly into an IncludeVersions query, skipping the intervening latest-only query while preserving selection of an older permitted version.
+
+(Written by Copilot)
+
 ## [#334303 — Improve customization message UI and migration behavior](https://github.com/microsoft/vscode/pull/334303)
 
 - Published comments: **1**
