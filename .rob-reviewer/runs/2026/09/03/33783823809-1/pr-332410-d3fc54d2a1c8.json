@@ -1,0 +1,297 @@
+{
+  "PullRequest": {
+    "Number": 332410,
+    "Title": "agentHost: centralize session and chat catalog metadata",
+    "Body": "## 1. What this PR changes\n\nToday, `listSessions` often enumerates providers and opens many individual `session.db` files to obtain titles, workspace information, read state, changes, and chats.\n\nThis PR makes `agent-host.db` the central index for session-list data:\n\n- **`sessions_v2`:** authoritative session identity, provider, timestamps, registration source, external state, and chat-backing identity.\n- **Central chat membership:** authoritative chat list, ordering, routing, and origin information.\n- **Rebuildable list payload:** title, read/archive state, project presentation, Git/GitHub summaries, aggregate changes, artifacts, and lightweight chat summaries.\n\nFull conversation data—including turns, drafts, attachments, annotations, and detailed edits—remains isolated in individual session and chat databases.\n\n## 2. Listing and synchronization\n\nNormal `listSessions` calls now read verified payloads directly from `agent-host.db` instead of opening every conversation database.\n\nIf one payload is missing, stale, or invalid:\n\n- Only that session uses the fallback path.\n- Other valid central rows remain fast.\n- The invalid row is scheduled for background repair.\n- Provider unavailability does not discard the last valid cached representation.\n\nChanges to titles, read state, workspace information, changes, or chats mark the payload dirty. Background reconciliation uses revisions and compare-and-set operations so delayed work cannot overwrite newer state.\n\n## 3. Migration and compatibility\n\nExisting sessions are imported from the legacy registry and provider discovery. Migration is resumable, tracked per provider, and normally runs in the background so the first list does not wait for the full migration.\n\nThe PR also protects upgrade and downgrade scenarios:\n\n- Central chat membership is temporarily mirrored into legacy `peerChats`.\n- Changes made by an older build are imported when a newer build starts again.\n- Tombstones prevent deleted sessions from being rediscovered.\n- Invalid provider entries are isolated and retried.\n- Title precedence remains consistent before and after opening a session.\n- Oversized summaries are bounded without changing provider-native data.\n\nAll product schema changes are introduced in one new **v5 migration**, after upstream’s existing v4 migration. A separate normalizer handles databases produced by earlier versions of this draft PR.\n\n## 4. Testing\n\nCoverage includes:\n\n- Fresh databases and existing profiles\n- Partial and interrupted migration\n- Restarts and crash recovery\n- Concurrent Agent Host processes\n- Session and chat deletion\n- Provider failures and retries\n- Corrupt or stale payload fallback\n- Title and background-update races\n- Old → new → old → new build cycles\n- Oversized metadata and Unicode truncation\n- Pre-release schema normalization\n\nThe affected unit suites pass, and the real-process compatibility matrix passed **20/20 scenarios**.\n\n## 5. Performance\n\nReal AHP measurements used equivalent pre-migration profile data, three fresh processes per target, and 60 warm calls per target:\n\n| Metric | `origin/main` | This PR | Improvement |\n|---|---:|---:|---:|\n| Cold mean | 1,314.9 ms | 123.4 ms | **90.6% faster** |\n| Cold median | 1,259.8 ms | 34.1 ms | **97.3% faster** |\n| Warm mean | 431.6 ms | 80.0 ms | **81.5% faster** |\n| Warm median | 342.7 ms | 53.1 ms | **84.5% faster** |\n| Warm p95 | 711.3 ms | 174.2 ms | **75.5% faster** |\n\nThe PR returned **32 sessions versus 26 on `origin/main`**, so it was faster while producing a larger result.\n\n## 6. PR size\n\nThe PR adds **11,782 lines**, but approximately **6,717 lines—57%—are tests**.\n\nThe remaining approximately 5K lines implement the database schema, catalog projection, migration, synchronization, reconciliation, chat membership, compatibility handling, and Agent Service integration. The size reflects the reliability work required for a persistence migration rather than the amount of data being moved.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/332410",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "4043ece7e81563d369a67ae16f61e6629bd7736f",
+    "HeadRef": "sandy081/agents/session-db-data-migration-plan",
+    "HeadSHA": "d3fc54d2a1c84ab24af96fca972159e0b75a9b9b",
+    "CreatedAt": "2026-08-24T19:08:08Z",
+    "UpdatedAt": "2026-09-03T14:29:29Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-60F8B7D90E18",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/chatContributions/sessionTitle/sessionTitleContribution.ts",
+      "Side": "RIGHT",
+      "Line": 77,
+      "Severity": "high",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed ordering is explicit, `tryOpenDatabase` is proven to issue a filesystem stat and acquire a SQLite database, and `_restorePeerChatsFromCatalog` invokes hydration for all peers via an unbounded `Promise.all` while passing cached catalog titles. The only magnitude uncertainty is the typical number of peer chats and disk speed.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "filesystem stat operations, SQLite database opens/migrations, metadata queries, and database objects",
+      "PerformanceScaling": "Cost grows linearly with restored peer-chat count, and `_restorePeerChatsFromCatalog` starts all hydrations concurrently rather than applying a limiter.",
+      "PerformanceOutcome": "increased restore latency and excessive concurrent filesystem/SQLite I/O",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The existing `if (restored.title !== undefined) return restored` ran before any database access, so verified central cached titles required zero chat-local database probes during peer catalog restore.",
+      "ChangedBehavior": "Every title hydration now stats and potentially opens/queries the chat-local SQLite database before accepting an already-restored title.",
+      "CausalDiffEvidence": "RIGHT line 77 inserts `await this._sessionDataService.tryOpenDatabase(URI.parse(context.chat))` and a metadata query before the existing `restored.title !== undefined` early return, so callers that already supplied a catalog title now perform per-chat disk/SQLite work they previously skipped.",
+      "Title": "Keep cached titles off the per-chat database path",
+      "Impact": "Opening a session with many restored peer chats now launches one filesystem probe and SQLite metadata read per chat concurrently, delaying restore and creating an I/O/open-handle burst; up to the catalog limit of 999 peers can be affected.",
+      "Evidence": "`SessionDataService.tryOpenDatabase` performs `_fileService.stat` and then acquires a `SessionDatabase`, whose first use opens/migrates SQLite; line 79 calls `getMetadata`. `AgentService._restorePeerChatsFromCatalog` maps every persisted peer through `hydrateChat` in `Promise.all` and passes `{ title: cachedTitle }` when the verified central payload already contains one. Session restore awaits `_restorePeerChats`, so all probes are on the restore critical path.",
+      "Recommendation": "Restore the cached-title fast path before chat-local database access, and import chat-local title changes through the catalog reconciliation path. If local verification must remain on restore, batch/limit it and only probe chats whose central title is missing or known stale."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "repeated-work",
+      "missing-coalescing",
+      "eager-work",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold and warm session-list requests over a populated Agent Host profile",
+        "CriticalPath": "The request waits for the registry read, one verified central catalog-row read per visible registration, payload decode/revival, and only invalid-row fallbacks. If the v2 registry is empty, the first request also waits for initial provider migration; otherwise migration and repairs are off the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogListReader.ts:31",
+            "Operation": "Read one verified `sessions_v2` row and bounded JSON payload for each visible registered session",
+            "Cardinality": "N central SQLite reads for N visible registrations, limited to concurrency 4 and coalesced across concurrent list callers",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Listing commonly queried providers and opened individual session databases to reconstruct each item.",
+            "CriticalPathEffect": "All selected reads complete before the list response"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_legacyRegisteredSessionMetadata",
+            "Operation": "Open/read provider or per-session metadata only when a central payload is missing, stale, or invalid",
+            "Cardinality": "K fallbacks where K is the number of unusable central rows, limited to concurrency 4; K is zero for a warm valid catalog",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The analogous expensive path ran for most or all listed sessions rather than only invalid rows.",
+            "CriticalPathEffect": "Each fallback blocks only its row, but the response awaits all rows"
+          }
+        ],
+        "ScalingInput": "Visible registered-session count N after external-mode filtering; fallback cardinality K after verified-payload eligibility.",
+        "EffectiveConcurrency": "Concurrent list calls for one mode share one computation; central and fallback per-row work each use a limiter of 4.",
+        "CacheBehavior": "Warm valid rows use the central payload directly. Cold/pre-migration or corrupt/outdated rows fall back individually and are marked dirty for repair; concurrent list calls are coalesced.",
+        "MechanismConfidence": "High: the changed list call path, limits, fallback predicate, and previous per-session enumeration are explicit.",
+        "MagnitudeUncertainty": "Central SQLite query and JSON decode duration varies with payload size, but payloads are bounded to 4 MiB and common payloads are much smaller.",
+        "Verdict": "No reportable regression; this is the intended performance improvement and fallback fan-out is reduced to invalid rows."
+      },
+      {
+        "Scenario": "Restoring a session with default, peer, and subagent chats",
+        "CriticalPath": "Session restore waits for default-chat hydration and later awaits peer-chat restoration together with configuration/customization work. Peer restoration waits for every chat hydration before registering summaries and completing restore.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_readCachedChatCatalog",
+            "Operation": "Read central peer membership and cached chat titles",
+            "Cardinality": "A constant number of central SQLite reads per restored session",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Peer membership/title reconstruction came from legacy/provider and session metadata rather than the central catalog.",
+            "CriticalPathEffect": "Required before peer summaries can be restored"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/sessionTitle/sessionTitleContribution.ts:77",
+            "Operation": "Stat every peer chat database and, when present, open/migrate SQLite and query `customTitle`",
+            "Cardinality": "One probe per restored peer chat, up to 999 peers; invoked through an unbounded `Promise.all` even when all central cached titles exist",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The pre-existing `restored.title` early return ran before database access, so cached titles caused zero per-chat probes.",
+            "CriticalPathEffect": "All probes must settle before `_restorePeerChatsFromCatalog` and session restore complete"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/chatDraft/chatDraftContribution.ts:onHydrateChat",
+            "Operation": "Read chat drafts from the owning session database through hydration contributions",
+            "Cardinality": "Existing metadata read per hydrated chat, sharing the parent session database",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same draft hydration already ran before this PR.",
+            "CriticalPathEffect": "Awaited serially within each contribution chain and collectively by peer restore"
+          }
+        ],
+        "ScalingInput": "Number of persisted peer chats in the restored session after central membership reconciliation.",
+        "EffectiveConcurrency": "Peer chats are mapped through unbounded `Promise.all`; each contribution chain is serial, but different chats perform the new stat/open/query concurrently.",
+        "CacheBehavior": "A verified central payload supplies warm cached titles, but the new ordering ignores that fast path and probes chat-local storage first. Missing chat databases are negative only for that call; each `tryOpenDatabase` still performs a stat.",
+        "MechanismConfidence": "Very high: the exact before/after ordering, filesystem stat implementation, SQLite acquisition, unbounded caller, and await chain were traced.",
+        "MagnitudeUncertainty": "Typical peer count and storage latency vary, affecting severity but not the linear fan-out or critical-path placement.",
+        "Verdict": "Reportable high-severity I/O boundary fan-out; finding submitted."
+      },
+      {
+        "Scenario": "Initial and periodic catalog reconciliation, including downgrade compatibility",
+        "CriticalPath": "Scheduled passes are background work. Explicit full reconciliation before external-session visibility changes is awaited by that reconciliation workflow, not by ordinary valid-row listing.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts:_runSinglePass",
+            "Operation": "Mark verified central rows dirty, list registry/receipts, and update clean markers",
+            "Cardinality": "Bulk central operations plus at most 50 selected sessions per ordinary pass",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no central dirty-marker reconciliation; ordinary lists repeatedly reconstructed metadata from provider/session storage.",
+            "CriticalPathEffect": "Background except when an explicit reconciliation/full pass is requested"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts:_reconcileSession",
+            "Operation": "Probe and open dirty per-session databases, validate snapshots/metadata, and possibly rewrite central payloads",
+            "Cardinality": "At most 50 sessions per ordinary pass, concurrency 4; clean rows are filtered before local database access",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Equivalent local metadata access happened on repeated list calls without dirty filtering.",
+            "CriticalPathEffect": "Off ordinary list critical path; can contend with foreground work when the one-second initial timer fires"
+          }
+        ],
+        "ScalingInput": "Dirty registered-session count after central receipt filtering; full sweeps rotate through batches.",
+        "EffectiveConcurrency": "A single running pass is shared, rerun requests collapse to one trailing loop, batches are capped at 50, and per-session work is limited to 4.",
+        "CacheBehavior": "Clean central receipts skip local databases. Startup and hourly safety verification mark all rows dirty to detect writes by older builds; failed/pending rows remain dirty.",
+        "MechanismConfidence": "High for scheduling and bounds; lower for user-visible contention magnitude.",
+        "MagnitudeUncertainty": "The one-second initial pass may overlap slow startup, but compared with the pre-diff repeated per-list local reads, the bounded background work does not establish a net regression.",
+        "Verdict": "No finding: intentional bounded compatibility verification, with less aggregate local I/O than the replaced listing path."
+      },
+      {
+        "Scenario": "Live session summary/title/read/archive/artifact changes synchronized into the central catalog",
+        "CriticalPath": "Explicit mutations that require durability await synchronization; ordinary summary-change synchronization is fire-and-forget and therefore off the immediate UI/action critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogSyncService.ts:synchronizeWithFactory",
+            "Operation": "Read/write local session metadata and durable pending snapshot, upsert the central payload, acknowledge locally, and increment dirty markers",
+            "Cardinality": "One synchronization operation per queued change; operations are serialized per session and generation retries are capped at 3",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Legacy metadata writes occurred locally, while no central payload/snapshot transaction was maintained.",
+            "CriticalPathEffect": "Awaited for ordered catalog mutations; background for `_queueCatalogSync` summary changes"
+          }
+        ],
+        "ScalingInput": "Number of durable summary mutations and active sessions; payload serialization scales with bounded chat/metadata size.",
+        "EffectiveConcurrency": "A `SequencerByKey` serializes each session; sessions may progress independently. Root summary notifications are debounced to one flush per session per 100 ms, but queued catalog syncs are not collapsed.",
+        "CacheBehavior": "Matching local/central hashes can replay without rewriting payload state, but dirty markers and reads still occur for queued operations. Pending snapshots support retry after failure.",
+        "MechanismConfidence": "High for the transaction path and serialization; insufficient evidence of realistic high-frequency summary changes for a separate regression finding.",
+        "MagnitudeUncertainty": "Activity-change frequency is provider-dependent; traced lifecycle changes are relatively infrequent and the work is off the immediate action path.",
+        "Verdict": "No finding: durable synchronization is serialized and bounded, and available evidence does not prove harmful hot-path multiplicity."
+      },
+      {
+        "Scenario": "Provider migration and first population of `sessions_v2`",
+        "CriticalPath": "When no current registrations exist, listing waits for initial provider migration; otherwise retries and further migration run in background.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_enumerateLegacyProviderSessions",
+            "Operation": "Enumerate a provider's legacy session catalog through provider APIs",
+            "Cardinality": "One provider enumeration per unbackfilled provider pass, not one network call per session at this layer",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Provider enumeration was already used for legacy discovery/listing.",
+            "CriticalPathEffect": "Can block the first list only when the v2 registry is empty"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionsV2MigrationService.ts:migrateProvider",
+            "Operation": "Bulk-read current registrations, receipts, legacy registrations, and exclusions, then synchronize selected candidates",
+            "Cardinality": "Four bulk central reads plus up to one local/session synchronization per effective candidate; candidate work limited to concurrency 4",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No v2 import existed; list-time provider/per-session reconstruction supplied the data repeatedly.",
+            "CriticalPathEffect": "On first-list critical path only for an empty v2 registry"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionsV2MigrationService.ts:_hasMatchingReceipt",
+            "Operation": "Probe/open candidate session databases to validate receipts or build projections",
+            "Cardinality": "At most one probe per selected candidate, under the migration limiter of 4",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Session databases were opened during listing rather than once for import/repair.",
+            "CriticalPathEffect": "Awaited by that candidate's migration"
+          }
+        ],
+        "ScalingInput": "Union cardinality of current v2 identities, legacy registrations, provider candidates, receipts, and exclusions after URI deduplication.",
+        "EffectiveConcurrency": "Candidates are sorted and processed by a limiter of 4; each session's catalog synchronization is also keyed/serialized.",
+        "CacheBehavior": "A projection-versioned provider marker skips provider enumeration on warm complete profiles; matching receipts skip synchronization; failures remain resumable.",
+        "MechanismConfidence": "High: marker, deduplication, limiter, and first-list gate are explicit.",
+        "MagnitudeUncertainty": "Provider enumeration latency and candidate count vary by provider/profile.",
+        "Verdict": "No finding: migration is resumable, concurrency-bounded, and replaces repeated list-time work."
+      },
+      {
+        "Scenario": "Creating, updating, or deleting peer chats",
+        "CriticalPath": "Peer creation awaits provider creation, central membership persistence, compatibility mirroring, ordered list-payload synchronization, and then publishes the chat. Data-change persistence is background; deletion awaits fenced cleanup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:createChat",
+            "Operation": "Create/materialize/dispose provider-backed chats",
+            "Cardinality": "One provider operation per chat mutation, as before",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The provider boundary already existed.",
+            "CriticalPathEffect": "Creation/disposal waits so published membership has a valid backing"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:_replaceCentral",
+            "Operation": "Replace central chat membership and mirror compatibility metadata into parent and member chat databases",
+            "Cardinality": "One central replacement per mutation; compatibility publication may touch each member chat, limited to concurrency 4 and bounded by 999 peers",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The parent session stored a single legacy `peerChats` metadata value; member chat-local metadata was not centrally reconciled this way.",
+            "CriticalPathEffect": "Awaited for ordered creation and migration paths"
+          }
+        ],
+        "ScalingInput": "Peer-chat count in one session, bounded by the 1000-child catalog limit including the default chat.",
+        "EffectiveConcurrency": "Mutations are serialized per session; member metadata mirror writes use concurrency 4; deletion fences drain queued synchronization.",
+        "CacheBehavior": "Central membership is authoritative; mirrored revision/payload avoids re-importing unchanged legacy state and failed mirrors remain retryable.",
+        "MechanismConfidence": "High for O(peer-count) mirror work, but insufficient evidence that realistic catalogs make this a material regression relative to required compatibility semantics.",
+        "MagnitudeUncertainty": "Large peer catalogs are uncommon, and compatibility publication is tied to infrequent membership/data changes.",
+        "Verdict": "No finding: bounded and serialized compatibility work on an infrequent mutation path."
+      },
+      {
+        "Scenario": "Parsing chat requests with dynamic variable range remapping",
+        "CriticalPath": "Range remapping is synchronous CPU work during request parsing; there are no filesystem, database, subprocess, IPC, or network boundaries.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of variable ranges multiplied by number of prompt-text edits, as before.",
+        "EffectiveConcurrency": "Single synchronous parser invocation; unchanged concurrency behavior.",
+        "CacheBehavior": "No cache is involved.",
+        "MechanismConfidence": "High: the diff changes only arithmetic inside the existing nested mapping loop.",
+        "MagnitudeUncertainty": "Prompt variable counts are typically small.",
+        "Verdict": "No performance regression; operation count and allocation behavior are unchanged."
+      }
+    ],
+    "Summary": "Completed the performance pass across all 40 changed files and paginated diffs. Traced central listing, migration, reconciliation, live synchronization, peer-chat lifecycle/restore, SQLite/filesystem/provider boundaries, cache states, and concurrency. Submitted one high-confidence restore-path boundary-fanout finding; other new work is bounded, background, infrequent, or replaces more expensive pre-diff behavior."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-03T17:26:33.438196818Z",
+    "CompletedAt": "2026-09-03T17:29:54.707213817Z",
+    "WallClockMilliseconds": 201269,
+    "ModelCalls": 11,
+    "InputTokens": 1374450,
+    "OutputTokens": 13497,
+    "TotalTokens": 1387947,
+    "ReasoningTokens": 4803,
+    "CacheReadTokens": 1183693,
+    "CacheWriteTokens": 190724,
+    "APIDurationMilliseconds": 188252,
+    "ToolCalls": 114,
+    "NanoAIUnits": 84858460000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1183693,
+      "cache_write": 190724,
+      "input": 33,
+      "output": 13497
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
