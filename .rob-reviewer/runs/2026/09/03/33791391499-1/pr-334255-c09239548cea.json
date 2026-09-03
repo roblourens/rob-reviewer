@@ -1,0 +1,155 @@
+{
+  "PullRequest": {
+    "Number": 334255,
+    "Title": "sessions: add Agents window layout telemetry",
+    "Body": "## Summary\n\nAdds an `agents/windowLayout` telemetry event when the Agents Window starts. The event distinguishes the classic layout from the new side-pane layout.\n\n## Validation\n\n- `npm run transpile-client`\n- `npm run eslint -- src/vs/sessions/browser/workbench.ts`\n- pre-commit hygiene checks",
+    "URL": "https://github.com/microsoft/vscode/pull/334255",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ed89ba1ebeb4be3ed9f90c4c74dfc6721ba061db",
+    "HeadRef": "sandy081/agents/add-telemetry-class-vs-sidepane-layout",
+    "HeadSHA": "c09239548ceacd7694e0bcc766bbba65a2784711",
+    "CreatedAt": "2026-09-03T13:54:22Z",
+    "UpdatedAt": "2026-09-03T14:21:12Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-0D437A7C38F8",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/browser/workbench.ts",
+      "Side": "RIGHT",
+      "Line": 618,
+      "Severity": "low",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The call order, delayed service registration, web health fetch, lazy SDK load, desktop IPC, and idle scheduling of the existing Sessions telemetry contribution are all directly visible in the repository. The exact millisecond impact varies with module cache and telemetry configuration, so severity is low, but the newly earlier work and critical-path placement are concrete.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "Synchronous telemetry service graph construction, telemetry payload processing, and cold-web network/module-load initiation",
+      "PerformanceScaling": "The cost is paid once for every Agents window opened; on a cold web window it initiates an endpoint health fetch and lazy loading of the telemetry SDK before the workbench has rendered, while warm module caches avoid the SDK fetch but not service construction and the health ping.",
+      "PerformanceOutcome": "Increased Agents window startup latency and competing network/CPU work before the first render",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The Sessions workbench did not resolve or log through ITelemetryService on this pre-render path. The existing SessionsTelemetryContribution resolves it in WorkbenchPhase.AfterRestored, whose registry instantiation is scheduled during browser idle time.",
+      "ChangedBehavior": "The added line synchronously resolves the delayed ITelemetryService and logs an event immediately after Ready-phase contributions, before renderWorkbench, createWorkbenchLayout, layout, and restore.",
+      "CausalDiffEvidence": "The new call at line 618 is placed before the render/layout calls in Workbench.startup and is the first direct ITelemetryService resolution added to this startup path; ITelemetryService is registered as InstantiationType.Delayed on both browser and desktop.",
+      "Title": "Defer layout telemetry until after the first render",
+      "Impact": "Opening an Agents window, especially a cold web window with telemetry enabled, now begins telemetry initialization, a health-check request, and telemetry SDK loading before the UI is rendered. This adds synchronous startup work and lets telemetry traffic/module parsing contend with first-render work for a constant one-event benefit.",
+      "Evidence": "On web, constructing the delayed telemetry service calls initializeService, whose OneDataSystemWebAppender constructor immediately starts a GET to the telemetry health endpoint; the first publicLog2 also enters AbstractOneDataSystemAppender.log, which starts loading the 1DS client modules. On desktop, the log synchronously queues a shared-process channel call. These completions are asynchronous, but resolving the service graph, constructing appenders/common properties, cleaning/mixing the payload, and initiating those boundaries all happen before Workbench.renderWorkbench. The existing SessionsTelemetryContribution is registered AfterRestored and therefore provides an idle-time owner for this event without moving telemetry initialization onto startup.",
+      "Recommendation": "Record the fixed layout from an AfterRestored/idle contribution (for example, the existing SessionsTelemetryContribution using IAgentWorkbenchLayoutService), or otherwise schedule this log after first render, so the event is preserved without forcing the delayed telemetry stack onto the startup critical path."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open a desktop Agents window in classic or side-pane layout",
+        "CriticalPath": "Workbench.startup synchronously initializes services and Ready-phase contributions, then the new telemetry lookup/log runs before renderWorkbench, grid creation, layout, and restore. Telemetry IPC completion is not awaited, but delayed service construction, common-property/payload processing, and IPC enqueue occur on the startup critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/browser/workbench.ts:618 via src/vs/platform/telemetry/common/telemetryIpc.ts:34",
+            "Operation": "Queue agents/windowLayout through TelemetryAppenderClient to the shared-process telemetryAppender channel",
+            "Cardinality": "One IPC call per Agents window open when usage telemetry is enabled; no collection multiplier or coalescing applies.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This pre-render workbench path did not resolve ITelemetryService or enqueue this IPC event; SessionsTelemetryContribution resolves telemetry AfterRestored during idle work.",
+            "CriticalPathEffect": "The channel response is asynchronous and off the critical path, but service construction, payload cleaning/mixing, serialization, and channel enqueue happen before workbench rendering."
+          }
+        ],
+        "ScalingInput": "Number of Agents windows opened; cost is constant per window and independent of session count or layout size.",
+        "EffectiveConcurrency": "One fire-and-forget channel call per window; no burst or parallel per-item fan-out.",
+        "CacheBehavior": "A new window owns a new delayed telemetry service, so each window pays service initialization. The shared telemetry process may be warm, but this does not remove renderer-side construction or the added IPC event.",
+        "MechanismConfidence": "High: the changed call order, delayed registration, payload path, and shared-process channel call are directly traced.",
+        "MagnitudeUncertainty": "The exact renderer CPU and IPC enqueue duration is unmeasured and likely small on a warm desktop process, which limits severity.",
+        "Verdict": "Reportable low-severity eager startup work because the PR forces a delayed telemetry stack and IPC enqueue before first render; defer to AfterRestored/idle while preserving the event."
+      },
+      {
+        "Scenario": "Open a web Agents window in classic or side-pane layout",
+        "CriticalPath": "The changed telemetry call executes synchronously before all workbench render/layout calls. Network responses and SDK imports are not awaited, but telemetry service construction, common-property resolution, appender construction, health-fetch dispatch, payload processing, and lazy SDK-load initiation happen before startup can reach rendering.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/telemetry/browser/1dsAppender.ts:20, reached from src/vs/sessions/browser/workbench.ts:618",
+            "Operation": "GET the OneData telemetry endpoint health URL when OneDataSystemWebAppender is constructed",
+            "Cardinality": "One health request per newly initialized web-window telemetry service when supported and enabled.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No telemetry service was directly forced on this pre-render Sessions workbench path; the existing Sessions telemetry contribution is AfterRestored and idle-scheduled.",
+            "CriticalPathEffect": "Response is off the critical path, but request initiation occurs before render and can compete for browser/network resources."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/telemetry/common/1dsAppender.ts:45-46 and :134, reached from src/vs/sessions/browser/workbench.ts:618",
+            "Operation": "Lazy-load the 1DS core and post modules and eventually send the agents/windowLayout event",
+            "Cardinality": "One SDK initialization sequence for a cold web-window service and one telemetry event per window; module caches reduce later window loads.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The pre-render startup path did not initiate telemetry SDK loading or this event; telemetry consumers were reached after restore/interaction.",
+            "CriticalPathEffect": "Promise completion and event transmission are off the critical path, but the first module load is initiated by the pre-render log and its loading/parsing can overlap first-render work."
+          }
+        ],
+        "ScalingInput": "Number of web Agents windows opened; one event per open, with no dependence on sessions or DOM cardinality.",
+        "EffectiveConcurrency": "The health request and lazy SDK initialization are asynchronous and may overlap startup; event cardinality is one with no limiter needed.",
+        "CacheBehavior": "Cold module cache triggers lazy 1DS loading; warm cache avoids module transfer but still constructs the per-window service, performs payload work, and starts the health ping. Disabled/unsupported telemetry short-circuits to the null service.",
+        "MechanismConfidence": "High: pre-render reachability, delayed service activation, immediate health fetch, and first-log SDK initialization are explicit in code.",
+        "MagnitudeUncertainty": "Impact varies with telemetry enablement, browser module cache, bandwidth, and CPU; exact first-render delay/contention is not measured.",
+        "Verdict": "Reportable low-severity startup regression; move logging to existing AfterRestored/idle telemetry ownership."
+      },
+      {
+        "Scenario": "Run the Sessions workbench unit test for layout telemetry",
+        "CriticalPath": "The test invokes the private method directly on two lightweight hosts and records two in-memory objects; it does not instantiate production telemetry appenders or cross external boundaries.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Exactly two method calls and two array entries in one unit test.",
+        "EffectiveConcurrency": "Fully synchronous, no concurrency.",
+        "CacheBehavior": "No cache or production telemetry service is involved.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "None material; test-only allocations are bounded.",
+        "Verdict": "No separate performance finding; test overhead is negligible and only validates the production event values."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and all diff pages. Traced desktop/web Agents-window startup through delayed telemetry construction, payload processing, IPC/network appenders, cache state, and concurrency. Submitted one low-severity eager-startup finding; test-only changes are bounded."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-03T18:40:23.206381393Z",
+    "CompletedAt": "2026-09-03T18:42:32.676682942Z",
+    "WallClockMilliseconds": 129470,
+    "ModelCalls": 18,
+    "InputTokens": 689229,
+    "OutputTokens": 8971,
+    "TotalTokens": 698200,
+    "ReasoningTokens": 3590,
+    "CacheReadTokens": 624713,
+    "CacheWriteTokens": 64462,
+    "APIDurationMilliseconds": 118047,
+    "ToolCalls": 88,
+    "NanoAIUnits": 37591560000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 624713,
+      "cache_write": 64462,
+      "input": 54,
+      "output": 8971
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
