@@ -6,3 +6,8 @@ This file contains host-generated review guidance derived from validated pairs o
 ## Cleanup lifecycle revealed by shipped fixes
 
 Trace cleanup ownership through failure, cancellation, replacement, and shutdown. Report when a changed path loses the last handle to a still-live resource, repeats expensive cleanup, or moves cleanup into contention with an important scenario.
+
+<!-- learned-family:synchronous-ui-work -->
+## Synchronous UI work revealed by shipped fixes
+
+Trace reads and writes on resize, scroll, render, and input paths through browser layout and compositor boundaries. Look for changed geometry reads after writes, live filters on moving surfaces, and synchronous nested relayouts.
