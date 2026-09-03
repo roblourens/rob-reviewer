@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/roblourens/rob-reviewer/internal/app"
 	"github.com/roblourens/rob-reviewer/internal/review"
@@ -33,6 +34,7 @@ func run(logger *slog.Logger) (returnErr error) {
 
 	switch os.Args[1] {
 	case "poll":
+		startedAt := time.Now()
 		flags := flag.NewFlagSet("poll", flag.ContinueOnError)
 		configPath := flags.String("config", "reviewer.yaml", "path to reviewer configuration")
 		stateRepository := flags.String("state-repository", os.Getenv("GITHUB_REPOSITORY"), "owner/name repository used for durable state")
@@ -42,14 +44,26 @@ func run(logger *slog.Logger) (returnErr error) {
 		}
 		reviewer, err := newApp(*configPath, logger)
 		if err != nil {
-			return err
+			_, recordErr := app.WritePollRunFiles(
+				*outputDirectory,
+				app.PollResult{},
+				err,
+				app.PollRunMetadataFromEnvironment(startedAt, time.Now(), os.Getenv),
+			)
+			return errors.Join(err, recordErr)
 		}
 		defer func() {
 			returnErr = errors.Join(returnErr, reviewer.Close())
 		}()
-		result, err := reviewer.Poll(ctx, *stateRepository, *outputDirectory)
-		if err != nil {
-			return err
+		result, pollErr := reviewer.Poll(ctx, *stateRepository, *outputDirectory)
+		_, recordErr := app.WritePollRunFiles(
+			*outputDirectory,
+			result,
+			pollErr,
+			app.PollRunMetadataFromEnvironment(startedAt, time.Now(), os.Getenv),
+		)
+		if pollErr != nil || recordErr != nil {
+			return errors.Join(pollErr, recordErr)
 		}
 		logger.Info(
 			"poll complete",

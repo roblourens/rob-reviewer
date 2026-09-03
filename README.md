@@ -86,6 +86,25 @@ The workflow-provided `GITHUB_TOKEN` is used only for the state branch in this r
 
 The first enabled scheduled poll creates `reviewer-state` from the default branch when needed, upgrades any version-1 high-water state, snapshots current open heads, and exits. Branch protection must allow the workflow token to update that branch.
 
+## Run history
+
+Every poll invocation writes `run.json` and `run.md` into the workflow output directory. The run record includes:
+
+- GitHub run ID, attempt, trigger, workflow, repository, and reviewer commit;
+- start/completion timestamps and success or failure;
+- bootstrap, reviewed, published, deferred, and skipped PR numbers;
+- each analyzed PR's title, URL, base/head SHAs, finding count, and report filenames;
+- the exact sanitized public comment bodies for findings freshly published by that run;
+- a surfaced error and any partial completed work when polling fails.
+
+The workflow first uploads the output as an Actions artifact. It then checks out the `reviewer-state` branch and commits the complete output directory under:
+
+```text
+.rob-reviewer/runs/YYYY/MM/DD/<github-run-id>-<attempt>/
+```
+
+Each workflow run therefore leaves an immutable, Git-browsable record alongside the mutable state file without adding generated reports to `main`. A resumed pending GitHub review is recorded in the run's `published` PR list; its original rendered comments remain in the earlier run record that created the pending review.
+
 ## Automatic operation
 
 The checked-in configuration enables automatic analysis and publication. The two Actions secrets must be configured and the `ROB_REVIEWER_ENABLED` repository variable must be `true` for scheduled runs.
@@ -207,6 +226,7 @@ Use a manual dry-run workflow for the real SDK smoke test. Publishing happens se
 
 - Processing stops at the first failed PR. Polling requires `--output-dir`, and both the authoritative JSON report and its Markdown rendering are atomically replaced inside the per-PR polling callback. A head is marked reviewed only after report persistence and, in automatic mode, successful publication.
 - Reports completed before a later PR fails remain in the output directory and are uploaded by the workflow's `always()` artifact step. A later poll retries the failed PR.
+- Run manifests are written from partial results before the poll command returns an error, so the artifact and state-branch archive show work completed before the failure.
 - Pending heads are refreshed directly even after they leave the updated-PR scan window, so transient model/GitHub failures retry. Heads older than `maxPendingAgeHours` are deliberately skipped.
 - If state persistence fails after a public review succeeds, the retry sees the authenticated PR/head marker, avoids duplicate comments, and then records the head as complete.
 - If GitHub created a pending bot review but submission failed, the next automatic run resumes that review without rerunning the model. A newer head deletes the bot's stale pending review before proceeding; adding a suppression label deletes the current pending review instead of leaving it to block future heads.

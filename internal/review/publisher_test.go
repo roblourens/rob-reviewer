@@ -369,6 +369,23 @@ func TestAutomaticPublisherRejectsClosedPRAndDeletesStalePendingReview(t *testin
 	}, false); !errors.Is(err, ErrPublicationSuppressed) {
 		t.Fatalf("expected closed automatic suppression, got %v", err)
 	}
+
+	open := closed
+	open.State = "open"
+	client.current = open
+	client.deletedID = 0
+	client.pendingReview = &ExistingReview{
+		ID:    92,
+		State: "PENDING",
+		Body:  "<!-- rob-reviewer:v1 pr=7 head=new-head -->\n" + humanApprovedSummary,
+	}
+	existing, err = publisher.PrepareAutomaticReview(context.Background(), open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing != nil || client.deletedID != 92 {
+		t.Fatalf("legacy pending review was not replaced: existing=%+v deleted=%d", existing, client.deletedID)
+	}
 }
 
 func TestSanitizeMarkdownTextNeutralizesActiveContent(t *testing.T) {
@@ -426,7 +443,7 @@ func TestReviewRequestSanitizesAllDynamicMetadata(t *testing.T) {
 			APIEndpoints:           []string{"@endpoint"},
 		},
 	}
-	request := buildReviewRequest(result, "<!-- marker -->")
+	request := buildReviewRequest(result, "<!-- marker -->", "Test review.")
 	combined := request.Body + request.Comments[0].Body
 	if !strings.Contains(combined, "`publicLog2`") {
 		t.Fatalf("review content did not preserve code span: %s", combined)

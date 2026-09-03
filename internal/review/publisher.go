@@ -14,6 +14,8 @@ import (
 const (
 	generatedDisclosure      = "(Written by Copilot)"
 	experimentalReviewPrefix = "**[Experimental performance review bot]**"
+	humanApprovedSummary     = "Human-approved experimental performance review."
+	automaticSummary         = "Automated experimental performance review."
 )
 
 var ErrPublicationSuppressed = errors.New("review publication suppressed")
@@ -53,6 +55,7 @@ type Publisher struct {
 	repo        string
 	skipLabels  []string
 	allowClosed bool
+	summary     string
 }
 
 func NewPublisher(client PublisherClient, owner, repo string, skipLabels ...string) *Publisher {
@@ -62,6 +65,7 @@ func NewPublisher(client PublisherClient, owner, repo string, skipLabels ...stri
 		repo:        repo,
 		skipLabels:  slices.Clone(skipLabels),
 		allowClosed: true,
+		summary:     humanApprovedSummary,
 	}
 }
 
@@ -72,6 +76,7 @@ func NewAutomaticPublisher(client PublisherClient, owner, repo string, skipLabel
 		repo:        repo,
 		skipLabels:  slices.Clone(skipLabels),
 		allowClosed: false,
+		summary:     automaticSummary,
 	}
 }
 
@@ -123,7 +128,7 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 		}
 		return true, nil
 	}
-	request := buildReviewRequest(result, marker+"\n"+approvalMarker)
+	request := buildReviewRequest(result, marker+"\n"+approvalMarker, publisher.summary)
 	pendingReviewID, err := publisher.client.CreatePendingReview(
 		ctx,
 		publisher.owner,
@@ -187,7 +192,7 @@ func (publisher *Publisher) PrepareAutomaticReview(
 	if err != nil {
 		return nil, fmt.Errorf("find pending automatic review: %w", err)
 	}
-	if pending != nil && !strings.Contains(pending.Body, marker) {
+	if pending != nil && (!strings.Contains(pending.Body, marker) || strings.Contains(pending.Body, humanApprovedSummary)) {
 		if err := publisher.client.DeletePendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number, pending.ID); err != nil {
 			return nil, fmt.Errorf("delete stale pending review %d: %w", pending.ID, err)
 		}
@@ -222,7 +227,22 @@ func publicationApprovalMarker(result Result) string {
 	)
 }
 
-func buildReviewRequest(result Result, marker string) ReviewRequest {
+func buildReviewRequest(result Result, marker, summaryText string) ReviewRequest {
+	comments := PublicComments(result)
+	var summary strings.Builder
+	summary.WriteString(experimentalReviewPrefix)
+	fmt.Fprintf(&summary, "\n\n%s\n\n", summaryText)
+	fmt.Fprintf(&summary, "%s\n\n%s", generatedDisclosure, marker)
+
+	return ReviewRequest{
+		CommitID: result.PullRequest.HeadSHA,
+		Event:    "",
+		Body:     summary.String(),
+		Comments: comments,
+	}
+}
+
+func PublicComments(result Result) []Comment {
 	comments := make([]Comment, 0, len(result.Findings))
 	for _, finding := range result.Findings {
 		comments = append(comments, Comment{
@@ -240,18 +260,7 @@ func buildReviewRequest(result Result, marker string) ReviewRequest {
 			),
 		})
 	}
-
-	var summary strings.Builder
-	summary.WriteString(experimentalReviewPrefix)
-	summary.WriteString("\n\nHuman-approved experimental performance review.\n\n")
-	fmt.Fprintf(&summary, "%s\n\n%s", generatedDisclosure, marker)
-
-	return ReviewRequest{
-		CommitID: result.PullRequest.HeadSHA,
-		Event:    "",
-		Body:     summary.String(),
-		Comments: comments,
-	}
+	return comments
 }
 
 func FormatStatsMarkdown(stats Stats) string {
