@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/roblourens/rob-reviewer/internal/learning"
 	"github.com/roblourens/rob-reviewer/internal/poller"
 	"github.com/roblourens/rob-reviewer/internal/review"
 )
@@ -93,5 +94,51 @@ func TestWritePollRunFilesRecordsPartialFailure(t *testing.T) {
 	}
 	if record.Succeeded || record.Error != expected.Error() || len(record.Reviewed) != 1 {
 		t.Fatalf("record = %+v", record)
+	}
+}
+
+func TestWritePollRunFilesPersistsRegressionCasesAndReplay(t *testing.T) {
+	directory := t.TempDir()
+	replay := savedResult()
+	replay.PullRequest.Number = 3
+	replay.PullRequest.HeadSHA = "introducer-head"
+	replay.Findings = nil
+	caseRecord := learning.RegressionCase{
+		ID:              "REG-123",
+		Fixer:           learning.PullRequestReference{Number: 7, HeadSHA: "fixer"},
+		Introducer:      learning.PullRequestReference{Number: 3, HeadSHA: "introducer-head"},
+		MechanismFamily: review.RegressionEagerWork,
+		Coverage:        learning.CoverageResult{Status: "instruction-gap"},
+	}
+	_, err := WritePollRunFiles(directory, PollResult{
+		Learning: learning.Evaluation{
+			Cases:   []learning.RegressionCase{caseRecord},
+			Replays: []review.Result{replay},
+		},
+	}, nil, PollRunMetadata{RunID: "456", RunAttempt: 1, StartedAt: time.Now(), CompletedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"regression-cases.json",
+		"learning-proposals.json",
+		"pr-3-introducer-h.json",
+		"pr-3-introducer-h.md",
+	} {
+		if _, err := os.Stat(filepath.Join(directory, name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	content, err := os.ReadFile(filepath.Join(directory, "regression-cases.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evaluation learning.Evaluation
+	if err := json.Unmarshal(content, &evaluation); err != nil {
+		t.Fatal(err)
+	}
+	if len(evaluation.Cases) != 1 || evaluation.Cases[0].RunID == "" ||
+		evaluation.Cases[0].RunArchivePath == "" {
+		t.Fatalf("evaluation = %+v", evaluation)
 	}
 }

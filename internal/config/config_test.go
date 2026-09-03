@@ -34,6 +34,9 @@ review:
 	if cfg.Automation.Enabled || cfg.Publication.Mode != "approval" {
 		t.Fatalf("safe automation defaults = %+v / %+v", cfg.Automation, cfg.Publication)
 	}
+	if !cfg.Learning.Enabled || cfg.Learning.MaxCasesPerRun != 1 {
+		t.Fatalf("learning defaults = %+v", cfg.Learning)
+	}
 	if cfg.Review.MaxFindings != DefaultMaxFindings {
 		t.Fatalf("maxFindings = %d, want %d", cfg.Review.MaxFindings, DefaultMaxFindings)
 	}

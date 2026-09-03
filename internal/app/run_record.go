@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/roblourens/rob-reviewer/internal/learning"
 	"github.com/roblourens/rob-reviewer/internal/review"
 )
 
@@ -27,16 +28,18 @@ type PollRunMetadata struct {
 }
 
 type PollRunRecord struct {
-	Version      int               `json:"version"`
-	Metadata     PollRunMetadata   `json:"metadata"`
-	Succeeded    bool              `json:"succeeded"`
-	Error        string            `json:"error,omitempty"`
-	Bootstrapped int               `json:"bootstrapped"`
-	Reviewed     []int             `json:"reviewed"`
-	Published    []int             `json:"published"`
-	Deferred     []int             `json:"deferred"`
-	Skipped      []int             `json:"skipped"`
-	Reviews      []RunReviewRecord `json:"reviews"`
+	Version                      int               `json:"version"`
+	Metadata                     PollRunMetadata   `json:"metadata"`
+	Succeeded                    bool              `json:"succeeded"`
+	Error                        string            `json:"error,omitempty"`
+	Bootstrapped                 int               `json:"bootstrapped"`
+	Reviewed                     []int             `json:"reviewed"`
+	Published                    []int             `json:"published"`
+	Deferred                     []int             `json:"deferred"`
+	Skipped                      []int             `json:"skipped"`
+	Reviews                      []RunReviewRecord `json:"reviews"`
+	RegressionCaseCount          int               `json:"regressionCaseCount"`
+	UnresolvedRegressionFixCount int               `json:"unresolvedRegressionFixCount"`
 }
 
 type RunReviewRecord struct {
@@ -111,16 +114,57 @@ func WritePollRunFiles(
 		}
 		reviews = append(reviews, record)
 	}
+	for _, replay := range result.Learning.Replays {
+		if _, err := WriteResultFiles(directory, replay); err != nil {
+			return nil, fmt.Errorf("write introducing PR replay: %w", err)
+		}
+	}
+	cases := slices.Clone(result.Learning.Cases)
+	for index := range cases {
+		cases[index].RunID = metadata.RunID
+		cases[index].RunAttempt = metadata.RunAttempt
+		if metadata.RunID != "" {
+			cases[index].RunArchivePath = fmt.Sprintf(
+				".rob-reviewer/runs/%s/%s-%d",
+				metadata.CompletedAt.UTC().Format("2006/01/02"),
+				metadata.RunID,
+				metadata.RunAttempt,
+			)
+		}
+	}
+	learningPayload := learning.Evaluation{
+		Cases:      cases,
+		Unresolved: slices.Clone(result.Learning.Unresolved),
+	}
+	learningContent, err := json.MarshalIndent(learningPayload, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode regression cases: %w", err)
+	}
+	learningContent = append(learningContent, '\n')
+	if err := writeFileAtomic(filepath.Join(directory, "regression-cases.json"), learningContent); err != nil {
+		return nil, fmt.Errorf("write regression cases: %w", err)
+	}
+	proposals := learning.Proposals(cases)
+	proposalContent, err := json.MarshalIndent(proposals, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode learning proposals: %w", err)
+	}
+	proposalContent = append(proposalContent, '\n')
+	if err := writeFileAtomic(filepath.Join(directory, "learning-proposals.json"), proposalContent); err != nil {
+		return nil, fmt.Errorf("write learning proposals: %w", err)
+	}
 	record := PollRunRecord{
-		Version:      runRecordVersion,
-		Metadata:     metadata,
-		Succeeded:    pollErr == nil,
-		Bootstrapped: result.Poll.Bootstrapped,
-		Reviewed:     slices.Clone(result.Poll.Reviewed),
-		Published:    slices.Clone(result.Poll.Published),
-		Deferred:     slices.Clone(result.Poll.Deferred),
-		Skipped:      slices.Clone(result.Poll.Skipped),
-		Reviews:      reviews,
+		Version:                      runRecordVersion,
+		Metadata:                     metadata,
+		Succeeded:                    pollErr == nil,
+		Bootstrapped:                 result.Poll.Bootstrapped,
+		Reviewed:                     slices.Clone(result.Poll.Reviewed),
+		Published:                    slices.Clone(result.Poll.Published),
+		Deferred:                     slices.Clone(result.Poll.Deferred),
+		Skipped:                      slices.Clone(result.Poll.Skipped),
+		Reviews:                      reviews,
+		RegressionCaseCount:          len(result.Learning.Cases),
+		UnresolvedRegressionFixCount: len(result.Learning.Unresolved),
 	}
 	if pollErr != nil {
 		record.Error = pollErr.Error()
@@ -159,6 +203,8 @@ func formatPollRunMarkdown(record PollRunRecord) string {
 	fmt.Fprintf(&output, "- Published: %d\n", len(record.Published))
 	fmt.Fprintf(&output, "- Deferred: %d\n", len(record.Deferred))
 	fmt.Fprintf(&output, "- Skipped: %d\n", len(record.Skipped))
+	fmt.Fprintf(&output, "- Regression cases: %d\n", record.RegressionCaseCount)
+	fmt.Fprintf(&output, "- Unresolved regression fixes: %d\n", record.UnresolvedRegressionFixCount)
 	if record.Error != "" {
 		fmt.Fprintf(&output, "\n## Error\n\n%s\n", review.SanitizeMarkdownTextWithCodeSpans(record.Error))
 	}

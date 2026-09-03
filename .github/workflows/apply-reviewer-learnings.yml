@@ -1,0 +1,79 @@
+name: Apply reviewer learnings
+
+on:
+  workflow_run:
+    workflows:
+      - Review VS Code pull requests
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: reviewer-learning-update
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: >-
+      ${{
+        github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Download trusted reviewer artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          artifact_name="performance-review-reports-${RUN_ID}-${RUN_ATTEMPT}"
+          artifact_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+              --jq ".artifacts[] | select(.name == \"${artifact_name}\") | .id" |
+              head -n 1
+          )"
+          if [[ -z "$artifact_id" ]]; then
+            echo "No reviewer artifact exists for $artifact_name; the source job was skipped."
+            exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > reviewer-artifact.zip
+          mkdir review-results
+          unzip -q reviewer-artifact.zip -d review-results
+      - name: Verify durable case archive
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          completed_at="$(jq -r '.metadata.completedAt' review-results/run.json)"
+          archive_date="$(date -u -d "$completed_at" +'%Y/%m/%d')"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/.rob-reviewer/runs/${archive_date}/${RUN_ID}-${RUN_ATTEMPT}/regression-cases.json?ref=reviewer-state" \
+            >/dev/null
+      - run: go mod download
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+      - run: go tool bundler
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        working-directory: cmd/rob-reviewer
+      - name: Apply host-owned guidance templates
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          go run ./cmd/rob-reviewer apply-learnings \
+            --proposals-path review-results/learning-proposals.json \
+            --cases-path review-results/regression-cases.json

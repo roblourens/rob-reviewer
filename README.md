@@ -59,6 +59,9 @@ automation:
   enabled: true
   skipLabels:
     - performance-reviewer:skip
+learning:
+  enabled: true
+  maxCasesPerRun: 1
 publication:
   mode: automatic
 review:
@@ -97,6 +100,8 @@ Every poll invocation writes `run.json` and `run.md` into the workflow output di
 - the exact sanitized public comment bodies for findings freshly published by that run;
 - a surfaced error and any partial completed work when polling fails.
 
+Manually dispatched one-PR reviews use the same manifest and archive format.
+
 The workflow first uploads the output as an Actions artifact. It then checks out the `reviewer-state` branch and commits the complete output directory under:
 
 ```text
@@ -104,6 +109,34 @@ The workflow first uploads the output as an Actions artifact. It then checks out
 ```
 
 Each workflow run therefore leaves an immutable, Git-browsable record alongside the mutable state file without adding generated reports to `main`. A resumed pending GitHub review is recorded in the run's `published` PR list; its original rendered comments remain in the earlier run record that created the pending review.
+
+## Learning from shipped performance fixes
+
+The performance skill also looks for PRs that remove a concrete, evidenced performance regression. This signal is separate from normal review findings and never creates a comment on the fixing PR.
+
+For a high-confidence fixing PR, the reviewer:
+
+1. identifies the changed line that removes or bounds the old mechanism;
+2. uses the bounded `blame_base_line` tool against the PR's base revision;
+3. records the blamed introducing commit and one predefined mechanism family;
+4. asks GitHub which PR introduced that commit;
+5. accepts only an earlier merged `MEMBER`/`OWNER` PR;
+6. replays that introducing PR with the current performance skill, without publishing;
+7. marks the case `detected` when the replay reports the same performance category on the implicated path, otherwise `instruction-gap`.
+
+At most one introducer replay runs per workflow by default. The fixing PR, introducing PR/commit, mechanism, symptom, evidence, replay result, and coverage status are written to `regression-cases.json`. The workflow merges resolved pairs into the separate ledger:
+
+```text
+.rob-reviewer/regression-cases.json
+```
+
+The introducing PR's full replay report is stored alongside the fixing PR's run archive. Each global case records the GitHub run/attempt and archive path containing that evidence. This ledger is intentionally shaped for future benchmark generation, but no benchmark runner is enabled yet.
+
+When replay indicates an instruction gap, the run's `learning-proposals.json` contains only the case ID and a constrained mechanism-family enum.
+
+A separate `Apply reviewer learnings` workflow is triggered after the reviewer workflow completes. It accepts only runs produced from this repository's default branch, executes the current trusted `main` implementation rather than producer-controlled branch code, downloads that exact run's immutable Actions artifact, verifies the matching case archive exists on `reviewer-state`, and checks that every proposal matches a current-run case with the same family and `instruction-gap` result. This includes a run that completed learning but failed later while saving mutable poll state; runs without an artifact are a no-op, and an artifact without durable archived evidence is rejected.
+
+The model, PR text, and mutable state ledger cannot authorize arbitrary instructions. Each mechanism family maps to a predefined, host-owned guidance paragraph; arbitrary mechanism/evidence prose remains only in the JSON case ledger. Updates are idempotent, modify only `learned-regressions.md`, use the GitHub Contents API with optimistic SHA checks, and carry the Copilot commit disclosure. The separate workflow can be rerun against the same immutable artifact if an update fails transiently.
 
 ## Automatic operation
 

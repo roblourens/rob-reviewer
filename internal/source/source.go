@@ -32,10 +32,11 @@ const (
 )
 
 type Source struct {
-	root    string
-	pull    review.PullRequest
-	diff    *diff.Diff
-	focuses *focus.Catalog
+	root      string
+	mergeBase string
+	pull      review.PullRequest
+	diff      *diff.Diff
+	focuses   *focus.Catalog
 }
 
 type PRContext struct {
@@ -81,7 +82,15 @@ type SearchMatch struct {
 	Text   string `json:"text"`
 }
 
-func New(root string, pull review.PullRequest, parsedDiff *diff.Diff, focuses *focus.Catalog) (*Source, error) {
+type BlameResult struct {
+	Commit     string `json:"commit"`
+	Path       string `json:"path"`
+	OriginPath string `json:"originPath"`
+	Line       int    `json:"line"`
+	Summary    string `json:"summary"`
+}
+
+func New(root, mergeBase string, pull review.PullRequest, parsedDiff *diff.Diff, focuses *focus.Catalog) (*Source, error) {
 	absoluteRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve source root: %w", err)
@@ -97,10 +106,69 @@ func New(root string, pull review.PullRequest, parsedDiff *diff.Diff, focuses *f
 		return nil, errors.New("focus catalog is required")
 	}
 	return &Source{
-		root:    absoluteRoot,
-		pull:    pull,
-		diff:    parsedDiff,
-		focuses: focuses,
+		root:      absoluteRoot,
+		mergeBase: strings.TrimSpace(mergeBase),
+		pull:      pull,
+		diff:      parsedDiff,
+		focuses:   focuses,
+	}, nil
+}
+
+func (source *Source) BlameBaseLine(ctx context.Context, path string, line int) (BlameResult, error) {
+	if source.mergeBase == "" {
+		return BlameResult{}, errors.New("merge base is unavailable")
+	}
+	if line < 1 {
+		return BlameResult{}, errors.New("line must be positive")
+	}
+	cleanPath := filepath.ToSlash(filepath.Clean(path))
+	if filepath.IsAbs(path) || cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return BlameResult{}, fmt.Errorf("path %q must stay inside the repository", path)
+	}
+	if !source.diff.ContainsPath(cleanPath) {
+		return BlameResult{}, fmt.Errorf("path %q is not in the pull request diff", cleanPath)
+	}
+	command := exec.CommandContext(
+		ctx,
+		"git",
+		"--no-pager",
+		"-c", "core.hooksPath="+os.DevNull,
+		"-c", "core.quotePath=false",
+		"blame",
+		"--follow",
+		"--line-porcelain",
+		"-L", fmt.Sprintf("%d,%d", line, line),
+		source.mergeBase,
+		"--",
+		cleanPath,
+	)
+	command.Dir = source.root
+	command.Env = append(os.Environ(), "GIT_PAGER=cat")
+	output, err := command.Output()
+	if err != nil {
+		return BlameResult{}, fmt.Errorf("blame base line %s:%d: %w", cleanPath, line, err)
+	}
+	if len(output) > maxReadBytes {
+		return BlameResult{}, fmt.Errorf("blame output exceeds %d bytes", maxReadBytes)
+	}
+	lines := strings.Split(string(output), "\n")
+	fields := strings.Fields(lines[0])
+	if len(fields) == 0 || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(fields[0]) {
+		return BlameResult{}, errors.New("git blame returned no valid commit")
+	}
+	var summary string
+	originPath := cleanPath
+	for _, outputLine := range lines[1:] {
+		if strings.HasPrefix(outputLine, "summary ") {
+			summary = strings.TrimSpace(strings.TrimPrefix(outputLine, "summary "))
+		}
+		if strings.HasPrefix(outputLine, "filename ") {
+			originPath = strings.TrimSpace(strings.TrimPrefix(outputLine, "filename "))
+		}
+	}
+	return BlameResult{
+		Commit: fields[0], Path: cleanPath, OriginPath: originPath,
+		Line: line, Summary: summary,
 	}, nil
 }
 

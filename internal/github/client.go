@@ -70,15 +70,16 @@ func NewClientWithBaseURL(httpClient *http.Client, token, baseURL string) *Clien
 }
 
 type pullResponse struct {
-	Number            int       `json:"number"`
-	Title             string    `json:"title"`
-	Body              string    `json:"body"`
-	HTMLURL           string    `json:"html_url"`
-	State             string    `json:"state"`
-	Draft             bool      `json:"draft"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
-	AuthorAssociation string    `json:"author_association"`
+	Number            int        `json:"number"`
+	Title             string     `json:"title"`
+	Body              string     `json:"body"`
+	HTMLURL           string     `json:"html_url"`
+	State             string     `json:"state"`
+	Draft             bool       `json:"draft"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	MergedAt          *time.Time `json:"merged_at"`
+	AuthorAssociation string     `json:"author_association"`
 	User              struct {
 		Login string `json:"login"`
 	} `json:"user"`
@@ -169,8 +170,34 @@ func (pull pullResponse) toReviewPullRequest() review.PullRequest {
 		HeadSHA:           pull.Head.SHA,
 		CreatedAt:         pull.CreatedAt,
 		UpdatedAt:         pull.UpdatedAt,
+		MergedAt:          pull.MergedAt,
 		Labels:            labels,
 	}
+}
+
+func (client *Client) ListPullRequestsForCommit(
+	ctx context.Context,
+	owner, repo, commit string,
+) ([]review.PullRequest, error) {
+	path := fmt.Sprintf(
+		"/repos/%s/%s/commits/%s/pulls",
+		url.PathEscape(owner),
+		url.PathEscape(repo),
+		url.PathEscape(commit),
+	)
+	responseBody, _, err := client.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var response []pullResponse
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		return nil, fmt.Errorf("decode commit pull requests: %w", err)
+	}
+	pulls := make([]review.PullRequest, 0, len(response))
+	for _, pull := range response {
+		pulls = append(pulls, pull.toReviewPullRequest())
+	}
+	return pulls, nil
 }
 
 type Repository struct {

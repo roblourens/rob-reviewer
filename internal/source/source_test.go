@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -35,7 +36,7 @@ func TestReadFileAndAnchorContainment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := New(root, review.PullRequest{}, parsed, catalog)
+	source, err := New(root, "", review.PullRequest{}, parsed, catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +119,59 @@ func TestSearchStopsAtGlobalResultLimit(t *testing.T) {
 	}
 }
 
+func TestBlameBaseLineReturnsIntroducingCommit(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "--quiet")
+	runGit(t, root, "config", "user.name", "Test")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(root, "file.ts"), []byte("expensive();\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", "file.ts")
+	runGit(t, root, "commit", "--quiet", "-m", "Introduce expensive work")
+	commit := strings.TrimSpace(runGit(t, root, "rev-parse", "HEAD"))
+	parsed, err := diff.ParseString("diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-expensive();\n+batched();\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	focusRoot := filepath.Join(root, "focuses")
+	if err := os.MkdirAll(filepath.Join(focusRoot, "performance"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(focusRoot, "performance", "SKILL.md"), []byte("---\nname: performance-review\n---\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := focus.Load(focusRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := New(root, commit, review.PullRequest{}, parsed, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := source.BlameBaseLine(context.Background(), "file.ts", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Commit != commit || result.OriginPath != "file.ts" || result.Summary != "Introduce expensive work" {
+		t.Fatalf("blame = %+v", result)
+	}
+	if _, err := source.BlameBaseLine(context.Background(), "../file.ts", 1); err == nil {
+		t.Fatal("expected path containment error")
+	}
+}
+
+func runGit(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = directory
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
+	return string(output)
+}
+
 func testSource(t *testing.T, root string) *Source {
 	t.Helper()
 	focusRoot := filepath.Join(root, "focuses")
@@ -135,7 +189,7 @@ func testSource(t *testing.T, root string) *Source {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := New(root, review.PullRequest{}, parsed, catalog)
+	result, err := New(root, "", review.PullRequest{}, parsed, catalog)
 	if err != nil {
 		t.Fatal(err)
 	}

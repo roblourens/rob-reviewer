@@ -159,6 +159,7 @@ func (d *Diff) ValidateAnchor(anchor Anchor) error {
 	if anchor.Line < 1 {
 		return errors.New("anchor line must be positive")
 	}
+
 	file := d.findFile(anchor.Path)
 	if file == nil {
 		return fmt.Errorf("path %q is not in the diff", anchor.Path)
@@ -185,6 +186,15 @@ func (d *Diff) ValidateAnchor(anchor Anchor) error {
 		}
 	}
 	return fmt.Errorf("%s line %d is not present in the patch for %q", anchor.Side, anchor.Line, anchor.Path)
+}
+
+func (d *Diff) ContainsPath(path string) bool {
+	for _, file := range d.Files {
+		if path == file.Path || path == file.OldPath || path == file.NewPath {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Diff) ReadFile(path string, maxBytes int) (ReadResult, error) {

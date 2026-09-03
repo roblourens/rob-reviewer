@@ -27,9 +27,15 @@ var toolNames = []string{
 	"read_diff",
 	"read_repository_file",
 	"search_repository",
+	"blame_base_line",
 	"read_focus_document",
 	"report_finding",
+	"report_regression_fix",
 	"complete_review",
+}
+
+func blameKey(path string, line int) string {
+	return fmt.Sprintf("%s\x00%d", path, line)
 }
 
 type ReviewSource interface {
@@ -39,6 +45,7 @@ type ReviewSource interface {
 	ReadDiff(path string, offset, maxBytes int) (source.DiffContent, error)
 	ReadFile(path string, startLine, endLine int) (source.FileContent, error)
 	Search(ctx context.Context, pattern, path string, literal bool, maxResults int) ([]source.SearchMatch, error)
+	BlameBaseLine(ctx context.Context, path string, line int) (source.BlameResult, error)
 	ReadFocusDocument(focusName, path string) (string, error)
 	review.AnchorValidator
 }
@@ -117,7 +124,7 @@ func (runner *Runner) Close() error {
 	return errors.Join(closeErrors...)
 }
 
-func (runner *Runner) Review(ctx context.Context, reviewSource ReviewSource) (_ []review.Finding, analysis review.Analysis, stats review.Stats, returnErr error) {
+func (runner *Runner) Review(ctx context.Context, reviewSource ReviewSource) (_ []review.Finding, regressionFixes []review.RegressionFix, analysis review.Analysis, stats review.Stats, returnErr error) {
 	stats.Model = runner.options.Model
 	stats.ReasoningEffort = runner.options.ReasoningEffort
 	stats.BillingTokensByType = make(map[string]int64)
@@ -170,7 +177,7 @@ func (runner *Runner) Review(ctx context.Context, reviewSource ReviewSource) (_ 
 		SkillDirectories: []string{runner.options.FocusRoot},
 	})
 	if err != nil {
-		return nil, analysis, stats, fmt.Errorf("create Copilot review session: %w", err)
+		return nil, nil, analysis, stats, fmt.Errorf("create Copilot review session: %w", err)
 	}
 	defer func() {
 		deleteContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -186,17 +193,17 @@ func (runner *Runner) Review(ctx context.Context, reviewSource ReviewSource) (_ 
 	reviewContext, cancel := context.WithTimeout(ctx, reviewTimeout)
 	defer cancel()
 	if _, err := session.SendPromptAndWait(reviewContext, reviewPrompt(runner.options.FocusNames)); err != nil {
-		return nil, analysis, stats, fmt.Errorf("run Copilot review: %w", err)
+		return nil, nil, analysis, stats, fmt.Errorf("run Copilot review: %w", err)
 	}
 	if err := collector.completionError(); err != nil {
-		return nil, analysis, stats, err
+		return nil, nil, analysis, stats, err
 	}
 	findings, err := pipeline.Process(collector.findingsSnapshot())
 	if err != nil {
-		return nil, analysis, stats, fmt.Errorf("validate collected findings: %w", err)
+		return nil, nil, analysis, stats, fmt.Errorf("validate collected findings: %w", err)
 	}
 	usage.finish()
-	return findings, collector.analysisSnapshot(), stats, nil
+	return findings, collector.regressionFixesSnapshot(), collector.analysisSnapshot(), stats, nil
 }
 
 type usageAccumulator struct {
@@ -328,26 +335,49 @@ type focusDocumentParams struct {
 	Path  string `json:"path" jsonschema:"Focus-relative Markdown or text document path"`
 }
 
+type blameBaseLineParams struct {
+	Path string `json:"path" jsonschema:"Repository-relative path as it existed in the base revision"`
+	Line int    `json:"line" jsonschema:"One-based base-revision line whose introducing commit should be resolved"`
+}
+
 type reportFindingParams struct {
-	Focus               string          `json:"focus" jsonschema:"Enabled focus skill that found the issue"`
-	Path                string          `json:"path" jsonschema:"Repository-relative changed file path"`
-	Side                review.Side     `json:"side" jsonschema:"LEFT for a deleted line or RIGHT for an added line"`
-	Line                int             `json:"line" jsonschema:"One-based changed line number"`
-	Severity            review.Severity `json:"severity" jsonschema:"low, medium, high, or critical"`
-	Confidence          float64         `json:"confidence" jsonschema:"Confidence from 0 through 1"`
-	ConfidenceRationale string          `json:"confidenceRationale" jsonschema:"Concise explanation of the traced evidence that justifies this confidence"`
-	PerformanceCategory string          `json:"performanceCategory" jsonschema:"One of latency, throughput, cpu, memory, gc, io, ipc, subprocess, rendering, layout, startup, or network"`
-	PerformanceResource string          `json:"performanceResource" jsonschema:"Concrete expensive or retained resource: CPU work, bytes, objects, DOM nodes, IPC calls, subprocesses, filesystem operations, or similar"`
-	PerformanceScaling  string          `json:"performanceScaling" jsonschema:"How performance cost grows with realistic input, frequency, collection size, lifetime, or concurrency"`
-	PerformanceOutcome  string          `json:"performanceOutcome" jsonschema:"Concrete performance degradation such as increased latency, blocked critical path, CPU/GC pressure, retained memory, excessive I/O, lower throughput, or dropped frames"`
-	ChangeCausality     string          `json:"changeCausality" jsonschema:"One of introduced, materially-amplified, or pre-existing-critical"`
-	PreviousBehavior    string          `json:"previousBehavior" jsonschema:"What the reviewed scenario did before the PR, including the prior performance cost or absence of this work"`
-	ChangedBehavior     string          `json:"changedBehavior" jsonschema:"What the changed lines now do differently and how that changes performance cost"`
-	CausalDiffEvidence  string          `json:"causalDiffEvidence" jsonschema:"Specific changed-line evidence proving this PR introduced or materially amplified the performance mechanism"`
-	Title               string          `json:"title" jsonschema:"Concise actionable title"`
-	Impact              string          `json:"impact" jsonschema:"Concrete user-visible impact and trigger"`
-	Evidence            string          `json:"evidence" jsonschema:"Mechanism and code evidence proving the regression"`
-	Recommendation      string          `json:"recommendation" jsonschema:"Bounded fix direction preserving behavior"`
+	Focus               string                           `json:"focus" jsonschema:"Enabled focus skill that found the issue"`
+	Path                string                           `json:"path" jsonschema:"Repository-relative changed file path"`
+	Side                review.Side                      `json:"side" jsonschema:"LEFT for a deleted line or RIGHT for an added line"`
+	Line                int                              `json:"line" jsonschema:"One-based changed line number"`
+	Severity            review.Severity                  `json:"severity" jsonschema:"low, medium, high, or critical"`
+	Confidence          float64                          `json:"confidence" jsonschema:"Confidence from 0 through 1"`
+	ConfidenceRationale string                           `json:"confidenceRationale" jsonschema:"Concise explanation of the traced evidence that justifies this confidence"`
+	PerformanceCategory string                           `json:"performanceCategory" jsonschema:"One of latency, throughput, cpu, memory, gc, io, ipc, subprocess, rendering, layout, startup, or network"`
+	MechanismFamily     review.RegressionMechanismFamily `json:"mechanismFamily" jsonschema:"One of repeated-work, unbounded-retention, eager-work, boundary-fanout, missing-coalescing, synchronous-ui-work, cache-lifecycle, cleanup-lifecycle, serialization-allocation, or concurrency-burst"`
+	PerformanceResource string                           `json:"performanceResource" jsonschema:"Concrete expensive or retained resource: CPU work, bytes, objects, DOM nodes, IPC calls, subprocesses, filesystem operations, or similar"`
+	PerformanceScaling  string                           `json:"performanceScaling" jsonschema:"How performance cost grows with realistic input, frequency, collection size, lifetime, or concurrency"`
+	PerformanceOutcome  string                           `json:"performanceOutcome" jsonschema:"Concrete performance degradation such as increased latency, blocked critical path, CPU/GC pressure, retained memory, excessive I/O, lower throughput, or dropped frames"`
+	ChangeCausality     string                           `json:"changeCausality" jsonschema:"One of introduced, materially-amplified, or pre-existing-critical"`
+	PreviousBehavior    string                           `json:"previousBehavior" jsonschema:"What the reviewed scenario did before the PR, including the prior performance cost or absence of this work"`
+	ChangedBehavior     string                           `json:"changedBehavior" jsonschema:"What the changed lines now do differently and how that changes performance cost"`
+	CausalDiffEvidence  string                           `json:"causalDiffEvidence" jsonschema:"Specific changed-line evidence proving this PR introduced or materially amplified the performance mechanism"`
+	Title               string                           `json:"title" jsonschema:"Concise actionable title"`
+	Impact              string                           `json:"impact" jsonschema:"Concrete user-visible impact and trigger"`
+	Evidence            string                           `json:"evidence" jsonschema:"Mechanism and code evidence proving the regression"`
+	Recommendation      string                           `json:"recommendation" jsonschema:"Bounded fix direction preserving behavior"`
+}
+
+type reportRegressionFixParams struct {
+	FixedPath           string                           `json:"fixedPath" jsonschema:"Repository-relative changed file path containing the performance fix"`
+	FixedSide           review.Side                      `json:"fixedSide" jsonschema:"LEFT for a deleted line or RIGHT for an added line"`
+	FixedLine           int                              `json:"fixedLine" jsonschema:"One-based changed line proving the fix"`
+	BasePath            string                           `json:"basePath" jsonschema:"Repository-relative path passed to blame_base_line"`
+	BaseLine            int                              `json:"baseLine" jsonschema:"One-based base-revision line passed to blame_base_line"`
+	IntroducingPath     string                           `json:"introducingPath" jsonschema:"originPath returned by blame_base_line"`
+	IntroducingCommit   string                           `json:"introducingCommit" jsonschema:"40-character commit returned by blame_base_line"`
+	MechanismFamily     review.RegressionMechanismFamily `json:"mechanismFamily" jsonschema:"One of repeated-work, unbounded-retention, eager-work, boundary-fanout, missing-coalescing, synchronous-ui-work, cache-lifecycle, cleanup-lifecycle, serialization-allocation, or concurrency-burst"`
+	PerformanceCategory string                           `json:"performanceCategory" jsonschema:"One of latency, throughput, cpu, memory, gc, io, ipc, subprocess, rendering, layout, startup, or network"`
+	Mechanism           string                           `json:"mechanism" jsonschema:"Concrete performance mechanism that existed before this fix"`
+	Symptom             string                           `json:"symptom" jsonschema:"Observed or strongly evidenced performance consequence that motivated the fix"`
+	FixedBehavior       string                           `json:"fixedBehavior" jsonschema:"How this PR removes or bounds the performance mechanism"`
+	Evidence            string                           `json:"evidence" jsonschema:"Changed-line and call-path evidence that this is a real performance fix"`
+	Confidence          float64                          `json:"confidence" jsonschema:"Confidence from 0 through 1 that this PR fixes a real regression and blame identifies the introducing change"`
 }
 
 type completeReviewParams struct {
@@ -400,6 +430,14 @@ func createTools(ctx context.Context, reviewSource ReviewSource, collector *find
 		func(params searchParams, _ sdk.ToolInvocation) ([]source.SearchMatch, error) {
 			return reviewSource.Search(ctx, params.Pattern, params.Path, params.Literal, params.MaxResults)
 		})
+	blameBaseLine := sdk.DefineTool("blame_base_line", "Resolve the commit that introduced one line in the PR base revision. Use only while proving that this PR fixes a real performance regression.",
+		func(params blameBaseLineParams, _ sdk.ToolInvocation) (source.BlameResult, error) {
+			result, err := reviewSource.BlameBaseLine(ctx, params.Path, params.Line)
+			if err == nil {
+				collector.recordBlame(result)
+			}
+			return result, err
+		})
 	readFocusDocument := sdk.DefineTool("read_focus_document", "Read a supporting document owned by an enabled review focus.",
 		func(params focusDocumentParams, _ sdk.ToolInvocation) (string, error) {
 			return reviewSource.ReadFocusDocument(params.Focus, params.Path)
@@ -407,6 +445,10 @@ func createTools(ctx context.Context, reviewSource ReviewSource, collector *find
 	reportFinding := sdk.DefineTool("report_finding", "Submit one concrete diff-introduced finding anchored to an added or deleted line.",
 		func(params reportFindingParams, _ sdk.ToolInvocation) (string, error) {
 			return collector.report(params.finding())
+		})
+	reportRegressionFix := sdk.DefineTool("report_regression_fix", "Record that this PR fixes a concrete performance regression and identify its introducing commit from blame_base_line.",
+		func(params reportRegressionFixParams, _ sdk.ToolInvocation) (string, error) {
+			return collector.reportRegressionFix(params.regressionFix())
 		})
 	completeReview := sdk.DefineTool("complete_review", "Mark all enabled focus passes complete after submitting every finding.",
 		func(params completeReviewParams, _ sdk.ToolInvocation) (string, error) {
@@ -419,15 +461,37 @@ func createTools(ctx context.Context, reviewSource ReviewSource, collector *find
 		readDiff,
 		readFile,
 		searchRepository,
+		blameBaseLine,
 		readFocusDocument,
 		reportFinding,
+		reportRegressionFix,
 		completeReview,
 	}
+
 	for index := range tools {
 		tools[index].SkipPermission = true
 		tools[index].Defer = sdk.ToolDeferNever
 	}
 	return tools
+}
+
+func (params reportRegressionFixParams) regressionFix() review.RegressionFix {
+	return review.RegressionFix{
+		FixedPath:           params.FixedPath,
+		FixedSide:           params.FixedSide,
+		FixedLine:           params.FixedLine,
+		BasePath:            params.BasePath,
+		BaseLine:            params.BaseLine,
+		IntroducingPath:     params.IntroducingPath,
+		IntroducingCommit:   params.IntroducingCommit,
+		MechanismFamily:     params.MechanismFamily,
+		PerformanceCategory: params.PerformanceCategory,
+		Mechanism:           params.Mechanism,
+		Symptom:             params.Symptom,
+		FixedBehavior:       params.FixedBehavior,
+		Evidence:            params.Evidence,
+		Confidence:          params.Confidence,
+	}
 }
 
 func (params reportFindingParams) finding() review.Finding {
@@ -440,6 +504,7 @@ func (params reportFindingParams) finding() review.Finding {
 		Confidence:          params.Confidence,
 		ConfidenceRationale: params.ConfidenceRationale,
 		PerformanceCategory: params.PerformanceCategory,
+		MechanismFamily:     params.MechanismFamily,
 		PerformanceResource: params.PerformanceResource,
 		PerformanceScaling:  params.PerformanceScaling,
 		PerformanceOutcome:  params.PerformanceOutcome,
@@ -455,20 +520,50 @@ func (params reportFindingParams) finding() review.Finding {
 }
 
 type findingCollector struct {
-	mutex     sync.Mutex
-	focuses   []string
-	pipeline  *review.Pipeline
-	findings  []review.Finding
-	completed bool
-	summary   string
-	analysis  review.Analysis
+	mutex           sync.Mutex
+	focuses         []string
+	pipeline        *review.Pipeline
+	findings        []review.Finding
+	regressionFixes []review.RegressionFix
+	blames          map[string]source.BlameResult
+	completed       bool
+	summary         string
+	analysis        review.Analysis
+}
+
+func (collector *findingCollector) reportRegressionFix(fix review.RegressionFix) (string, error) {
+	collector.mutex.Lock()
+	defer collector.mutex.Unlock()
+	if collector.completed {
+		return "", errors.New("review is already complete")
+	}
+	if len(collector.regressionFixes) >= 3 {
+		return "", errors.New("at most three regression fixes may be reported per PR")
+	}
+	fix = review.NormalizeRegressionFix(fix)
+	if err := collector.pipeline.ValidateRegressionFix(fix); err != nil {
+		return "", err
+	}
+	blame := collector.blames[blameKey(fix.BasePath, fix.BaseLine)]
+	if blame.Commit != fix.IntroducingCommit || blame.OriginPath != fix.IntroducingPath {
+		return "", errors.New("introducing commit must match a blame_base_line result from this review session")
+	}
+	collector.regressionFixes = append(collector.regressionFixes, fix)
+	return "Regression fix accepted for introducer analysis.", nil
 }
 
 func newCollector(focuses []string, pipeline *review.Pipeline) *findingCollector {
 	return &findingCollector{
 		focuses:  slices.Clone(focuses),
 		pipeline: pipeline,
+		blames:   make(map[string]source.BlameResult),
 	}
+}
+
+func (collector *findingCollector) recordBlame(result source.BlameResult) {
+	collector.mutex.Lock()
+	defer collector.mutex.Unlock()
+	collector.blames[blameKey(result.Path, result.Line)] = result
 }
 
 func (collector *findingCollector) report(finding review.Finding) (string, error) {
@@ -579,6 +674,12 @@ func (collector *findingCollector) findingsSnapshot() []review.Finding {
 	return slices.Clone(collector.findings)
 }
 
+func (collector *findingCollector) regressionFixesSnapshot() []review.RegressionFix {
+	collector.mutex.Lock()
+	defer collector.mutex.Unlock()
+	return slices.Clone(collector.regressionFixes)
+}
+
 func (collector *findingCollector) analysisSnapshot() review.Analysis {
 	collector.mutex.Lock()
 	defer collector.mutex.Unlock()
@@ -603,6 +704,8 @@ Submit findings only through report_finding. Report performance problems only. N
 Every finding must be high confidence, actionable, caused by the diff, and anchored to an added RIGHT line or deleted LEFT line. It must name the performance category, expensive or retained resource, scaling relationship, and performance outcome.
 
 Prove PR causality with an explicit before/after comparison. A changed line that merely exposes, preserves metadata for, or passes through an existing expensive path is not enough. Classify the issue as introduced or materially-amplified only when the PR adds the expensive work, moves it onto a hotter path, increases its frequency/cardinality, defeats an optimization, or retains substantially more state. A pre-existing issue may be reported only as pre-existing-critical, only at critical severity, and only when the changed code creates a direct, review-relevant catastrophic risk; otherwise omit it to avoid expanding PR scope.
+
+If this PR itself fixes a concrete performance regression, use blame_base_line on the base-revision line carrying the old mechanism and call report_regression_fix. Do not infer a regression fix from words such as "perf", "optimize", or "fix" alone; require changed-code and call-path evidence of a real performance symptom. This signal is for internal learning and never becomes a review comment on the fixing PR.
 
 A finding's title, impact, confidence rationale, and causal evidence must match the effective cardinality and concurrency established in the scenario analysis after caching and grouping. Do not submit generic advice, style feedback, nearby pre-existing bugs, correctness-only bugs, or speculation. After every focus pass and scenario analysis is complete, call complete_review exactly once with every enabled focus.`, strings.Join(focuses, ", "))
 }

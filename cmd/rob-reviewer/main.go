@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/roblourens/rob-reviewer/internal/app"
+	"github.com/roblourens/rob-reviewer/internal/poller"
 	"github.com/roblourens/rob-reviewer/internal/review"
 )
 
@@ -27,7 +28,7 @@ func main() {
 
 func run(logger *slog.Logger) (returnErr error) {
 	if len(os.Args) < 2 {
-		return errors.New("usage: rob-reviewer <poll|review|publish-report> [options]")
+		return errors.New("usage: rob-reviewer <poll|review|publish-report|apply-learnings> [options]")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -77,6 +78,7 @@ func run(logger *slog.Logger) (returnErr error) {
 		return nil
 
 	case "review":
+		startedAt := time.Now()
 		flags := flag.NewFlagSet("review", flag.ContinueOnError)
 		configPath := flags.String("config", "reviewer.yaml", "path to reviewer configuration")
 		pullRequest := flags.String("pr", "", "pull request number")
@@ -86,16 +88,28 @@ func run(logger *slog.Logger) (returnErr error) {
 		if err := flags.Parse(os.Args[2:]); err != nil {
 			return err
 		}
+		recordFailure := func(runErr error) error {
+			if strings.TrimSpace(*outputDirectory) == "" {
+				return runErr
+			}
+			_, recordErr := app.WritePollRunFiles(
+				*outputDirectory,
+				app.PollResult{},
+				runErr,
+				app.PollRunMetadataFromEnvironment(startedAt, time.Now(), os.Getenv),
+			)
+			return errors.Join(runErr, recordErr)
+		}
 		number, err := app.ParsePullRequestNumber(*pullRequest)
 		if err != nil {
-			return err
+			return recordFailure(err)
 		}
 		if *outputFormat != "json" && *outputFormat != "markdown" {
-			return fmt.Errorf("--format must be json or markdown, got %q", *outputFormat)
+			return recordFailure(fmt.Errorf("--format must be json or markdown, got %q", *outputFormat))
 		}
 		reviewer, err := newApp(*configPath, logger)
 		if err != nil {
-			return err
+			return recordFailure(err)
 		}
 		defer func() {
 			returnErr = errors.Join(returnErr, reviewer.Close())
@@ -108,14 +122,34 @@ func run(logger *slog.Logger) (returnErr error) {
 			result, analyzed, err = reviewer.ReviewPullRequest(ctx, number, false)
 		}
 		if err != nil {
-			return err
+			return recordFailure(err)
 		}
 		if !analyzed {
 			logger.Info("pull request already has a review marker; no report was written", "pr", number)
-			return nil
+			if strings.TrimSpace(*outputDirectory) == "" {
+				return nil
+			}
+			_, err := app.WritePollRunFiles(
+				*outputDirectory,
+				app.PollResult{Poll: poller.Result{Skipped: []int{number}}},
+				nil,
+				app.PollRunMetadataFromEnvironment(startedAt, time.Now(), os.Getenv),
+			)
+			return err
 		}
 		if *outputDirectory != "" {
-			_, err := app.WriteResultFiles(*outputDirectory, result)
+			if _, err := app.WriteResultFiles(*outputDirectory, result); err != nil {
+				return recordFailure(err)
+			}
+			_, err := app.WritePollRunFiles(
+				*outputDirectory,
+				app.PollResult{
+					Poll:    poller.Result{Reviewed: []int{result.PullRequest.Number}},
+					Reviews: []review.Result{result},
+				},
+				nil,
+				app.PollRunMetadataFromEnvironment(startedAt, time.Now(), os.Getenv),
+			)
 			return err
 		}
 		var printErr error
@@ -158,8 +192,37 @@ func run(logger *slog.Logger) (returnErr error) {
 		)
 		return nil
 
+	case "apply-learnings":
+		flags := flag.NewFlagSet("apply-learnings", flag.ContinueOnError)
+		repository := flags.String("repository", os.Getenv("GITHUB_REPOSITORY"), "owner/name repository containing reviewer guidance")
+		branch := flags.String("branch", "main", "branch containing reviewer guidance")
+		proposalsPath := flags.String("proposals-path", "", "learning-proposals.json file or directory tree containing proposal files")
+		casesPath := flags.String("cases-path", "", "current-run regression-cases.json file authorizing the proposals")
+		if err := flags.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*proposalsPath) == "" {
+			return errors.New("--proposals-path is required")
+		}
+		if strings.TrimSpace(*casesPath) == "" {
+			return errors.New("--cases-path is required")
+		}
+		changed, err := app.PublishLearnedGuidance(
+			ctx,
+			*repository,
+			*branch,
+			*proposalsPath,
+			*casesPath,
+			os.Getenv("GITHUB_TOKEN"),
+		)
+		if err != nil {
+			return err
+		}
+		logger.Info("learned performance guidance processed", "changed", changed)
+		return nil
+
 	default:
-		return fmt.Errorf("unknown command %q; use poll, review, or publish-report", os.Args[1])
+		return fmt.Errorf("unknown command %q; use poll, review, publish-report, or apply-learnings", os.Args[1])
 	}
 }
 

@@ -62,6 +62,24 @@ func TestListUpdatedAndOpenPullRequestsUseExpectedQueries(t *testing.T) {
 	}
 }
 
+func TestListPullRequestsForCommit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/repos/microsoft/vscode/commits/abc/pulls" {
+			t.Fatalf("path = %q", request.URL.Path)
+		}
+		fmt.Fprint(writer, `[{"number":7,"title":"Introduce feature","state":"closed","merged_at":"2026-08-01T00:00:00Z","author_association":"MEMBER","user":{"login":"teammate"},"base":{"sha":"base"},"head":{"sha":"head"}}]`)
+	}))
+	defer server.Close()
+	client := NewClientWithBaseURL(server.Client(), "token", server.URL)
+	pulls, err := client.ListPullRequestsForCommit(context.Background(), "microsoft", "vscode", "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pulls) != 1 || pulls[0].Number != 7 || pulls[0].MergedAt == nil || pulls[0].HeadSHA != "head" {
+		t.Fatalf("pulls = %+v", pulls)
+	}
+}
+
 func TestCreateAndSubmitPendingReview(t *testing.T) {
 	var created CreateReviewRequest
 	var submitted struct {

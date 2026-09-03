@@ -28,6 +28,7 @@ func validFinding(title string, confidence float64, line int) Finding {
 		Confidence:          confidence,
 		ConfidenceRationale: "The changed loop is directly reachable from the scroll callback and scales with history.",
 		PerformanceCategory: "latency",
+		MechanismFamily:     RegressionRepeatedWork,
 		PerformanceResource: "Synchronous renderer CPU work.",
 		PerformanceScaling:  "One expensive update per historical item per row reconstruction.",
 		PerformanceOutcome:  "Scroll latency and dropped frames.",
@@ -233,5 +234,30 @@ func TestPipelineRejectsPreExistingNonCriticalIssue(t *testing.T) {
 	_, err := pipeline.Process([]Finding{finding})
 	if err == nil || !strings.Contains(err.Error(), "only at critical severity") {
 		t.Fatalf("expected PR-scope validation error, got %v", err)
+	}
+}
+
+func TestValidateRegressionFixRequiresBlameAndChangedAnchor(t *testing.T) {
+	pipeline := NewPipeline(
+		[]string{"performance-review"},
+		0.85,
+		10,
+		anchorSet{anchor("src/file.ts", SideRight, 5): {}},
+	)
+	fix := NormalizeRegressionFix(RegressionFix{
+		FixedPath: "src/file.ts", FixedSide: SideRight, FixedLine: 5,
+		BasePath: "src/file.ts", BaseLine: 4,
+		IntroducingPath:   "src/file.ts",
+		IntroducingCommit: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		MechanismFamily:   RegressionRepeatedWork, PerformanceCategory: "cpu",
+		Mechanism: "Repeated scan", Symptom: "Jank", FixedBehavior: "Batched",
+		Evidence: "Changed line removes the scan", Confidence: 0.99,
+	})
+	if err := pipeline.ValidateRegressionFix(fix); err != nil {
+		t.Fatal(err)
+	}
+	fix.IntroducingCommit = "not-a-sha"
+	if err := pipeline.ValidateRegressionFix(fix); err == nil {
+		t.Fatal("expected invalid introducing commit")
 	}
 }

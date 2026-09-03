@@ -31,6 +31,7 @@ type Config struct {
 	Poll        PollConfig        `yaml:"poll"`
 	Automation  AutomationConfig  `yaml:"automation"`
 	Publication PublicationConfig `yaml:"publication"`
+	Learning    LearningConfig    `yaml:"learning"`
 	Review      ReviewConfig      `yaml:"review"`
 	State       StateConfig       `yaml:"state"`
 }
@@ -55,6 +56,11 @@ type AutomationConfig struct {
 
 type PublicationConfig struct {
 	Mode string `yaml:"mode"`
+}
+
+type LearningConfig struct {
+	Enabled        bool `yaml:"enabled"`
+	MaxCasesPerRun int  `yaml:"maxCasesPerRun"`
 }
 
 type ReviewConfig struct {
@@ -101,6 +107,7 @@ func Decode(reader io.Reader) (Config, error) {
 		},
 		Automation:  AutomationConfig{SkipLabels: []string{"performance-reviewer:skip"}},
 		Publication: PublicationConfig{Mode: "approval"},
+		Learning:    LearningConfig{Enabled: true, MaxCasesPerRun: 1},
 		Review: ReviewConfig{
 			Model:           DefaultModel,
 			ReasoningEffort: "high",
@@ -164,6 +171,12 @@ func (cfg Config) Validate() error {
 	}
 	if !slices.Contains([]string{"approval", "automatic"}, cfg.Publication.Mode) {
 		validationErrors = append(validationErrors, errors.New("publication.mode must be approval or automatic"))
+	}
+	if cfg.Learning.MaxCasesPerRun < 0 || cfg.Learning.MaxCasesPerRun > 3 {
+		validationErrors = append(validationErrors, errors.New("learning.maxCasesPerRun must be between 0 and 3"))
+	}
+	if cfg.Learning.Enabled && cfg.Learning.MaxCasesPerRun < 1 {
+		validationErrors = append(validationErrors, errors.New("learning.maxCasesPerRun must be at least 1 when learning is enabled"))
 	}
 	if strings.TrimSpace(cfg.Review.Model) == "" {
 		validationErrors = append(validationErrors, errors.New("review.model is required"))

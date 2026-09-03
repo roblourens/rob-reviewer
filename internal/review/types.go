@@ -21,6 +21,7 @@ type PullRequest struct {
 	HeadSHA           string
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+	MergedAt          *time.Time
 	Labels            []string
 }
 
@@ -65,6 +66,7 @@ type Finding struct {
 	Confidence          float64
 	ConfidenceRationale string
 	PerformanceCategory string
+	MechanismFamily     RegressionMechanismFamily `json:"MechanismFamily,omitempty"`
 	PerformanceResource string
 	PerformanceScaling  string
 	PerformanceOutcome  string
@@ -79,10 +81,43 @@ type Finding struct {
 }
 
 type Result struct {
-	PullRequest PullRequest
-	Findings    []Finding
-	Analysis    Analysis
-	Stats       Stats
+	PullRequest     PullRequest
+	Findings        []Finding
+	RegressionFixes []RegressionFix
+	Analysis        Analysis
+	Stats           Stats
+}
+
+type RegressionMechanismFamily string
+
+const (
+	RegressionRepeatedWork       RegressionMechanismFamily = "repeated-work"
+	RegressionUnboundedRetention RegressionMechanismFamily = "unbounded-retention"
+	RegressionEagerWork          RegressionMechanismFamily = "eager-work"
+	RegressionBoundaryFanout     RegressionMechanismFamily = "boundary-fanout"
+	RegressionMissingCoalescing  RegressionMechanismFamily = "missing-coalescing"
+	RegressionSynchronousUI      RegressionMechanismFamily = "synchronous-ui-work"
+	RegressionCacheLifecycle     RegressionMechanismFamily = "cache-lifecycle"
+	RegressionCleanupLifecycle   RegressionMechanismFamily = "cleanup-lifecycle"
+	RegressionSerialization      RegressionMechanismFamily = "serialization-allocation"
+	RegressionConcurrencyBurst   RegressionMechanismFamily = "concurrency-burst"
+)
+
+type RegressionFix struct {
+	FixedPath           string
+	FixedSide           Side
+	FixedLine           int
+	BasePath            string
+	BaseLine            int
+	IntroducingPath     string
+	IntroducingCommit   string
+	MechanismFamily     RegressionMechanismFamily
+	PerformanceCategory string
+	Mechanism           string
+	Symptom             string
+	FixedBehavior       string
+	Evidence            string
+	Confidence          float64
 }
 
 type Analysis struct {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -15,6 +16,8 @@ const (
 	maxTitleLength          = 120
 	maxFindingSectionLength = 2_000
 )
+
+var commitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 type AnchorValidator interface {
 	ValidAnchor(path string, side Side, line int) bool
@@ -50,6 +53,7 @@ func (pipeline *Pipeline) Process(candidates []Finding) ([]Finding, error) {
 			validationErrors = append(validationErrors, fmt.Errorf("finding %d: %w", index+1, err))
 			continue
 		}
+
 		if candidate.Confidence < pipeline.minConfidence {
 			continue
 		}
@@ -70,6 +74,65 @@ func (pipeline *Pipeline) Process(candidates []Finding) ([]Finding, error) {
 		result = result[:pipeline.maxFindings]
 	}
 	return result, nil
+}
+
+func (pipeline *Pipeline) ValidateRegressionFix(fix RegressionFix) error {
+	return ValidateRegressionFix(fix, pipeline.anchors)
+}
+
+func NormalizeRegressionFix(fix RegressionFix) RegressionFix {
+	fix.FixedPath = strings.TrimSpace(strings.TrimPrefix(fix.FixedPath, "./"))
+	fix.BasePath = strings.TrimSpace(strings.TrimPrefix(fix.BasePath, "./"))
+	fix.IntroducingPath = strings.TrimSpace(strings.TrimPrefix(fix.IntroducingPath, "./"))
+	fix.IntroducingCommit = strings.ToLower(strings.TrimSpace(fix.IntroducingCommit))
+	fix.MechanismFamily = RegressionMechanismFamily(strings.ToLower(strings.TrimSpace(string(fix.MechanismFamily))))
+	fix.PerformanceCategory = strings.ToLower(strings.TrimSpace(fix.PerformanceCategory))
+	fix.Mechanism = strings.TrimSpace(fix.Mechanism)
+	fix.Symptom = strings.TrimSpace(fix.Symptom)
+	fix.FixedBehavior = strings.TrimSpace(fix.FixedBehavior)
+	fix.Evidence = strings.TrimSpace(fix.Evidence)
+	return fix
+}
+
+func ValidateRegressionFix(fix RegressionFix, anchors AnchorValidator) error {
+	if fix.FixedPath == "" || fix.BasePath == "" || fix.IntroducingPath == "" {
+		return errors.New("fixed path, base path, and introducing path are required")
+	}
+	if fix.FixedSide != SideLeft && fix.FixedSide != SideRight {
+		return fmt.Errorf("fixed side must be %s or %s", SideLeft, SideRight)
+	}
+	if fix.FixedLine < 1 || anchors == nil || !anchors.ValidAnchor(fix.FixedPath, fix.FixedSide, fix.FixedLine) {
+		return fmt.Errorf("%s:%d on %s is not a changed diff line", fix.FixedPath, fix.FixedLine, fix.FixedSide)
+	}
+	if fix.BaseLine < 1 {
+		return errors.New("base line must be positive")
+	}
+	if !commitPattern.MatchString(fix.IntroducingCommit) {
+		return errors.New("introducing commit must be a 40-character lowercase SHA")
+	}
+	if !validRegressionMechanismFamily(fix.MechanismFamily) {
+		return fmt.Errorf("unsupported regression mechanism family %q", fix.MechanismFamily)
+	}
+	if !slices.Contains([]string{
+		"latency", "throughput", "cpu", "memory", "gc", "io", "ipc",
+		"subprocess", "rendering", "layout", "startup", "network",
+	}, fix.PerformanceCategory) {
+		return fmt.Errorf("unsupported performance category %q", fix.PerformanceCategory)
+	}
+	if fix.Confidence < 0.9 || fix.Confidence > 1 {
+		return errors.New("regression fix confidence must be between 0.9 and 1")
+	}
+	for name, value := range map[string]string{
+		"mechanism":      fix.Mechanism,
+		"symptom":        fix.Symptom,
+		"fixed behavior": fix.FixedBehavior,
+		"evidence":       fix.Evidence,
+	} {
+		if value == "" || len(value) > maxFindingSectionLength {
+			return fmt.Errorf("%s must contain 1-%d characters", name, maxFindingSectionLength)
+		}
+	}
+	return nil
 }
 
 func FindingID(finding Finding) string {
@@ -205,9 +268,13 @@ func (pipeline *Pipeline) validate(finding Finding) error {
 	}, finding.PerformanceCategory) {
 		return fmt.Errorf("unsupported performance category %q", finding.PerformanceCategory)
 	}
+	if !validRegressionMechanismFamily(finding.MechanismFamily) {
+		return fmt.Errorf("unsupported regression mechanism family %q", finding.MechanismFamily)
+	}
 	if !slices.Contains([]string{"introduced", "materially-amplified", "pre-existing-critical"}, finding.ChangeCausality) {
 		return fmt.Errorf("unsupported change causality %q", finding.ChangeCausality)
 	}
+
 	if finding.ChangeCausality == "pre-existing-critical" && finding.Severity != SeverityCritical {
 		return errors.New("pre-existing issues may be reported only at critical severity")
 	}
@@ -232,12 +299,28 @@ func (pipeline *Pipeline) validate(finding Finding) error {
 	return nil
 }
 
+func validRegressionMechanismFamily(family RegressionMechanismFamily) bool {
+	return slices.Contains([]RegressionMechanismFamily{
+		RegressionRepeatedWork,
+		RegressionUnboundedRetention,
+		RegressionEagerWork,
+		RegressionBoundaryFanout,
+		RegressionMissingCoalescing,
+		RegressionSynchronousUI,
+		RegressionCacheLifecycle,
+		RegressionCleanupLifecycle,
+		RegressionSerialization,
+		RegressionConcurrencyBurst,
+	}, family)
+}
+
 func normalizeFinding(finding Finding) Finding {
 	finding.Focus = strings.TrimSpace(finding.Focus)
 	finding.Path = strings.TrimSpace(strings.TrimPrefix(finding.Path, "./"))
 	finding.Title = strings.TrimSpace(finding.Title)
 	finding.ConfidenceRationale = strings.TrimSpace(finding.ConfidenceRationale)
 	finding.PerformanceCategory = strings.ToLower(strings.TrimSpace(finding.PerformanceCategory))
+	finding.MechanismFamily = RegressionMechanismFamily(strings.ToLower(strings.TrimSpace(string(finding.MechanismFamily))))
 	finding.PerformanceResource = strings.TrimSpace(finding.PerformanceResource)
 	finding.PerformanceScaling = strings.TrimSpace(finding.PerformanceScaling)
 	finding.PerformanceOutcome = strings.TrimSpace(finding.PerformanceOutcome)

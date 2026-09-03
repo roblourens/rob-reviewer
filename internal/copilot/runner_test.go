@@ -6,6 +6,7 @@ import (
 
 	sdk "github.com/github/copilot-sdk/go"
 	"github.com/roblourens/rob-reviewer/internal/review"
+	"github.com/roblourens/rob-reviewer/internal/source"
 )
 
 type allAnchors struct{}
@@ -39,6 +40,7 @@ func TestCollectorAcceptsValidFinding(t *testing.T) {
 		Confidence:          0.95,
 		ConfidenceRationale: "The changed loop is directly called once per historical child.",
 		PerformanceCategory: "latency",
+		MechanismFamily:     review.RegressionRepeatedWork,
 		PerformanceResource: "Synchronous Markdown and presentation CPU work.",
 		PerformanceScaling:  "One update per historical child.",
 		PerformanceOutcome:  "Blocked scrolling and dropped frames.",
@@ -64,6 +66,35 @@ func TestCollectorAcceptsValidFinding(t *testing.T) {
 	}
 	if len(collector.findingsSnapshot()) != 1 {
 		t.Fatalf("findings = %v", collector.findingsSnapshot())
+	}
+}
+
+func TestCollectorAcceptsOnlyRegressionFixesBackedBySessionBlame(t *testing.T) {
+	pipeline := review.NewPipeline([]string{"performance-review"}, 0.85, 10, allAnchors{})
+	collector := newCollector([]string{"performance-review"}, pipeline)
+	fix := review.RegressionFix{
+		FixedPath: "src/file.ts", FixedSide: review.SideRight, FixedLine: 10,
+		BasePath: "src/file.ts", BaseLine: 9,
+		IntroducingPath:   "src/file.ts",
+		IntroducingCommit: "1111111111111111111111111111111111111111",
+		MechanismFamily:   review.RegressionRepeatedWork, PerformanceCategory: "cpu",
+		Mechanism: "Repeated scan", Symptom: "Jank", FixedBehavior: "Batched",
+		Evidence: "Changed line removes the scan", Confidence: 0.99,
+	}
+	if _, err := collector.reportRegressionFix(fix); err == nil {
+		t.Fatal("accepted regression fix without blame provenance")
+	}
+	collector.recordBlame(source.BlameResult{
+		Commit:     fix.IntroducingCommit,
+		Path:       fix.BasePath,
+		OriginPath: fix.IntroducingPath,
+		Line:       fix.BaseLine,
+	})
+	if _, err := collector.reportRegressionFix(fix); err != nil {
+		t.Fatal(err)
+	}
+	if len(collector.regressionFixesSnapshot()) != 1 {
+		t.Fatalf("regression fixes = %+v", collector.regressionFixesSnapshot())
 	}
 }
 

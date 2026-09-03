@@ -19,6 +19,7 @@ import (
 	"github.com/roblourens/rob-reviewer/internal/diff"
 	"github.com/roblourens/rob-reviewer/internal/focus"
 	"github.com/roblourens/rob-reviewer/internal/github"
+	"github.com/roblourens/rob-reviewer/internal/learning"
 	"github.com/roblourens/rob-reviewer/internal/poller"
 	"github.com/roblourens/rob-reviewer/internal/review"
 	"github.com/roblourens/rob-reviewer/internal/source"
@@ -48,8 +49,9 @@ type Options struct {
 }
 
 type PollResult struct {
-	Poll    poller.Result
-	Reviews []review.Result
+	Poll     poller.Result
+	Reviews  []review.Result
+	Learning learning.Evaluation
 }
 
 func New(options Options) (*App, error) {
@@ -124,6 +126,8 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 		app.config.State.Path,
 	)
 	var reviews []review.Result
+	var learningEvaluation learning.Evaluation
+	learningReplayCache := make(learning.ReplayCache)
 	prPoller := poller.New(
 		app.reviewClient,
 		store,
@@ -177,6 +181,28 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 				return poller.ReviewOutcome{}, fmt.Errorf("persist dry-run report for PR %d: %w", pull.Number, err)
 			}
 			reviews = append(reviews, result)
+			if app.config.Learning.Enabled {
+				remaining := app.config.Learning.MaxCasesPerRun - len(learningEvaluation.Cases)
+				if remaining > 0 && len(result.RegressionFixes) > 0 {
+					evaluation, err := learning.Evaluate(
+						reviewContext,
+						app.config.Target.Owner,
+						app.config.Target.Repo,
+						result,
+						remaining,
+						app.reviewClient,
+						app.analyze,
+						learningReplayCache,
+						time.Now(),
+					)
+					learningEvaluation.Cases = append(learningEvaluation.Cases, evaluation.Cases...)
+					learningEvaluation.Unresolved = append(learningEvaluation.Unresolved, evaluation.Unresolved...)
+					learningEvaluation.Replays = append(learningEvaluation.Replays, evaluation.Replays...)
+					if err != nil {
+						return poller.ReviewOutcome{}, err
+					}
+				}
+			}
 			if app.config.Publication.Mode != "automatic" || len(result.Findings) == 0 {
 				return poller.ReviewOutcome{}, nil
 			}
@@ -197,9 +223,9 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 	)
 	pollResult, err := prPoller.Run(ctx)
 	if err != nil {
-		return PollResult{Poll: pollResult, Reviews: reviews}, err
+		return PollResult{Poll: pollResult, Reviews: reviews, Learning: learningEvaluation}, err
 	}
-	return PollResult{Poll: pollResult, Reviews: reviews}, nil
+	return PollResult{Poll: pollResult, Reviews: reviews, Learning: learningEvaluation}, nil
 }
 
 func (app *App) ReviewPullRequest(ctx context.Context, number int, publish bool) (review.Result, bool, error) {
@@ -350,7 +376,7 @@ func (app *App) analyze(ctx context.Context, pull review.PullRequest) (_ review.
 	if err != nil {
 		return review.Result{}, fmt.Errorf("parse pull request diff: %w", err)
 	}
-	reviewSource, err := source.New(checkout.Root, pull, parsedDiff, app.focusCatalog)
+	reviewSource, err := source.New(checkout.Root, checkout.MergeBase, pull, parsedDiff, app.focusCatalog)
 	if err != nil {
 		return review.Result{}, err
 	}
@@ -358,7 +384,7 @@ func (app *App) analyze(ctx context.Context, pull review.PullRequest) (_ review.
 	if err != nil {
 		return review.Result{}, err
 	}
-	findings, analysis, stats, err := runner.Review(ctx, reviewSource)
+	findings, regressionFixes, analysis, stats, err := runner.Review(ctx, reviewSource)
 	if err != nil {
 		return review.Result{}, err
 	}
@@ -366,7 +392,7 @@ func (app *App) analyze(ctx context.Context, pull review.PullRequest) (_ review.
 	stats.StartedAt = startedAt.UTC()
 	stats.CompletedAt = completedAt.UTC()
 	stats.WallClockMilliseconds = completedAt.Sub(startedAt).Milliseconds()
-	result := review.Result{PullRequest: pull, Findings: findings, Analysis: analysis, Stats: stats}
+	result := review.Result{PullRequest: pull, Findings: findings, RegressionFixes: regressionFixes, Analysis: analysis, Stats: stats}
 	review.BindFindingIDs(&result)
 	return result, nil
 }
@@ -420,7 +446,7 @@ func FormatResultMarkdown(result review.Result) string {
 		for index, finding := range result.Findings {
 			fmt.Fprintf(
 				&output,
-				"### %d. [%s] %s\n\n**Finding ID:** `%s`  \n**Location:** <code>%s:%d</code> (<code>%s</code>)  \n**Performance category:** <code>%s</code>  \n**Resource:** %s  \n**Scaling:** %s  \n**Outcome:** %s  \n**PR causality:** <code>%s</code>  \n**Previous behavior:** %s  \n**Changed behavior:** %s  \n**Confidence:** %.2f — %s\n\n**Causal diff evidence:** %s\n\n%s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n",
+				"### %d. [%s] %s\n\n**Finding ID:** `%s`  \n**Location:** <code>%s:%d</code> (<code>%s</code>)  \n**Performance category:** <code>%s</code>  \n**Mechanism family:** <code>%s</code>  \n**Resource:** %s  \n**Scaling:** %s  \n**Outcome:** %s  \n**PR causality:** <code>%s</code>  \n**Previous behavior:** %s  \n**Changed behavior:** %s  \n**Confidence:** %.2f — %s\n\n**Causal diff evidence:** %s\n\n%s\n\n**Evidence:** %s\n\n**Suggested direction:** %s\n\n",
 				index+1,
 				finding.Severity,
 				singleLineMarkdown(finding.Title),
@@ -429,6 +455,7 @@ func FormatResultMarkdown(result review.Result) string {
 				finding.Line,
 				finding.Side,
 				review.SanitizeMarkdownText(finding.PerformanceCategory),
+				review.SanitizeMarkdownText(string(finding.MechanismFamily)),
 				review.SanitizeMarkdownText(finding.PerformanceResource),
 				review.SanitizeMarkdownText(finding.PerformanceScaling),
 				review.SanitizeMarkdownText(finding.PerformanceOutcome),
@@ -441,6 +468,31 @@ func FormatResultMarkdown(result review.Result) string {
 				review.SanitizeMarkdownText(finding.Impact),
 				review.SanitizeMarkdownText(finding.Evidence),
 				review.SanitizeMarkdownText(finding.Recommendation),
+			)
+		}
+	}
+	if len(result.RegressionFixes) > 0 {
+		fmt.Fprintf(&output, "\n## Performance regression fixes detected (%d)\n\n", len(result.RegressionFixes))
+		for index, fix := range result.RegressionFixes {
+			fmt.Fprintf(
+				&output,
+				"### %d. %s\n\n**Fix location:** `%s:%d` (`%s`)  \n**Blamed base line:** `%s:%d`  \n**Introducing path:** `%s`  \n**Introducing commit:** `%s`  \n**Mechanism family:** `%s`  \n**Performance category:** `%s`  \n**Confidence:** %.2f\n\n**Mechanism:** %s\n\n**Symptom:** %s\n\n**Fixed behavior:** %s\n\n**Evidence:** %s\n\n",
+				index+1,
+				review.SanitizeMarkdownText(string(fix.MechanismFamily)),
+				review.SanitizeMarkdownText(fix.FixedPath),
+				fix.FixedLine,
+				fix.FixedSide,
+				review.SanitizeMarkdownText(fix.BasePath),
+				fix.BaseLine,
+				review.SanitizeMarkdownText(fix.IntroducingPath),
+				review.SanitizeMarkdownText(fix.IntroducingCommit),
+				review.SanitizeMarkdownText(string(fix.MechanismFamily)),
+				review.SanitizeMarkdownText(fix.PerformanceCategory),
+				fix.Confidence,
+				review.SanitizeMarkdownTextWithCodeSpans(fix.Mechanism),
+				review.SanitizeMarkdownTextWithCodeSpans(fix.Symptom),
+				review.SanitizeMarkdownTextWithCodeSpans(fix.FixedBehavior),
+				review.SanitizeMarkdownTextWithCodeSpans(fix.Evidence),
 			)
 		}
 	}
