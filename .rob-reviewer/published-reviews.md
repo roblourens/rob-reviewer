@@ -2,6 +2,27 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#332410 — agentHost: centralize session and chat catalog metadata](https://github.com/microsoft/vscode/pull/332410)
+
+- Published comments: **1**
+- Head: `0f605424902269dc6acd45bcbfc679dbcb014126`
+- Completed: `2026-09-04T17:05:45Z`
+- Run: [33897628556 attempt 1](runs/2026/09/04/33897628556-1/run.md)
+
+### `src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:339`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+\_publishCompatibilityState now maps the complete current entry list to \_writeChatMetadata before writing the parent legacy mirror, and createChat/disposeChat synchronously await peerChatStore.upsert/remove.
+
+In a long-lived session with many peer chats, adding or deleting one chat blocks on potentially hundreds of unrelated SQLite opens/writes (250 four-wide waves at the 1,000-chat limit). Repeated additions accumulate roughly N(N+1)/2 writes, causing increasingly slow chat operations and disk churn.
+
+**Suggested fix:** Diff the previous and updated central catalogs and write chat-local metadata only for added or actually changed entries, then write the parent peerChats mirror once. Reserve full per-chat repair sweeps for migration/background reconciliation rather than the interactive mutation path.
+
+(Written by Copilot)
+
 ## [#334022 — Center full-width characters in two monospace cells](https://github.com/microsoft/vscode/pull/334022)
 
 - Published comments: **1**
