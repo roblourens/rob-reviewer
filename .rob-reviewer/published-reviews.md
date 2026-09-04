@@ -2,6 +2,27 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#334375 — Update Component Explorer packages](https://github.com/microsoft/vscode/pull/334375)
+
+- Published comments: **1**
+- Head: `57121e6a364d6c5faccf3ca8b1ae78ed23045d07`
+- Completed: `2026-09-04T00:20:11Z`
+- Run: [33820613710 attempt 1](runs/2026/09/04/33820613710-1/run.md)
+
+### `package-lock.json:255`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+This lockfile refresh deletes every `libc` selector while retaining both GNU and musl packages as optional dependencies with identical Linux OS and CPU constraints, making both variants eligible in the lockfile's install tree.
+
+A Linux x64 cache-miss `npm ci`—including the root install on component-fixtures and CSS-order-scan CI—downloads and unpacks both x64 variants for all three families before any build or fixture can start. Warm node\_modules-cache hits avoid the install, but fresh developer/CI installs pay the extra binary transfer and disk cost.
+
+**Suggested fix:** Restore the deleted `libc` arrays (or regenerate the lockfile with the repository-supported npm version that preserves them) so only the host's GNU or musl artifact is fetched and unpacked.
+
+(Written by Copilot)
+
 ## [#333859 — Surface extensions blocked by the marketplace](https://github.com/microsoft/vscode/pull/333859)
 
 - Published comments: **1**
