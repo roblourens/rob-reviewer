@@ -1,0 +1,137 @@
+{
+  "PullRequest": {
+    "Number": 334379,
+    "Title": "Stop ABExp.queriedFeature telemetry from being redacted as a file path",
+    "Body": "### Summary\r\n\r\nThe new TAS assignments endpoint (POST /api/v1/assignments) returns every feature variable key scoped with a `/vscode/` prefix (e.g. /vscode/config.foo). The telemetry cleaner's anonymizeFilePaths heuristic treats any word/word value as a path and redacts it, making the field `ABExp.queriedFeature` unusable for \"which feature is being experimented on\" queries.\r\n\r\n**Fix**\r\nMark `ABExp.queriedFeature` as a trusted telemetry value in both experiment-telemetry sinks so cleanData skips path anonymization for it (the field is always an experiment feature key, never user data). This preserves the raw name — the redaction disappears and the field is queryable again. ",
+    "URL": "https://github.com/microsoft/vscode/pull/334379",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "vijayupadya",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "68a1501847cb087c2ec94340bc161f75aa4ccfe3",
+    "HeadRef": "stiff-gecko",
+    "HeadSHA": "67aca0b7d86219e8bdc2e4843481eca736f90f2b",
+    "CreatedAt": "2026-09-03T22:46:41Z",
+    "UpdatedAt": "2026-09-04T00:57:51Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Workbench startup and configuration refresh resolving experiment-backed settings",
+        "CriticalPath": "On a cold start, the first treatment request awaits the shared TAS client initialization and initial fetch; subsequent setting reads use the populated in-memory client. Telemetry payload cleaning and appender dispatch happen synchronously after each treatment result but the diff only changes how one already-present property is represented.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/assignment/common/assignmentService.ts:348 assignmentsFetch and setupTASClient",
+            "Operation": "Fetch legacy/new TAS assignments used by all treatment reads.",
+            "Cardinality": "One coalesced initial fetch per TAS client generation, plus existing timer/filter-driven refetches; not one fetch per queried setting.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same TAS initialization, assignments request, cache, and refetch behavior existed before the payload-wrapping change.",
+            "CriticalPathEffect": "The cold first treatment waits for initialFetch; warm reads do not cross this network boundary."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/telemetry/common/telemetryIpc.ts:35 TelemetryAppenderClient.log",
+            "Operation": "Forward each cleaned telemetry event to telemetry appenders.",
+            "Cardinality": "One existing appender call per emitted query event per configured IPC appender; scoped lookup can avoid the bare fallback, while a miss can cause a second tas-client query event.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Each query event already traversed publicLog, cleaning, and appender dispatch; the diff adds no event or appender call.",
+            "CriticalPathEffect": "Fire-and-forget channel dispatch occurs after treatment resolution and does not gate returning the treatment."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/telemetry/common/1dsAppender.ts:128 AbstractOneDataSystemAppender.log",
+            "Operation": "Queue the existing cleaned event in the telemetry SDK for backend transmission.",
+            "Cardinality": "Unchanged one tracked event per emitted query event and configured 1DS appender; SDK transport batching is unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same telemetry event and transport path existed; only ABExp.queriedFeature now bypasses string-cleaning regexes via TelemetryTrustedValue.",
+            "CriticalPathEffect": "Tracking is invoked synchronously, but transport is not awaited by treatment resolution."
+          }
+        ],
+        "ScalingInput": "Cost scales with the number of experiment-backed configuration properties processed and with scoped-key fallback misses. The diff preserves the existing O(number of telemetry properties) copy and adds only one constant-time conditional/object allocation for the matching property; it may avoid regex cleaning of that string.",
+        "EffectiveConcurrency": "Experimental settings are processed sequentially by processExperimentalSettings. All cold treatment reads share the same tasClient/initialFetch promise, so there is one effective initial assignment fetch rather than one network request per setting. Telemetry dispatch remains one postEvent path per tas-client query with the existing appender fan-out.",
+        "CacheBehavior": "Cold treatment access awaits the shared initial fetch; warm accesses read the TAS client's in-memory assignments. Client replacement resets that cache generation, while normal feature-query telemetry is not cached or coalesced. The changed trusted wrapper neither changes TAS cache keys nor negative-cache behavior.",
+        "MechanismConfidence": "High: the changed helper, treatment callers, shared initial-fetch promise, cleaner, IPC client, and telemetry appender path were directly traced.",
+        "MagnitudeUncertainty": "The exact number of registered experiment-backed settings and configured telemetry appenders varies by product build, but neither cardinality nor concurrency is changed by this PR.",
+        "Verdict": "No reportable regression. The runtime loop and telemetry boundaries already existed; marking one value trusted adds bounded constant work and skips cleaner regex work without increasing calls, retained state, or critical-path I/O."
+      },
+      {
+        "Scenario": "GitHub Copilot extension reading TAS feature variables and emitting query telemetry",
+        "CriticalPath": "Treatment reads synchronously consult the initialized delegate's in-memory assignments, first using the /vscode/-scoped key and then the bare key on a miss. The tas-client query telemetry then traverses BaseTelemetryService.postEvent and existing Microsoft reporters; initial assignment fetching is managed separately by the delegate and is unchanged.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/telemetry/node/baseExperimentationService.ts:220 _createDelegate",
+            "Operation": "Initialize/refetch TAS assignments used by feature reads.",
+            "Cardinality": "One initial fetch per delegate generation plus existing polling/filter-driven refreshes, shared by feature lookups.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Delegate creation, caching, and assignment network requests are unchanged.",
+            "CriticalPathEffect": "Initialization can gate callers that explicitly await hasTreatments, but ordinary getTreatmentVariable reads are in-memory; the changed postEvent logic does not move assignment fetching onto either path."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/telemetry/common/baseTelemetryService.ts:205 postEvent via BaseMsftTelemetrySender",
+            "Operation": "Queue the existing query event to external Microsoft telemetry and, for internal users, the existing raw internal reporter.",
+            "Cardinality": "Unchanged one external sender call per query event and at most one additional internal sender call for internal users; scoped misses may already produce an additional query event through the bare lookup.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Both sender calls and their destination fan-out existed before the PR. The change only wraps the already-present queried-feature string before those calls.",
+            "CriticalPathEffect": "Reporter methods are invoked synchronously but no promise is awaited by the feature read; transport remains off the read's awaited critical path."
+          }
+        ],
+        "ScalingInput": "Work scales with the number of feature-variable reads and scoped-key misses. Per emitted event, the diff adds one property lookup, type check, and short-lived wrapper allocation; payload size and sender count remain unchanged, while downstream cleaning can skip work for that value.",
+        "EffectiveConcurrency": "Each caller performs synchronous in-memory reads. Delegate initialization/refetch owns the existing network concurrency. postEvent keeps its existing two sender invocations: the internal reporter is a no-op for non-internal users, while the external reporter queues the event; the PR adds no parallel request or queue.",
+        "CacheBehavior": "Assignments are cached in the tas-client delegate and shared across feature reads. Scoped and bare names remain distinct lookup keys, with bare fallback only on a scoped miss. Query telemetry itself remains uncached. The trusted-value object is event-local and not retained.",
+        "MechanismConfidence": "High: the changed postEvent method, scoped fallback, delegate cache lifecycle, reporter construction, and sender fan-out were directly inspected.",
+        "MagnitudeUncertainty": "Exact query frequency varies with enabled Copilot features and account type, but the added work is constant and event-local even at high lookup counts.",
+        "Verdict": "No reportable regression. There is no new network/IPC boundary, concurrency burst, retained collection, or scaling payload transformation; the constant wrapper allocation is not actionable and can reduce cleaner CPU."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and all diff pages. Traced workbench and Copilot TAS query paths through caches, payload cleaning, IPC/reporters, and network appenders. The PR preserves event and boundary cardinality and adds only bounded trusted-value wrapping, so no performance finding was submitted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-04T04:36:02.465608426Z",
+    "CompletedAt": "2026-09-04T04:37:09.358037665Z",
+    "WallClockMilliseconds": 66892,
+    "ModelCalls": 10,
+    "InputTokens": 287888,
+    "OutputTokens": 4610,
+    "TotalTokens": 292498,
+    "ReasoningTokens": 1324,
+    "CacheReadTokens": 242358,
+    "CacheWriteTokens": 45500,
+    "APIDurationMilliseconds": 55573,
+    "ToolCalls": 44,
+    "NanoAIUnits": 41676320000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 242358,
+      "cache_write": 45500,
+      "input": 30,
+      "output": 4610
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

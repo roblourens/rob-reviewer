@@ -1,0 +1,144 @@
+{
+  "PullRequest": {
+    "Number": 334163,
+    "Title": "sessions: rename focused chat with F2",
+    "Body": "## Summary\n\n- add a higher-priority chat rename command for focused peer chats, mirroring the existing Ctrl/Cmd+W chat-over-session layering\n- preserve session rename for the main chat while preventing unsupported or untitled peer chats from falling through to session rename\n- derive the rename claim and target from the DOM-focused chat group so split-group activation cannot rename stale session state\n- track nested Sessions-list focus, keep rename targets stable while Quick Input is open, and scope accessibility guidance to chats where Rename is available\n\nFixes #334162\n\n## Recording\n\n![Agents Window F2 rename issue](https://github.com/user-attachments/assets/729b0302-788a-4bf2-a503-1c9015d07c39)\n\n## Validation\n\n- `./scripts/test.sh src/vs/sessions/test/browser/chatGroupsView.test.ts src/vs/sessions/contrib/sessions/test/browser/sessionsSessionManagementActions.test.ts src/vs/sessions/contrib/sessions/test/browser/sessionsRename.test.ts src/vs/sessions/contrib/sessions/test/browser/sessionsList.test.ts` (123 passing)\n- `npm run typecheck-client`\n- targeted ESLint for all changed TypeScript files\n- `npm run valid-layers-check`\n- `git diff --check`\n",
+    "URL": "https://github.com/microsoft/vscode/pull/334163",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "DonJayamanne",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b6234bd71943c8a5caf5eef03bc4a8e49aef2698",
+    "HeadRef": "don/agents/chat-rename-issue-investigation",
+    "HeadSHA": "979f2acb2a2546c0d4b1547c9914c59ab828e627",
+    "CreatedAt": "2026-09-03T02:56:01Z",
+    "UpdatedAt": "2026-09-04T00:08:23Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "repeated-work",
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Opening or restoring an Agents Window session with one or more split chat groups",
+        "CriticalPath": "Each visible group is synchronously constructed before its chat UI can render. The diff adds one scoped context-key service, one child instantiation service, one bound boolean key, and one two-observable autorun per group; all are lightweight in-process setup and no new external operation blocks rendering.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Work grows linearly with the number of visible split groups, not with transcript messages or all sessions. Group count is user-created and each group already owns a full ChatGroupView/ChatView; the added constant per-group state is disposed with the group.",
+        "EffectiveConcurrency": "Group creation remains synchronous on the UI thread. There is no new queue, parallel fan-out, or asynchronous work; each group owns one scoped service and autorun.",
+        "CacheBehavior": "No cache or cache key is added or bypassed. Cold and warm rendering differ only through existing chat/session loading; the new context scope performs the same bounded local setup in both cases.",
+        "MechanismConfidence": "High confidence that the added work is synchronous and linear in visible groups, and that group removal disposes the owning store and ChatGroupView. This does not establish a meaningful regression against the pre-existing heavyweight per-group chat view.",
+        "MagnitudeUncertainty": "Exact allocation size of a scoped context service and child DI container was not measured, but the cardinality is one per visible group and lifecycle cleanup is explicit.",
+        "Verdict": "No reportable regression: the extra constant per-group objects are required to scope F2 correctly, are not multiplied by rows/messages, and are disposed when the group is removed."
+      },
+      {
+        "Scenario": "Switching tabs or keyboard focus between chat groups",
+        "CriticalPath": "The existing focus path promotes the group and can call SessionsService.openChat; the diff additionally updates one scoped context key when active/main resource observables change. The context update completes synchronously before keybinding resolution, while the pre-existing openChat reconciliation remains asynchronous.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/sessions/browser/parts/chatGroupsView.ts::_onGroupFocused and src/vs/sessions/services/sessions/browser/sessionsService.ts::_openChatSession",
+            "Operation": "Existing session/chat activation and possible wait for a session catalog to load via SessionsService.openChat",
+            "Cardinality": "At most one openChat request for a focus transition when the target differs from the active chat; repeated transitions use the existing cancellation token so superseded opens are cancelled.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Focus transitions already called SessionsService.openChat and performed the same session loading/reconciliation before this diff.",
+            "CriticalPathEffect": "The existing openChat path may delay canonical active-chat reconciliation, but the new scoped context-key update does not wait for it and adds no provider, filesystem, IPC, or network call."
+          }
+        ],
+        "ScalingInput": "The context-key update is O(1) per active-resource/main-resource change. F2 target lookup scans visible groups and then chats in the focused group once per command invocation, not per frame or message.",
+        "EffectiveConcurrency": "Existing open requests are latest-wins through _startOpenSession cancellation. The added autorun is synchronous and coalesced by the observable transaction behavior; it does not launch concurrent work.",
+        "CacheBehavior": "Existing loaded-session state determines whether openChat waits; the diff neither changes session cache keys nor defeats warm-session behavior.",
+        "MechanismConfidence": "High confidence from the focus handlers, autorun dependencies, and openChat cancellation path that no new expensive boundary or unbounded repeated work is introduced.",
+        "MagnitudeUncertainty": "DOM ancestry depth and visible split-group count vary, but both are small compared with transcript size and the changed checks occur only on focus/command events.",
+        "Verdict": "No reportable regression: the changed focus tracking adds bounded DOM/context work and leaves the existing potentially asynchronous openChat path and concurrency unchanged."
+      },
+      {
+        "Scenario": "Renaming a peer chat via F2 or the Sessions-list context menu",
+        "CriticalPath": "On invocation, target discovery reads the focused list/group, the helper scans the target session's chats to validate eligibility, Quick Input waits for the user, validation repeats once on acceptance, and exactly one renameChat provider call is awaited when the title changed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts::renameChat",
+            "Operation": "Dispatch a chat-title change to the agent host connection for agent-host sessions",
+            "Cardinality": "One dispatch per accepted, changed title; no per-chat fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The existing inline tab rename and Sessions-list context-menu rename already called the same management/provider method once; focused F2 previously routed to one session rename provider operation rather than multiplying calls.",
+            "CriticalPathEffect": "The command awaits the management method, but the agent-host implementation performs one dispatch and local cache/event update. This operation is user-triggered and cannot overlap within one awaited command execution unless the user starts separate renames."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/copilotChatSessions/browser/copilotChatSessionsProvider.ts::renameChat",
+            "Operation": "Execute the Copilot CLI setTitle command for supported Copilot chat sessions",
+            "Cardinality": "One command execution per accepted, changed title; no collection fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The Sessions-list chat rename already reached this same single provider command; focused F2 changes which one-item rename is selected, not call count.",
+            "CriticalPathEffect": "The rename command waits for this provider operation after the user accepts Quick Input."
+          }
+        ],
+        "ScalingInput": "Two linear searches over session.chats occur around Quick Input, so local CPU scales as O(number of chats) once per rename. Effective external cardinality stays one after validation and deduplication by exact resource.",
+        "EffectiveConcurrency": "One awaited provider rename per successful command. There is no batching need because one user-selected chat is targeted; no loop or concurrency burst was introduced.",
+        "CacheBehavior": "Target validation uses current observable session state before and after the prompt rather than a retained cache. Provider caches and warm/cold behavior are unchanged; failed or cancelled input performs no external rename.",
+        "MechanismConfidence": "High confidence that the call path and one-call cardinality are established by the helper and provider implementations. The added scans are real but do not meet the threshold for an actionable performance regression.",
+        "MagnitudeUncertainty": "Sessions may contain varying chat counts, but the scans are user-triggered and simple URI comparisons; there is no evidence of a realistically hot frequency or large enough collection to create user-visible latency.",
+        "Verdict": "No reportable regression: the feature preserves one external rename per accepted action and adds only bounded, user-triggered validation scans."
+      },
+      {
+        "Scenario": "Moving focus within the Sessions list, including nested chat rows",
+        "CriticalPath": "Tree focus/focus-entry events now read the active DOM element, inspect the current focus array, and set one scoped context key before keyboard handling proceeds.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Cost scales with focused-item count and DOM ancestor depth, not total list size; neither operation traverses all rendered sessions.",
+        "EffectiveConcurrency": "All work is synchronous on the UI thread with no scheduling, I/O, IPC, or parallelism. Each focus event performs one ancestry check and scans the tree's focused-item array, which is normally a single item.",
+        "CacheBehavior": "No cache is involved. The context key resets on blur and follows the tree-scoped context service lifecycle.",
+        "MechanismConfidence": "High confidence from the event subscriptions and getFocus usage that this is bounded synchronous work and not a list-wide scan or layout read.",
+        "MagnitudeUncertainty": "Exact focus-event frequency depends on keyboard navigation, but each event remains constant-sized for normal single-focus tree behavior.",
+        "Verdict": "No reportable regression: the focus bookkeeping is constant-sized and does not cross an expensive boundary or trigger layout."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 19 changed files and all diff pages. Traced construction/disposal, focus and chat-switch paths, list focus tracking, and both provider rename implementations. No diff-introduced hot-path, fan-out, retention, cache-lifecycle, or concurrency regression met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-04T04:31:51.219915813Z",
+    "CompletedAt": "2026-09-04T04:33:57.153881994Z",
+    "WallClockMilliseconds": 125933,
+    "ModelCalls": 8,
+    "InputTokens": 341758,
+    "OutputTokens": 6333,
+    "TotalTokens": 348091,
+    "ReasoningTokens": 2121,
+    "CacheReadTokens": 274432,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 111443,
+    "ToolCalls": 62,
+    "NanoAIUnits": 50573680000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 274432,
+      "cache_write": 0,
+      "input": 67326,
+      "output": 6333
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
