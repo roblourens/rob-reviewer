@@ -1,0 +1,213 @@
+{
+  "PullRequest": {
+    "Number": 334374,
+    "Title": "Fixes github pr and issue link presentation data fetching",
+    "Body": "FYI @benibenj ",
+    "URL": "https://github.com/microsoft/vscode/pull/334374",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "hediet",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "61fc6318881a456d1519cee1d15412cbd1abddf3",
+    "HeadRef": "hediet/b/reliable-llama",
+    "HeadSHA": "8fd881e8e9023ce8b2f5b31a6c11ee19001e9a0d",
+    "CreatedAt": "2026-09-03T21:36:15Z",
+    "UpdatedAt": "2026-09-03T21:42:03Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "repeated-work",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Rendering GitHub repository, issue, and pull-request links as rich links in chat",
+        "CriticalPath": "A link watcher must obtain a GitHub credential and then subscribe to the corresponding resource before details appear. Repository and issue bulk hydration and pull-request/resource fetches are on this presentation critical path; the new warning/notification handling runs only after an error and does not delay successful rendering.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubCredentialService.ts:86-172",
+            "Operation": "Resolve the current GitHub identity with GET /user when no credential generation is cached.",
+            "Cardinality": "At most one shared identity request per token/endpoint generation; concurrent watchers reuse the current promise.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same credential resolution and request coalescing occurred before the diff.",
+            "CriticalPathEffect": "Blocks creation of the first resource subscription for a new credential generation; warm generations reuse the resolved credential."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/github/browser/githubLinkPresentation.contribution.ts:135-290",
+            "Operation": "Bulk-hydrate repository and issue resources, then subscribe/fetch repository, issue, or pull-request fragments.",
+            "Cardinality": "Repository and issue links created in one microtask are deduplicated and grouped into one hydration request per account; subscriptions are shared per canonical resource, while pull-request core/check fragment work is scheduled per unique pull request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same hydration grouping, resource subscriptions, priorities, and network cardinality existed before the diff.",
+            "CriticalPathEffect": "These GitHub reads provide the presentation data and are on the cold path; shared service/resource caches serve duplicate or warm watchers."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/workbench/contrib/github/browser/githubLinkPresentation.contribution.ts:303-311",
+            "Operation": "Emit a warning and possibly create one sticky authentication notification when a presentation reaches an error state.",
+            "Cardinality": "One _setPresentation invocation per observable state update per unique active resource; authentication notifications are coalesced to one live handle for the contribution.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Errors updated the presentation without warning logging or an authentication notification.",
+            "CriticalPathEffect": "Runs after an error, not on the successful data-fetch critical path. Logging cost scales with error-state updates, but the traced update frequency and shared watcher cardinality do not establish a material regression."
+          }
+        ],
+        "ScalingInput": "The number of distinct GitHub URLs currently rendered, after canonical-resource sharing and hydration deduplication; duplicate renderers for the same URL do not add provider watchers.",
+        "EffectiveConcurrency": "Link presentation entries are shared by provider/resource; repository and issue hydration is microtask-batched, deduplicated, and issued once per account group, while the existing GitHub queues/schedulers govern request concurrency. The notification is explicitly coalesced to one live handle.",
+        "CacheBehavior": "The data-channel service restores cached presentations and shares active entries; GitHub transport retains ETags and coalesces in-flight REST/GraphQL reads. Cold links fetch data, while warm/duplicate links reuse these layers. The diff does not alter these cache keys or invalidation paths.",
+        "MechanismConfidence": "High confidence in the watcher sharing, hydration grouping, network path, and error callback placement from the traced implementations.",
+        "MagnitudeUncertainty": "Large chats can contain many distinct links, but no evidence shows the added error-only warning work dominates the existing failed network/resource updates; the authentication notification remains bounded to one.",
+        "Verdict": "No reportable performance regression: successful-path boundary count and concurrency are unchanged, and the new error UI is bounded/coalesced."
+      },
+      {
+        "Scenario": "Resolving a repository-capable GitHub authentication session",
+        "CriticalPath": "getToken waits for authentication-session enumeration and, only when no compatible session is already present, a repo-scoped session lookup/creation. This precedes cold credential and link data fetching.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/github/browser/githubService.ts:55-79",
+            "Operation": "Enumerate GitHub authentication sessions via IAuthenticationService.getSessions.",
+            "Cardinality": "One all-session query per getToken call, plus one repo-scoped query only when no compatible repo session for the selected account is already present.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The first session enumeration already occurred, and the old code performed the second repo-scoped query whenever the default session itself lacked repo scope, even if another compatible session existed.",
+            "CriticalPathEffect": "Both calls are awaited before a token can be returned; when an existing compatible session is found, the changed code removes the second awaited query."
+          }
+        ],
+        "ScalingInput": "Number of authentication sessions for the provider, normally small; local scans remain linear in that count.",
+        "EffectiveConcurrency": "getToken does not add its own fan-out; credential consumers may call it concurrently, while the authentication service controls provider request serialization. The diff reduces conditional query cardinality for an existing compatible session.",
+        "CacheBehavior": "The GitHub credential service shares the resolved credential generation and identity promise, but token-provider session enumeration occurs when getToken is invoked. The changed compatible-session scan avoids a second query in a newly covered warm-session case.",
+        "MechanismConfidence": "High confidence from the direct getToken implementation and credential-service callers.",
+        "MagnitudeUncertainty": "Authentication-provider implementation cost varies, but the before/after call count is clear and non-regressive.",
+        "Verdict": "No regression; this path can avoid an existing extra authentication-service boundary call."
+      },
+      {
+        "Scenario": "Executing GitHub REST, GraphQL, and download requests",
+        "CriticalPath": "Each transport operation reaches fetch through the existing rate-limit queue and retry/redirect logic. Application ETag revalidation remains on REST reads; fetch cache mode remains no-store.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubTransport.ts:212-430",
+            "Operation": "Perform GitHub fetches for REST, GraphQL, or downloads.",
+            "Cardinality": "Unchanged: one fetch per attempt plus existing bounded redirects/retries; in-flight REST and GraphQL reads remain coalesced by request key.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same fetches used cache: no-store and additionally sent Cache-Control: no-store; application ETag caching and request coalescing were otherwise identical.",
+            "CriticalPathEffect": "Network fetches remain the request critical path. Removing the Cache-Control request header does not add requests, retries, serialization, or response allocation."
+          }
+        ],
+        "ScalingInput": "Number of distinct transport requests after in-flight coalescing, with bounded retry and redirect counts.",
+        "EffectiveConcurrency": "Existing account/rate-limit queues and in-flight maps bound and coalesce requests; the diff changes only request headers.",
+        "CacheBehavior": "Browser fetch caching remains disabled by cache: no-store. REST's explicit ETag/body cache remains active and unchanged; GraphQL in-flight coalescing is unchanged.",
+        "MechanismConfidence": "High confidence from all three changed fetch call sites and unchanged queue/cache code.",
+        "MagnitudeUncertainty": "Browser and proxy treatment of the removed header varies, but there is no mechanism for increased work in the changed implementation.",
+        "Verdict": "No performance regression; request cardinality, critical path, and cache lifecycle are unchanged."
+      },
+      {
+        "Scenario": "Creating an extension-host link presentation watcher that no current provider accepts",
+        "CriticalPath": "The extension-host-to-main-thread request checks the provider registry and immediately returns an error presentation when no watcher is available. The added warning occurs before sending that existing error result.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadDataChannels.ts:49-59",
+            "Operation": "Send the create-watcher request from extension host to main thread and return the unavailable presentation.",
+            "Cardinality": "One existing IPC request and response per rejected watcher creation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same rejected watcher request returned the same unavailable presentation without the warning.",
+            "CriticalPathEffect": "The IPC already existed; the added warning is local diagnostic work on the rejection path and does not introduce another cross-process call."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/workbench/api/browser/mainThreadDataChannels.ts:52",
+            "Operation": "Format the rejected resource URI and emit a warning through ILogService.",
+            "Cardinality": "One warning per rejected watcher request.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No warning was emitted.",
+            "CriticalPathEffect": "Runs synchronously before the existing unavailable response, but realistic callers select a matching rule before watcher creation and no hot-path rejection multiplicity is established."
+          }
+        ],
+        "ScalingInput": "Number of invalid or raced watcher creation requests, not the number of successfully rendered links.",
+        "EffectiveConcurrency": "No new concurrency or fan-out; each rejected RPC is handled independently.",
+        "CacheBehavior": "No cache participates in this rejection path; successful data-channel entries are shared elsewhere by canonical resource.",
+        "MechanismConfidence": "High confidence in the one-warning-per-rejection mechanism; low evidence of performance magnitude, so it is not reportable.",
+        "MagnitudeUncertainty": "A misbehaving extension could generate many invalid requests, but that is not established as a realistic normal-product trigger for a material regression.",
+        "Verdict": "No reportable performance regression."
+      },
+      {
+        "Scenario": "User accepts the new GitHub authentication-required notification",
+        "CriticalPath": "The notification is created after an authentication failure. Only an explicit Sign In action awaits defaultAccountService.signIn; account-change handling then clears the single notification and refreshes provider registrations/watchers.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/github/browser/githubLinkPresentation.contribution.ts:60-64",
+            "Operation": "Invoke the authentication provider through defaultAccountService.signIn with repo scope.",
+            "Cardinality": "One sign-in invocation per user activation of the notification choice; notification creation itself does not invoke sign-in.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This link-presentation flow did not offer or invoke sign-in.",
+            "CriticalPathEffect": "Off the initial failed-link critical path and only blocks the user-triggered sign-in action."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/github/browser/githubLinkPresentation.contribution.ts:43-47,60-64",
+            "Operation": "Authentication-provider sign-in may perform provider/network work, followed by existing GitHub credential/resource refreshes after account change.",
+            "Cardinality": "User-triggered once per choice activation; the live prompt is coalesced and provider entries are refreshed once per default-account change.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No recovery boundary was reachable from this notification because the notification did not exist.",
+            "CriticalPathEffect": "Required to recover authenticated link details; it is not eagerly started for every failed link."
+          }
+        ],
+        "ScalingInput": "One user action and the number of currently active distinct link entries refreshed after the account changes.",
+        "EffectiveConcurrency": "A MutableDisposable allows only one live authentication notification. Default-account change performs one registration refresh; data-channel entry and GitHub request sharing continue to coalesce duplicate resources.",
+        "CacheBehavior": "Account change intentionally invalidates/rebuilds provider watchers; existing data-channel and GitHub caches then govern warm presentation/resource reuse.",
+        "MechanismConfidence": "High confidence in notification coalescing, explicit user gating, and account-change refresh behavior.",
+        "MagnitudeUncertainty": "The number of active links at sign-in varies, but refresh is a one-time recovery action rather than repeated eager work.",
+        "Verdict": "No performance regression; the new expensive boundary is user initiated, bounded, and necessary for recovery."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files and traced rich-link rendering, authentication, transport, rejected watcher, and sign-in scenarios. No high-confidence diff-introduced performance issue met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-04T00:15:51.680776804Z",
+    "CompletedAt": "2026-09-04T00:17:56.50833952Z",
+    "WallClockMilliseconds": 124827,
+    "ModelCalls": 6,
+    "InputTokens": 160010,
+    "OutputTokens": 5494,
+    "TotalTokens": 165504,
+    "ReasoningTokens": 2013,
+    "CacheReadTokens": 110080,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 115406,
+    "ToolCalls": 29,
+    "NanoAIUnits": 17681600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 110080,
+      "cache_write": 0,
+      "input": 49930,
+      "output": 5494
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
