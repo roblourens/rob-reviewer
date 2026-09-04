@@ -1,0 +1,168 @@
+{
+  "PullRequest": {
+    "Number": 334412,
+    "Title": "agentHost: Resolve published MCP server lifecycle IDs",
+    "Body": "Fixes #332072\n\n## Problem\n\nAgent Host start/stop handling reverse-resolved customization IDs only through the controller's runtime `_live` inventory. During a same-name collision, the runtime can first associate a server name with a published plugin child and then receive a distinct same-name workspace top-level customization.\n\nAgent Customizations presents the workspace entry and sends its exact ID, but the live lookup no longer recognizes that ID. The provider logs `Cannot start unknown MCP server customization ...`, no server process starts, and the optimistic client reducer leaves the row at `Starting`.\n\n## Change\n\nKeep the runtime lookup as the first choice, then fall back to an exact-ID lookup across the session's currently published customizations.\n\nThe fallback accepts only an ID that is present in current session state. It does not add a broad same-name alias and does not change collision precedence. The SDK lifecycle API remains name-keyed, so it starts the effective server winner already selected for that name.\n\n## Validation\n\n- `npm run gulp compile-client`\n- `npx mocha test/unit/node/index.js --delay --ui=tdd --timeout=20000 --exit --run src/vs/platform/agentHost/test/node/shared/mcpCustomizationController.test.ts` — 20 passing\n- Targeted ESLint and `git diff --check`\n- Regression coverage verifies published IDs resolve before the SDK has populated the live inventory and unknown IDs remain rejected.\n- Deterministic live Code OSS A/B with a real Copilot Agent Host session and real local stdio MCP processes:\n  - A host-only plugin published and started `dupe`; the real UI then stopped it through its plugin-child customization ID.\n  - A workspace-root `.mcp.json` with another `dupe` was published afterward, producing two distinct current customization IDs with no synthetic `mcp-top-level:*` ID and no intervening SDK state event that could repair the mapping.\n  - Unpatched main: the UI dispatched `SessionMcpServerStartRequested` with the exact workspace ID, Agent Host logged the matching unknown-customization warning, no process spawned, and the clicked row remained stuck at `Starting`.\n  - Patched: the UI dispatched the same workspace ID, no unknown-customization warning was logged, a new real MCP process spawned, the workspace entry transitioned `stopped -\u003e starting -\u003e ready`, and the clicked row reached `Running`.\n  - A separate `solo` server completed stop/start successfully as a control.\n- The patched live arm was repeated through the repository's normal `scripts/code.bat` launch path with the same result.\n\nCurrent source combines user and `.vscode/mcp.json` inputs before Agent Host receives them, so the live harness used a host-configured plugin child plus workspace-root `.mcp.json` to deterministically reproduce the same published child/top-level identity collision described by the issue.",
+    "URL": "https://github.com/microsoft/vscode/pull/334412",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "kondv",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d52881e2e42e6bb5db002937dc8485f1f823c094",
+    "HeadRef": "dev/kondv/mcp-agent-host-collision-lifecycle",
+    "HeadSHA": "1e85eb8b75a46e07e0adcb1cc9eda2d9f1454523",
+    "CreatedAt": "2026-09-04T04:16:19Z",
+    "UpdatedAt": "2026-09-04T12:40:42Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Copilot MCP start/stop for a customization ID that is published in current session state but not yet represented by the SDK live inventory",
+        "CriticalPath": "A client dispatches one session MCP lifecycle action; the reducer updates optimistic state, AgentSideEffects invokes the provider, serverNameForCustomizationId checks the live inventory and then synchronously scans current session customizations. On a match, the provider lifecycle RPC is on the critical path. Start also schedules an inventory-list RPC in its finally block; that refresh is not awaited by the lifecycle promise. Stop awaits its lifecycle RPC.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentSideEffects.ts:1560",
+            "Operation": "Client-to-Agent-Host session/mcpServerStartRequested or session/mcpServerStopRequested action",
+            "Cardinality": "One inbound action per user lifecycle request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same action reached AgentSideEffects and the provider before the diff.",
+            "CriticalPathEffect": "This delivers the request to the provider; it exists before and after the diff."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:3387 and 3511",
+            "Operation": "Copilot SDK startServer or stopServer lifecycle RPC",
+            "Cardinality": "One lifecycle RPC per accepted action, serialized per server name. Start additionally triggers one asynchronous mcp.list inventory RPC.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "For a published-only ID missing from _live, the provider rejected the ID before issuing any lifecycle or inventory RPC. Existing live IDs already issued the same RPCs.",
+            "CriticalPathEffect": "The lifecycle RPC is awaited; the start-side inventory refresh is launched from finally but is not awaited."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:3387",
+            "Operation": "Start or stop the effective MCP server selected by the SDK, potentially launching a local stdio server or connecting a configured remote server",
+            "Cardinality": "At most one server lifecycle operation per accepted action; same-name requests are serialized.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The published-only ID was rejected, so no server lifecycle operation occurred; live IDs already performed this work.",
+            "CriticalPathEffect": "The requested server lifecycle dominates latency and is the intended effect of accepting the published ID."
+          }
+        ],
+        "ScalingInput": "The fallback cost grows with the number of current top-level customizations and their MCP children. It runs once per explicit lifecycle action; realistic effective cardinality is one target ID, not one provider call per customization. Existing live entries are checked first, and published-only entries become live after SDK reporting.",
+        "EffectiveConcurrency": "Copilot serializes lifecycle RPCs per server name with SequencerByKey; different server names may progress concurrently. The synchronous fallback scan itself is not parallelized and runs once before queueing.",
+        "CacheBehavior": "The live inventory is the warm fast path. A published-only ID falls back to authoritative session state until the SDK reports it; unknown IDs also scan once and then stop. There is no separate fallback cache or negative cache, but the trigger is a low-frequency user action.",
+        "MechanismConfidence": "High: the fallback, call path, per-action cardinality, and per-server sequencer are explicit in the code.",
+        "MagnitudeUncertainty": "The exact customization count and provider RPC duration vary, but the new local work is one shallow state projection plus one linear flatten/find scan per explicit click. The heavier newly reachable provider operation is intentional functionality rather than redundant work.",
+        "Verdict": "No reportable performance regression. The PR adds one bounded linear lookup to a low-frequency control path and enables exactly the lifecycle operation the user requested; it does not fan out provider work across the collection."
+      },
+      {
+        "Scenario": "Codex MCP start/stop for a customization ID published before the thread inventory contains it",
+        "CriticalPath": "A lifecycle action resolves the session, synchronously rebuilds controller state from the current per-thread inventory, refreshes the name-to-ID map, and then uses the new session-state fallback. For start, a successful fallback proceeds through lazy thread materialization, one configuration reload request, and a paginated status refresh. Stop currently performs no provider boundary after successful resolution.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentSideEffects.ts:1560",
+            "Operation": "Client-to-Agent-Host MCP lifecycle action",
+            "Cardinality": "One inbound action per explicit user request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical protocol dispatch occurred before the diff.",
+            "CriticalPathEffect": "The action dispatch precedes provider handling and is unchanged by the diff."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:7682",
+            "Operation": "Lazily materialize the Codex thread/connection when needed",
+            "Cardinality": "At most once for an unmaterialized session, then reused by later operations.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A published-only unresolved ID returned before materialization; accepted live IDs already followed this path.",
+            "CriticalPathEffect": "Materialization must finish before reload can proceed on a cold session."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:7305",
+            "Operation": "Codex config/mcpServer/reload request",
+            "Cardinality": "Exactly one request per accepted start action.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Published-only unresolved IDs did not issue reload; live IDs already issued one reload.",
+            "CriticalPathEffect": "Awaited on the start critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:7478",
+            "Operation": "Paginated mcpServerStatus/list inventory refresh",
+            "Cardinality": "One or more requests according to nextCursor; grouping is by the full thread inventory, not per customization.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Published-only unresolved IDs did not refresh; live IDs already performed the same full inventory refresh.",
+            "CriticalPathEffect": "All pages are awaited before start returns."
+          }
+        ],
+        "ScalingInput": "Resolution scales with current MCP inventory plus published top-level customizations and children. The fallback is one scan for one target ID. Status refresh scales by the provider's paginated server inventory, not by issuing one request per customization.",
+        "EffectiveConcurrency": "No lifecycle sequencer is present on the Codex start path; separate accepted actions can overlap. Normal UI dispatch is one action for the selected row, and this diff does not alter concurrency for already-live IDs. Stop performs only local resolution.",
+        "CacheBehavior": "Current thread inventory populates the live path when available; published-only IDs use current session state. After reload/status refresh, inventory is refreshed and subsequent resolution can use live data. Unknown IDs do not cross provider boundaries.",
+        "MechanismConfidence": "High: the synchronous resolver, reload request, pagination loop, and absence of a stop boundary are directly traced.",
+        "MagnitudeUncertainty": "Provider inventory page count and cold materialization latency vary. The local added scan remains bounded by current published customizations, while the newly reachable expensive work is the intended start behavior.",
+        "Verdict": "No reportable performance regression. The fallback only makes the requested lifecycle operation reachable for an exact current ID; it adds no per-item provider fan-out, and the local scan is not a hot path."
+      },
+      {
+        "Scenario": "Lifecycle resolution for an already-live ID or an unknown ID",
+        "CriticalPath": "Already-live IDs return from the existing live-inventory loop before executing the added fallback. Unknown IDs execute the added session-state scan and then return without provider work.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Live resolution retains its prior behavior. A miss adds one O(C) flatten/find over current MCP customizations, where C is the effective total of top-level MCP entries and MCP children, once per explicit action.",
+        "EffectiveConcurrency": "No additional asynchronous work is created for unknown IDs. Provider-specific concurrency behavior is unchanged for live hits.",
+        "CacheBehavior": "Live hits avoid the fallback on both cold and warm actions. Unknown misses are not negatively cached, but they require repeated explicit invalid actions to repeat the scan.",
+        "MechanismConfidence": "High: the early return and fallback placement are explicit in the changed method.",
+        "MagnitudeUncertainty": "Only unusually large customization collections and repeated invalid lifecycle actions increase the added local CPU/allocation cost; neither is evidenced as a realistic hot path.",
+        "Verdict": "No finding. Existing successful requests incur no new work, and misses add only a bounded in-memory scan with no I/O, IPC, or subprocess operation."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and all diff pages. Traced Copilot and Codex lifecycle callers, authoritative session-state access, fallback allocation/scanning, provider RPC/subprocess boundaries, cache behavior, and concurrency. The only added local cost is one fallback flatten/find on a low-frequency explicit control action; newly reachable lifecycle boundaries are the intended behavior, not redundant or scaling work. No valid performance finding and no qualifying performance-regression fix signal."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-04T17:03:54.842409666Z",
+    "CompletedAt": "2026-09-04T17:05:42.1501278Z",
+    "WallClockMilliseconds": 107307,
+    "ModelCalls": 12,
+    "InputTokens": 425875,
+    "OutputTokens": 6171,
+    "TotalTokens": 432046,
+    "ReasoningTokens": 2158,
+    "CacheReadTokens": 371533,
+    "CacheWriteTokens": 54306,
+    "APIDurationMilliseconds": 95910,
+    "ToolCalls": 46,
+    "NanoAIUnits": 54370720000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 371533,
+      "cache_write": 54306,
+      "input": 36,
+      "output": 6171
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
