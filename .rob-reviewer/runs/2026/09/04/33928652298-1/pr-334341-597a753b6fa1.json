@@ -1,0 +1,335 @@
+{
+  "PullRequest": {
+    "Number": 334341,
+    "Title": "Add opt-in auto-archive inactive sessions with merged pull requests",
+    "Body": "## Summary\n\n- add two disabled-by-default, application-scoped Preview settings:\n  - `chat.agentSessions.autoArchiveMergedSessionsAfterDays` controls inactivity before automatic archival\n  - `chat.agentSessions.autoDeleteArchivedMergedSessionsAfterDays` controls the grace period after automatic archival before permanent deletion\n- allow either lifecycle stage to be enabled or disabled independently with 1, 7, 15, or 30 day thresholds\n- archive inactive agent sessions only after their designated pull request is authoritatively confirmed merged\n- permanently delete only sessions carrying durable automatic-archive provenance after the independently configured deletion grace period\n- expose independent enterprise policies:\n  - `ChatAgentSessionsAutoArchiveMergedSessionsAfterDays`\n  - `ChatAgentSessionsAutoDeleteArchivedMergedSessionsAfterDays`\n- synchronize both settings into Agent Host root configuration and keep startup/hourly candidate evaluation authoritative in the host\n- prefilter archived deletion candidates from durable metadata before restoring sessions\n- refresh pull request state before each action and revalidate the relevant setting, session state, retention period, and designated pull request inside the deletion critical section\n- preserve manually archived sessions, clear automatic-archive provenance on unarchive, and retain sessions whose archived worktree still exists\n- use the existing archive and deletion lifecycle paths so persistence, provider callbacks, registry updates, client updates, and safe worktree cleanup remain consistent\n- keep the one-time opt-in notification in the workbench as UI only; enabling it sets both thresholds to 15 days\n\n## Demo\n\nNo visual capture: the only new UI is a standard VS Code notification and two Settings enums. When both cleanup settings are disabled, an inactive merged-PR session offers **Turn On Session Cleanup** and **Open Settings**. Enabling cleanup archives eligible sessions after 15 days of inactivity and permanently deletes them 15 days later.\n\n## Safety\n\n- permanent deletion applies only when a durable automatic-archive timestamp establishes the full configured deletion grace period; manually archived and pre-existing archived sessions are not deleted\n- unarchiving clears the automatic-archive timestamp for both loaded and unloaded sessions, so a later manual re-archive cannot inherit deletion eligibility\n- disabling or changing the relevant setting, reopening the pull request, or unarchiving the session aborts the corresponding lifecycle action during final validation\n- unarchive actions are rejected once deletion has entered its critical section, preventing session/worktree restoration from racing destructive cleanup\n- automatic deletion fails closed while an archived worktree remains or its state cannot be inspected\n\n## Validation\n\n- `npm run transpile-client`\n- targeted Agent Host lifecycle, passive-unarchive, and policy tests — 40 passing\n- targeted GitHub contribution browser tests — 16 passing\n- targeted ESLint for all changed TypeScript files\n- `npm run export-policy-data`\n- `git diff --check`\n- `npm run typecheck-client` reports no errors in changed files; the branch retains unrelated `@github/copilot-sdk` type failures\n\nFixes #334334\nFixes #334352\n",
+    "URL": "https://github.com/microsoft/vscode/pull/334341",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "meganrogge",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "99fbee351cb651f25cea4afdf27ae7b3322aefcd",
+    "HeadRef": "meganrogge/auto-archive-merged-sessions",
+    "HeadSHA": "597a753b6fa15d563544dcaacd743bc4b5520fd9",
+    "CreatedAt": "2026-09-03T18:28:18Z",
+    "UpdatedAt": "2026-09-04T20:16:11Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-830BEC7DDDC1",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostSessionLifecycle.ts",
+      "Side": "RIGHT",
+      "Line": 151,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The ordering and heavy restore call path are directly traced, as are the residency limit and full transcript fetch. Provider-specific restore latency is uncertain, but the allocation/I/O work and candidate/history scaling are not.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "provider chat runtimes, transcript bytes/objects, filesystem reads, and session-state allocations",
+      "PerformanceScaling": "Cost grows with both the number of inactive pull-request sessions and the total size of their chat histories; sessions beyond the default residency limit of 10 are repeatedly restored and evicted on later passes.",
+      "PerformanceOutcome": "Recurring CPU/I/O and GC pressure, plus provider-session residency churn that can interfere with active agent work.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, an inactive nonresident session was restored when a user or existing feature actually needed its full live chat state; there was no hourly background hydration of all stale pull-request sessions.",
+      "ChangedBehavior": "Every cleanup candidate is fully restored before the lifecycle service performs the authoritative core GitHub refresh that determines whether any archive/delete action is possible.",
+      "CausalDiffEvidence": "RIGHT line 151 introduces full AgentService restoration on the new startup/hourly candidate path before the changed code knows whether the designated pull request is merged.",
+      "Title": "Resolve pull request state before restoring candidate sessions",
+      "Impact": "With cleanup enabled, old sessions whose pull requests are still open are cold-restored every lifecycle pass merely to discover that no action is needed. AgentService restoration activates provider metadata, materializes the default provider chat, calls provider.chats.getMessages for the whole transcript, hydrates contributions, and reads session databases. Restores touch residency and reconcile against a default limit of 10, so a catalogue with many candidates churns restored sessions; archived sessions are immediately release-eligible and can repeat this work each pass. Users can see periodic CPU/disk spikes and memory/GC pressure proportional to accumulated histories.",
+      "Evidence": "The added _evaluateCandidate starts with restoreSession at line 151, while resolveForLifecycle is not called until after restoration. AgentService._restoreSessionState calls agent.materializeChat and _getChatMessages; _getChatMessages fetches all provider turns and hydrates them. AgentSessionResidency retains only 10 sessions by default and treats archived sessions as always release-required. The authoritative PR operation itself needs only the designated PR URL/core state, already present in IAgentSessionMetadata used by _isCandidate.",
+      "Recommendation": "Let the new lifecycle resolver accept the designated PR identity/branch from IAgentSessionMetadata and perform the core refresh without live session hydration; restore (and hold) the session only after a merged result, immediately before revalidation and the archive/delete action."
+    },
+    {
+      "ID": "PERF-143EAF12DECA",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostSessionLifecycle.ts",
+      "Side": "RIGHT",
+      "Line": 64,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The event's all-keys semantics and the lifecycle call path to authoritative network refresh are explicit. The number of unrelated edits varies by workflow, so prevalence affects severity rather than mechanism confidence.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "GitHub API requests, provider restores, and catalogue filesystem operations",
+      "PerformanceScaling": "Each unrelated root-config event fans out into one lifecycle evaluation per stale pull-request candidate, including one authoritative GitHub core refresh per effective candidate after catalogue work/restoration.",
+      "PerformanceOutcome": "Unnecessary network/API consumption and repeated background CPU/I/O whenever unrelated Agent Host settings change.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this listener was added, changing an unrelated Agent Host root setting did not start a merged-session cleanup scan or issue lifecycle GitHub refreshes.",
+      "ChangedBehavior": "The new listener schedules an immediate cleanup pass for every onDidRootConfigChange event, although that event is unkeyed and explicitly fires for every root-config key, not only the two lifecycle thresholds.",
+      "CausalDiffEvidence": "RIGHT line 64 newly maps every root configuration notification to _schedule(0), materially increasing lifecycle-pass and GitHub-refresh frequency beyond startup/hourly and beyond changes to the feature's own settings.",
+      "Title": "Do not rerun cleanup for unrelated root configuration changes",
+      "Impact": "Once either cleanup threshold is enabled, changing settings such as proxy, sandbox, MCP, model, migration, or provider setup values can trigger a full catalogue pass and authoritative refreshes for all stale PR sessions. For users with many inactive sessions this converts a single unrelated setting update into N GitHub requests and session restores, consuming rate limit and causing avoidable background latency.",
+      "Evidence": "RIGHT line 64 subscribes directly to the unfiltered Event\u003cvoid\u003e. IAgentConfigurationService documents that the event fires whenever any RootConfigChanged action is processed, and another service in the same subsystem explicitly notes it fires for every root-config key and compares its own relevant value before reacting. AgentHostSessionLifecycle.run then lists sessions and serially calls resolveForLifecycle, whose subscription.refresh('core', ..., { authoritative: true }) reaches a GitHub core fetch.",
+      "Recommendation": "Cache the last validated archive/delete threshold pair and schedule an immediate pass only when one of those two values actually changes; ignore root-config events whose effective pair is unchanged."
+    },
+    {
+      "ID": "PERF-5979444802F1",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostSessionLifecycle.ts",
+      "Side": "RIGHT",
+      "Line": 117,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The recurring schedule, unconditional call, and transitive provider/database operations are explicit. Exact elapsed time varies by provider cache warmth and catalogue size, which affects severity but not the O(total sessions) repeated-work mechanism.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "provider metadata operations and per-session filesystem/database reads",
+      "PerformanceScaling": "Each enabled startup/hourly pass performs O(total registered sessions) provider metadata work and database stats/reads, even when zero sessions are old enough or have a pull request.",
+      "PerformanceOutcome": "Repeated background filesystem/provider I/O and CPU work, with user session-list requests able to wait on the same in-flight catalogue computation.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, enabling no cleanup lifecycle meant Agent Host did not periodically call listSessions; full catalogue computation occurred only for existing consumers such as an actual session-list request.",
+      "ChangedBehavior": "The new scheduled lifecycle pass calls AgentService.listSessions before applying any cutoff or pull-request filtering, at startup, hourly, and after scheduled configuration/provider events.",
+      "CausalDiffEvidence": "RIGHT line 117 adds the unconditional full-catalogue call to the new recurring lifecycle path; candidate filtering begins only on the following loop, so the diff directly puts all-session provider and database work on every pass.",
+      "Title": "Filter cleanup candidates before rebuilding the full catalogue",
+      "Impact": "Users who opt into cleanup and retain a large session history now pay a complete catalogue rebuild every hour even if there are no cleanup candidates. AgentService._computeSessions prewarms each involved provider, reads metadata for every registered session, then stats/opens every per-session database for overlays; its own comments identify those operations as the dominant cost on large catalogues. This can create recurring disk/provider activity and delay a concurrent user-triggered listing that joins the shared computation.",
+      "Evidence": "The added run() calls _accessor.listSessions() at line 117 and only then invokes _isCandidate. The accessor is AgentService.listSessions(None); its _computeSessions enumerates all registered sessions, prewarms provider bulk metadata, runs _registeredSessionMetadata for every entry with a limiter, and performs tryOpenDatabase/getMetadataObject for every returned session. The scheduler starts immediately and reschedules every hour while either setting is enabled. Thus the expensive work is collection-wide rather than candidate-wide.",
+      "Recommendation": "Add a cutoff-aware lifecycle candidate enumeration that first filters registry entries by external/modified state and reads only the archived/provenance and GitHub metadata needed for survivors (folding provenance into the existing metadata batch where applicable), rather than invoking the presentation-oriented full listSessions computation on every tick."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "eager-work",
+      "boundary-fanout",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Workbench observes an inactive merged-PR session while cleanup remains disabled and shows the one-time opt-in prompt",
+        "CriticalPath": "The prompt waits only for the already-existing browser pull-request model to report merged and for local observable reads; enabling performs two user-configuration writes. No new GitHub request was added to the prompt path itself.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/github/browser/github.contribution.ts:GitHubPullRequestPollingContribution._pollPullRequest",
+            "Operation": "Existing GitHub pull-request model polling that supplies merged state",
+            "Cardinality": "Existing polling cardinality remains one model per effective PR identity; the added prompt autorun does not create another request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The contribution already acquired and polled the same PR models for session status.",
+            "CriticalPathEffect": "A merged snapshot must already exist before the prompt condition can become true, but this boundary predates the diff."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/contrib/github/browser/github.contribution.ts:_promptToEnableAutoArchive",
+            "Operation": "Read/store the one-time prompted flag in application storage",
+            "Cardinality": "Local read on each eligible autorun evaluation, one durable store for the application lifetime unless enabling fails.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No cleanup prompt storage key existed.",
+            "CriticalPathEffect": "Synchronous/local gating before notification; bounded and not collection-scaling after the flag is set."
+          }
+        ],
+        "ScalingInput": "One tracker/autorun per designated session PR already being polled; prompt work is suppressed globally after the first durable storage flag.",
+        "EffectiveConcurrency": "Existing PR pollers retain their prior concurrency. The two setting writes run with Promise.all and their resulting Agent Host config notifications are coalesced only while a lifecycle run is pending.",
+        "CacheBehavior": "The existing GitHub model supplies cached/polled PR state. The application storage key is a durable positive cache preventing repeated prompts; failures remove it so retry remains possible.",
+        "MechanismConfidence": "High: the added autorun performs local reads only and attaches to an existing model; no added network call is present.",
+        "MagnitudeUncertainty": "Observable reevaluation count depends on existing model/status updates, but durable prompt suppression bounds side effects.",
+        "Verdict": "No reportable performance regression in the prompt itself; its side effects are bounded and reuse existing polling."
+      },
+      {
+        "Scenario": "Cleanup-enabled Agent Host startup and hourly pass with a large session catalogue, including passes with no eligible candidate",
+        "CriticalPath": "The lifecycle scheduler is off the UI startup await path, but each pass must finish AgentService.listSessions before it can reject recent/non-PR sessions. A concurrent consumer requesting the same list mode can join and wait on this computation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_computeSessions",
+            "Operation": "Provider bulk metadata prewarm followed by per-registered-session metadata reads",
+            "Cardinality": "One prewarm per involved provider plus one metadata operation per registered visible internal session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The provider/list computation existed, but this PR newly invokes it on startup/hourly cleanup ticks even without a session-list consumer.",
+            "CriticalPathEffect": "All complete before candidate filtering and before the lifecycle pass progresses."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_computeSessions",
+            "Operation": "Stat/open each session database and read the catalogue metadata overlay",
+            "Cardinality": "One database existence check/open and metadata object read per provider-returned session on every completed pass.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These reads occurred during actual listSessions consumers, not from a recurring cleanup timer.",
+            "CriticalPathEffect": "All overlay reads must finish before run() receives the sessions and applies _isCandidate."
+          }
+        ],
+        "ScalingInput": "Total registered internal sessions, not the much smaller set older than the configured cutoff; effective cardinality remains the full catalogue before filtering.",
+        "EffectiveConcurrency": "Only one lifecycle run executes at a time. listSessions prewarms involved providers concurrently, then limits provider metadata and database overlay work to four operations each.",
+        "CacheBehavior": "Concurrent list requests coalesce through _inFlightListSessions, but completed results are not retained for the next hourly pass. Provider prewarming is scoped to one computation and each pass repeats per-session database stat/open/read operations.",
+        "MechanismConfidence": "High: the new recurring call precedes filtering and the transitive collection-wide operations are explicit.",
+        "MagnitudeUncertainty": "Warm provider metadata can reduce provider latency, but database traversal and O(total sessions) work remain; exact catalogue sizes vary.",
+        "Verdict": "Reportable repeated-work regression; finding submitted at the unconditional listSessions call."
+      },
+      {
+        "Scenario": "Cleanup-enabled pass evaluates stale unarchived sessions whose designated pull requests may still be open",
+        "CriticalPath": "For each candidate, full AgentService restoration completes before an authoritative GitHub core refresh can determine whether archival is needed. Merged sessions then dispatch archive and await provenance persistence; open sessions exit after paying restore and network costs.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:restoreSession/_restoreSessionState",
+            "Operation": "Restore registry/session metadata, provider backing, persisted chat/session metadata, annotations, and related state",
+            "Cardinality": "Once per cold candidate per pass; bytes and allocations scale with that session's full history and contributions.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Inactive sessions were restored when a user/existing feature needed live state, not by an hourly lifecycle scan.",
+            "CriticalPathEffect": "Blocks reaching the GitHub merge-state decision for each candidate."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_restoreSessionState and _getChatMessages",
+            "Operation": "Materialize provider chat and fetch/hydrate all provider turns",
+            "Cardinality": "One materialization and full transcript fetch per cold candidate; repeated after residency eviction.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No background cleanup path invoked full chat restoration.",
+            "CriticalPathEffect": "Must complete before lifecycle validation and PR refresh."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostPullRequestStatusService.ts:resolveForLifecycle",
+            "Operation": "Acquire GitHub credential and authoritatively fetch the PR core fragment",
+            "Cardinality": "One fresh core refresh for each candidate that remains valid after restoration; lifecycle serialization limits concurrency to one.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Agent Host watched/refreshed PRs only for subscribed visible sessions or existing explicit operations, not every stale cleanup candidate.",
+            "CriticalPathEffect": "Determines whether archive can proceed and is awaited per candidate."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionLifecycle.ts:_evaluateCandidate and SessionFlagsContribution",
+            "Operation": "Persist archived status and automatic-archive timestamp",
+            "Cardinality": "Only for candidates authoritatively confirmed merged, once per successful archival.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No automatic archival provenance write existed.",
+            "CriticalPathEffect": "Timestamp persistence is awaited before moving to the next candidate; status contribution persistence is dispatched through the existing lifecycle path."
+          }
+        ],
+        "ScalingInput": "Number of inactive PR sessions after metadata filtering and the sum of their transcript sizes. Effective network cardinality is one authoritative core refresh per evaluated session; same-PR resources may share dormant cache state, but authoritative per-session refreshes are still issued.",
+        "EffectiveConcurrency": "Candidates are evaluated strictly serially by the for/await loop. Restoration itself uses provider internals; residency reconciliation retains at most 10 ordinary sessions by default and evicts older restored sessions.",
+        "CacheBehavior": "Already-resident sessions skip cold hydration. Cold/evicted sessions materialize provider backing and fetch full messages. Pull-request resources can retain dormant snapshots, but authoritative refresh deliberately performs a fresh core fetch rather than accepting warm state.",
+        "MechanismConfidence": "High: restore-before-refresh ordering, full-message hydration, and residency behavior are directly traced.",
+        "MagnitudeUncertainty": "Provider implementations differ in restore cost, and up to 10 recently restored sessions can remain warm; large histories and candidate sets determine the visible spike magnitude.",
+        "Verdict": "Reportable eager-work regression; finding submitted recommending PR resolution before full hydration."
+      },
+      {
+        "Scenario": "Cleanup-enabled pass evaluates aged automatically archived sessions for permanent deletion",
+        "CriticalPath": "The pass first reads provenance, then attempts a full restore. If live state remains available, it authoritatively refreshes GitHub, enters the serialized disposal guard, inspects worktree metadata/path, re-reads provenance for final validation, and invokes the existing provider/session-data deletion path. Cold archived restores are immediately release-eligible under residency, so they can also pay restore/release cost and stop before later boundaries.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentServiceComposition.ts:getAutoArchivedAt accessor",
+            "Operation": "Open session database and read automatic-archive provenance",
+            "Cardinality": "At least one read for every archived PR session considered when deletion is enabled; additional reads for candidates reaching revalidation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No automatic deletion provenance was read.",
+            "CriticalPathEffect": "Prefilters deletion before restore and is awaited serially."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionLifecycle.ts:_evaluateCandidate -\u003e AgentService.restoreSession",
+            "Operation": "Full provider/session restore and possible immediate residency release",
+            "Cardinality": "One cold restore per aged automatic-deletion candidate; archived state makes release eligibility immediate unless another hold exists.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No recurring automatic-deletion path restored archived sessions.",
+            "CriticalPathEffect": "Precedes any authoritative PR decision and can terminate evaluation if state was released."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostPullRequestStatusService.ts:resolveForLifecycle",
+            "Operation": "Authoritative GitHub core refresh",
+            "Cardinality": "At most one per candidate that retains a valid restored summary; serial.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Archived sessions were excluded from PR watches.",
+            "CriticalPathEffect": "Required before entering deletion validation."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:canAutomaticallyDeleteArchivedSession/_readWorktreeMetadata",
+            "Operation": "Read worktree metadata, inspect worktree path, and possibly resolve canonical repository/worktree information",
+            "Cardinality": "Once for each candidate reaching the deletion critical section; existing worktree blocks deletion and will be checked again on a later pass.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Automatic deletion did not perform this preflight; user deletion used its existing worktree path.",
+            "CriticalPathEffect": "Blocks destructive deletion as a safety preflight."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_doDisposeSession and SessionDataService.deleteSessionData",
+            "Operation": "Delete session data recursively and run existing provider/registry cleanup",
+            "Cardinality": "Once per successfully revalidated deletion candidate.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only explicit existing deletion paths invoked these boundaries, not an automatic scheduled lifecycle.",
+            "CriticalPathEffect": "The candidate deletion and serial lifecycle iteration await completion."
+          }
+        ],
+        "ScalingInput": "Number of archived PR sessions for the initial catalogue/provenance checks; later deletion boundaries apply only to sessions with aged automatic provenance and retained live summary. Worktree checks are one candidate at a time.",
+        "EffectiveConcurrency": "The lifecycle loop is serial. Session deletion uses residency disposal guards; worktree deletion operations use existing per-session sequencing.",
+        "CacheBehavior": "Provenance is durable but not included in list metadata, so it is read from the database during prefilter and revalidation. Archived sessions are release-required by residency, preventing a reliable warm restore cache. GitHub core refresh remains authoritative.",
+        "MechanismConfidence": "High for the eager restore/provenance work and intended conditional deletion boundaries; the exact fraction reaching deletion is uncertain.",
+        "MagnitudeUncertainty": "The current archived-residency interaction can prevent later boundaries on cold sessions; prevalence of retained worktrees and database sizes varies.",
+        "Verdict": "The eager restore cost is covered by the submitted restore-before-refresh finding; final deletion work is necessary, serial, and candidate-bounded, so no separate cleanup-boundary finding was submitted."
+      },
+      {
+        "Scenario": "An unrelated Agent Host root configuration value changes while cleanup is enabled",
+        "CriticalPath": "The unkeyed root-config event immediately schedules the same lifecycle pass. It performs full listing and, for stale candidates, restoration and authoritative GitHub refresh before returning to the hourly cadence.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionLifecycle.ts:onDidRootConfigChange -\u003e run -\u003e listSessions",
+            "Operation": "Full provider/session catalogue computation and per-session metadata overlay",
+            "Cardinality": "One all-session scan per non-coalesced unrelated root-config event.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Unrelated root configuration changes did not invoke merged-session cleanup.",
+            "CriticalPathEffect": "All listing work precedes candidate evaluation."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostPullRequestStatusService.ts:resolveForLifecycle",
+            "Operation": "Authoritative PR core refresh after candidate restore",
+            "Cardinality": "One per stale valid PR candidate for each unnecessary pass; serial rather than burst-concurrent.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Unrelated root setting changes did not fan out into GitHub lifecycle reads.",
+            "CriticalPathEffect": "Awaited before each candidate can be rejected or acted upon."
+          }
+        ],
+        "ScalingInput": "One extra pass per non-coalesced root-config event, multiplied by total catalogue size for listing and stale candidate count for restore/network fan-out.",
+        "EffectiveConcurrency": "RunOnceScheduler coalesces events that arrive before firing, and _runPromise serializes overlapping runs; distinct events after a run starts can still enqueue complete follow-up passes.",
+        "CacheBehavior": "The listener does not cache/compare the two relevant thresholds. listSessions only shares concurrent in-flight work, and authoritative GitHub refreshes do not use cached status as the final result.",
+        "MechanismConfidence": "High: Event\u003cvoid\u003e has all-key semantics, no value comparison is present, and the network path is explicit.",
+        "MagnitudeUncertainty": "Frequency depends on user settings changes and transient provider/setup config updates, but the event contract covers every root key.",
+        "Verdict": "Reportable boundary-fanout regression; finding submitted to compare the effective cleanup threshold pair before scheduling."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 24 changed files and all diff pages. Reported three diff-introduced regressions: recurring full-catalogue work before filtering, full session/transcript restoration before PR merge resolution, and all-key root-config events fanning out into cleanup/network passes. Browser prompt, policy handling, persistence, worktree safety, and serialized deletion were reviewed without additional reportable performance issues."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-04T23:16:54.931691171Z",
+    "CompletedAt": "2026-09-04T23:21:07.569992842Z",
+    "WallClockMilliseconds": 252638,
+    "ModelCalls": 10,
+    "InputTokens": 710897,
+    "OutputTokens": 15399,
+    "TotalTokens": 726296,
+    "ReasoningTokens": 7571,
+    "CacheReadTokens": 596048,
+    "CacheWriteTokens": 114819,
+    "APIDurationMilliseconds": 238785,
+    "ToolCalls": 80,
+    "NanoAIUnits": 112061420000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 596048,
+      "cache_write": 114819,
+      "input": 30,
+      "output": 15399
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

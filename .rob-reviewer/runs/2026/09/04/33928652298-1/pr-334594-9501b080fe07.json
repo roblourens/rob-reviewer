@@ -1,0 +1,266 @@
+{
+  "PullRequest": {
+    "Number": 334594,
+    "Title": "chat: fix GitHub context repository selection",
+    "Body": "Fixes GitHub issue and pull request attachment selection across the Agents window and editor window.\n\n- avoid waiting on unresolved local Git metadata before opening GitHub context in the Agents window\n- in a multi-root editor workspace, choose a workspace folder before resolving its GitHub repository\n- pass unresolved folder selections to Copilot Chat so the Issue/Pull Request search remains repository-scoped\n- resolve remotes without waiting for repository `HEAD` state, including direct `.git/config` lookup\n- support Git worktrees by following their `gitdir` and `commondir` pointers\n- preserve normal remote preference ordering and folder identity\n- add regressions for unresolved local metadata, different multi-root repositories, multiple roots of the same repository, and folder-based repository resolution\n\nFixes #334603\n\nValidation:\n- `npm run transpile-client`\n- `./scripts/test.sh --run src/vs/workbench/contrib/chat/test/browser/actions/chatContext.test.ts --run src/vs/sessions/contrib/providers/copilotChatSessions/test/browser/copilotChatSessionsProvider.test.ts` (92 passing)\n- `npm --prefix extensions/copilot run test:unit -- src/extension/chatSessions/vscode-node/test/copilotCloudSessionsProvider.spec.ts` (37 passing)\n- `npm --prefix extensions/copilot run typecheck`\n- live Code OSS verification with a two-folder workspace: Issue and Pull Request searches for both a normal Git repository and a Git worktree were scoped exclusively to the selected repository\n",
+    "URL": "https://github.com/microsoft/vscode/pull/334594",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "meganrogge",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "99fbee351cb651f25cea4afdf27ae7b3322aefcd",
+    "HeadRef": "agents/bugfix-attach-issue-pr-context-menu",
+    "HeadSHA": "9501b080fe0786fad7aae9020d87f5e472e22148",
+    "CreatedAt": "2026-09-04T19:32:17Z",
+    "UpdatedAt": "2026-09-04T21:54:10Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-C6BE8E527714",
+      "Focus": "performance-review",
+      "Path": "extensions/copilot/src/platform/git/vscode-node/gitServiceImpl.ts",
+      "Side": "RIGHT",
+      "Line": 201,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed boundary call, hot transitive callers, no-cache startup condition, and per-file scaling are explicit in code and tests. Exact wall-clock impact varies by filesystem latency, so severity is medium rather than high.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "filesystem stat operations",
+      "PerformanceScaling": "The added stat runs once for every uncached local URI passed to getRepositoryFetchUrls; before Git discovery settles, content-exclusion verdicts deliberately are not memoized, so concurrent file checks scale the new I/O with files and checks rather than repositories.",
+      "PerformanceOutcome": "excessive filesystem I/O and increased completion, search, review, and prompt latency during Git discovery, especially on network-mounted workspaces",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "getRepositoryFetchUrls first joined the shared initial-discovery promise. For an opened repository it then returned Git API state without filesystem I/O; unresolved files reached only the existing fallback stat after discovery.",
+      "ChangedBehavior": "Every file-scheme URI now performs and awaits workspace.fs.stat before joining discovery, even when the URI is a file and therefore cannot take the new direct .git/config branch.",
+      "CausalDiffEvidence": "RIGHT line 201 newly adds `await vscode.workspace.fs.stat(uri)` ahead of the shared discovery wait. No equivalent filesystem operation existed on the opened-repository fast path before the PR.",
+      "Title": "Gate the direct config probe to repository-root callers",
+      "Impact": "While repository discovery is pending, content exclusion calls this API for each file and does not cache unsettled verdicts; collection-based prompt/search/review paths can therefore launch a burst of one extra stat per file on their critical path. Warm repository-root and verdict caches reduce later calls, but do not protect this startup window.",
+      "Evidence": "RemoteContentExclusion.isIgnored calls getRepositoryFetchUrls on each repo-cache miss (extensions/copilot/src/platform/ignore/node/remoteContentExclusion.ts:187-195), explicitly avoids memoizing while discovery is unsettled (lines 263-271), and documents that a render can request hundreds of verdicts (lines 112-119). Its tests prove repeated Git lookups before discovery and concurrent multi-repository lookups. Numerous completion, search, review, and prompt call sites invoke isCopilotIgnored, including collection paths using Promise.all. The added line awaits a filesystem stat for all local URIs; for normal file inputs the result is not a directory, so this work cannot contribute to the direct-config optimization and execution falls through to the prior flow.",
+      "Recommendation": "Restrict the direct .git/config fast path to callers that know they are passing a selected repository/workspace root (for example via a root-specific method or option), leaving generic file-based getRepositoryFetchUrls calls on the Git API/discovery path without this preflight stat."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "extensions/copilot/src/platform/git/vscode-node/gitServiceImpl.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 216,
+      "BasePath": "extensions/copilot/src/platform/git/vscode-node/gitServiceImpl.ts",
+      "BaseLine": 202,
+      "IntroducingPath": "extensions/copilot/src/platform/git/vscode-node/gitServiceImpl.ts",
+      "IntroducingCommit": "88a8ef6f793d1b593b47862bd00aab36e88b0733",
+      "MechanismFamily": "eager-work",
+      "PerformanceCategory": "latency",
+      "Mechanism": "Folder-based GitHub context resolution previously called getRepositoryFetchUrls, which eagerly awaited the shared initial Git repository discovery before reading remotes; that wait is bounded only after 30 seconds and discovery itself waits for every repository HEAD to initialize.",
+      "Symptom": "Opening the Issue or Pull Request context picker for a selected local folder could be blocked for up to 30 seconds when local Git HEAD metadata remained unresolved.",
+      "FixedBehavior": "The new local repository-root fast path reads `.git/config` (including worktree pointers) and returns remote URLs before waitForInitialDiscovery, so the picker can proceed without waiting for HEAD/discovery.",
+      "Evidence": "The changed Agents-window path passes its single local folder URI to the extension command; resolveGitHubContextRepository calls getRepositoryFetchUrls. RIGHT lines 200-216 now read and return direct config before the still-existing wait at line 226. waitForInitialDiscovery shares a raceTimeout with INITIAL_DISCOVERY_TIMEOUT_MS=30,000, while initial discovery waits for every repository HEAD. The added unresolved-metadata tests exercise the URI pass-through path. Base blame identifies commit 88a8ef6f793d1b593b47862bd00aab36e88b0733 as introducing the old wait on base line 202.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "eager-work",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Attach an Issue or Pull Request from the Agents window for a single local folder whose Git HEAD metadata is unresolved",
+        "CriticalPath": "The browse action chooses the current folder, dispatches the extension command, resolves that folder to a GitHub repository, and only then opens and populates the GitHub search picker. Repository resolution and the initial GitHub search are on the user-visible critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/copilotChatSessions/browser/copilotChatSessionsProvider.ts:_browseForGitHubContext",
+            "Operation": "Dispatch the open-issue/open-pull-request extension command with the selected repository string or folder URI.",
+            "Cardinality": "One command per user browse action, plus at most one repository-picker command when no folder/repository can be selected directly.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same context command was dispatched, but the core side first attempted to open/resolve the local Git repository and passed a string repository id.",
+            "CriticalPathEffect": "The command must resolve before the context workspace can be created."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/git/vscode-node/gitServiceImpl.ts:getRepositoryFetchUrls/readLocalGitConfig",
+            "Operation": "Stat the selected root and `.git`, then read `.git/config`; worktrees additionally read the gitdir pointer and `commondir`.",
+            "Cardinality": "For one normal repository, two stats and one config read; a worktree adds pointer and common-directory reads. One probe per browse action.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No direct pre-discovery config probe existed; resolution joined initial Git discovery and could wait up to 30 seconds.",
+            "CriticalPathEffect": "These operations must finish before the picker opens, but replace/bypass a Git discovery wait of up to 30 seconds."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/chatSessions/vscode-node/copilotCloudSessionsProvider.ts:openGitHubContext search",
+            "Operation": "Search GitHub issues or pull requests scoped to the resolved repository.",
+            "Cardinality": "One initial search and at most one search per settled debounced query.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same GitHub search ran after repository selection.",
+            "CriticalPathEffect": "The initial result list waits on this request; picker creation itself follows only repository resolution."
+          }
+        ],
+        "ScalingInput": "Exactly one selected folder and, after the picker opens, one initial query plus debounced user queries; remote count is normally small and scanned sequentially.",
+        "EffectiveConcurrency": "Repository resolution is serialized before picker creation. The initial search is one request; later input is debounced by 300 ms and generation-guarded, although an older network request is not physically cancelled.",
+        "CacheBehavior": "The new direct `.git/config` read is not cached. It intentionally bypasses the shared cold Git-discovery promise. GitHub search results have no local cache in this path.",
+        "MechanismConfidence": "High: the URI pass-through, direct config return before waitForInitialDiscovery, and serialized command/search flow are explicit and tested.",
+        "MagnitudeUncertainty": "Local config reads are usually fast; the fixed delay is largest only when Git discovery/HEAD is unresolved. The 30-second bound and critical-path dependency are explicit.",
+        "Verdict": "This scenario is materially faster and constitutes a recorded regression fix; no review finding applies to the intentional one-root filesystem probe itself."
+      },
+      {
+        "Scenario": "Attach an Issue or Pull Request from the editor chat context picker in a multi-root workspace",
+        "CriticalPath": "Opening the attachment picker snapshots workspace folders and known Git repositories, presents one folder-level choice, then dispatches the extension command. Only an unresolved selected folder crosses into direct filesystem resolution; known repository ids skip it. GitHub search follows resolution.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/actions/chatContext.ts:GitHubContextValuePick.asAttachment",
+            "Operation": "Execute the extension-host GitHub context command with the chosen repository id or folder URI.",
+            "Cardinality": "One command for the one chosen folder; no command is sent if a multi-root quick pick is cancelled.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same command ran with a repository string or no scope; the core picker deduplicated repositories rather than preserving folder identity.",
+            "CriticalPathEffect": "The attachment cannot be created until this returns."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/git/vscode-node/gitServiceImpl.ts:getRepositoryFetchUrls/readLocalGitConfig",
+            "Operation": "Resolve an unresolved selected folder through local Git config.",
+            "Cardinality": "Zero for known repository ids; one direct root probe for the selected unresolved folder.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Unresolved folders were not passed through for direct config resolution and could fall back to an unscoped repository picker.",
+            "CriticalPathEffect": "Blocks opening the scoped GitHub search picker for that selection."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/chatSessions/vscode-node/copilotCloudSessionsProvider.ts:openGitHubContext search",
+            "Operation": "Search GitHub for scoped issues or pull requests.",
+            "Cardinality": "One initial request plus debounced query requests, independent of total workspace roots.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same search existed, potentially under a different or unscoped repository selection.",
+            "CriticalPathEffect": "Populates the picker after folder resolution."
+          }
+        ],
+        "ScalingInput": "Workspace folder count F and known repository count R control the in-memory O(F*R) matching; only one selected folder reaches command and filesystem/network boundaries.",
+        "EffectiveConcurrency": "Folder/repository matching is synchronous and serial. The user makes one selection; repository resolution then GitHub search are serial. There is no per-root boundary fan-out.",
+        "CacheBehavior": "Known Git metadata acts as the warm path and passes a repository string without filesystem work. An unresolved selected folder has no direct-config cache. Search behavior is unchanged.",
+        "MechanismConfidence": "High: tests cover distinct repositories, duplicate repository ids across roots, and unresolved roots, and the call path is direct.",
+        "MagnitudeUncertainty": "Very large multi-root workspaces make the O(F*R) in-memory scan larger, but this is a user-invoked picker and realistic root counts are low; no expensive boundary scales with all roots.",
+        "Verdict": "No reportable regression: added CPU work is bounded to a user action and boundary work remains one selected folder, not all roots."
+      },
+      {
+        "Scenario": "Filter files through remote content exclusions during completion, prompt construction, workspace/text search, or code review",
+        "CriticalPath": "isCopilotIgnored awaits repository resolution and policy loading before a file may be used. Review and feedback paths use Promise.all across changed files; text search can enqueue checks for every hit; completion and prompt paths await checks before producing context.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/git/vscode-node/gitServiceImpl.ts:201",
+            "Operation": "Preflight `workspace.fs.stat` on every local URI before Git discovery/API lookup.",
+            "Cardinality": "One newly added stat per uncached local file check; concurrent startup/search/review collections can therefore issue N stats for N files even when all files belong to one repository.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Callers immediately joined one shared discovery promise; opened repositories then resolved from Git API state without filesystem I/O. Only the pre-existing no-repository fallback performed a later stat.",
+            "CriticalPathEffect": "Each ignore verdict awaits the stat, and aggregate workflows await all verdicts before progressing."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/ignore/node/remoteContentExclusion.ts:isIgnored",
+            "Operation": "Read up to 1 KB of a file when repository or organization regex rules require content matching.",
+            "Cardinality": "At most one read per uncached file requiring regex evaluation, limited to 10 concurrent reads and keyed by content/rule scope afterward.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical limited file-content reads occurred before this PR.",
+            "CriticalPathEffect": "Existing content-rule evaluation waits for this read."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/ignore/node/remoteContentExclusion.ts:ensureRulesLoaded",
+            "Operation": "Fetch repository/organization exclusion policies from the Copilot API/GitHub-backed endpoint.",
+            "Cardinality": "One effective fetch per missing remote after coalescing, grouped 10 remotes per request with at most five batches in flight; warm rules avoid requests for 30 minutes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same coalesced, batched policy loading existed.",
+            "CriticalPathEffect": "A file verdict waits only for the policies of its effective repository and the non-git scope."
+          }
+        ],
+        "ScalingInput": "On a warm known repository, root metadata and per-file verdict caches eliminate Git lookups. Before Git discovery settles, verdicts are intentionally not memoized, so effective new preflight-stat cardinality is N for N checked local files, including repeats; collection call sites can make N concurrent.",
+        "EffectiveConcurrency": "The new pre-discovery filesystem stats have no limiter or per-URI coalescing and can fan out to caller concurrency (for example all changed files under Promise.all, or all queued text-search jobs). Policy network requests are separately coalesced by repository, batched 10 repositories per request, and limited to five concurrent batches. Regex-triggered file reads are limited to 10.",
+        "CacheBehavior": "Warm `_repoRootCache` reduces repository resolution to once per repository and `_ignoreGlobResultCache` memoizes settled per-file verdicts. During cold/unsettled discovery, repository metadata is absent and negative verdicts are deliberately not memoized; successful policy rules are cached for 30 minutes and in-flight policy fetches are shared.",
+        "MechanismConfidence": "Very high: the added awaited stat is unconditional for file-scheme URIs, tests prove repeated lookup while discovery is unsettled, source comments establish hundreds of render-time checks, and multiple production collection paths use Promise.all.",
+        "MagnitudeUncertainty": "The exact latency of stat varies greatly between local SSDs and network-mounted workspaces, and warm caches sharply reduce frequency after discovery; the uncached per-file mechanism and unbounded caller concurrency are not uncertain.",
+        "Verdict": "Reportable medium-severity I/O boundary fan-out; the accepted finding is anchored to the added preflight stat."
+      },
+      {
+        "Scenario": "Build ignore patterns for workspace search by bulk-loading discovered Git roots, and resolve workspace organization metadata",
+        "CriticalPath": "Search pattern generation first discovers `.git/HEAD` files, then loadRepos resolves every discovered root before policy patterns are available; searches explicitly wait for this. Workspace organization resolution calls the same Git API for only the first workspace folder before any network fallback.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/ignore/node/ignoreServiceImpl.ts:asMinimatchPattern and GitServiceImpl.getRepositoryFetchUrls",
+            "Operation": "Search for `.git/HEAD`, then stat/read direct Git config for each discovered repository root.",
+            "Cardinality": "One root-resolution probe per discovered repository D, all launched together; normal roots require root and `.git` stats plus one config read, with extra pointer reads for worktrees.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Root resolution waited for shared Git discovery and then used an opened Git API repository or the existing stat/getRepositoryRoot/config fallback; it had no pre-discovery worktree-aware direct read.",
+            "CriticalPathEffect": "Workspace search waits for the complete ignore pattern, so all D root resolutions complete first."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/ignore/node/remoteContentExclusion.ts:loadRepos/ensureRulesLoaded",
+            "Operation": "Fetch exclusion policies for effective remotes.",
+            "Cardinality": "Deduplicated per remote, grouped by 10 and limited to five concurrent batches; warm rules eliminate requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same endpoint, batching, cache, and limiter.",
+            "CriticalPathEffect": "Pattern generation waits for required rules before starting the dependent search."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/agents/vscode-node/githubOrgChatResourcesService.ts:getWorkspaceRepositoryOrganization",
+            "Operation": "Fall back to fetching the user's GitHub organizations if local repository remotes and token organization metadata do not identify one.",
+            "Cardinality": "At most one organizations request for the first workspace folder resolution path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same fallback request followed getRepositoryFetchUrls.",
+            "CriticalPathEffect": "The caller waits for organization selection, but the network fallback is unchanged."
+          }
+        ],
+        "ScalingInput": "Bulk pattern generation scales with D discovered repository roots after search deduplication; organization resolution is one root. Each root is passed once to getRepositoryFetchUrls.",
+        "EffectiveConcurrency": "loadRepos invokes repository resolution for all D roots with Promise.all, so direct config probes run concurrently. Subsequent policy network work is batched 10 per request and limited to five batches. Organization resolution is serial.",
+        "CacheBehavior": "loadRepos populates the repository-root metadata cache and policy rules then use the normal 30-minute cache/coalescing. Direct Git-config bytes themselves are not cached. Organization resolution has no method-local cache shown.",
+        "MechanismConfidence": "High for boundary placement and concurrency; net cost relative to the Git API root lookup is workload-dependent.",
+        "MagnitudeUncertainty": "D can be large in workspaces containing many nested repositories, but the new direct probes replace slower discovery/root-resolution work and remain one per discovered root; no evidence establishes a net regression in this bulk-root scenario.",
+        "Verdict": "No additional finding: direct root probing is appropriate for root inputs and can shorten the critical path, while the reported bug is specifically its unconditional application to file inputs."
+      }
+    ],
+    "Summary": "Completed the performance pass over all seven changed files and transitive Git, picker, ignore, search, review, filesystem, IPC, and network paths. Submitted one medium boundary-fan-out finding for the unconditional per-file filesystem stat and recorded the PR's high-confidence fix for the prior 30-second discovery wait."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-04T23:29:51.120356772Z",
+    "CompletedAt": "2026-09-04T23:32:42.468596681Z",
+    "WallClockMilliseconds": 171348,
+    "ModelCalls": 11,
+    "InputTokens": 502741,
+    "OutputTokens": 11243,
+    "TotalTokens": 513984,
+    "ReasoningTokens": 4963,
+    "CacheReadTokens": 425730,
+    "CacheWriteTokens": 76978,
+    "APIDurationMilliseconds": 161515,
+    "ToolCalls": 56,
+    "NanoAIUnits": 78017400000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 425730,
+      "cache_write": 76978,
+      "input": 33,
+      "output": 11243
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

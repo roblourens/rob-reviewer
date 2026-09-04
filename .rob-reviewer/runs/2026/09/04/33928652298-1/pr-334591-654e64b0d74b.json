@@ -1,0 +1,187 @@
+{
+  "PullRequest": {
+    "Number": 334591,
+    "Title": "sessions: redesign unified workspace picker",
+    "Body": "\u003cimg width=\"446\" height=\"406\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/9f03cec5-3f32-4a0a-b712-8d8448d646ad\" /\u003e\n\n## Summary\n\n- replace the Local/Remote tabs with one searchable workspace picker behind `chat.agentSessions.consolidatedRemoteWorkspaces`\n- add explicit local **Add GitHub Repository**, **Clone Repository**, and **Use Repository in Cloud** flows while preserving the legacy repository action when the setting is disabled\n- move remote recents, hosts, SSH, tunnels, WSL, and related actions into a single icon-aware **Remote** flyout\n- align wording and icons with the GitHub app, including **Start from Scratch**, **Open Folder**, and the **Search** placeholder\n- collapse generated worktree recents onto known parent repositories without changing the actual execution checkout\n\n## Validation\n\n- `npm run transpile-client`\n- ESLint on all changed files\n- `./scripts/test.sh --run src/vs/sessions/contrib/chat/test/browser/sessionWorkspacePicker.test.ts src/vs/sessions/contrib/providers/copilotChatSessions/test/browser/copilotChatSessionsProvider.test.ts` (169 passing)\n- `git diff --check`\n- manually verified the dedicated Agents window after provider hydration and exercised the picker presentation\n\nCloses #334563",
+    "URL": "https://github.com/microsoft/vscode/pull/334591",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "meganrogge",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "99fbee351cb651f25cea4afdf27ae7b3322aefcd",
+    "HeadRef": "agents/workspace-picker-redesign-ideas",
+    "HeadSHA": "654e64b0d74b497aa99a56aaaa11657fe92ffa14",
+    "CreatedAt": "2026-09-04T19:14:19Z",
+    "UpdatedAt": "2026-09-04T19:55:55Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-5A60A2E0A679",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/chat/browser/sessionWorkspacePicker.ts",
+      "Side": "RIGHT",
+      "Line": 1416,
+      "Severity": "low",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed gate, synchronous picker call path, and full-cache scans are directly traced. Session enumeration is cache-backed and coalesces any initialization refresh, so magnitude depends on users' remote-host and session counts; that uncertainty is reflected in low severity rather than mechanism confidence.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "Synchronous CPU work and temporary session arrays/filtered arrays",
+      "PerformanceScaling": "Each unified-picker open now performs serial work proportional to the sum of cached sessions across every registered remote host, O(sum sessions per host), even when the user only wants a local or GitHub workspace.",
+      "PerformanceOutcome": "Increased workspace-picker open latency plus CPU/GC pressure for users with large accumulated remote-session histories.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this change, `includeRemoteProviders` was true only on the Remote tab, so opening the picker on Local/GitHub did not enumerate remote-host sessions; the work occurred only after selecting Remote.",
+      "ChangedBehavior": "With tabs removed, `activeGroup` is normally undefined, and this added condition includes every remote provider while constructing the unified picker. The subsequent loop calls `getRemoteHostStatusDescription`, which calls `provider.getSessions()` and filters every session to compute active counts before the Remote submenu is opened.",
+      "CausalDiffEvidence": "The RIGHT-side condition `activeGroup === undefined || activeGroup === SESSION_WORKSPACE_GROUP_REMOTE` newly activates remote-provider row construction for the default tabless unified picker; the deleted condition required `_activeTab === SESSION_WORKSPACE_GROUP_REMOTE`.",
+      "Title": "Defer remote session counts until the Remote flyout opens",
+      "Impact": "Opening the workspace selector for any new session can pause longer as remote session history grows, even if the user selects Open Folder or a GitHub action and never opens Remote.",
+      "Evidence": "`includeRemoteProviders` now accepts `activeGroup === undefined` at line 1416. That drives the loop at lines 1500-1503 for every remote provider. `getRemoteHostStatusDescription` at lines 167-170 calls `provider.getSessions().filter(...)`; `BaseAgentHostSessionsProvider.getSessions` itself copies the full session cache, after which this helper allocates and scans another filtered array. The picker builds these items synchronously before `actionWidgetService.show` at lines 746-760.",
+      "Recommendation": "Gate remote-provider status/count construction behind opening the Remote flyout (or otherwise compute those rows lazily), while keeping only the cheap top-level Remote action in the initial unified list."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "synchronous-ui-work",
+      "serialization-allocation",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open the consolidated workspace picker to choose a local, GitHub, or remote workspace",
+        "CriticalPath": "`showPicker` synchronously calls `_buildItems` before `actionWidgetService.show`; provider/action enumeration, recent resolution, remote status/count construction, menu action construction, and list allocation must all finish before the picker is visible.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_ensureSessionCache/_refreshSessions",
+            "Operation": "Potential agent-host `connection.listSessions()` cache initialization reached by `provider.getSessions()`",
+            "Cardinality": "At most one in-flight or scheduled refresh per remote provider; normally zero on picker open because connection setup already initiated hydration. The synchronous scan still covers every cached session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Connected hosts already refresh on `setConnection`; before the diff, remote-session cache reads/counting during picker construction occurred only on the Remote tab.",
+            "CriticalPathEffect": "The asynchronous IPC is fire-and-forget from `getSessions` and does not block picker display, but synchronous cache copying/filtering is on the critical path."
+          }
+        ],
+        "ScalingInput": "Registered providers and remote hosts, up to 20 resolved recent entries (10 session recents plus 10 VS Code recents), and the sum of cached sessions across all remote hosts. Remote session counting has effective cardinality O(sum of sessions across hosts), without deduplication across hosts.",
+        "EffectiveConcurrency": "All item construction and remote cache scanning is serial on the UI thread. Any agent-host cache refresh is internally guarded by one in-flight refresh or backoff retry per provider.",
+        "CacheBehavior": "VS Code recent URIs are cached after asynchronous hydration; stored session recents are parsed each call but capped at 10. Remote `getSessions()` reads/copies the provider cache. On a cold connected provider `_ensureSessionCache` can initiate `listSessions`, but `setConnection` already starts that refresh and the provider coalesces in-flight/retry attempts; warm opens do no IPC but still rescan cached sessions.",
+        "MechanismConfidence": "High: the changed default gate, synchronous build path, and two serial full-session scans per host are explicit in code.",
+        "MagnitudeUncertainty": "Typical host/session counts and exact scan duration are unmeasured, but users with accumulated histories across several hosts provide a realistic scaling trigger.",
+        "Verdict": "Reportable low-severity eager synchronous work because every unified-picker open now scans all remote session caches before the Remote flyout is requested."
+      },
+      {
+        "Scenario": "Choose Add GitHub Repository or Clone Repository from the new local acquisition actions",
+        "CriticalPath": "The repository picker (for Add GitHub Repository), `git.clone`, and local workspace resolution must complete before the selected local workspace is returned.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/providers/copilotChatSessions/browser/copilotChatSessionsProvider.ts:_browseForGitHubRepo",
+            "Operation": "Select a GitHub repository through `github.copilot.chat.cloudSessions.openRepository`",
+            "Cardinality": "One command per Add GitHub Repository invocation; skipped for direct Clone Repository.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The legacy Repository action invoked the same repository picker once but returned a virtual cloud workspace rather than continuing to clone.",
+            "CriticalPathEffect": "Selection must finish before cloning starts."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/sessions/contrib/providers/copilotChatSessions/browser/copilotChatSessionsProvider.ts:_cloneRepository",
+            "Operation": "Run `git.clone` for the selected or entered repository",
+            "Cardinality": "Exactly one clone command per explicit acquisition invocation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No local clone acquisition action existed on this picker path; the legacy action created a virtual GitHub workspace without cloning.",
+            "CriticalPathEffect": "Clone network/filesystem work is the dominant critical-path operation before a local workspace can be returned."
+          }
+        ],
+        "ScalingInput": "One selected repository and one clone operation per explicit user action.",
+        "EffectiveConcurrency": "Sequential: Add GitHub Repository awaits repository selection and then one clone; Clone Repository directly awaits one clone. No fan-out or retry loop is added here.",
+        "CacheBehavior": "No new cache is used. Repository selection and clone are explicit cold operations; repeated selections intentionally repeat the user-requested clone flow.",
+        "MechanismConfidence": "High: both command boundaries and sequential ordering are directly shown and tested.",
+        "MagnitudeUncertainty": "Clone duration and bytes depend on repository size and network conditions, but this is explicit, user-requested work rather than hidden amplification.",
+        "Verdict": "No performance finding: the expensive clone is a deliberate new one-shot action with no multiplicative fan-out or concurrency burst."
+      },
+      {
+        "Scenario": "Choose Use Repository in Cloud or attach a GitHub repository as context",
+        "CriticalPath": "One repository-selection command must return before the virtual GitHub workspace is constructed and selected/attached.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/providers/copilotChatSessions/browser/copilotChatSessionsProvider.ts:_browseForCloudRepo",
+            "Operation": "Invoke the GitHub repository picker command",
+            "Cardinality": "One command per user invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The previous Repository action invoked the same command once and built the same virtual workspace; the diff renames/splits the action without increasing this boundary count.",
+            "CriticalPathEffect": "The command result is required to build the selected virtual workspace."
+          }
+        ],
+        "ScalingInput": "One repository selection per invocation; workspace construction creates one folder descriptor.",
+        "EffectiveConcurrency": "Single sequential command with no parallel fan-out.",
+        "CacheBehavior": "No local cache or repeated background refresh is introduced on this path.",
+        "MechanismConfidence": "High for unchanged boundary count and call path.",
+        "MagnitudeUncertainty": "The extension command's internal network behavior is outside the reviewed diff, but its cardinality remains one.",
+        "Verdict": "No performance regression: the PR preserves the existing one-command cloud selection path."
+      },
+      {
+        "Scenario": "Collapse generated worktree recents onto known parent repositories and remove a collapsed recent",
+        "CriticalPath": "Opening the consolidated picker parses and resolves recents synchronously; removal filters stored and cached recent URIs, persists changed session recents, then makes one batched `removeRecentlyOpened` call.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/services/sessions/browser/sessionsRecentWorkspacesService.ts:removeRecentWorkspace",
+            "Operation": "Persist session recent-workspace storage and update VS Code's recently-opened records",
+            "Cardinality": "At most one session-storage write when entries changed and one batched `removeRecentlyOpened` service call, regardless of alias count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Removal already persisted session recents and called `removeRecentlyOpened` once; the diff expands the single call's URI payload to include bounded collapsed aliases.",
+            "CriticalPathEffect": "Runs only after an explicit remove action; bounded alias matching precedes the service call."
+          }
+        ],
+        "ScalingInput": "At most 10 stored session recents plus 10 cached VS Code recents. Removal can pass at most 11 URIs (the selected parent plus up to 10 aliases) in one call.",
+        "EffectiveConcurrency": "Serial bounded array/set processing; removal uses one batched service call rather than one call per alias.",
+        "CacheBehavior": "Stored recents are read from storage each time; VS Code recents are held in memory after hydration. URI collapse/deduplication is recomputed, with no cache, but both collections are hard-capped.",
+        "MechanismConfidence": "High: caps, loops, and batched call are explicit.",
+        "MagnitudeUncertainty": "Actual persistence implementation cost is service-dependent, but cardinality is strictly bounded and calls are not multiplied.",
+        "Verdict": "No performance finding: added URI normalization and fan-out are bounded to small fixed recent lists and preserve a single removal boundary call."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and every diff page. One low-severity eager synchronous UI regression was submitted; explicit repository operations and bounded recent-workspace normalization did not create additional reportable performance regressions."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-04T23:26:09.600098747Z",
+    "CompletedAt": "2026-09-04T23:29:43.186418645Z",
+    "WallClockMilliseconds": 213586,
+    "ModelCalls": 16,
+    "InputTokens": 873885,
+    "OutputTokens": 9120,
+    "TotalTokens": 883005,
+    "ReasoningTokens": 3590,
+    "CacheReadTokens": 782044,
+    "CacheWriteTokens": 91793,
+    "APIDurationMilliseconds": 166497,
+    "ToolCalls": 71,
+    "NanoAIUnits": 95437460000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 782044,
+      "cache_write": 91793,
+      "input": 48,
+      "output": 9120
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
