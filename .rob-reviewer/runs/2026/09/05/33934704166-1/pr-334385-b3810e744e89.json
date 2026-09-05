@@ -1,0 +1,190 @@
+{
+  "PullRequest": {
+    "Number": 334385,
+    "Title": "agentHost: publish client tools before starting turns",
+    "Body": "## Summary\n\n- wait for the active-client customization scope to resolve and publish before dispatching new or resumed Agent Host turns\n- prevent the first provider request from using a stale tool inventory when a client plugin finishes resolving during send\n- avoid retaining cancelled unresolved claims and join concurrent resumes instead of dispatching a stale duplicate\n- add ordering, cancellation, and resume-concurrency regressions\n\n## What this waits for\n\nThe new barrier waits only for **client-side customization resolution and publication**: discovering plugin/skill/instruction/MCP configuration metadata, preparing any synced plugin bundle, and sending the resulting `session/activeClientSet` before `chat/turnStarted`.\n\nIt does **not** wait for an MCP server to connect, authenticate, complete its initialize handshake, or return `tools/list`. Those network-facing steps happen afterward inside the Copilot runtime and retain the runtime's existing timeout behavior; this PR does not add to or change that wait.\n\nWith the actual local `vscode-corpus` plugin (9 MCP servers / 83 declared tools), the fixed run published the Corpus customization 74 ms after submit. Submit-to-turn-start was 515 ms with the fix versus 472 ms on the parent (+43 ms), while submit-to-first-model-request was 55 ms faster with the fix, putting the observed difference within normal run-to-run noise. See the [real Corpus timing details](https://github.com/microsoft/vscode/pull/334385#issuecomment-5546650938).\n\n## Testing\n\n- `npm run typecheck-client`\n- `./scripts/test.sh --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts --grep \"customizations|resume\"` (29 passing)\n- `./scripts/test-integration.sh --run src/vs/platform/agentHost/test/node/e2e/providers/copilotAgentHostE2E.integrationTest.ts --grep \"plugin MCP tool executes and returns its result to the model\"` (1 passing)\n- [Before/after UI validation with screenshots and AHP/model-request evidence](https://github.com/microsoft/vscode/pull/334385#issuecomment-5546418509)",
+    "URL": "https://github.com/microsoft/vscode/pull/334385",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "pwang347",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0758edeec112d0d806e8005e4d2a3b1539e0d0b9",
+    "HeadRef": "fix/agent-host-first-turn-tools",
+    "HeadSHA": "b3810e744e89884eaeaaff9cdb279068dc9bc99b",
+    "CreatedAt": "2026-09-03T23:19:43Z",
+    "UpdatedAt": "2026-09-04T21:49:48Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "missing-coalescing",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Send the first turn immediately after opening an existing Agent Host session",
+        "CriticalPath": "Session/chat hydration completes and starts the shared customization scope; the changed claim path now waits for any remaining initial customization resolution, performs a microtask reconciliation, and queues any required active-client publication before ChatTurnStarted. The initial resolution is therefore newly on this turn's critical path only when it has not already completed while the session UI was opening.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostActiveClientService.ts AgentCustomizationScope and agentHostLocalCustomizations.ts resolveCustomizationRefs/resolveLocalCustomAgents",
+            "Operation": "Enumerate prompt/customization sources; stat plugin roots and skill trees; read agent and bundle files; write the synthetic in-memory customization bundle when its nonce changes.",
+            "Cardinality": "Once per cold shared sessionType-plus-root scope; enumeration covers each configured storage source and eligible customization, while recursive skill traversal scales with files in each skill. File operations are limited to 10 concurrently and the scope is shared across simultaneously open sessions with the same roots.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same scope resolution and filesystem work ran after opening the session but a turn could dispatch before it completed; the diff changes ordering by waiting for it.",
+            "CriticalPathEffect": "Only the unfinished portion of cold initial resolution blocks the changed claim; warm scopes return immediately. This work already started when the session content acquired the scope."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts ActiveClientEntry._requestReconciliation and _handleTurn",
+            "Operation": "Publish SessionActiveClientSet through the Agent Host connection when the authoritative state differs, followed by ChatTurnStarted.",
+            "Cardinality": "At most one active-client publication for the reconciled snapshot before one turn dispatch; Delayer coalesces concurrent claims and equality/_lastPublished suppress duplicate publications.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Both message types already existed; active-client reconciliation used a 5 ms delayed asynchronous path and could be queued after ChatTurnStarted.",
+            "CriticalPathEffect": "The active-client message is now synchronously queued before the turn message, but dispatch does not await a host acknowledgement."
+          }
+        ],
+        "ScalingInput": "Number of eligible plugins, prompt files, agents, MCP definitions, and recursively contained skill files for one root set; effective scope cardinality is one cold resolution per concurrently retained root/session-type key, not one scan per turn.",
+        "EffectiveConcurrency": "Customization discovery runs its independent top-level resolvers in parallel; bundle filesystem operations use a limiter of 10, writes are sequential, and one ref-counted scope is shared by identical roots. Concurrent turn claims share one Delayer completion and reconcile once per microtask snapshot.",
+        "CacheBehavior": "Cold scopes resolve and bundle once. Warm calls use the settled initial promise, cached derived active-client data, nonce reuse in the bundler, and equality suppression. Disposing the final session reference drops the scope, so a later cold reopen resolves again.",
+        "MechanismConfidence": "High confidence in the changed ordering and filesystem call graph; medium confidence that meaningful residual latency remains in normal use because resolution starts before the UI becomes invokable and is shared/cached.",
+        "MagnitudeUncertainty": "Residual cold-resolution time depends on how quickly the user submits after hydration and on customization/file-system size. The code proves a temporary critical-path wait, but not a sustained or high-impact regression; the ordering is required to prevent stale tool/customization publication.",
+        "Verdict": "No finding. The diff intentionally places only unfinished initial resolution on the critical path to guarantee the first request observes the published client snapshot; the work is once-per-scope, already initiated before invocation, bounded/coalesced, and no evidence establishes a user-visible regression large enough for an actionable performance finding."
+      },
+      {
+        "Scenario": "Create a new Agent Host session and send its first turn",
+        "CriticalPath": "The pre-existing create path already waits for ActiveClientEntry.whenSettled before createSession, sends the active client in createSession, hydrates subscriptions, then reaches the changed claim. The added claim normally sees a resolved scope and adds one microtask reconciliation before ChatTurnStarted.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts _createAndSubscribe; transitive AgentCustomizationScope resolution",
+            "Operation": "Resolve and optionally bundle local customizations for the active-client snapshot.",
+            "Cardinality": "One cold resolution per shared scope, scaling with eligible customization files and skill contents.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The first new-session turn already awaited active-client settlement before the createSession boundary.",
+            "CriticalPathEffect": "Already blocked createSession before the diff; the changed post-create claim does not add a second scan."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts _createAndSubscribe and _handleTurn",
+            "Operation": "Create and subscribe to the backend session, then dispatch ChatTurnStarted; SessionActiveClientSet is only queued if hydrated state differs.",
+            "Cardinality": "One create request, session/chat subscriptions, and one turn dispatch per new session/turn; active-client publication remains equality-suppressed.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same create, subscribe, and turn boundaries occurred, with the active client included in createSession.",
+            "CriticalPathEffect": "Create/subscription round trips remain the dominant pre-existing critical path. The changed warm microtask executes after those operations."
+          }
+        ],
+        "ScalingInput": "Customization count affects the pre-existing create barrier; one turn and one session are dispatched.",
+        "EffectiveConcurrency": "Scope initialization is shared and in flight while session setup proceeds; claim does not launch another resolution. Reconciliation is serialized/coalesced by one Delayer.",
+        "CacheBehavior": "The scope was acquired when the new chat content was provided and is warm by the time createSession returns; nonce and active-client equality avoid redundant bundle writes/publications.",
+        "MechanismConfidence": "High confidence from the explicit pre-existing whenSettled call before createSession and the shared scope instance.",
+        "MagnitudeUncertainty": "Only microtask scheduling and equality cost are newly added here; exact metadata size varies, but there is no new scaling boundary.",
+        "Verdict": "No finding. The expensive initialization was already on the new-session critical path, while the diff adds only a warm, coalesced reconciliation needed for ordering."
+      },
+      {
+        "Scenario": "Send later turns after client tools or customization metadata changes",
+        "CriticalPath": "Each changed turn now forces pending active-client reconciliation to the next microtask and waits until its current snapshot is queued; unchanged warm turns perform a derived snapshot read and equality checks before dispatching ChatTurnStarted.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostActiveClientService.ts AgentCustomizationScope.activeClient and agentHostSessionHandler.ts ActiveClientEntry._requestReconciliation",
+            "Operation": "Compose/copy the tool and customization arrays and deep-compare the active-client snapshot with session state and the last publication.",
+            "Cardinality": "Once per turn claim after microtask coalescing; comparisons scale with the enabled tool/customization list. Concurrent claims in the same microtask share the reconciliation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same composition/comparison ran asynchronously after a 5 ms debounce rather than before the turn.",
+            "CriticalPathEffect": "Newly moved onto the turn critical path, but it operates on already-resolved in-memory metadata and avoids dispatch when equal."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts lines 999 and 3009",
+            "Operation": "Queue SessionActiveClientSet before ChatTurnStarted when metadata changed.",
+            "Cardinality": "One publication for the latest coalesced changed snapshot and one turn dispatch; no publication for unchanged or already-unacknowledged equivalent snapshots.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The active-client publication was already produced on metadata changes but could be delayed and ordered after the turn.",
+            "CriticalPathEffect": "Ordering changes so publication is queued first; neither dispatch waits for host acknowledgement."
+          }
+        ],
+        "ScalingInput": "Enabled client tool and customization count, with realistic effective cardinality one list comparison and at most one publication per turn-time snapshot rather than one per changed item.",
+        "EffectiveConcurrency": "Microtask Delayer calls collapse simultaneous claims and metadata notifications to the latest task. `_lastPublished` prevents repeated sends while server state has not converged.",
+        "CacheBehavior": "Derived observables cache until dependencies change; warm scope promise is settled; unchanged and last-published snapshots are negative-cached by equality checks.",
+        "MechanismConfidence": "High confidence that in-memory reconciliation is newly ordered before the turn and remains coalesced/deduplicated.",
+        "MagnitudeUncertainty": "Deep equality grows with metadata size, but typical tool/customization inventories are bounded and the diff does not establish measurable CPU or serialization pressure.",
+        "Verdict": "No finding. The added critical-path work is one microtask plus bounded in-memory comparison, and changed snapshots retain the existing one-message coalescing and duplicate suppression."
+      },
+      {
+        "Scenario": "Retry/resume a turn while scope resolution is pending, including concurrent resume and cancellation",
+        "CriticalPath": "The resumed invocation now joins the same scope-resolution/reconciliation barrier before inspecting and observing the resumed turn. Cancellation races the barrier and exits without active-client or turn dispatch. Concurrent resumes share reconciliation, after which existing state determines whether a resume message is needed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts ActiveClientEntry.claim",
+            "Operation": "Complete the same cold customization scope resolution described for an existing session.",
+            "Cardinality": "One shared cold scope resolution regardless of the number of concurrent retries.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Resolution ran independently and retry observation/dispatch proceeded without waiting.",
+            "CriticalPathEffect": "Newly blocks retry attachment only while initial resolution is pending; cancellation releases the caller without waiting for completion."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts _handleResumedTurn",
+            "Operation": "Queue a changed SessionActiveClientSet and, only if still necessary, ChatTurnResume; cancellation may queue ChatTurnCancelled after observation is installed.",
+            "Cardinality": "One coalesced active-client update and zero or one resume dispatch for concurrent retry attempts; the tested concurrently accepted remote resume avoids a duplicate local resume.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same messages existed, but active-client claiming did not delay state inspection and publication was not guaranteed to precede resume.",
+            "CriticalPathEffect": "Active-client publication is ordered first without acknowledgement; a remote resume received during the barrier can remove the need for local resume dispatch."
+          }
+        ],
+        "ScalingInput": "Number of concurrent local retries for one turn; effective expensive-work cardinality remains one scope resolution and one reconciliation, not one per retry.",
+        "EffectiveConcurrency": "Concurrent callers await one shared initial-resolution promise and one Delayer settlement. Cancellation is caller-specific via raceCancellation and does not cancel or duplicate the shared scope work.",
+        "CacheBehavior": "Warm scopes bypass filesystem work; the settled promise and shared scope are reused. Active-client equality and last-published state suppress duplicate messages.",
+        "MechanismConfidence": "High confidence in joining/coalescing and cancellation behavior from the changed call order, Delayer implementation, and focused regression tests.",
+        "MagnitudeUncertainty": "A cold retry can inherit residual discovery latency, but retries are less frequent and the work is shared; no evidence shows unbounded concurrency or repeat I/O.",
+        "Verdict": "No finding. The barrier may add bounded cold latency but prevents stale duplicate resume behavior, coalesces concurrent callers, and introduces no additional expensive boundary or fan-out."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and all diff pages. Traced cold/warm customization resolution, active-client publication, normal/new/resumed turn critical paths, cancellation, cache lifetime, dispatch ordering, filesystem cardinality, and effective concurrency. No high-confidence actionable performance regression was found; the only newly critical work is intentionally ordered, shared/coalesced, and either already pre-existing on new-session creation or bounded to residual cold resolution/in-memory reconciliation."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-05T01:02:35.591040856Z",
+    "CompletedAt": "2026-09-05T01:04:31.603997861Z",
+    "WallClockMilliseconds": 116012,
+    "ModelCalls": 10,
+    "InputTokens": 390430,
+    "OutputTokens": 7804,
+    "TotalTokens": 398234,
+    "ReasoningTokens": 3207,
+    "CacheReadTokens": 305664,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 103054,
+    "ToolCalls": 44,
+    "NanoAIUnits": 61740960000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 305664,
+      "cache_write": 0,
+      "input": 84766,
+      "output": 7804
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
