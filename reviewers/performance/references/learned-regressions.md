@@ -11,3 +11,8 @@ Trace cleanup ownership through failure, cancellation, replacement, and shutdown
 ## Synchronous UI work revealed by shipped fixes
 
 Trace reads and writes on resize, scroll, render, and input paths through browser layout and compositor boundaries. Look for changed geometry reads after writes, live filters on moving surfaces, and synchronous nested relayouts.
+
+<!-- learned-family:eager-work -->
+## Eager work revealed by shipped fixes
+
+Inspect eagerly constructed hidden sections and details. Report when a changed constructor starts heavyweight UI, model, filesystem, or network work before the feature is visible or requested, and identify the first-use boundary that could own lazy creation.
