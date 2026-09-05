@@ -2,6 +2,48 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#334696 — sessions: measure and unblock V3 onboarding GitHub personalization](https://github.com/microsoft/vscode/pull/334696)
+
+- Published comments: **1**
+- Head: `fda8f5b56fbe33ab077346719a380e643ffe3b49`
+- Completed: `2026-09-05T12:58:15Z`
+- Run: [33966858284 attempt 1](runs/2026/09/05/33966858284-1/run.md)
+
+### `src/vs/sessions/contrib/chat/browser/newChatInput.ts:685`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+The PR makes prompt options selectable immediately while repository discovery and GitHub personalization are still in flight, then only suppresses later renders after selection instead of cancelling that work.
+
+A user who immediately chooses one of the newly available standard or partial options can still trigger the rest of a 10-second personalization run in the background. That consumes filesystem and GitHub network capacity after its result can no longer be rendered, potentially contending with session startup and wasting up to eight GraphQL requests per impression.
+
+**Suggested fix:** When option selection begins, cancel the active prompt-options refresh/token in addition to setting the selection guard (without clearing the selected/generated input). Preserve the existing guard for focus-only render suppression, since focus alone should not abort personalization.
+
+(Written by Copilot)
+
+## [#334694 — \[cherry-pick\] agentHost: Preserve workspace transition boundaries](https://github.com/microsoft/vscode/pull/334694)
+
+- Published comments: **1**
+- Head: `4b4be225afb770efd6718857998959ecc9d1f6ce`
+- Completed: `2026-09-05T12:58:15Z`
+- Run: [33966858284 attempt 1](runs/2026/09/05/33966858284-1/run.md)
+
+### `src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionContribution.ts:76`
+
+**[Experimental performance review bot]**
+
+**Severity: low**
+
+Hydrating a converted transcript now performs a fresh storage existence check/database acquisition and a full workspace-transition query after provider history has returned.
+
+Reopening a converted agent session is delayed by an additional filesystem/database round trip after provider history has already completed; sessions with many lazily opened peer or subagent transcripts repeat the delay per transcript.
+
+**Suggested fix:** Read the transition map while the existing restore database reference is open and start that read alongside provider history, then pass the resolved map into hydration. For peer/subagent chats, propagate a storage-specific marker/map so a parent session transition does not trigger empty child-database probes.
+
+(Written by Copilot)
+
 ## [#334341 — Add opt-in auto-archive inactive sessions with merged pull requests](https://github.com/microsoft/vscode/pull/334341)
 
 - Published comments: **1**
