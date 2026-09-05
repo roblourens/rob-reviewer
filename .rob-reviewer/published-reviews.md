@@ -2,6 +2,62 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#334341 — Add opt-in auto-archive inactive sessions with merged pull requests](https://github.com/microsoft/vscode/pull/334341)
+
+- Published comments: **1**
+- Head: `7e6d14157062b843b8a4ca0efc58f6b2157f306b`
+- Completed: `2026-09-05T09:24:43Z`
+- Run: [33957353041 attempt 1](runs/2026/09/05/33957353041-1/run.md)
+
+### `src/vs/platform/agentHost/node/agentHostSessionLifecycle.ts:144`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+The new hourly lifecycle restores every due deletion candidate before checking whether its retained worktree makes automatic deletion impossible; rejected candidates remain eligible and repeat the sequence next hour.
+
+Automatically archived sessions whose worktree cleanup was skipped or failed repeatedly consume GitHub API budget and provider/database I/O every hour despite being unable to make deletion progress.
+
+**Suggested fix:** For delete candidates, run a cheap `canDeleteSession` preflight before the GitHub refresh and restore, while retaining the current in-disposal recheck for race safety.
+
+(Written by Copilot)
+
+## [#333196 — chat: add customization migration assessment telemetry](https://github.com/microsoft/vscode/pull/333196)
+
+- Published comments: **2**
+- Head: `37e5ee7b1a9747057e9f3d6b4797ce90f27ba6e9`
+- Completed: `2026-09-05T09:24:43Z`
+- Run: [33957353041 attempt 1](runs/2026/09/05/33957353041-1/run.md)
+
+### `src/vs/sessions/services/sessions/browser/sessionsService.ts:789`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+The added fire-and-forget call invokes `reportCustomizationMigrationTelemetry` after every `_openChat`, including opens of side chats and subagent chats in a session that is already active.
+
+Opening or switching among chats in an already-open Agents session calls `_openChat` each time, so normal tab navigation repeatedly launches the complete customization assessment even though the session lifecycle has not changed.
+
+**Suggested fix:** Move this report to the actual session-entry transition (or guard/deduplicate it by session resource for the current open lifecycle) and leave chat-only navigation free of migration recomputation.
+
+(Written by Copilot)
+
+### `src/vs/sessions/services/sessions/browser/sessionsService.ts:1614`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+The new loop fire-and-forgets one `_reportCustomizationMigrationTelemetry` call for every already-resolved restored session without a limiter, idle deferral, or grouping by equivalent assessment scope.
+
+Reloading an Agents window with several persisted visible sessions immediately launches a full customization assessment for every restored session just as the workbench is restoring. Different workspace roots prevent MCP-scope coalescing, so a realistic multi-session grid fans out concurrent work.
+
+**Suggested fix:** Queue these reports with bounded concurrency or defer them to idle, and coalesce assessments that share the same session type/workspace scope while preserving the required per-session telemetry semantics.
+
+(Written by Copilot)
+
 ## [#334594 — chat: fix GitHub context repository selection](https://github.com/microsoft/vscode/pull/334594)
 
 - Published comments: **1**
