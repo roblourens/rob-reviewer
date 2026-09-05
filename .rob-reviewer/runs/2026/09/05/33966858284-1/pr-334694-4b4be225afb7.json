@@ -1,0 +1,235 @@
+{
+  "PullRequest": {
+    "Number": 334694,
+    "Title": "[cherry-pick] agentHost: Preserve workspace transition boundaries",
+    "Body": "## Summary\n\nBackport of #334534 to `release/1.137`.\n\n- skip workspace trust prompts when effective permissions are Allow All or global auto-approve is enabled\n- preserve the always-visible `Now working in` workspace transition boundary across collapsed progress and Agent Host restarts\n- hide the internal continuation request while preserving provider output and file-change attribution\n- persist transition state atomically and serialize transition restoration with turn-ID mapping writes\n- expose truncated transition labels through the standard hover service\n\nThis branch contains only the five commits from #334534. The prerequisite workspace-conversion implementation from #334250 is already present on `release/1.137`.\n\n## Validation\n\n- `npm run typecheck-client`\n- targeted ESLint across all 26 changed TypeScript files\n- targeted Stylelint for the transition CSS\n- `npm run transpile-client`\n- 848 focused unit tests passed, 38 pending\n- `git diff --check`",
+    "URL": "https://github.com/microsoft/vscode/pull/334694",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "release/1.137",
+    "BaseSHA": "dc5c57a87d09b36ff1c31af2395be30cdfbd96c2",
+    "HeadRef": "sandy081/agents/workspace-transition-boundaries-1.137",
+    "HeadSHA": "4b4be225afb770efd6718857998959ecc9d1f6ce",
+    "CreatedAt": "2026-09-05T08:22:18Z",
+    "UpdatedAt": "2026-09-05T08:33:04Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-ABC24421A76B",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionContribution.ts",
+      "Side": "RIGHT",
+      "Line": 76,
+      "Severity": "low",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed call path is direct: restoreSession reads and disposes the session DB, _getChatMessages awaits provider history, and this contribution then awaits tryOpenDatabase plus getTurnWorkspaceTransitions. chatStorageUri maps the default chat back to that same session storage; for peer/subagent chats the session-level marker also enables one analogous lookup per materialized chat. Exact milliseconds vary with filesystem and database warmth, so severity is low, but the added serial I/O is certain.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "missing-coalescing",
+      "PerformanceResource": "filesystem stat calls, SQLite connection/migration checks on a cold reference, and SQLite transition queries",
+      "PerformanceScaling": "One additional storage lookup/query per hydrated converted chat; the cost scales with the number of peer/subagent transcripts a user materializes, while cold references also pay database open and migration-check costs.",
+      "PerformanceOutcome": "increased session and transcript restore latency from serialized storage I/O",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Transcript hydration did not touch session storage after provider history retrieval; default-session restore performed only its existing metadata database pass.",
+      "ChangedBehavior": "Hydrating a converted transcript now performs a fresh storage existence check/database acquisition and a full workspace-transition query after provider history has returned.",
+      "CausalDiffEvidence": "The added onHydrateTurns path at lines 76-79 calls tryOpenDatabase(storage) and getTurnWorkspaceTransitions(). AgentService now invokes this only after its earlier session metadata database reference has been disposed and after provider.chats.getMessages completes, so the new storage lookup/query is a separate serial boundary introduced by this diff.",
+      "Title": "Coalesce transition loading with the existing restore DB pass",
+      "Impact": "Reopening a converted agent session is delayed by an additional filesystem/database round trip after provider history has already completed; sessions with many lazily opened peer or subagent transcripts repeat the delay per transcript.",
+      "Evidence": "AgentService's changed restore path reads AH_META_HAS_WORKSPACE_TRANSITIONS_DB_KEY through an existing database reference, disposes that reference, then awaits _getChatMessages. hydrateTurns runs contributions sequentially, and this added contribution awaits tryOpenDatabase(storage) followed by a SQLite SELECT before restored turns can be returned. tryOpenDatabase first performs fileService.stat; a cold reference then opens SQLite and runs migration checks. For the default chat, storage is the same session URI already opened for metadata. The session summary marker is also consulted for calls where no explicit flag is supplied, so each lazily materialized peer/subagent transcript in a converted session can incur its own storage lookup/query.",
+      "Recommendation": "Read the transition map while the existing restore database reference is open and start that read alongside provider history, then pass the resolved map into hydration. For peer/subagent chats, propagate a storage-specific marker/map so a parent session transition does not trigger empty child-database probes."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "missing-coalescing",
+      "boundary-fanout",
+      "serialization-allocation",
+      "synchronous-ui-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Complete a workspace-less session conversion and resume the provider turn",
+        "CriticalPath": "Workspace resolution, optional trust approval, provider working-directory alignment, and the new atomic SQLite persistence must complete before the deferred continuation starts.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionService.ts::_requireWorkspaceTrust",
+            "Operation": "Request workspace trust from the initiating client.",
+            "Cardinality": "Zero trust IPC calls in global/ effective Allow All mode; otherwise one folder call plus repository/worktree calls when isolation resolves distinct paths.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Trust IPC was always attempted; the diff skips it in effective Allow All modes, reducing rather than increasing boundary work.",
+            "CriticalPathEffect": "Trust responses block conversion before workspace creation/alignment."
+          },
+          {
+            "Kind": "subprocess/filesystem",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionService.ts::_convert/_resolveWorkspace",
+            "Operation": "Resolve/create a workspace or worktree and align the provider working directory.",
+            "Cardinality": "One provider working-directory change per successful conversion, plus existing worktree filesystem/git work when isolation is requested.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same conversion boundaries existed before the diff.",
+            "CriticalPathEffect": "Must complete before converted state is published."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionService.ts:228 and src/vs/platform/agentHost/node/sessionDatabase.ts:setWorkspaceConversion",
+            "Operation": "Atomically persist conversion metadata and its transition boundary.",
+            "Cardinality": "One transaction per successfully persisted conversion, containing turn insertion, transition insertion, marker write, and existing conversion metadata writes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only conversion metadata was persisted; no transition row or marker was written.",
+            "CriticalPathEffect": "Now completes before the transition is published and the provider continuation begins."
+          }
+        ],
+        "ScalingInput": "Number of workspace conversions in a session; one bounded record and transaction per successful conversion.",
+        "EffectiveConcurrency": "One pending conversion is admitted per chat. The database transaction acquires metadata, turn-data, and global mutation sequencers, so it is serialized with other writes for that session database.",
+        "CacheBehavior": "Normal sessions are gated by the persisted summary marker and do not read transition rows. Converted sessions persist the marker and transition with last-writer-wins turn keys; no cache is kept for the transition map.",
+        "MechanismConfidence": "High: the call sequence and transaction cardinality are explicit in the changed code.",
+        "MagnitudeUncertainty": "Workspace conversion is relatively infrequent and SQLite writes are small; exact latency depends on worktree/provider work that usually dominates.",
+        "Verdict": "No reportable regression from the bounded durability write; it is required for the feature, atomically grouped, and transition retention is tied to turn pruning."
+      },
+      {
+        "Scenario": "Restore a converted session after Agent Host restart",
+        "CriticalPath": "Existing materialization and metadata reads complete, provider history is awaited, then the newly added transition storage lookup/query must complete before the restored session is returned.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:5512-5633",
+            "Operation": "Stat/open the session database and read metadata keys.",
+            "Cardinality": "One existing session metadata lookup per restore.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This metadata pass already existed, although provider history previously ran before it.",
+            "CriticalPathEffect": "Provides persisted session configuration and the transition marker before history retrieval."
+          },
+          {
+            "Kind": "network/IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_getChatMessages",
+            "Operation": "Call provider.chats.getMessages.",
+            "Cardinality": "One provider history request per restored default chat.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider request existed.",
+            "CriticalPathEffect": "Returns the turns that must be hydrated before session restoration completes."
+          },
+          {
+            "Kind": "filesystem/database",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionContribution.ts:76-79",
+            "Operation": "Reacquire chat storage and select all persisted workspace-transition rows.",
+            "Cardinality": "One additional storage stat/acquisition and one full transition query for each restored converted default chat.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Hydration did not perform this post-provider storage pass.",
+            "CriticalPathEffect": "Runs after provider history and blocks restored turns from being returned."
+          }
+        ],
+        "ScalingInput": "One added storage pass per converted session restore, with row decoding proportional to retained workspace transitions.",
+        "EffectiveConcurrency": "These boundaries are sequential on a single restore. Transition reads also queue behind the session database's turn-data and global mutation sequencers.",
+        "CacheBehavior": "The metadata marker avoids all transition storage work for ordinary sessions. Converted sessions have no cached transition map; even when the session DB was just read for metadata, hydration reacquires storage and queries it again. A live database reference may make the connection warm, but tryOpenDatabase still stats storage and the query remains.",
+        "MechanismConfidence": "High: the existing DB reference is disposed before _getChatMessages, and the added hydration hook explicitly awaits a new tryOpenDatabase and query.",
+        "MagnitudeUncertainty": "The extra query is small and a shared live reference can avoid a physical reopen, but cold references pay SQLite open/migration checks and all converted restores pay the serialized stat/query.",
+        "Verdict": "Reportable low-severity latency regression because independent transition data is not loaded/coalesced with the existing database pass and is serialized after provider history."
+      },
+      {
+        "Scenario": "Open restored peer-chat and subagent transcripts in a converted session",
+        "CriticalPath": "A peer or subagent transcript is materialized lazily; provider history returns first, then the new storage lookup/query blocks the transcript from opening.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network/IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_materializeRestoredPeerChat/_resolveRestoredSubagentTurns",
+            "Operation": "Fetch peer or subagent turns from the provider.",
+            "Cardinality": "One existing provider history request per materialized child transcript.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The provider history request already existed.",
+            "CriticalPathEffect": "Blocks transcript materialization."
+          },
+          {
+            "Kind": "filesystem/database",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionContribution.ts:76-79",
+            "Operation": "Probe child chat storage and read transition rows.",
+            "Cardinality": "One new filesystem stat and, when child storage exists, one SQLite open/query per materialized child transcript in a session whose parent marker is true.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Child transcript hydration did not access transition storage.",
+            "CriticalPathEffect": "Runs after provider history and blocks display of that child transcript."
+          }
+        ],
+        "ScalingInput": "Number of peer and subagent transcripts materialized after a session has at least one workspace transition.",
+        "EffectiveConcurrency": "Each materialization performs its own awaited lookup. Distinct chat databases can run independently, but within each database the query is sequenced behind mutations; no cross-chat coalescing exists.",
+        "CacheBehavior": "The parent session summary's transition marker enables hydration, but each peer/subagent uses its own chatStorageUri. No per-chat transition marker or transition-map cache suppresses repeated empty child-storage probes.",
+        "MechanismConfidence": "High: _getChatMessages omits the explicit marker for child calls, the contribution falls back to the parent summary marker, and chatStorageUri resolves non-default chats to per-chat storage.",
+        "MagnitudeUncertainty": "Only lazily materialized children pay the cost, and exact child-chat counts vary; agent workflows can retain many peer/subagent transcripts.",
+        "Verdict": "Covered by the same missing-coalescing finding; the added boundary fans out per materialized child rather than requiring a separate duplicate report."
+      },
+      {
+        "Scenario": "Render, collapse, hover, and expose workspace-transition boundaries accessibly",
+        "CriticalPath": "Live responses use the existing incremental renderer; completed-response disclosure work runs only after completion or on disclosure-related refreshes. Accessible plaintext generation runs only when the accessible view is requested.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of visible persisted workspace transitions and response parts in a completed response.",
+        "EffectiveConcurrency": "Rendering remains UI-thread synchronous and rAF-batched by the existing renderer. One separator content part is created per visible transition.",
+        "CacheBehavior": "Rendered content parts are reused through hasSameContent, and hover registrations are disposed with each content part. Transition DOM is retained only while its owning response is rendered.",
+        "MechanismConfidence": "High: changed renderer branches and lifecycle ownership are explicit; no forced geometry read follows the new DOM writes.",
+        "MagnitudeUncertainty": "Very long transcripts can contain many transitions, but each adds a small fixed DOM/listener footprint and the added collapse scan occurs only on completed responses.",
+        "Verdict": "No reportable regression: DOM/listener allocation is bounded per visible transition, disposed with the part, and the added list scan is not on each streaming token while the response is incomplete."
+      },
+      {
+        "Scenario": "Prune, remap, and fork persisted session history",
+        "CriticalPath": "Turn deletion/truncation/remapping and chat fork database copies await database operations; these are management actions rather than steady-state rendering/startup paths.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database/filesystem",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts:truncateFromTurn/deleteTurnsAfter/remapTurnIds/vacuumInto",
+            "Operation": "Prune or remap turn-owned records and copy a database for chat fork.",
+            "Cardinality": "One SQLite transaction per prune/remap, with remap statements proportional to retained turn mappings; one VACUUM INTO filesystem copy per fork.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same prune/remap/copy boundaries existed; the diff adds transition cleanup and shared ordering.",
+            "CriticalPathEffect": "Blocks the corresponding prune/fork operation but not unrelated session databases."
+          }
+        ],
+        "ScalingInput": "Number of concurrent writes to one session database and number of turns remapped during a fork.",
+        "EffectiveConcurrency": "The diff introduces a shared mutation sequencer and transactions. Operations on one session database are serialized; different session/chat databases remain independent.",
+        "CacheBehavior": "Per-session databases remain reference-counted. Transition rows cascade with turns and the marker is deleted when the final transition disappears, preventing unbounded orphan retention.",
+        "MechanismConfidence": "High for serialization and cleanup behavior; insufficient evidence for a concrete user-visible regression from queueing itself.",
+        "MagnitudeUncertainty": "The shared sequencer can alter queueing under concurrent writes, but the repository does not establish realistic same-database write concurrency or a measurable throughput loss beyond SQLite's own single-connection serialization.",
+        "Verdict": "No separate finding: transition lifetime is correctly bounded, and evidence is insufficient that the broader mutation ordering materially reduces throughput on a realistic path."
+      }
+    ],
+    "Summary": "Completed the performance pass across all 27 changed files. One low-severity missing-coalescing regression was reported for serialized, repeated transition-storage access during converted-session and child-transcript restoration; conversion persistence, mutation cleanup, and UI rendering were otherwise bounded or lacked evidence of material regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-05T12:47:23.930907571Z",
+    "CompletedAt": "2026-09-05T12:50:51.526139849Z",
+    "WallClockMilliseconds": 207595,
+    "ModelCalls": 12,
+    "InputTokens": 1095488,
+    "OutputTokens": 12221,
+    "TotalTokens": 1107709,
+    "ReasoningTokens": 5740,
+    "CacheReadTokens": 962487,
+    "CacheWriteTokens": 132965,
+    "APIDurationMilliseconds": 187649,
+    "ToolCalls": 84,
+    "NanoAIUnits": 129438380000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 962487,
+      "cache_write": 132965,
+      "input": 36,
+      "output": 12221
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

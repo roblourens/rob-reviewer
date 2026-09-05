@@ -1,0 +1,220 @@
+{
+  "PullRequest": {
+    "Number": 334696,
+    "Title": "sessions: measure and unblock V3 onboarding GitHub personalization",
+    "Body": "## Why\r\n\r\nThe V3 new-session onboarding personalizes its 3 prompt options with GitHub items (assigned issues, authored PRs with conflicts / failing CI / unresolved review comments), falling back to standard options.\r\n\r\nAnalysis of experiment `f716301b` over 3 weeks and ~780k users found that, restricted to users with a resolved GitHub repository who saw the options widget (222,470 impressions):\r\n\r\n- **61.0%** timed out with zero GitHub options\r\n- **~9.4%** saw at least one GitHub option (only **0.17%** saw a full 3/3 set)\r\n- **29.6%** got all-standard options\r\n\r\nAnd we could not measure *how* badly, because `fallbackReason` was only set to `'none'` when all 3 slots were GitHub — so a widget with 2 real GitHub issues logged identically to one with zero. That blind spot covered 81% of impressions.\r\n\r\nThe root cause of the timeouts is that per-stage budgets could exceed the total budget: the PR chain was summary(5s) → review(4s) = 9s, with repository resolution also inside the same 10s budget.\r\n\r\n## Telemetry\r\n\r\nAdditive only — existing field names and values are emitted in the same situations, so live dashboards keep working.\r\n\r\n`onboarding.promptStrategy` gains:\r\n\r\n| Field | Question it answers |\r\n|---|---|\r\n| `gitHubOptionCount` | How many of the 3 slots were actually GitHub items — closes the main blind spot |\r\n| `candidatesFound` | Pre-truncation count: \"repo has nothing\" vs \"found items but were too slow\" |\r\n| `lookupDurationMs` | Total lookup time (plumbed from the value the code already computed for logging) |\r\n| `repositoryMs`, `issueSummaryMs`, `issueLinkageMs`, `prSummaryMs`, `prReviewMs` | Which stage is actually slow |\r\n| `issueSummaryOutcome`, `issueLinkageOutcome`, `prSummaryOutcome`, `prReviewOutcome` | Per-stage outcome, so \"issues succeeded, PRs timed out\" is distinguishable from total failure |\r\n| `timedOutStage` | Which stage was in flight when the total budget expired |\r\n\r\n`onboarding.promptOptionInteraction` gains `optionIndex` and `optionKindsShown`, making a true per-option CTR computable — today \"implementFeature is most picked\" is confounded with it being almost always present.\r\n\r\nBoth events gain a shared `impressionId`, so they can be joined per impression instead of on `DevDeviceId`, which is lossy for devices with multiple impressions.\r\n\r\nAlso splits the overloaded `noCandidate` — it meant both \"no composer available\" (an infra bug) and \"lookup returned nothing\" (a data outcome). The former is now `noComposer`.\r\n\r\n**Privacy:** bounded categories and counts only. No issue/PR titles, URLs, numbers, repository names or prompt text. Every numeric has `isMeasurement: true`.\r\n\r\n## Latency\r\n\r\n`totalMs` stays at 10s.\r\n\r\n1. **Publish issue candidates before linkage.** Linkage exists only to filter out issues that already have linked PRs, so a slow linkage call was discarding issues we already held.\r\n2. **Review-thread enrichment off the critical path.** It fired N parallel lookups after a summary to produce `githubPRComments` — 30 selections, 0.37% of all picks — while `githubIssue` (the most-picked GitHub option) is the cheapest to fetch. The budget was being spent inversely to user value. It can now only refine, never delay first paint.\r\n3. **Rebalanced sub-budgets** to `summaryMs: 4_000, linkageMs: 1_500, reviewMs: 3_000`. The issue and PR chains run concurrently under `Promise.all`, so the worst case for timed lookups is `max(4_000+1_500, 4_000+3_000) = 7_000ms`, leaving ~3s for repository resolution and rendering. Repository resolution has no budget of its own and a workspace change restarts the chain; both are bounded only by the `totalMs` race, and the comment on the constant says so rather than asserting a tighter bound than the code has.\r\n4. **Streaming.** The 3 standard options are painted immediately and slots are replaced as GitHub items arrive, instead of blocking first paint on the whole lookup. Beyond timeouts, this also addresses V3's ~17pp tour-reach deficit versus V2.\r\n\r\n## API change\r\n\r\n`INewSessionPromptOptionsController.resolve` gains an optional progress callback:\r\n\r\n```ts\r\nexport type NewSessionPromptOptionsProgress = (state: NewSessionPromptOptionsState) =\u003e boolean;\r\n\r\nresolve(token: CancellationToken, progress?: NewSessionPromptOptionsProgress): Promise\u003cNewSessionPromptOptionsState\u003e;\r\n```\r\n\r\nAdditive and optional, so existing callers are unaffected. It returns `boolean` rather than `void` deliberately: the composer refuses late updates while the user is already acting on the options, and the runner needs to know that so interaction telemetry describes what was actually rendered.\r\n\r\n## Notes for reviewers\r\n\r\nThe streaming path has three subtle interactions that are each covered by a test that fails without its fix:\r\n\r\n- `_renderedPromptOptions` is reset per `resolve`, not per `run`. `newChatWidget` calls `refreshPromptOptions()` on every workspace change against the same runner, and a per-run reset made the second refresh compare against the previous refresh's final set — suppressing first paint entirely in exactly the all-standard case this PR targets.\r\n- `_promptOptionsSelected` is set at the *start* of `selectOption`, not in `onDidSelectOption`. The widget only reports a selection after the 2.5s prompt animation completes; a streamed update in that window would clear the selection and leave every option `aria-disabled`.\r\n- The runner commits `_renderedPromptOptions` only when the composer accepted the update, so `optionIndex` / `optionKindsShown` can never describe options the user never saw.\r\n\r\n`impressionId` is regenerated per `run`, not per `resolve`: strategy telemetry is emitted once per run, so a per-resolve id would orphan interaction events from any strategy event.\r\n\r\n## Validation\r\n\r\n- `scripts\\test.bat --grep \"NewSession\"` → **93 passing**, 0 failing\r\n- `npm run typecheck-client` → clean for `sessions/contrib`\r\n- `eslint` → clean\r\n- Code hygiene → clean on changed files (the repo-wide `npm run hygiene` task fails on an unrelated pre-existing Windows path bug in `checkPackageJSON`, reproducible on an untouched checkout; no `package.json` is touched here)\r\n\r\nNew test coverage: partial GitHub candidate counts, the early issue publish, streaming updates arriving after first paint, budget-stage attribution, re-resolve after a workspace change, and the composer refusing late updates.\r\n\r\n## Kusto queries this makes answerable\r\n\r\n- Distribution of `gitHubOptionCount` (0/1/2/3) — the true personalization rate, vs today's binary\r\n- Per-stage p50/p95 latency and timeout rate, attributing the 61% bucket to `repository` vs `prSummary` vs `prReview`\r\n- `candidatesFound == 0` vs `candidatesFound \u003e gitHubOptionCount` — \"nothing to show\" vs \"found more than we could show\"\r\n- Partial-success cohorts, e.g. `issueSummaryOutcome == 'success' and prSummaryOutcome == 'timeout'`\r\n- True per-option CTR, joining `optionKindsShown` impressions with `option` selections\r\n- Position bias: selections by `optionIndex`, controlling for slot content\r\n- Impression-level funnel joined on `impressionId`\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/334696",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "fc0a9e94576224c89cc08d390b38ab760a261f1f",
+    "HeadRef": "copilot/v3-onboarding-telemetry",
+    "HeadSHA": "fda8f5b56fbe33ab077346719a380e643ffe3b49",
+    "CreatedAt": "2026-09-05T08:35:53Z",
+    "UpdatedAt": "2026-09-05T10:16:11Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-81DE79864892",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/chat/browser/newChatInput.ts",
+      "Side": "RIGHT",
+      "Line": 685,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed first-paint path, selection guard, and cancellation ownership are explicit. `selectOption` sets the new flag but never cancels the refresh; cancellation only occurs on refresh/clear/dispose. The transitive lookup is bounded but concrete: repository resolution may perform up to 50 parent filesystem stats, followed by two summary GraphQL calls, one batched linkage call, and up to five parallel review-thread calls.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "filesystem operations and GitHub GraphQL requests",
+      "PerformanceScaling": "Per early selection, work can continue for the remaining total budget: repository discovery scans up to 50 parents, then one issue summary, one PR summary, one linkage request, and up to five parallel per-PR review requests. Cost repeats for each onboarding impression or workspace refresh selected before completion.",
+      "PerformanceOutcome": "unnecessary network/filesystem activity and possible contention with the newly started session",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Options were not selectable until the GitHub lookup had completed or timed out, so selection could not leave personalization I/O running after its UI result became unusable.",
+      "ChangedBehavior": "The PR makes prompt options selectable immediately while repository discovery and GitHub personalization are still in flight, then only suppresses later renders after selection instead of cancelling that work.",
+      "CausalDiffEvidence": "RIGHT line 685 sets `_promptOptionsSelected = true` when a streamed option click begins, but unlike `_cancelPromptOptionsRefresh` it does not cancel `_promptOptionsRefresh`; the resolve token therefore remains live. RIGHT line 362 now publishes selectable standard options before `_resolveGitHubPromptOptionsWithFallback` starts, making selection-before-lookup-completion newly possible.",
+      "Title": "Cancel personalization when an option is selected",
+      "Impact": "A user who immediately chooses one of the newly available standard or partial options can still trigger the rest of a 10-second personalization run in the background. That consumes filesystem and GitHub network capacity after its result can no longer be rendered, potentially contending with session startup and wasting up to eight GraphQL requests per impression.",
+      "Evidence": "`resolveOptions` publishes three standard options before awaiting personalization. A click reaches the added `_promptOptionsSelected = true`, while `refreshPromptOptions` continues awaiting `controller.resolve(cts.token)`. The flag only makes `canRerender()` false. The live token continues through `_resolveGitHubRepository`, `getRecentAssignedIssues`, `getRecentAuthoredPullRequests`, batched `getIssuesWithLinkedPullRequests`, and `Promise.all` review-thread requests. Before this PR, the widget stayed loading until `resolve` returned, so a user could not select an option while any of these operations remained.",
+      "Recommendation": "When option selection begins, cancel the active prompt-options refresh/token in addition to setting the selection guard (without clearing the selected/generated input). Preserve the existing guard for focus-only render suppression, since focus alone should not abort personalization."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/sessions/contrib/onboardingTours/browser/newSessionViewV3Prompt.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 362,
+      "BasePath": "src/vs/sessions/contrib/onboardingTours/browser/newSessionViewV3Prompt.ts",
+      "BaseLine": 215,
+      "IntroducingPath": "src/vs/sessions/contrib/onboardingTours/browser/newSessionViewV3Prompt.ts",
+      "IntroducingCommit": "99d3dc07f4c0eed84d7a62c8690cce30bb826063",
+      "MechanismFamily": "eager-work",
+      "PerformanceCategory": "rendering",
+      "Mechanism": "Initial prompt-option rendering was serialized behind repository discovery and multiple GitHub GraphQL stages, with up to the full 10-second total timeout on the onboarding critical path.",
+      "Symptom": "The onboarding widget remained in loading skeletons for seconds or timed out before presenting usable options; experiment telemetry cited in the PR observed 61% timeout impressions with zero GitHub options.",
+      "FixedBehavior": "The runner now sends a complete standard three-option state through the progress callback before awaiting GitHub personalization, then incrementally refines slots. GitHub work remains asynchronous and no longer blocks first usable prompt-option paint.",
+      "Evidence": "In the base implementation, `_runPromptOptions` displayed loading skeletons and awaited `resolveOptions(token)` before calling `showPromptOptions(state)`. `resolveOptions` awaited repository resolution plus concurrent issue and PR chains; the PR chain could sequentially consume the 5s summary and 4s review budgets under the 10s total timeout. The changed line publishes the three standard options synchronously before entering that lookup, so first usable paint no longer waits for filesystem/GitHub boundaries. The PR reports the affected experiment had 61% zero-GitHub-option timeouts and a tour-reach deficit, matching this call-path mechanism.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "eager-work",
+      "boundary-fanout",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Initial V3 onboarding prompt-option paint and GitHub personalization",
+        "CriticalPath": "Configured-variation resolution must complete first. After the diff, publishing three standard options is the first usable paint and occurs before repository/filesystem/GitHub work; personalization is off that first-paint critical path. The final strategy event still waits for the bounded lookup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/contrib/onboardingTours/browser/gitHubRepositoryResolver.ts:resolveGitHubRepositoryFromGitConfig",
+            "Operation": "Discover and read Git repository configuration.",
+            "Cardinality": "Up to 50 parent-directory `stat` operations plus a small bounded number of `.git`, `commondir`, and config reads when repository metadata/URI does not resolve it; often zero when session metadata is populated.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same repository-resolution path and cardinality ran before options were shown.",
+            "CriticalPathEffect": "Before the diff these operations delayed any usable options. They now run after the standard-option first paint, but remain before final personalization and telemetry."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/onboardingTours/browser/newSessionViewV3Prompt.ts:_resolveGitHubPromptOptions",
+            "Operation": "Fetch GitHub issue/PR summaries, issue linkage, and review threads.",
+            "Cardinality": "One assigned-issue summary and one authored-PR summary request concurrently per resolve; one linkage request batching at most five issues; up to five concurrent per-PR review-thread requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same bounded request families existed, but all completed or timed out before options were rendered. The diff shortens stage budgets and moves their UI effect off first paint without increasing cardinality.",
+            "CriticalPathEffect": "These calls previously blocked all resolved options. They now refine already usable options; issue linkage and review enrichment cannot block first paint."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/onboardingTours/browser/newSessionViewV3Prompt.ts:_reportStrategy",
+            "Operation": "Emit expanded lookup diagnostics telemetry.",
+            "Cardinality": "One strategy event per run, with a fixed set of added scalar/category fields.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One smaller strategy event was emitted at the same point.",
+            "CriticalPathEffect": "Emitted after lookup completion; it does not gate first usable options."
+          }
+        ],
+        "ScalingInput": "One onboarding impression, at most five recent issues and five recent PRs, three rendered option slots, and up to five review-thread lookups.",
+        "EffectiveConcurrency": "Issue and PR chains run concurrently via `Promise.all`. Each chain is internally serial (issue summary then linkage; PR summary then review enrichment). Review-thread requests fan out concurrently for eligible PRs, bounded by the GraphQL summary's first-five result.",
+        "CacheBehavior": "No runner-level cache: each initial resolve and workspace refresh repeats repository discovery and GitHub reads. The diff does not change cache keys or add negative caching; deduplication is limited to suppressing renders when the three option IDs are unchanged.",
+        "MechanismConfidence": "High: render ordering, timeout budgets, request limits, and Promise concurrency are directly established by the changed code and fetcher queries.",
+        "MagnitudeUncertainty": "Exact repository-resolution cost and GitHub latency vary by provider and workspace, but the bounded call path and removal from first paint are explicit.",
+        "Verdict": "The streaming change fixes the prior first-paint latency regression. Rebuilding three buttons for a bounded number of distinct states is small and deduplicated by option ID, so it is not independently reportable."
+      },
+      {
+        "Scenario": "Selecting an option while personalization is streaming",
+        "CriticalPath": "The selected option's prompt animation and session flow can proceed immediately. Remaining personalization work is no longer useful to UI progress and is off the direct critical path, but can contend with session-start activity.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/contrib/chat/browser/newChatInput.ts:selectOption callback / refreshPromptOptions",
+            "Operation": "Continue repository discovery after an immediately rendered option is selected.",
+            "Cardinality": "Depending on click timing, up to 50 repository-discovery stats/reads and up to eight GitHub GraphQL requests can still execute after one selection.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Selection was impossible until resolve completed, so no repository work could remain after selection.",
+            "CriticalPathEffect": "Results cannot be rendered after selection, so all remaining calls are wasted background work and may contend with the new session."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/onboardingTours/browser/newSessionViewV3Prompt.ts:_resolveGitHubPromptOptions",
+            "Operation": "Continue GitHub personalization after the composer refuses all later renders.",
+            "Cardinality": "At most two summaries, one batched linkage request, and five parallel review requests per early selection.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "All requests completed or timed out before options became selectable.",
+            "CriticalPathEffect": "The work is not required for selection progress and can consume network capacity during session startup."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/onboardingTours/browser/newSessionViewV3Prompt.ts:_reportPromptOptionInteraction",
+            "Operation": "Emit option index, shown kinds, and impression ID.",
+            "Cardinality": "One interaction telemetry event per selection.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same interaction event existed with fewer fixed fields.",
+            "CriticalPathEffect": "A small fixed event after prompt insertion; no scaling regression identified."
+          }
+        ],
+        "ScalingInput": "Each onboarding impression where a user chooses a standard or partial option before the 10-second personalization run settles.",
+        "EffectiveConcurrency": "The still-live resolve retains the same two concurrent chains and up to five parallel review calls. Selection only flips a render guard; it does not signal backpressure or cancellation to those operations.",
+        "CacheBehavior": "There is no cache involved. Once selected, later states are rejected by the composer, but the underlying lookup is neither cached nor cancelled.",
+        "MechanismConfidence": "High: first paint is now before lookup, selection sets `_promptOptionsSelected`, and the only refresh-token cancellation sites are refresh replacement, clear, and disposal—not selection.",
+        "MagnitudeUncertainty": "How quickly users select and how much I/O remains varies, but the newly possible lifetime mismatch and maximum bounded fan-out are explicit; this affects severity, not mechanism confidence.",
+        "Verdict": "Reportable medium cleanup-lifecycle regression: rejected late renders do not cancel now-useless filesystem and GitHub work."
+      },
+      {
+        "Scenario": "Refreshing prompt options after a workspace change",
+        "CriticalPath": "The workspace-change handler cancels the prior refresh, shows loading, then synchronously receives standard options before the new repository lookup. The new workspace's final personalized state waits for its own lookup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/contrib/chat/browser/newChatWidget.ts:_handlePromptOptionsWorkspaceChange",
+            "Operation": "Re-resolve repository metadata for the newly selected workspace.",
+            "Cardinality": "One fresh repository discovery and one bounded GitHub request set per actual workspace change.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Workspace changes already triggered a full prompt-options refresh and lookup.",
+            "CriticalPathEffect": "Standard options are available before these calls; personalized slots await them."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/onboardingTours/browser/newSessionViewV3Prompt.ts:resolveOptions",
+            "Operation": "Fetch personalization for the replacement workspace.",
+            "Cardinality": "One issue summary, one PR summary, optional one linkage batch, and up to five review requests for the new repository.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same full lookup per refresh, but no intermediate standard or partial rendering.",
+            "CriticalPathEffect": "Off first standard-option paint; required only for personalization."
+          }
+        ],
+        "ScalingInput": "Number of real workspace changes during one draft onboarding session; each change has effective GitHub cardinality capped by five issues/PRs.",
+        "EffectiveConcurrency": "Refreshes are logically serialized by cancelling the previous `CancellationTokenSource`; each current resolve uses two concurrent chains and bounded review fan-out. Cancellation support is passed through filesystem/GitHub APIs.",
+        "CacheBehavior": "No warm cache is maintained by this controller. Every workspace change performs a fresh resolve; render deduplication resets per resolve so the new workspace always receives a first paint.",
+        "MechanismConfidence": "High for refresh frequency and configured concurrency; underlying transport cancellation responsiveness is not proven here.",
+        "MagnitudeUncertainty": "Actual workspace-change frequency is low and provider cancellation latency is implementation-dependent.",
+        "Verdict": "No additional regression: the diff does not increase boundary cardinality, cancels replaced refreshes, and bounds UI reconstruction to three option slots."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and all diff pages. Reported one introduced cancellation-lifecycle issue and recorded the PR's concrete first-paint regression fix; no unbounded retention, request-cardinality increase, or meaningful synchronous UI regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "/responses",
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-05T12:50:58.321275603Z",
+    "CompletedAt": "2026-09-05T12:53:42.621758958Z",
+    "WallClockMilliseconds": 164300,
+    "ModelCalls": 14,
+    "InputTokens": 709891,
+    "OutputTokens": 10318,
+    "TotalTokens": 720209,
+    "ReasoningTokens": 5068,
+    "CacheReadTokens": 553106,
+    "CacheWriteTokens": 78385,
+    "APIDurationMilliseconds": 134321,
+    "ToolCalls": 48,
+    "NanoAIUnits": 113312740000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 553106,
+      "cache_write": 78385,
+      "input": 78400,
+      "output": 10318
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
