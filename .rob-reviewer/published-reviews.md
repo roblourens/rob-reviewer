@@ -2,6 +2,27 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#332410 — agentHost: centralize session and chat catalog metadata](https://github.com/microsoft/vscode/pull/332410)
+
+- Published comments: **1**
+- Head: `3392bf9d61d3b5c848eb09bfd8d7d7de5e404713`
+- Completed: `2026-09-05T15:52:44Z`
+- Run: [33975248149 attempt 1](runs/2026/09/05/33975248149-1/run.md)
+
+### `src/vs/platform/agentHost/node/agentService.ts:5313`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+The passive toggle now awaits `_synchronizePassiveSessionMetadata` before updating surfaced state. That synchronization reads the local snapshot and central row, writes a local pending snapshot, upserts the central catalog, and writes a local acknowledgement, after which this method also marks the payload dirty.
+
+Marking an unopened session read or archived can now remain pending while several SQLite operations complete, and any subsequent action from that client waits behind the same dispatch promise. This is especially visible while startup migration or reconciliation is using the central database sequencer.
+
+**Suggested fix:** After the original metadata write, update/dispatch the surfaced state immediately and enqueue the catalog projection on the existing per-session sequencer/background-write tracker. Preserve deletion ordering by draining that tracked work, and invalidate/reconcile the list when the projection finishes.
+
+(Written by Copilot)
+
 ## [#334696 — sessions: measure and unblock V3 onboarding GitHub personalization](https://github.com/microsoft/vscode/pull/334696)
 
 - Published comments: **1**
