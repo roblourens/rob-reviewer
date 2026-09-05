@@ -16,3 +16,8 @@ Trace reads and writes on resize, scroll, render, and input paths through browse
 ## Eager work revealed by shipped fixes
 
 Inspect eagerly constructed hidden sections and details. Report when a changed constructor starts heavyweight UI, model, filesystem, or network work before the feature is visible or requested, and identify the first-use boundary that could own lazy creation.
+
+<!-- learned-family:boundary-fanout -->
+## Boundary fan-out revealed by shipped fixes
+
+Count effective subprocess, IPC, filesystem, database, and network operations after grouping. Check whether a changed loop turns one logical request into per-item boundary calls even when callers use Promise.all or other superficial concurrency.
