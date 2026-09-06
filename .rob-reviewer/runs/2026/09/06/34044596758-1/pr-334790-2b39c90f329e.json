@@ -1,0 +1,179 @@
+{
+  "PullRequest": {
+    "Number": 334790,
+    "Title": "configuration: batch initial policy definitions",
+    "Body": "## Summary\n\n- submit regular and excluded policy definitions in one initialization batch\n- avoid rebuilding the native policy watcher for a second changed batch\n- add coverage that verifies included and excluded definitions reach one underlying policy update\n\n## Root cause\n\nWhile profiling Agents Window startup, the main process appeared to spend 40-50 ms reading state, loading settings, and creating required directories. Direct `fs/promises` measurements against the same signed-in profile showed that the actual operations are fast:\n\n| Operation | Median | p95 |\n|---|---:|---:|\n| Concurrent startup I/O group | 1.02 ms | 1.41 ms |\n| Read 3.6 KB `storage.json` | 1.02 ms | 1.30 ms |\n| Read missing `settings.json` | 0.13 ms | 0.32 ms |\n| Existing-directory `mkdir({ recursive: true })` | 0.62-0.76 ms | 0.83-1.18 ms |\n\nThe callbacks were delayed together because `PolicyConfiguration.initialize()` submitted definitions in two sequential groups:\n\n1. regular/default configuration policies\n2. excluded/internal configuration policies\n\n`AbstractPolicyService` merges each changed group and invokes the native implementation. `NativePolicyService` therefore imported/updated the policy watcher for the first group, then disposed and recreated it for the second group before startup I/O callbacks could run.\n\nThis change combines both key sets before resolving and submitting policy definitions. The resulting policy model is unchanged, but native watcher initialization happens once.\n\n## Instrumented startup impact\n\nThree warmed packaged launches per variant, using the same Windows x64 Insiders runtime and signed-in isolated profile:\n\n| Operation | Before median | After median | Change |\n|---|---:|---:|---:|\n| Policy initialization | 45 ms | 33 ms | **-12 ms** |\n| State read callback | 50 ms | 40 ms | **-10 ms** |\n| Missing settings callback | 27 ms | 17 ms | **-10 ms** |\n| Required-directory callbacks | 46 ms | 38 ms | **-8 ms** |\n\nThe callback improvements overlap; they are not additive. They show that removing the redundant watcher update frees the main event loop sooner.\n\nThe remaining combined policy segment spends approximately 27 ms importing `@vscode/policy-watcher` and 6 ms creating the watcher. #334769 independently targets the packaged ESM resolution work in that import.\n\n## End-to-end A/B\n\nThe first 30 alternating paired launches measured spawn to renderer `code/didStartWorkbench`:\n\n- baseline median: 1,330.31 ms\n- change median: 1,326.40 ms\n- median paired difference: **-6.01 ms**\n- mean paired difference: **-4.03 ms**\n- approximate 95% interval: -9.71 to +1.66 ms\n\nA second 30-pair batch had a system disturbance around pairs 42-47. Across all 60 pairs, excluding five pairs where either launch exceeded 1,450 ms:\n\n- included pairs: 55\n- median paired difference: **-3.03 ms**\n- mean paired difference: **-1.96 ms**\n- approximate 95% interval: -5.76 to +1.83 ms\n\nThe end-to-end result is directional, not statistically significant. The deterministic result is one fewer native watcher build and an 8-12 ms reduction in the blocking initialization segment.\n\n## Compatibility\n\nThe previous initialization called `update()` twice before registering policy-change listeners. The new initialization calls it once with the union of the same configuration keys. Existing behavior remains covered for:\n\n- regular policy values\n- excluded/internal policy values\n- owning policies and references\n- late owner registration\n- owner deregistration fallback\n- policy updates and removals\n\n## Validation\n\n- targeted ESLint\n- `npm run transpile-client`\n- focused `PolicyConfiguration` suite: 23 passing\n- minified NLS desktop bundle\n- instrumentation-free signed-in Agents Window product smoke\n- `git diff --check`",
+    "URL": "https://github.com/microsoft/vscode/pull/334790",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "814ab138a8994ee8984c0acd6816ad77e2aa3cef",
+    "HeadRef": "agents/batch-policy-initialization",
+    "HeadSHA": "2b39c90f329e5809c18ee918ea6d6d3f1424cb6f",
+    "CreatedAt": "2026-09-06T10:31:11Z",
+    "UpdatedAt": "2026-09-06T15:00:51Z",
+    "MergedAt": null,
+    "Labels": [
+      "perf"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/configuration/common/configurations.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 125,
+      "BasePath": "src/vs/platform/configuration/common/configurations.ts",
+      "BaseLine": 124,
+      "IntroducingPath": "src/vs/platform/configuration/common/configurations.ts",
+      "IntroducingCommit": "567f6dee8a8f4caa2c5bd0b25eb2e1f87880a261",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "startup",
+      "Mechanism": "Two sequential definition batches each changed the accumulated policy definitions, causing the backend to perform collection-wide policy initialization twice; native desktop recreated the policy watcher after the first batch and blocked startup on the second watcher creation.",
+      "Symptom": "Configuration/policy initialization occupied the startup critical path and delayed main-process I/O callbacks; measured policy initialization improved by 12 ms after batching, with related callbacks improving by 8-10 ms.",
+      "FixedBehavior": "The added array union at configurations.ts:125 submits regular and excluded configuration keys to one `updatePolicyDefinitions` call, so the abstract service performs one backend update and native watcher construction (or one file-policy refresh) instead of two sequential updates during configuration startup.",
+      "Evidence": "Base `PolicyConfiguration.initialize()` invoked `updatePolicyDefinitions` once for default keys and awaited it before invoking it again for excluded keys. `AbstractPolicyService.updatePolicyDefinitions` calls `_updatePolicyDefinitions(this.policyDefinitions)` whenever each batch adds definitions; on Windows/macOS `NativePolicyService._updatePolicyDefinitions` dynamically imports `@vscode/policy-watcher`, queues creation, and replaces its `MutableDisposable\u003cWatcher\u003e`, while Linux `FilePolicyService` rereads and parses the policy file. This initialization is awaited by `ConfigurationService.initialize()` and the workbench/session initialization path. The PR's instrumented startup data reports that eliminating the second batch removes one watcher build and reduces the blocking policy initialization segment by 8-12 ms.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "missing-coalescing",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Desktop workbench / Agents Window configuration startup on Windows or macOS",
+        "CriticalPath": "`WorkbenchConfigurationService.initializeConfiguration()` awaits `PolicyConfiguration.initialize()` in the same `Promise.all` gate as user/application configuration, so policy initialization must finish before workspace configuration loading proceeds. The diff combines the two definition groups before this awaited operation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/policy/common/policyIpc.ts:74 `PolicyChannelClient._updatePolicyDefinitions`",
+            "Operation": "Serializes policy definitions and calls the main-process `updatePolicyDefinitions` channel.",
+            "Cardinality": "One IPC request per changed initialization batch; for a desktop `PolicyConfiguration` instance this changes from up to two sequential requests to one. Definition count is the union of policy-bearing regular and excluded settings.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Two sequential initialization batches could each cross IPC; the diff coalesces them into one.",
+            "CriticalPathEffect": "The renderer awaits the IPC response through policy initialization before workspace configuration proceeds."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/policy/node/nativePolicyService.ts:25 `NativePolicyService._updatePolicyDefinitions`",
+            "Operation": "Imports `@vscode/policy-watcher` and creates/replaces a native OS policy watcher.",
+            "Cardinality": "One watcher creation per backend definition update. The changed initialization reduces two sequential creations to one per policy-configuration initialization when both groups contain new policy definitions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The first batch created a watcher and the second batch disposed/recreated it with the accumulated definitions; now one watcher is created with the union.",
+            "CriticalPathEffect": "Watcher creation resolves through a callback and is awaited by policy/configuration initialization, so it blocks this startup gate."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/policy/common/nativeManagedSettingsIpc.ts:94 `NativeManagedSettingsChannelClient.updatePolicyDefinitions`",
+            "Operation": "Sends managed-setting policy definitions to the main-process native managed-settings service when the accumulated definitions contain managed settings.",
+            "Cardinality": "At most one request for the new combined batch versus up to one for each of the two old batches; `hasManagedSettingsDefinitions` suppresses calls for batches without relevant definitions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Eligible regular and excluded batches were processed separately; combining cannot increase request count and can reduce it.",
+            "CriticalPathEffect": "When issued, the account-policy branch awaits it inside the multiplex initialization fan-out."
+          }
+        ],
+        "ScalingInput": "All registered default configuration keys plus excluded/internal configuration keys; policy names are deduplicated by a `Set`, and each resolved policy definition is submitted once in the combined batch.",
+        "EffectiveConcurrency": "Before the diff, regular and excluded groups were explicitly serialized by two awaits. Each native watcher rebuild is additionally serialized by `NativePolicyService`'s `Throttler`. In the renderer, `MultiplexPolicyService` fans a single batch to the policy IPC client and account-policy service in parallel; the diff changes two sequential multiplex batches into one.",
+        "CacheBehavior": "`PolicyConfiguration._submittedPolicyDefinitions` structurally suppresses resubmission within an instance, and `AbstractPolicyService` suppresses identical object identities. The native module import is warm after first load, but watcher creation was not reused across changed batches. Combining works for cold startup and prevents the redundant warm watcher recreation.",
+        "MechanismConfidence": "High: the two old awaits, abstract changed-batch dispatch, IPC path, watcher replacement, throttler serialization, and startup await are directly traced.",
+        "MagnitudeUncertainty": "Exact policy counts and native watcher latency vary by product build, platform, and profile; the supplied startup measurements establish an 8-12 ms blocking-segment improvement but end-to-end variance remains larger.",
+        "Verdict": "No regression. The diff removes repeated startup work and boundary calls while preserving one union-sized linear scan; no new expensive operation or increased effective cardinality is introduced."
+      },
+      {
+        "Scenario": "CLI/main-process configuration initialization and Linux/file-policy startup",
+        "CriticalPath": "`ConfigurationService.initialize()` awaits policy initialization alongside default and user configuration; `cliProcessMain` awaits that entire initialization before continuing. Main-process desktop startup uses the same configuration service. The changed call is therefore on startup's completion path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/policy/common/filePolicyService.ts:48 `FilePolicyService.read`",
+            "Operation": "Reads and JSON-parses the configured system policy file.",
+            "Cardinality": "One read for the combined changed-definition batch instead of up to two sequential reads during initialization.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Each of the two changed definition groups triggered a full file read/parse; the diff coalesces them.",
+            "CriticalPathEffect": "`FilePolicyService._updatePolicyDefinitions` awaits `refresh`, and configuration startup awaits policy initialization."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/policy/node/nativePolicyService.ts:25 `NativePolicyService._updatePolicyDefinitions`",
+            "Operation": "Creates the OS-native policy watcher for CLI or main-process configuration on Windows/macOS.",
+            "Cardinality": "One creation for the union instead of two sequential creations when both groups add definitions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The watcher was rebuilt after each group.",
+            "CriticalPathEffect": "Awaited before CLI configuration initialization completes."
+          }
+        ],
+        "ScalingInput": "Number of registered configuration keys and policy definitions; processing remains O(regular + excluded), while whole-file reads/watcher builds decrease from two to one.",
+        "EffectiveConcurrency": "The two old policy updates were sequential. File reads inside each `FilePolicyService.refresh()` were consequently serialized; after the diff there is one refresh for the union. Other state/user configuration work can run concurrently via the surrounding `Promise.all`.",
+        "CacheBehavior": "A warm filesystem/page cache can make the second old file read cheaper, but `FilePolicyService` has no parsed-content initialization cache. Native import caching avoids repeated module loading after the first call but does not avoid watcher replacement. Definition maps suppress later unchanged updates.",
+        "MechanismConfidence": "High: the CLI await, configuration `Promise.all`, abstract update dispatch, and file/native backend implementations directly establish the boundary path.",
+        "MagnitudeUncertainty": "Filesystem and watcher costs are platform- and cache-dependent; the cardinality reduction is deterministic.",
+        "Verdict": "No regression. Batching removes one whole-backend initialization and adds only a transient union array proportional to keys already scanned by the old two calls."
+      },
+      {
+        "Scenario": "Sessions / Agents Window configuration initialization",
+        "CriticalPath": "`sessions` configuration initialization awaits `PolicyConfiguration.initialize()` in a `Promise.all` with user and workspace configuration before constructing the effective configuration model.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/policy/common/policyIpc.ts:74 and src/vs/platform/policy/common/nativeManagedSettingsIpc.ts:94",
+            "Operation": "Updates main-process policy and eligible managed-settings definitions from the sessions renderer.",
+            "Cardinality": "Up to one call per backend for the combined initialization batch instead of calls from two sequential batches; backend-specific guards may reduce the count further.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Included and excluded definitions traversed the renderer-to-main boundary separately.",
+            "CriticalPathEffect": "The policy branch must resolve before sessions configuration initialization completes, although user/workspace work proceeds concurrently."
+          }
+        ],
+        "ScalingInput": "Union of policy-bearing regular and excluded settings registered for the sessions product; policy names are deduplicated before submission.",
+        "EffectiveConcurrency": "User/workspace operations remain parallel with policy initialization. Within policy initialization, two sequential definition submissions become one; desktop multiplex backends remain parallel within that one submission.",
+        "CacheBehavior": "Initial definitions are cold for the local `PolicyConfiguration`; downstream services retain definition maps and suppress unchanged later submissions. The diff improves both cold initialization and any fresh sessions window instance without changing invalidation behavior.",
+        "MechanismConfidence": "High for the startup and IPC call path; medium for whether every backend receives both old batches because that depends on registered policy content.",
+        "MagnitudeUncertainty": "The number of sessions-window launches and presence of excluded managed policies vary, so some launches may previously have produced only one effective backend update.",
+        "Verdict": "No reportable regression. The combined batch cannot increase downstream update count and bounds initialization to one submission."
+      }
+    ],
+    "Summary": "Reviewed the complete two-file diff and the production call graph across startup, IPC, native watcher, managed-settings, and file-policy backends. No performance regression was introduced. The change is a concrete repeated-work fix: it coalesces two sequential initialization batches into one, and the introducing commit was recorded via base blame."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-06T16:14:24.706402752Z",
+    "CompletedAt": "2026-09-06T16:16:05.431942987Z",
+    "WallClockMilliseconds": 100725,
+    "ModelCalls": 10,
+    "InputTokens": 244797,
+    "OutputTokens": 5019,
+    "TotalTokens": 249816,
+    "ReasoningTokens": 1136,
+    "CacheReadTokens": 201216,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 73105,
+    "ToolCalls": 43,
+    "NanoAIUnits": 35519040000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 201216,
+      "cache_write": 0,
+      "input": 43581,
+      "output": 5019
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
