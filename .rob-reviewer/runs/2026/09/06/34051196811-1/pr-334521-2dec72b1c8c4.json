@@ -1,0 +1,238 @@
+{
+  "PullRequest": {
+    "Number": 334521,
+    "Title": "automations: refactor: make provider session templates canonical",
+    "Body": "## Summary\n\nThis is the architectural follow-up to #333723 and #333949.\n\nAutomations are now stored and executed through Agent Host Protocol (AHP), but the workbench still edited their session configuration through the legacy flattened `modelId`, generic chat `mode`, and `permissionLevel` fields. That representation cannot faithfully describe provider-native AHP configuration and caused Mode and Approvals to be conflated or dropped.\n\nThis change makes a provider-owned session template canonical for new Automations:\n\n```text\nLegacy\n  modelId + generic chat mode + permissionLevel\n\nCanonical\n  model + model-specific options + custom agent + provider-owned JSON-safe config\n```\n\nIt then uses a real provider draft and the existing New Session controls to edit that template, and passes the same initial configuration through both AHP-owned execution and older-host/browser fallback.\n\n## Why\n\nThe old projection had several structural problems:\n\n- generic chat uses mode values such as `agent`, `ask`, and `edit`, while Agent Host providers use their own values such as `interactive`, `plan`, and `autopilot`;\n- legacy `permissionLevel: 'autopilot'` represented two now-independent axes:\n  - Mode = Autopilot;\n  - Approvals = Assisted;\n- custom-agent selection and future provider configuration could not round-trip;\n- unrelated edits could erase provider-owned values that the generic dialog could not represent;\n- fallback execution created a session first and relied on optional post-create Mode/Approvals setters that Agent Host providers do not implement;\n- stored elevated approval preferences risked being treated as permission grants instead of being revalidated against current policy when the Automation ran.\n\n## Architecture\n\n### Target and template have separate authority\n\nThe Automation target owns:\n\n- workspace or workspace-less execution;\n- provider/session type;\n- folder/worktree isolation;\n- branch.\n\nThe provider session template owns:\n\n- model identity and model-specific preferences, such as thinking effort;\n- custom agent;\n- Mode and Approvals where the provider exposes them;\n- other provider-defined configuration.\n\nShared Sessions code remains provider-neutral and does not interpret Copilot-, Claude-, or Codex-specific keys.\n\n### Canonical session template\n\n`IAutomationSessionTemplate` carries:\n\n```ts\ninterface IAutomationSessionTemplate {\n\tmodelId?: string;\n\tmodelConfiguration?: Readonly\u003cRecord\u003cstring, string | number | boolean | null\u003e\u003e;\n\tagent?: { uri: string };\n\tconfig?: Readonly\u003cRecord\u003cstring, unknown\u003e\u003e;\n}\n```\n\nModel-specific configuration requires a model identifier and remains separate from provider session configuration. Each Automation draft owns its preferences; restoring one does not overwrite ordinary New Session defaults.\n\nThe existing flat fields remain only as deprecated decode/input aliases for old ledgers and callers. Once an Automation has a canonical template, a shared authority guard prevents stale legacy aliases from mutating it.\n\n### Provider-owned Automation drafts\n\nThe Automation dialog creates a dedicated provider draft, separate from the normal New Session composer draft.\n\nProviders opt into:\n\n- restoring `automationConfiguration` during draft creation;\n- capturing the resolved Automation configuration before Save.\n\nThe draft synchronizer:\n\n- coalesces equal target updates;\n- serializes target changes;\n- ignores stale generations;\n- captures the previous target before retargeting when possible;\n- caches the latest configuration per concrete target;\n- bounds synchronization and capture;\n- distinguishes unavailable, unsupported, replaced, failed, valid-empty, and preserved configuration.\n\nA capture failure therefore cannot be mistaken for a successful request to reset configuration.\n\n### Reuse New Session controls\n\nThe dialog now renders the same `NewSessionConfig` and `NewSessionControl` contributions used by New Session, scoped to the Automation draft.\n\nThis gives each selected provider its actual Model, Agent, Mode, and Approvals controls. Repository configuration is intentionally not reused because the Automation target already owns workspace, isolation, and branch.\n\n`ChatInputPart` remains the prompt editor but uses Automation-specific toolbar menus so generic configuration controls are not duplicated.\n\nExplicit Automation picker changes update the same remembered provider selections used by New Session. Merely opening or cancelling an edit does not.\n\n### Lossless AHP projection\n\nThe Agent Host Automation store now projects:\n\n```text\nAutomationDefinition.session \u003c-\u003e IAutomationSessionTemplate\n```\n\nThe projection preserves model identity and configuration, custom agent, and provider config.\n\nReusable templates exclude values owned by a concrete run or target, including:\n\n- per-tool session permission lists;\n- isolation and branch;\n- worktree settings;\n- Agent Merge state;\n- transient shell initialization scripts.\n\nWhen writing an edited template back, existing definition-owned values are preserved separately.\n\nSame-provider edits preserve authoritative values the editor has no opinion about. Retargeting to another provider does not carry incompatible model/agent/config state.\n\n### AHP and fallback execution converge\n\nAHP execution already creates the run session from `AutomationDefinition.session`.\n\nThe first Automation message also inherits the template's complete model selection, unless the message explicitly overrides it. This records the actual model options in turn history so opening a completed run restores them rather than falling back to the current editor defaults.\n\nThe older-host/browser runner now passes the same canonical template during draft creation, before the first request, together with target-owned isolation and branch. It no longer depends on optional post-create Mode/Approvals setters.\n\nThe older Copilot Chat sessions provider also implements Automation restore/capture so fallback configuration can round-trip instead of being flattened.\n\n## Compatibility and policy\n\n### Legacy Autopilot migration\n\nHistorical Copilot Automations migrate:\n\n```text\nautoApprove = autopilot\n\nto\n\nmode        = autopilot\nautoApprove = assisted\n```\n\nThe migration also repairs the transitional invalid shape produced around the narrow #333949 fix:\n\n```text\nunknown/generic mode + assisted approvals\n  -\u003e autopilot mode + assisted approvals\n```\n\nThis heuristic is scoped to Copilot Automations, but it has no per-row provenance marker: a newly stored canonical Copilot template with an unknown mode and Assisted approvals can also match on restart. That semantic risk was identified during review and deliberately left unchanged. Non-Copilot providers do not acquire Copilot configuration keys.\n\n### Preferences are not grants\n\nThe stored template is a preference snapshot.\n\nCurrent provider schema, availability, and managed policy are reapplied when a run starts. If policy requires confirmations, effective approval is clamped at the runtime decision points without rewriting the stored preference.\n\nThis also covers policy changes during an active session and avoids elevated fallback if provider resolution fails.\n\n### Policy implementation and commit history\n\nThe initial mixed commit was split into Automation mapping (`1e3c7db137b`) and a configuration-resolution policy clamp (`1bbf55eea20`). **The immediately following `d6ab9d12fd9` exactly reverts the entire `1bbf55eea20` patch**, including its regression test. Both affected files are identical before that patch and after its reversal.\n\nThis is a replacement of the enforcement approach, not removal of policy enforcement:\n\n| Approach | Behavior |\n|---|---|\n| Superseded `1bbf55eea20` | Returns restricted approval values while resolving Copilot configuration. Persisting those resolved values could erase the saved preference. |\n| Replacement in `d6ab9d12fd9` | Checks policy when computing effective SDK permission mode and host approval decisions, leaving the saved preference intact. |\n\nThe replacement checks remain in [CopilotAgentSession](https://github.com/microsoft/vscode/blob/f9ab78c923b/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L3975) and [SessionPermissionManager](https://github.com/microsoft/vscode/blob/f9ab78c923b/src/vs/platform/agentHost/node/sessionPermissions.ts#L426). Their tests cover revoking elevated SDK permissions during an active session and disabling a persisted session's auto-approval after policy changes. These are general runtime checks, not Automation-only logic.\n\nThe published stack therefore still contains an unnecessary add/revert pair. Recommended history cleanup is to drop `1bbf55eea20` together with its inverse hunks in `d6ab9d12fd9`; if separate policy review is desired, extract the replacement runtime checks and their tests instead. **That additional cleanup has not been performed.** The existing split preserved the final source tree.\n\n## Tool behavior\n\n`listAutomations` now returns the complete JSON-safe `sessionTemplate` for canonical rows.\n\n`configureAutomation`:\n\n- preserves omitted templates on unrelated updates;\n- accepts a complete template or `null` to reset it;\n- rejects mixing templates with legacy aliases;\n- rejects legacy alias updates to an existing canonical template;\n- validates and clones opaque JSON values;\n- preserves model-specific configuration and rejects it without a model identifier;\n- bounds provider config to depth 32, 10,000 values, and 65,536 serialized characters.\n\nOpaque provider configuration is not emitted through telemetry.\n\n## Save and cancellation behavior\n\nProvider capture is asynchronous, so Save must not close the dialog until capture succeeds.\n\nThe lifecycle is kept local to the Automation dialog rather than extending the widely used base `Dialog` widget:\n\n- Save/Create validates and starts a bounded capture;\n- form content becomes inert and `aria-busy`;\n- the primary action becomes `Saving…` and stays disabled;\n- a live status announces progress;\n- focus moves to Cancel;\n- rejection or timeout keeps the dialog open, restores the UI, and focuses an inline error;\n- Cancel, Escape, and Close cancel the active operation;\n- successful capture closes with the canonical result.\n\nThe local footer reuses standard button styles and platform-specific ordering. The final branch has no changes to the shared base `Dialog` implementation or tests relative to its merge base.\n\n## User-visible behavior\n\n- The Automation configuration strip reflects the selected provider rather than generic chat state.\n- Mode and Approvals can be selected independently.\n- Existing Automations remain editable when their provider or a saved value is temporarily unavailable; configuration is preserved rather than silently replaced.\n- Retargeting creates provider-appropriate configuration and does not leak settings between providers.\n- Save has a visible, cancellable busy state.\n- The dialog remains keyboard accessible and overflow-free at narrow widths.\n\n## Validation\n\n### Static and unit coverage\n\n- client type-check passed;\n- full OSS compile passed;\n- targeted ESLint and stylelint passed;\n- source-layer validation passed;\n- whitespace checks passed;\n- changed-surface matrix: 1,205 passed, 13 platform-gated pending;\n- full OSS unit suite: 34,078 passed, 470 pending;\n- 20 repeated synchronization/capture race runs passed;\n- final shared Dialog/Automation regression run: 92 passed.\n- post-rebase validation on `main` at `2e12155dfa05`: client type-check, targeted ESLint, source-layer validation, fresh client transpile, 468 provider/Automation tests passed with 13 platform-gated pending, and the strict Copilot restart replay passed.\n\n### Agent Host E2E\n\n- added a recorded Copilot restart scenario proving `mode: autopilot` and `autoApprove: assisted` survive host restart and reach the created run session;\n- focused strict replay passed repeatedly;\n- the Automation scenario passed in the broader deterministic E2E run.\n\n### Live Code OSS\n\nValidated:\n\n- create and edit;\n- reload persistence;\n- workspace and workspace-less targets;\n- retarget A -\u003e B -\u003e A;\n- duplicate;\n- enable/disable;\n- Run Now;\n- delete;\n- Saving state and Cancel/Escape/Close behavior;\n- accessible labels, focus, and live status;\n- desktop and 420px layouts with no horizontal overflow;\n- zero browser-console errors in the earlier baseline run.\n\n### Final model-configuration verification (2026-09-06)\n\nLive Code OSS testing exposed a missing model-options boundary: Codex displayed Low thinking but ran at Medium. The fix preserves model-specific preferences through provider drafts, tools, persistence, AHP projection, fallback requests, and recorded first-turn metadata. It also refreshes same-model badges when switching targets.\n\n- 598 focused tests passed, with 11 pending; 115 overlapping follow-up checks passed after the final fixes.\n- Fresh transpilation, client type-check, focused ESLint, source-layer checks, and commit hygiene passed.\n- The strict tokenless Copilot Automation restart replay passed without fixture changes.\n- Separate Codex Low/High Automations sent the corresponding reasoning effort in actual model requests.\n- After a full restart, a fresh Low run both executed at Low and restored Low in its chat input, while ordinary New Session retained its High default.\n- Same-model target retargeting now correctly displays Low -\u003e High -\u003e Low.\n- A deliberately stalled capture failed visibly after about five seconds; Escape cancelled a pending save in 27 ms without a late save. Retry after recovery succeeded.\n- Create/edit/duplicate/delete, workspace and workspace-less runs, weekly schedule round-trip, Worktree target persistence, keyboard navigation, and 420px layout passed.\n\nThe earlier full-suite results above predate these final fixes; they were not rerun as a full suite.\n\n## Reviewer attention / remaining merge gates\n\nThe branch was last rebased onto `main` at `814ab138a8994ee8984c0acd6816ad77e2aa3cef`. Upstream provider changes were retained while adapting the Automation restore/capture work to those APIs.\n\n1. **Run the cross-platform restart gate.** The recorded test should complete cleanly twice on Windows, Linux, and macOS through pipeline 111.\n2. **Explicitly sign off on the migration heuristic.** There is no per-row marker distinguishing historical broken data from newer canonical Copilot configuration. An unknown canonical mode plus Assisted can also be rewritten on restart; provider scoping alone does not establish historical provenance.\n3. **Remaining live coverage limits.** Codex was explicitly enabled and its harness, native controls, save/reload, provider retargeting, Low/High options, and real execution were verified. Native workspace custom agents were not offered in either the Automation picker or ordinary materialized sessions in the isolated environment. Browser/older-provider custom-agent paths have deterministic regression coverage, but not a live end-to-end pass here.\n4. **Review the compatibility boundary.** Flat aliases intentionally remain for old data and callers; no new code should write them for canonical Automations.\n5. **Account for the superseded policy commit.** `1bbf55eea20` is completely reversed by `d6ab9d12fd9`. The final runtime-policy checks live in the latter commit. See the history explanation above; cleanup is recommended but has not been applied.\n\nThe branch spans several layers, so the commit stack is organized into reviewable layers: migration/policy, canonical domain/storage, provider drafts, New Session control reuse, execution parity, tools/E2E, and robustness fixes.\n\n## Known unrelated test/environment findings\n\nThe broad test pass also reproduced pre-existing or unrelated failures:\n\n- conformance bang-command failures;\n- Copilot worktree cwd and nested peer-file failures;\n- Claude replay text drift;\n- an isolated scenario-runner custom-view activation gap;\n- component-explorer MCP initialization failures;\n- Apple `/usr/bin/git` blocked by the local Xcode license state.\n\nThese were isolated from the Automation behavior and are not hidden by success-shaped fallbacks in this change.\n\n## UI\n\n420px Automation edit dialog using the provider-backed configuration controls and local asynchronous Save lifecycle. This screenshot is from the earlier Copilot pass; the latest live verification also covered Codex as described above.\n\n![Automation dialog at 420px](https://github.com/user-attachments/assets/3d167b0d-8f5c-40ce-b9e8-0773f2f11ef7)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/334521",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "ulugbekna",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "2147551cfa2a723b461b8676ea117ee93f5ec02f",
+    "HeadRef": "ulugbekna/agents/issue-investigation-assistance",
+    "HeadSHA": "2dec72b1c8c47606885910917b7457e5fa08858e",
+    "CreatedAt": "2026-09-04T15:13:26Z",
+    "UpdatedAt": "2026-09-06T16:06:08Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-E7F1A29971F1",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/automations/browser/automationDialog.ts",
+      "Side": "RIGHT",
+      "Line": 365,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The synchronizer's serialized while-loop, generation update, one-second timeout, and post-await generation check are explicit in the changed code. The new test also establishes that provider capture may never settle. Exact provider stall prevalence is uncertain, which affects severity rather than the mechanism.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "missing-coalescing",
+      "PerformanceResource": "Provider configuration capture promises, including Agent Host configuration-resolution IPC, plus serialized wall-clock wait time.",
+      "PerformanceScaling": "Cost is one capture/timeout per synchronization iteration rather than one per old draft; rapid target changes during a stalled capture can repeatedly pay 1,000 ms against the same session, and timed-out underlying promises remain pending.",
+      "PerformanceOutcome": "Retarget UI latency grows by the one-second capture timeout for each stale synchronization iteration, blocking creation and display of the final target draft.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this change, target synchronization validated the workspace and immediately created the latest draft; it did not await provider capture or repeat stalled capture work while coalescing target changes.",
+      "ChangedBehavior": "Retargeting now synchronously captures the previous provider draft before creating the requested draft; stale retarget iterations still pay that capture and leave the old draft installed, causing the next iteration to capture it again.",
+      "CausalDiffEvidence": "The added `await this.captureSessionConfiguration(this.session, this.appliedTarget, this.retargetConfigurationCaptureTimeoutMs);` runs before the stale-generation check. `update()` marks another sync iteration while the await is pending, so after a timeout the stale iteration returns and the next iteration invokes the same capture again against the unchanged draft.",
+      "Title": "Coalesce capture before applying the latest target",
+      "Impact": "When an Agent Host/provider configuration request is slow or disconnected, quickly switching folder/provider/session type leaves the session controls unavailable for roughly two seconds for a common A→B→C correction, and further switches can add another timeout while also spawning additional never-settling capture promises.",
+      "Evidence": "`scheduleSync()` serializes updates in a loop. During `sync()`, line 365 awaits capture with a 1,000 ms timeout and only then checks whether `generation` changed. For A→B followed quickly by C while A's capture stalls, B's iteration waits one second, observes it is stale, leaves A as `this.session`, and the queued C iteration waits another second capturing A again. `captureSessionConfiguration` uses `raceTimeout` without cancelling the underlying provider promise, and `automationDialog.test.ts` explicitly covers a never-resolving capture promise.",
+      "Recommendation": "Coalesce capture by applied session: start at most one capture attempt for the old draft, share its result/deadline across queued target updates, and after it settles or times out create only the latest requested target. Also cancel or otherwise release the underlying provider capture when abandoning the draft."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "missing-coalescing",
+      "repeated-work",
+      "cleanup-lifecycle",
+      "boundary-fanout",
+      "eager-work",
+      "synchronous-ui-work",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open/edit an Automation, switch workspace/provider/session type, and save the provider-owned session template",
+        "CriticalPath": "Opening or retargeting must create the selected provider draft before configuration controls become available; Save additionally waits for synchronization and a final capture. The newly added previous-target capture is on the retarget critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/automations/browser/automationDialog.ts:365 -\u003e BaseAgentHostSessionsProvider.getAutomationSessionConfiguration",
+            "Operation": "Capture provider configuration; Agent Host capture may wait for or retry `resolveSessionConfig` over the host connection.",
+            "Cardinality": "Normally one final capture on Save plus one capture per retarget synchronization iteration. With A→B→C during a stalled A capture, A is captured twice because the stale iteration leaves it applied.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Retargeting validated and created the latest draft without capturing the old provider draft first; Save did not perform provider-owned capture.",
+            "CriticalPathEffect": "Each retarget capture blocks creation and display of the next draft for up to 1,000 ms; final Save is bounded by a shared 5,000 ms deadline."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_createDraftSession/NewSession.resolveConfig",
+            "Operation": "Resolve provider schema/configuration and eagerly create the Agent Host draft backend.",
+            "Cardinality": "One draft initialization for the effective target after coalescing, although changing targets creates a replacement draft.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Automation target changes already created provider drafts and initiated their configuration/backend lifecycle, but without canonical template restoration.",
+            "CriticalPathEffect": "Configuration controls depend on draft creation/config resolution; this boundary already existed for Automation drafts, while the diff adds template payload and restoration."
+          }
+        ],
+        "ScalingInput": "Number and timing of target changes while provider capture is pending; effective cardinality is synchronization iterations, not raw picker events. A quick A→B→C produces two captures of A when capture stalls.",
+        "EffectiveConcurrency": "A single serialized synchronizer processes target changes. Equal updates coalesce, but a changed generation does not cancel the in-flight capture and the next iteration can recapture the same applied draft.",
+        "CacheBehavior": "The dialog caches the latest successful configuration per concrete target for its lifetime. Cache keys include target kind, folder URI, provider, and session type; there is no cross-dialog cache. Timed-out captures do not populate the cache.",
+        "MechanismConfidence": "High: the await precedes the generation check, synchronization is serialized, and the old draft remains applied after a stale iteration.",
+        "MagnitudeUncertainty": "Provider stalls are environment-dependent, but the tests explicitly permit a never-settling capture. The added delay is deterministically bounded at one second per stale iteration.",
+        "Verdict": "Reportable missing-coalescing latency regression; submitted one finding."
+      },
+      {
+        "Scenario": "Run an Automation through Agent Host authority or the older browser/fallback runner",
+        "CriticalPath": "Session creation and the first request are on the run critical path. Canonical model/config values are now supplied at creation; fallback custom-agent runs additionally wait for fresh agent discovery before send.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostAutomationService.ts:_executeRun",
+            "Operation": "Create the run session and start it through the Agent Host execution service.",
+            "Cardinality": "One create and one start per Automation run; no per-template-field fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one create plus one start occurred, without complete canonical model metadata in the first turn.",
+            "CriticalPathEffect": "Both calls remain on the run startup path. The diff only adds model configuration to the existing first message/session payload."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/automations/browser/automationRunner.ts:runOnce -\u003e SessionsManagementService",
+            "Operation": "Create/configure a fallback provider session and send the first request.",
+            "Cardinality": "One session creation and one request per run; target isolation remains configured once.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Fallback created the same session and request, then optionally applied flat model/mode/permission setters.",
+            "CriticalPathEffect": "Required before the fallback run can proceed. The boundary is pre-existing; the diff moves canonical template restoration into creation rather than post-create setters."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/contrib/providers/copilotChatSessions/browser/copilotChatSessionsProvider.ts:_resolveAutomationSessionMode",
+            "Operation": "Refresh workspace custom-agent modes before sending a fallback Automation using a custom agent.",
+            "Cardinality": "One discovery sequence per first send, with a single 30-second deadline even if selection changes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Canonical custom-agent Automation templates were not supported on this fallback path, so this discovery wait was absent.",
+            "CriticalPathEffect": "Blocks the first request until the selected agent is resolved; cancellation and timeout dispose each discovery scope."
+          }
+        ],
+        "ScalingInput": "Automation run count; each run creates one fresh session. Custom-agent discovery does not fan out by automation collection size.",
+        "EffectiveConcurrency": "Runs follow existing scheduler/runner concurrency. Within a fallback run, custom-agent discovery is serialized before first send and bounded by one deadline.",
+        "CacheBehavior": "Each run is a fresh session; model preferences come from the saved template. Custom-agent availability is deliberately revalidated rather than trusted from a stale cache.",
+        "MechanismConfidence": "High for the call paths and bounds.",
+        "MagnitudeUncertainty": "Provider/session creation and agent-discovery duration vary, but call cardinality is fixed at one sequence per run.",
+        "Verdict": "No additional finding: canonical restoration does not add boundary fan-out, and the new custom-agent discovery is required, single-shot, cancellable, and bounded."
+      },
+      {
+        "Scenario": "Receive Agent Host Automation catalog updates, list/edit definitions, and persist browser legacy-store definitions",
+        "CriticalPath": "Catalog projection feeds the Automation view and mutation conflict checks; browser-store persistence runs on create/update/import, not per frame.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/agentHostAutomationStore.ts:catalog subscription",
+            "Operation": "Receive authoritative Automation catalog snapshots/actions from Agent Host.",
+            "Cardinality": "Existing subscription; each catalog change can reproject all N definitions and runs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Catalog updates already reprojected and sorted all Automations; only model/mode/permission fields were exposed.",
+            "CriticalPathEffect": "Projection occurs before consumers observe updated lists. The diff adds shallow projection of each template config but no new IPC request."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/common/automations/automationService.ts:serializeAutomationEditableState",
+            "Operation": "Stable-stringify editable state, now including the complete session template, for optimistic conflict checks.",
+            "Cardinality": "A small fixed number of serializations per mutation/approval check; not per render or run-history item.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same checks serialized flat fields but not the provider template.",
+            "CriticalPathEffect": "Synchronous on user/tool mutation paths. Tool-supplied opaque configuration is bounded to 65,536 serialized characters and 10,000 values."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/contrib/automations/browser/automationService.ts:ledger load/store",
+            "Operation": "Read, parse, migrate, and write the Automation ledger through the storage service.",
+            "Cardinality": "One startup/load parse and one write per mutation, across N Automations; schema migration maps each row once on load.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The ledger already persisted all Automation rows and runs, without canonical template data.",
+            "CriticalPathEffect": "Startup/load and mutations already depended on storage; the diff increases payload by the bounded template size."
+          }
+        ],
+        "ScalingInput": "Automation count N and aggregate template size. Tool input is bounded; provider-authored Agent Host config size is not established as large in normal use.",
+        "EffectiveConcurrency": "Catalog projection and mutation checks are synchronous; storage mutations retain existing sequencing/optimistic guards.",
+        "CacheBehavior": "Derived catalog observables recompute on catalog changes. Run-specific observables are cached by automation ID; template projection itself is not memoized.",
+        "MechanismConfidence": "High for added serialization/copy work, low for harmful magnitude.",
+        "MagnitudeUncertainty": "Templates can be richer, but realistic provider configs are small and no hot high-cardinality workload proves a user-visible regression beyond existing whole-catalog projection.",
+        "Verdict": "No finding: added work is bounded on mutation paths or a small incremental cost inside an existing whole-catalog projection."
+      },
+      {
+        "Scenario": "Use ordinary New Session/model/mode controls and resize the Automation dialog",
+        "CriticalPath": "Toolbar construction and responsive layout run while rendering the composer; model configuration work is lazy until queried or changed.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "A bounded number of toolbar actions and model preference entries per draft; resize cost scales with the small control count.",
+        "EffectiveConcurrency": "UI updates are synchronous on render/resize; picker model caches retain one model per active scoped surface and release it in a microtask after the last reference.",
+        "CacheBehavior": "Scoped mode-picker models are keyed by the session observable and disposed after the final release; Automation model preferences are per draft and disposed with it.",
+        "MechanismConfidence": "High for lifecycle and bounded cardinality.",
+        "MagnitudeUncertainty": "DOM/layout timing is not measured, but there is no loop over large collections or forced read-after-write chain established by the changed hunks.",
+        "Verdict": "No finding: eager allocations are small, responsive work is bounded, and cache cleanup is explicit."
+      },
+      {
+        "Scenario": "Load stored Agent Host Automations after restart and enforce approval policy during active sessions",
+        "CriticalPath": "Startup maps stored Automation definitions once; permission checks occur at existing runtime decision points.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostAutomationService.ts:constructor storage load",
+            "Operation": "Read existing stored catalog and migrate legacy Copilot mode/approval shapes in memory.",
+            "Cardinality": "One pass over N stored Automations at service startup.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Stored rows were wrapped with run windows without this migration pass.",
+            "CriticalPathEffect": "Adds constant-time field checks and only allocates replacement objects for rows requiring migration."
+          }
+        ],
+        "ScalingInput": "Number of stored Automations N; each row is visited once and unchanged rows retain identity.",
+        "EffectiveConcurrency": "Synchronous one-time startup mapping; no added parallel boundary burst.",
+        "CacheBehavior": "Migration result becomes the in-memory catalog for the process lifetime; no repeated migration per access.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Large catalogs increase linear startup work, but per-row work is tiny and no expensive boundary is added.",
+        "Verdict": "No finding: bounded linear startup migration and constant-time policy checks do not establish a meaningful regression."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 62 changed files and relevant call paths. One medium-confidence-impact, high-mechanism-confidence finding was submitted for repeated serialized provider-capture waits during rapid retargeting. Other new work is bounded, single-shot, lifecycle-cleaned, or piggybacks on pre-existing session/catalog/storage boundaries."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-06T18:23:49.689828863Z",
+    "CompletedAt": "2026-09-06T18:26:05.160537567Z",
+    "WallClockMilliseconds": 135470,
+    "ModelCalls": 9,
+    "InputTokens": 1061095,
+    "OutputTokens": 11244,
+    "TotalTokens": 1072339,
+    "ReasoningTokens": 3948,
+    "CacheReadTokens": 885760,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 120928,
+    "ToolCalls": 102,
+    "NanoAIUnits": 128052400000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 885760,
+      "cache_write": 0,
+      "input": 175335,
+      "output": 11244
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
