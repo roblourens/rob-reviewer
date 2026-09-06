@@ -1,0 +1,175 @@
+{
+  "PullRequest": {
+    "Number": 331691,
+    "Title": "Pause automatic inline completions on metered connections",
+    "Body": "## Summary\n\nRespect metered connections in the existing network-backed inline completion providers owned by the codebase, without adding a generic provider API.\n\n- skip new automatic Copilot ghost-text requests while the connection is metered\n- skip new automatic Copilot next-edit suggestion (NES) requests while the connection is metered, including requests triggered by switching editors\n- preserve explicit user-triggered requests and requests already in flight\n- leave local-only providers such as Emmet unchanged\n\n## Issue coverage\n\n- Fixes #297407: automatic Copilot completions no longer start network requests on metered connections.\n- Fixes #297412: editor switches can trigger NES refreshes, but those automatic provider requests now stop before request logging or network work when the connection is metered.\n\nThird-party providers and non-completion network activity are intentionally outside this change.\n\n## Validation\n\n- `npx tsc --noEmit --project tsconfig.json`\n- `npm run compile`",
+    "URL": "https://github.com/microsoft/vscode/pull/331691",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "584af9d9798bd3e05c7f7b90401397dd70652609",
+    "HeadRef": "dev/dmitriv/metered-inline-completions",
+    "HeadSHA": "50892dea883d0a5c463219fafe8dca930a9791a7",
+    "CreatedAt": "2026-08-19T19:01:00Z",
+    "UpdatedAt": "2026-09-06T05:53:10Z",
+    "MergedAt": null,
+    "Labels": [
+      "network",
+      "inline-completions",
+      "editor-api"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Automatic Copilot ghost-text request while the connection is metered",
+        "CriticalPath": "The editor invokes CopilotInlineCompletionItemProvider.provideInlineCompletionItems; the added trigger-kind and cached env-state check completes before logging, prompt construction, cache lookup, or backend access, so only the local check remains on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/completions-core/vscode-node/lib/src/ghostText/ghostText.ts:getGhostText / CompletionsFromNetwork",
+            "Operation": "Streams a Copilot completion when no usable local completion exists.",
+            "Cardinality": "Before the diff, a cold automatic invocation could create one logical completion backend request; warm cache or async-request reuse could avoid it. After the diff, metered automatic invocations create zero.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Metered status did not affect provider entry, so automatic requests continued through existing cache and network logic.",
+            "CriticalPathEffect": "Before the diff, a cold response could gate suggestion production; after the diff this boundary is not reached and the provider returns immediately."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHost.api.impl.ts:env.isMeteredConnection",
+            "Operation": "Reads metered status already mirrored into the extension host; status initialization and changes are forwarded separately by MainThreadMeteredConnection.",
+            "Cardinality": "The changed provider performs one local cached boolean read per automatic invocation; there is no per-invocation IPC.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The provider did not read metered status; the underlying status-propagation service already existed.",
+            "CriticalPathEffect": "Constant-time local read before all expensive provider work."
+          }
+        ],
+        "ScalingInput": "Automatic editor completion triggers, commonly scaling with typing events; each metered invocation now does one constant-time gate and no backend request.",
+        "EffectiveConcurrency": "One ghost-text provider invocation per editor request. Under the regular joint provider it can be invoked alongside NES, but both added metered gates resolve immediately; no new queue, limiter, or network concurrency is created.",
+        "CacheBehavior": "The new gate is before ghost-text cache lookup, so both cold and warm automatic invocations return immediately while metered. Existing cache keys, async request reuse, and negative behavior are unchanged when unmetered.",
+        "MechanismConfidence": "High: the changed line is the first statement in the provider, and env.isMeteredConnection resolves from an extension-host boolean field rather than synchronous IPC.",
+        "MagnitudeUncertainty": "Exact automatic trigger frequency and cache-hit rate vary with typing and editor configuration, but the changed path strictly removes downstream work on metered connections.",
+        "Verdict": "No reportable regression. The diff removes prompt/cache/network work from this metered automatic path and adds only a local cached-state read."
+      },
+      {
+        "Scenario": "Automatic next-edit suggestion request while metered, including editor-switch refreshes",
+        "CriticalPath": "The editor or joint provider invokes InlineCompletionProviderImpl.provideInlineCompletionItems; the added check returns before CapturingToken/logger creation, workspace/model processing, diagnostics racing, cache lookup, serialization, and the stateless next-edit stream.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/inlineEdits/node/nextEditProvider.ts:fetchNextEdit / IStatelessNextEditProvider.provideNextEdit",
+            "Operation": "Builds and streams a Copilot next-edit request on cache miss.",
+            "Cardinality": "Before the diff, each effective cache miss could start or join one pending/speculative next-edit stream; repeated triggers may coalesce when state matches. After the diff, new metered automatic invocations start or join zero streams.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Automatic metered invocations entered the normal cache/coalescing/network path.",
+            "CriticalPathEffect": "Before the diff, cache processing or a backend first edit could gate NES completion; after the diff the provider returns before that path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHost.api.impl.ts:env.isMeteredConnection",
+            "Operation": "Reads extension-host-cached connection status.",
+            "Cardinality": "One local boolean read per automatic NES provider invocation and no per-request IPC.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No metered-state read occurred in the NES provider.",
+            "CriticalPathEffect": "Constant-time local gate replaces all downstream request setup on the metered path."
+          }
+        ],
+        "ScalingInput": "Automatic NES triggers from edits, cursor/editor changes, and joint-provider refreshes; cost after the diff remains O(1) per metered trigger with zero new backend streams.",
+        "EffectiveConcurrency": "The regular joint provider may invoke NES and ghost text concurrently. Both now resolve without downstream work while metered. Existing pending/speculative request coalescing is bypassed for new automatic invocations, while already-running work is not canceled by the added gate.",
+        "CacheBehavior": "The gate precedes NES cache and pending/speculative request lookup. Cold and warm new automatic requests are skipped while metered; existing in-flight requests remain governed by pre-existing cancellation/coalescing. Unmetered cache behavior is unchanged.",
+        "MechanismConfidence": "High: the early return is directly before request logging and the traced getNextEdit path, and the environment getter is local state.",
+        "MagnitudeUncertainty": "Editor-switch and typing trigger rates vary, and cache/coalescing previously reduced some backend calls; nevertheless the changed early return can only reduce work on this path.",
+        "Verdict": "No reportable regression. The change removes local model work and cold network requests, and does not increase concurrency or retention."
+      },
+      {
+        "Scenario": "Automatic Copilot completions while the connection is not metered",
+        "CriticalPath": "Each provider evaluates trigger kind and the local metered boolean, then follows the same pre-diff logging, cache, model, and backend path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/completions-core/vscode-node/lib/src/ghostText/ghostText.ts and extensions/copilot/src/extension/inlineEdits/node/nextEditProvider.ts",
+            "Operation": "Fetches ghost text and/or streams NES on effective cache misses.",
+            "Cardinality": "Unchanged by the diff: up to one logical invocation per selected provider per editor trigger, with the regular joint strategy potentially invoking both and existing caches/coalescing reducing actual backend calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider and network paths ran with the same cache keys, grouping, and concurrency.",
+            "CriticalPathEffect": "Unchanged apart from one constant-time local state check before provider work."
+          }
+        ],
+        "ScalingInput": "Typing/editor automatic-trigger frequency, with at most one added constant-time check in each provider actually invoked.",
+        "EffectiveConcurrency": "Existing behavior is retained: standalone strategies invoke one provider, while the regular joint strategy can race ghost text and NES; existing cancellation and pending/speculative coalescing remain intact.",
+        "CacheBehavior": "Cold misses and warm hits use exactly the pre-existing ghost-text and NES cache/coalescing logic; the added false predicate neither changes keys nor invalidation.",
+        "MechanismConfidence": "High: source tracing shows the getter returns an in-memory field and no changed allocation, serialization, IPC, or I/O follows from the check itself.",
+        "MagnitudeUncertainty": "The number of editor triggers and cache misses varies, but the only added unmetered cost is a boolean getter plus proposed-API enablement check per selected provider invocation.",
+        "Verdict": "No actionable regression. The added local check is negligible and does not amplify an expensive resource or boundary."
+      },
+      {
+        "Scenario": "Explicitly invoked Copilot ghost-text or NES request on any connection",
+        "CriticalPath": "Because triggerKind is not Automatic, short-circuit evaluation bypasses env.isMeteredConnection and execution enters the exact pre-diff provider path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/completions-core/vscode-node/lib/src/ghostText/ghostText.ts and extensions/copilot/src/extension/inlineEdits/node/nextEditProvider.ts",
+            "Operation": "Performs an explicit completion or next-edit backend request when existing caches cannot satisfy it.",
+            "Cardinality": "Exactly as before: selected providers may issue one logical request each on an effective miss, with existing joint concurrency and coalescing.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Explicit requests followed these same paths regardless of connection status.",
+            "CriticalPathEffect": "The same cache/model/network work remains on the explicit request critical path."
+          }
+        ],
+        "ScalingInput": "Number of explicit user invocations; the diff adds no per-invocation work after the first trigger-kind comparison already needed for the branch.",
+        "EffectiveConcurrency": "Unchanged: explicit requests use the existing standalone or joint-provider strategy, cancellation, races, and request coalescing.",
+        "CacheBehavior": "Existing warm-cache service and cold-request behavior are unchanged because the new conjunction short-circuits before reading metered state for explicit triggers.",
+        "MechanismConfidence": "High: JavaScript short-circuit semantics and both changed predicates make this path behaviorally and computationally unchanged.",
+        "MagnitudeUncertainty": "Explicit request frequency and cache hit rates vary, but no changed mechanism executes for this trigger kind.",
+        "Verdict": "No reportable performance change."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and traced provider registration, joint-provider concurrency, environment-state propagation, ghost-text cache/network behavior, and NES cache/coalescing/network behavior. The PR adds constant-time local gates that eliminate downstream work on metered automatic paths while leaving unmetered and explicit paths effectively unchanged; no performance finding or qualifying regression-fix record was warranted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-06T13:07:53.788037111Z",
+    "CompletedAt": "2026-09-06T13:09:21.032155819Z",
+    "WallClockMilliseconds": 87244,
+    "ModelCalls": 9,
+    "InputTokens": 286059,
+    "OutputTokens": 5937,
+    "TotalTokens": 291996,
+    "ReasoningTokens": 2086,
+    "CacheReadTokens": 223232,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 67839,
+    "ToolCalls": 42,
+    "NanoAIUnits": 45934080000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 223232,
+      "cache_write": 0,
+      "input": 62827,
+      "output": 5937
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
