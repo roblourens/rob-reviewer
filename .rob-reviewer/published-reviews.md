@@ -2,6 +2,27 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#334521 — automations: refactor: make provider session templates canonical](https://github.com/microsoft/vscode/pull/334521)
+
+- Published comments: **1**
+- Head: `2dec72b1c8c47606885910917b7457e5fa08858e`
+- Completed: `2026-09-06T18:26:13Z`
+- Run: [34051196811 attempt 1](runs/2026/09/06/34051196811-1/run.md)
+
+### `src/vs/sessions/contrib/automations/browser/automationDialog.ts:365`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+Retargeting now synchronously captures the previous provider draft before creating the requested draft; stale retarget iterations still pay that capture and leave the old draft installed, causing the next iteration to capture it again.
+
+When an Agent Host/provider configuration request is slow or disconnected, quickly switching folder/provider/session type leaves the session controls unavailable for roughly two seconds for a common A→B→C correction, and further switches can add another timeout while also spawning additional never-settling capture promises.
+
+**Suggested fix:** Coalesce capture by applied session: start at most one capture attempt for the old draft, share its result/deadline across queued target updates, and after it settles or times out create only the latest requested target. Also cancel or otherwise release the underlying provider capture when abandoning the draft.
+
+(Written by Copilot)
+
 ## [#334705 — Make action widget menu items directly clickable by Playwright](https://github.com/microsoft/vscode/pull/334705)
 
 - Published comments: **1**
