@@ -2,6 +2,27 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#334705 — Make action widget menu items directly clickable by Playwright](https://github.com/microsoft/vscode/pull/334705)
+
+- Published comments: **1**
+- Head: `2373481a96253a7623f1df8234169b1b000cb224`
+- Completed: `2026-09-06T13:18:23Z`
+- Run: [34034967193 attempt 1](runs/2026/09/06/34034967193-1/run.md)
+
+### `src/vs/platform/actionWidget/browser/actionList.ts:961`
+
+**[Experimental performance review bot]**
+
+**Severity: low**
+
+The diff registers List.onMouseMove for the full widget lifetime. Although the callback body becomes a no-op once \_ignoreInitialHover is false, ListView still maps every DOM mousemove through toMouseEvent before invoking it.
+
+After the first movement over an open code-action, dropdown, or model-picker list, all later movements still perform DOM target-to-row resolution and allocate a mapped list event. This scales with mouse polling rate and can add avoidable CPU/GC pressure while the popup is being interacted with.
+
+**Suggested fix:** Use a raw disposable `mousemove` listener on the list element and dispose/clear that listener immediately after the first non-zero movement (while retaining mousedown activation), so row hover continues via the existing `onMouseOver` handler without permanent per-move mapping.
+
+(Written by Copilot)
+
 ## [#332410 — agentHost: centralize session and chat catalog metadata](https://github.com/microsoft/vscode/pull/332410)
 
 - Published comments: **1**
