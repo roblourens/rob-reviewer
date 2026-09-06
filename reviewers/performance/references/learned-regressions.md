@@ -21,3 +21,8 @@ Inspect eagerly constructed hidden sections and details. Report when a changed c
 ## Boundary fan-out revealed by shipped fixes
 
 Count effective subprocess, IPC, filesystem, database, and network operations after grouping. Check whether a changed loop turns one logical request into per-item boundary calls even when callers use Promise.all or other superficial concurrency.
+
+<!-- learned-family:repeated-work -->
+## Repeated work revealed by shipped fixes
+
+When a fix removes repeated work, reconstruct the pre-fix multiplicity explicitly. Check whether the introducing diff placed collection-wide work inside an incremental, per-item, per-event, or per-frame path, including work hidden behind helpers.
