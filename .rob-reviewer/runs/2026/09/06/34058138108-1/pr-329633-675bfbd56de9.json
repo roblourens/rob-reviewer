@@ -1,0 +1,277 @@
+{
+  "PullRequest": {
+    "Number": 329633,
+    "Title": "agentHost: make the orchestrator own session enumeration and chat lifecycle",
+    "Body": "## Summary\n\nThis completes the Agent Host multi-chat ownership refactor:\n\n- Agent Host owns session identity, durable registry, enumeration, chat catalog, lifecycle ordering, restore, deletion, and configuration fan-out.\n- Providers keep exact chat-to-SDK bindings and reverse SDK-id routing. They do not infer AH chat membership or cascade lifecycle through shared SDK resources.\n- Fresh session provisioning uses the chat-surface seam (`createSessionChat`); additional chats use exact `createChat` / `fork` operations with transient host-owned context.\n- `AgentSessionRegistry` drives top-level enumeration and one-time legacy backfill, removing the host's dependency on I3/default-chat SDK-id reuse.\n- Claude, Copilot, and Codex preserve main-era side-chat, multi-root, client-type, model-refresh, edit-attribution, OTLP, and custom-agent behavior.\n- Codex now advertises multiple chats and fork support. Exact peer routing and provider-qualified model forwarding are fixed.\n\n## Codex multi-chat\n\nThis PR enables multiple chats and chat forks for Codex in Agent Host. Live validation covered independent peer routing and transcript isolation, exact-chat sends, restart restoration, close/reopen, deletion isolation, and forking.\n\nKnown report-only model behavior: Codex can emit duplicate `create_chat` tool calls, and `create_session` can select the wrong workspace. These do not change Agent Host chat routing or lifecycle ownership and are intentionally outside this PR.\n\n## Codex E2E coverage\n\nCodex host-only capability assertions and provider-independent conformance catalog/lifecycle scenarios are enabled and replay green.\n\nModel-backed Codex peer/fork parity remains replay-gated with `supportsMultipleChatsE2E: false` / `supportsChatForkE2E: false`. Focused live recording was attempted without accepting or hand-editing captures, but the current Codex live recording path fails before a usable model response (including the pre-existing simple-turn recording path). The focused reproduction and expected/observed behavior are recorded in `e2e/KNOWN_ISSUES.md`. Recording mode still enables these tests automatically once that environment defect is fixed.\n\n## Validation and confidence\n\nValidation was layered so protocol ownership, provider routing, persistence, and real UI behavior were checked independently.\n\n### Automated checks\n\n- `npm run typecheck-client` — passed after the final changes and after merging current `main`.\n- `npm run valid-layers-check` — passed.\n- Hygiene and `git diff --check` — passed.\n- Full AgentService suite after the final merge: 209 passing, 17 pre-existing pending.\n- Claude subagent resolver: 16 passing, including unique result correlation and ambiguous-match rejection.\n- Persisted subagent resource normalization: 4 passing.\n- Focused Copilot and Claude provider tests cover canonical child-chat addressing.\n- Provider replay suites exercised Copilot, Claude, and Codex host behavior; Codex model-backed peer/fork cases remain recording-environment gated as described below.\n\n### Authenticated live validation\n\nThe branch was run in Code OSS against real authenticated Copilot, Claude, and Codex providers. The following scenarios were exercised manually, one at a time, with exact AHP channels/provider/model routing checked in Agent Host logs rather than relying only on visible response text:\n\n- Default-chat and peer-chat isolation for all three providers.\n- Sends to exact chats, independent transcripts, close/reopen, and deletion isolation.\n- Restart restoration followed by post-restore sends.\n- Copilot and Codex forks; Copilot exact-turn fork routing was explicitly verified.\n- Copilot and Claude `/btw` side chats.\n- Session-management tools: current/list/context, create chat/session, and send message.\n- Parallel subagent spawning and child viewing for Copilot and Claude.\n- A final restart restored all four Copilot and all four Claude child chats; each Claude child was opened successfully. The final log run emitted canonical `session/chatAdded` actions with no relevant resource, enrichment, unknown-chat, or restore errors.\n\n### Regression comparison\n\nResidual startup unknown-session actions and Codex model-readiness races were reproduced on current `main`, classifying them as pre-existing rather than introduced by this refactor.\n\n### Known limitations / report-only findings\n\n- Codex model-backed peer/fork replay E2Es remain gated because the live recording path fails before producing a usable model response; host/conformance coverage and authenticated live validation are present.\n- Codex sometimes emitted duplicate `create_chat` calls and selected the wrong repository for `create_session`.\n- Claude emitted duplicate and Codex emitted triple `send_message` calls; delivery to the child was deduplicated.\n- Subagent persistence is upgrade-compatible but not downgrade-compatible: an older Agent Host cannot resolve canonical child-chat references written by this version. Parent sessions and normal chats remain available.\n\nThese provider/model behaviors are recorded for follow-up and intentionally not changed by this ownership refactor.\n\n## Claude ownership audit\n\nThe Claude provider preserves the core invariant: each concrete AH chat maps to exactly one Claude SDK conversation. Its chat bindings retain only provider-owned backing data, exact-chat sends/forks/model changes target that binding, and default-chat lifecycle operations do not cascade to sibling chats. `ClaudeAgentSession` / SDK `sessionId` terminology refers to Claude SDK conversations and is not itself an AH ownership leak.\n\nThe audit did identify remaining session-neutrality debt in `claudeAgent.ts`:\n\n- **Subagents:** transcript restoration and tool-result completion can parse canonical/legacy child resources and consult `AgentHostStateManager` to recover the child origin/parent chat. AgentService should eventually pass that origin/parent/tool-call context explicitly; Claude should only resolve the exact parent SDK backing to its child transcript.\n- **Customizations:** some materialize/send/customization paths read session customizations back from Agent Host state. These should eventually arrive through transient create/materialize context or exact-chat updates.\n- **Active clients:** Agent Host supplies the initial exact chat list, but Claude retains a session-keyed active-client handle and adds newly created chats to it, thereby maintaining part of the fan-out membership itself.\n- **Legacy compatibility:** session-level compatibility methods still synthesize the deterministic default-chat URI and `_legacySessionChatBindings` preserves the historical AH-id-equals-SDK-id restore path. This is intentional compatibility debt, not sibling grouping or lifecycle cascading.\n\nThese findings do not invalidate the PR’s tested exact-chat routing or lifecycle behavior, but they are called out explicitly as follow-up extraction work rather than claiming that Claude is already completely session-neutral.\n\n## Copilot ownership audit\n\nCopilot’s chat-addressed surface is clean: `_chatBindings` maps each concrete chat to one SDK conversation, opaque `providerData` and `backingSession` are preserved, normal `listSessions()` is empty, legacy discovery is isolated, and create/send/fork/side-chat/dispose/release operations do not reconstruct or cascade through AH chat membership. Process-wide iterations are tied to the shared Copilot CLI process rather than an AH-session sibling cascade.\n\nResidual coupling is low severity:\n\n- Copilot directly injects `AgentHostStateManager` for narrow customization/session-metadata reads and prompt-cache metadata writes. This does not manipulate the catalog or infer default/peer membership, but it is an extra seam not represented by the desired transient-context boundary.\n- Subagent history recognizes `chatId.startsWith(\"subagent/\")` as a restore fallback instead of relying exclusively on `IAgentChatContext.origin`. AgentService currently mirrors the same convention; longer term, origin should be supplied exhaustively and URI-shape checks centralized or removed.\n- Session-level compatibility adapters still synthesize the deterministic default-chat URI, as explicitly allowed for legacy callers. `_findAnySession` is an exact SDK-id lookup despite its broad name; renaming it would reduce future cascade risk.\n\nNo Copilot catalog ownership, sibling lifecycle cascade, or provider-side default/peer grouping was found.\n\n## Codex ownership audit\n\nCodex also keeps exact chat-to-thread bindings, round-trips opaque `providerData`/`backingSession`, leaves catalog enumeration to Agent Host (`listSessions()` is empty; legacy listing is backfill-only), and disposes/releases only the addressed thread. It does not read Agent Host chat state for routing or construct subagent chat URIs; it emits provider signals and lets AgentService create catalog entries.\n\nOne medium-severity boundary leak remains:\n\n- `codexAgent.ts` calls `isDefaultChatUri(...)` at three runtime gates (materialization, server-tool advertisement, and `onDidMaterializeSession` emission). This decodes AH default-chat membership from URI shape inside the provider, contrary to the session-neutral boundary. The behavior should be driven by explicit transient provisioning intent from the `createSessionChat`/materialization path rather than parsing the chat URI.\n\nAdditional observations:\n\n- Default-chat URI construction in `disposeSession`, `releaseSession`, and eager active-client defaults is confined to documented legacy compatibility paths.\n- Codex injects the broad `AgentHostStateManager` type only for session-title telemetry. It does not currently consume catalog state, but a narrower read-only title signal would better enforce the boundary structurally.\n\nThe medium Codex finding does not change the tested exact-thread routing or lifecycle results, but is recorded as follow-up session-neutrality debt.\n\n## Audit follow-up scope\n\nThe remaining Claude, Copilot, and Codex session-neutrality gaps identified in the ownership audits are intentionally out of scope for this PR. I will address them in a separate follow-up PR so this ownership refactor can be reviewed against its tested routing, lifecycle, persistence, and restoration behavior without mixing in another boundary change.\n\n## Design notes\n\n`MULTI_CHAT_ARCHITECTURE.md` documents the final ownership model, provider-specific I3 compatibility, registry/backfill behavior, multi-root/client-type propagation, and Codex capability status.\n\n## Compatibility caveat\n\nSubagent restoration is forward-compatible but not downgrade-compatible. Current code migrates legacy persisted subagent references to canonical `ahp-chat://subagent/...` chats. If a profile that has persisted those canonical child-chat references is subsequently opened with an older Agent Host, the parent session and normal chats remain available, but that older host cannot resolve the canonical restored subagent chats because it only understands the former synthetic-session representation.",
+    "URL": "https://github.com/microsoft/vscode/pull/329633",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "802ccf1e430594da0836a36d8095d538361eb9dd",
+    "HeadRef": "agents/agent-host-i3-removal",
+    "HeadSHA": "675bfbd56de910baf8efa75a42248a812a6f7ad7",
+    "CreatedAt": "2026-08-07T16:41:35Z",
+    "UpdatedAt": "2026-08-12T10:51:26Z",
+    "MergedAt": "2026-08-12T10:36:07Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-D13A207294DF",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentService.ts",
+      "Side": "RIGHT",
+      "Line": 1243,
+      "Severity": "high",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed loop, all three provider boundary implementations, Codex payload, and the awaited UI refresh call path are explicit. Only the exact number of stored sessions and provider latency vary by user.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Provider SDK/IPC requests and, for Codex, full transcript bytes returned by thread/read",
+      "PerformanceScaling": "Each catalog refresh now starts one metadata lookup for every registered session (N calls at unrestricted Promise.all concurrency); cold Codex lookups additionally scale with the total turns in those sessions because includeTurns is true.",
+      "PerformanceOutcome": "Increased session-picker/startup latency and burst load on provider subprocesses/SDK connections",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The host enumerated sessions with one bulk provider list call per provider and did not issue a separate provider metadata RPC for every catalog entry.",
+      "ChangedBehavior": "listSessions now maps the complete registry through _registeredSessionMetadata, which calls getChatMetadata separately for each session, and waits for all calls before returning the catalog.",
+      "CausalDiffEvidence": "RIGHT line 1243 introduces Promise.all(registered.map(...)); the added body at line 1256 invokes _registeredSessionMetadata for each registered session instead of using the prior per-provider bulk enumeration.",
+      "Title": "Batch provider metadata reads for the session catalog",
+      "Impact": "Opening or refreshing the session list with a large history can send tens or hundreds of concurrent SDK/IPC requests before any results are published. Copilot calls getSessionMetadata once per row, Claude calls getSessionInfo once per row, and cold Codex rows issue thread/read with includeTurns:true, so catalog latency and subprocess pressure grow with both session count and Codex history size.",
+      "Evidence": "The added Promise.all at agentService.ts:1243 calls _registeredSessionMetadata for every registry row; that helper delegates to agent.getChatMetadata. CopilotAgent.getChatMetadata crosses the SDK through client.getSessionMetadata, ClaudeAgent.getChatMetadata calls _sdkService.getSessionInfo, and CodexAgent.getChatMetadata falls through to _readSession, whose thread/read request explicitly sets includeTurns:true. BaseAgentHostSessionsProvider._refreshSessions awaits connection.listSessions before updating its cache, placing the entire fan-out on the visible refresh path.",
+      "Recommendation": "Group registry entries by provider and join them against one bulk provider metadata snapshot per refresh, with targeted cached/bounded-concurrency fallbacks only for missing rows. Also make the Codex fallback request metadata without turns when the catalog does not need history."
+    },
+    {
+      "ID": "PERF-22B6F2AC1009",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentSideEffects.ts",
+      "Side": "RIGHT",
+      "Line": 339,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The nested active-client/chat loops and duplicate default-chat call are directly encoded and tested, and each provider setter's expensive synchronization path is explicit. Magnitude depends on chat, client, and plugin counts, which is reflected in medium severity rather than uncertainty about the mechanism.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Repeated plugin filesystem checks/copies plus provider-side plugin parsing and customization reconciliation",
+      "PerformanceScaling": "Adding the kth chat reassigns every active client to all k chats, so adding N chats performs C*(1+...+N) handle updates and up to O(C*P*N²) plugin-sync work for C clients and P customizations.",
+      "PerformanceOutcome": "Filesystem/CPU pressure and growing customization queues that delay chat readiness in sessions that create many peers or subagents",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this handler was added, a SessionChatAdded event did not reapply every active-client contribution to every already-existing provider handle; active-client setup was applied when the client contribution itself was set.",
+      "ChangedBehavior": "Every SessionChatAdded envelope now invokes _fanOutActiveClient once per active client, and that helper loops the session's entire chat catalog and reassigns tools and customizations to old chats as well as the new one.",
+      "CausalDiffEvidence": "RIGHT line 339 adds a session-wide _fanOutActiveClient call for every active client whenever one SessionChatAdded action arrives; the same diff's helper fans that call over the full chat collection.",
+      "Title": "Seed only the chat that was just added",
+      "Impact": "In a live session that creates multiple peer chats or subagents, each addition re-synchronizes unchanged customizations for all earlier chats. The new test explicitly records the default chat being invoked a second time when one peer is added. Each customization assignment triggers Copilot SessionPluginController.sync or Claude/Codex plugin synchronization; cache hits still perform filesystem existence checks, while misses copy trees, and Codex reparses plugins and refreshes skill roots.",
+      "Evidence": "agentSideEffects.ts:336-340 handles each SessionChatAdded by looping all active clients; _fanOutActiveClient at lines 378-389 then loops all chats and assigns handle.customizations. agentSideEffects.test.ts:3047-3074 expects calls [default, default, peer], directly proving duplicate work. CopilotActiveClientHandle.customizations calls pluginController.sync, Claude routes the setter to AgentPluginManager.syncCustomizations, and Codex additionally parses synced plugins and runs _refreshSkillExtraRoots/_reconcileMaterializedCustomizations. AgentPluginManager performs an exists call even on a nonce-cache hit and recursive copy/cache writes on a miss.",
+      "Recommendation": "For SessionChatAdded, create/update each active-client handle only for action.summary.resource. Keep the full fan-out for SessionActiveClientSet, where a newly contributing client genuinely must seed every existing chat."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "repeated-work",
+      "eager-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold startup and session-picker catalog refresh",
+        "CriticalPath": "BaseAgentHostSessionsProvider._refreshSessions awaits connection.listSessions before the authoritative cache is initialized or refreshed, so registry backfill, registry enumeration, all provider metadata lookups, and title overlays must settle before the list is published.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:listSessions / AgentSessionRegistry.list",
+            "Operation": "Read the durable top-level session registry.",
+            "Cardinality": "One registry list per refresh.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The host queried providers directly and had no registry list on this path.",
+            "CriticalPathEffect": "Must finish before metadata fan-out can begin."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_registeredSessionMetadata and provider getChatMetadata implementations",
+            "Operation": "Fetch one session's provider metadata; Copilot uses getSessionMetadata, Claude uses getSessionInfo, and cold Codex uses thread/read with includeTurns:true.",
+            "Cardinality": "N requests per refresh after effective registry filtering, started together; live Codex rows can be served from memory.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The host made one bulk list call per provider rather than one provider request per registered row.",
+            "CriticalPathEffect": "Promise.all waits for every row before returning any catalog result."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:listSessions title overlay",
+            "Operation": "Open/read per-session metadata for titles and internal-backing suppression.",
+            "Cardinality": "Up to one database access per surviving session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Per-session title overlay work was already part of listSessions.",
+            "CriticalPathEffect": "Awaited before the list returns."
+          }
+        ],
+        "ScalingInput": "Number N of registered top-level sessions after registry filtering; Codex cost also grows with total turns returned for cold sessions.",
+        "EffectiveConcurrency": "All N provider metadata calls are launched through an unrestricted Promise.all; Codex shares one app-server connection, while provider-specific internal limiters only cover narrower sub-work. The browser coalesces overlapping refreshes into one in-flight refresh but does not reduce the N calls inside it.",
+        "CacheBehavior": "The registry is durable. Copilot still performs an SDK metadata request per row; Claude can skip when its SDK cannot load locally but otherwise performs per-row SDK reads; Codex serves live sessions from its in-memory map but cold startup misses issue thread/read. No refresh-level metadata snapshot coalesces the rows.",
+        "MechanismConfidence": "High: the added per-row Promise.all, each provider boundary, Codex full-history flag, and awaited cache refresh are explicit.",
+        "MagnitudeUncertainty": "Exact N and provider response times vary, but long-lived users can realistically accumulate many sessions and cold Codex histories can be large.",
+        "Verdict": "Reportable high-severity boundary fan-out: the diff replaces provider-level bulk enumeration with N concurrent provider metadata calls on the visible refresh path."
+      },
+      {
+        "Scenario": "Creating peer chats or spawning subagents while clients contribute plugins/tools",
+        "CriticalPath": "SessionChatAdded dispatch itself does not await provider synchronization, but it synchronously schedules a full client-by-chat fan-out. The resulting plugin jobs are on the path to customizations being available in the new chat and contend with later provider work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentPluginManager.ts:syncCustomizations/_syncPlugin",
+            "Operation": "Check cached plugin directories, copy plugin trees on misses, clean stale nonces, and persist cache metadata.",
+            "Cardinality": "Up to C*k*P sync attempts on the kth chat addition; cache hits avoid copies but retain at least one existence check per plugin.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A chat-added event did not reassign every active client's unchanged customizations to every pre-existing chat.",
+            "CriticalPathEffect": "Usually fire-and-forget from the catalog action, but serialized plugin queues delay customization settlement and consume shared I/O/CPU."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_syncClientCustomizations",
+            "Operation": "Parse each synced plugin, rebuild process-wide skill roots, and reconcile materialized customization state.",
+            "Cardinality": "Repeated for every Codex handle assignment generated by the nested fan-out, even when plugin nonces are unchanged.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Existing chat handles were not resynchronized merely because another chat joined the catalog.",
+            "CriticalPathEffect": "Runs asynchronously but adds CPU and queue pressure before provider customization state settles."
+          }
+        ],
+        "ScalingInput": "C active clients, k chats currently in the catalog, and P plugin customizations per client; over N additions the repeated assignments grow as C*(1+...+N), with plugin work up to O(C*P*N^2).",
+        "EffectiveConcurrency": "The outer client/chat loops schedule work immediately. AgentPluginManager runs different customizations in parallel but serializes repeated work per plugin URI; provider session sequencers further serialize some application, so duplicate jobs become queue backlog rather than being coalesced.",
+        "CacheBehavior": "Nonce caching skips recursive copies only after a filesystem exists check. It does not coalesce repeated sync calls, and Codex still reparses cached plugin directories and refreshes skill roots.",
+        "MechanismConfidence": "High: the nested loops, duplicate default-chat invocation asserted by the new test, and provider setter-to-plugin-sync paths are all direct.",
+        "MagnitudeUncertainty": "Sessions with one chat or no client plugins see little impact; sessions that create many peer/subagent chats with active extension clients amplify it rapidly.",
+        "Verdict": "Reportable medium-severity repeated work: only the added chat needs seeding, while the diff reprocesses every existing chat on each addition."
+      },
+      {
+        "Scenario": "First-run registry migration and provider change backfill",
+        "CriticalPath": "The first list after upgrade waits for each provider's backfill before reading the registry. A successful sweep performs provider enumeration, filters internal backings, registers identities, and writes a durable completion marker.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_enumerateProviderSessions",
+            "Operation": "Bulk-enumerate legacy chats from each provider.",
+            "Cardinality": "One bulk call per provider per initial or forced sweep.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Provider bulk enumeration was the normal listing operation rather than a durable one-time migration.",
+            "CriticalPathEffect": "Initial list waits for the non-forced sweep; provider-triggered forced sweeps are separate refresh work."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_backfillProviderFromLegacyChats",
+            "Operation": "Check each candidate for a backing marker, register non-tombstoned identities, and mark the provider backfilled.",
+            "Cardinality": "M backing checks are concurrent, followed by up to M sequential registry writes and one marker write.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No registry migration writes were performed.",
+            "CriticalPathEffect": "The initial migration must finish before the first registry-backed list proceeds."
+          }
+        ],
+        "ScalingInput": "Number of providers and legacy sessions M returned by each provider.",
+        "EffectiveConcurrency": "Providers backfill in parallel via Promise.allSettled; per-provider backing checks use Promise.all; registry registrations are deliberately sequential. Concurrent callers share one in-flight provider sweep, and forced notifications queue at most one immediate follow-up at a time.",
+        "CacheBehavior": "Durable per-provider completion markers make the normal migration one-time; in-flight attempts are shared. Failed or unavailable enumerations remain unmarked and retry later; forced provider-change signals intentionally re-enumerate.",
+        "MechanismConfidence": "High for the one-time O(M) work and scheduling; there is no evidence that realistic one-time cost is severe enough to outweigh the required migration.",
+        "MagnitudeUncertainty": "Migration duration depends on legacy history size and database latency, but it occurs once for a successful provider migration rather than on every steady-state refresh.",
+        "Verdict": "No finding: the extra work is bounded to migration/provider-change reconciliation, is coalesced per provider, and preserves existing sessions when adopting the registry."
+      },
+      {
+        "Scenario": "Restoring a session and lazily opening peer chats",
+        "CriticalPath": "Restoring the top-level session materializes the default chat and its history. Peer chat summaries are registered from persisted catalog data without provider history; selecting or otherwise resolving one peer then awaits that chat's provider materialization and transcript read.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_restorePeerChats",
+            "Operation": "Read persisted peer catalog data, titles, drafts, and providerData.",
+            "Cardinality": "One catalog read plus title/draft reads per persisted peer summary.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The pre-diff session-centric model did not restore a host-owned peer-chat catalog.",
+            "CriticalPathEffect": "Summary restoration runs while reconstructing the session, but provider histories remain deferred."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_materializeRestoredPeerChat",
+            "Operation": "Materialize the selected provider chat and fetch/interleave its turn history.",
+            "Cardinality": "Once per peer chat actually resolved; concurrent requests for the same chat share state-manager entry.inFlight.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Peer chats were not independently host-owned/lazily materialized.",
+            "CriticalPathEffect": "Blocks opening/using that peer, not initial summary enumeration for every peer."
+          }
+        ],
+        "ScalingInput": "Number of persisted peer chats and size of the one chat history being opened; turn-ID validation can inspect already-established unresolved peers according to the existing validation semantics.",
+        "EffectiveConcurrency": "Summary title/draft reads are parallel. Each peer entry coalesces concurrent materialization through one in-flight promise; distinct requested peers may materialize concurrently.",
+        "CacheBehavior": "Resolved ChatState remains in memory until session eviction. Summary metadata is persisted; provider backing/history is intentionally lazy and retried after failures.",
+        "MechanismConfidence": "High for lazy/coalesced behavior from registerRestoredChatSummary and resolveChatState.",
+        "MagnitudeUncertainty": "Peer counts and transcript sizes vary, but ordinary restore does not eagerly fetch every peer provider history solely to render the catalog.",
+        "Verdict": "No additional finding: the new per-chat boundary is deferred until the peer is needed and coalesced per chat; no separate diff-introduced redundant call was proven."
+      },
+      {
+        "Scenario": "Idle eviction and explicit deletion of a multi-chat session",
+        "CriticalPath": "Idle unsubscribe removes host cache immediately and releases provider chats asynchronously. Explicit deletion awaits provider chat disposal and durable registry/database cleanup before completing.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_releaseSession/_disposeSession",
+            "Operation": "Release or dispose each provider chat in teardown order.",
+            "Cardinality": "One provider lifecycle call per owned chat, sequentially, while still attempting later chats after an error.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The session-centric provider API issued one lifecycle call for the top-level session.",
+            "CriticalPathEffect": "Idle release is fire-and-forget and off the unsubscribe critical path; explicit destructive disposal is awaited."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:disposeSession and AgentSessionRegistry",
+            "Operation": "Tombstone/unregister the top-level identity and clean durable session/chat metadata.",
+            "Cardinality": "Bounded by the session and its K owned chats.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no host-owned catalog requiring per-chat provider cleanup.",
+            "CriticalPathEffect": "Awaited for explicit deletion, not normal browsing or sending."
+          }
+        ],
+        "ScalingInput": "Number of concrete chats K owned by the session.",
+        "EffectiveConcurrency": "Provider chat teardown is intentionally sequential to preserve teardown order; independent idle releases are tracked per session. Subscriber and in-flight restore checks prevent unnecessary/racing release.",
+        "CacheBehavior": "Eviction drops in-memory state but preserves durable metadata for restoration; deletion uses tombstones to prevent later backfill from reviving the entry. Release completion is tracked so restore waits for the same session's prior release.",
+        "MechanismConfidence": "High for K sequential calls and lifecycle placement; user-visible regression magnitude is low because the work is required to avoid retained provider runtimes and idle cleanup is asynchronous.",
+        "MagnitudeUncertainty": "K can grow with peer/subagent use, but cleanup is infrequent and idle eviction does not block the user-facing unsubscribe path.",
+        "Verdict": "No finding: per-chat cleanup scales with newly owned resources and prevents retention; the only common idle path is off the critical path."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over the full changed-file inventory. Reported two regressions: registry-backed listing creates unbounded per-session provider metadata fan-out, and each chat addition quadratically repeats active-client/plugin synchronization across existing chats. One-time backfill, lazy peer restoration, and per-chat lifecycle cleanup were traced but are bounded, coalesced, deferred, or necessary and did not meet the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-06T20:38:09.431793778Z",
+    "CompletedAt": "2026-09-06T20:44:05.077067674Z",
+    "WallClockMilliseconds": 355645,
+    "ModelCalls": 39,
+    "InputTokens": 3868357,
+    "OutputTokens": 24651,
+    "TotalTokens": 3893008,
+    "ReasoningTokens": 8550,
+    "CacheReadTokens": 3604580,
+    "CacheWriteTokens": 263660,
+    "APIDurationMilliseconds": 340889,
+    "ToolCalls": 288,
+    "NanoAIUnits": 90002720000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 3604580,
+      "cache_write": 263660,
+      "input": 117,
+      "output": 24651
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
