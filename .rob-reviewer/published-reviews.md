@@ -2,6 +2,27 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#334889 — Sort chat pill dropdown entries newest first](https://github.com/microsoft/vscode/pull/334889)
+
+- Published comments: **1**
+- Head: `3e5d8f7d9fdfe9645aa53cc9fde4e78fccd1d149`
+- Completed: `2026-09-07T19:05:27Z`
+- Run: [34153072178 attempt 1](runs/2026/09/07/34153072178-1/run.md)
+
+### `src/vs/workbench/contrib/browserView/common/browserView.ts:113`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+The shared newest-first helper inserts every match at index zero, shifting the accumulated array for each matching browser on every recomputation.
+
+When an agent session accumulates many browser pages, each page load/navigation emits several label events; both pill surfaces can repeatedly perform quadratic array copying before updating the UI, delaying rendering and increasing GC pressure.
+
+**Suggested fix:** Append matching inputs with `push` during the map walk and call `views.reverse()` once afterward; this preserves newest-first ordering and restores O(n) construction.
+
+(Written by Copilot)
+
 ## [#334369 — Add MCP customization migration](https://github.com/microsoft/vscode/pull/334369)
 
 - Published comments: **2**
