@@ -1,0 +1,245 @@
+{
+  "PullRequest": {
+    "Number": 334849,
+    "Title": "agentHost: Support SSH proxy configuration",
+    "Body": "Fixes #317445\n\n## Problem\n\nAgent Host resolves effective OpenSSH configuration with `ssh -G`, but dropped `ProxyJump` and `ProxyCommand` before creating the `ssh2` connection. Hosts that work through Remote SSH were therefore dialed directly from the Agents window. Native proxy helpers also had no secure path for host-key, password, or key-passphrase prompts.\n\n## Change\n\nCarry proxy configuration and `HostKeyAlias` through SSH resolution, expand OpenSSH tokens including `%k`, and use native proxy helper streams as the `ssh2` socket.\n\nNative helper prompts are routed through a per-attempt askpass IPC bridge to the Agents UI. The bridge preserves fingerprints and prompt text, fails closed without UI, keeps nested Node proxy commands isolated, avoids `cmd.exe` reinterpretation on Windows, and tears down helper process trees, IPC endpoints, and launch artifacts on cancellation or disposal.\n\n## Validation\n\n- Transpiled 8,807 files and extensions with 0 errors\n- Focused SSH suites: 192 passing\n- Typecheck, ESLint, hygiene, and layer checks\n- Live built Code OSS validation through **Agents UI \u003e Remote \u003e SSH** using real target and jump SSH daemons:\n  - direct SSH, `ProxyCommand`, and `ProxyJump`\n  - unknown-host confirmation with exact SHA256 fingerprints\n  - password and private-key passphrase authentication\n  - cancellation and process-tree cleanup\n  - nested Node proxy isolation and malicious-prompt safety\n  - `%k` parity for aliases, explicit `HostKeyAlias none`, and fallback\n- 9/9 live scenarios passed with zero auth prompts, secret log entries, or leftover processes",
+    "URL": "https://github.com/microsoft/vscode/pull/334849",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "kondv",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b6d68fbe0a37b57967e1efa6bf19c24de9fa39b5",
+    "HeadRef": "dev/kondv/agent-host-ssh-proxy-config",
+    "HeadSHA": "8de3d6f45dd6f2a0635eb4efdddb7fd96720e9bd",
+    "CreatedAt": "2026-09-07T05:17:03Z",
+    "UpdatedAt": "2026-09-07T06:42:51Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cleanup-lifecycle",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "User selects a configured SSH host using ProxyCommand or ProxyJump",
+        "CriticalPath": "Renderer resolves the alias, stages the connection, and waits for the shared process to resolve config, create the askpass bridge, spawn the proxy helper, complete the ssh2 handshake, and run the existing remote endpoint discovery/bootstrap before the host is usable.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/remoteAgentHost/browser/remoteAgentHostActions.ts:381 connectToConfiguredSSHHost",
+            "Operation": "Resolve effective SSH configuration in the shared process and then request connection creation.",
+            "Cardinality": "One resolve request and one connection request per user-selected host; same-address in-flight dials are coalesced by RemoteAgentHostService._pendingConnects.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same alias-resolution and connect IPC calls occurred before the diff.",
+            "CriticalPathEffect": "Both requests are on the connect critical path."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1313 resolveSSHConfig",
+            "Operation": "Run `ssh -G` to resolve effective OpenSSH configuration.",
+            "Cardinality": "Once for the selected alias before the staged connection; later full reconnects resolve once per attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same `ssh -G` subprocess already ran; the diff only retains additional fields from its output.",
+            "CriticalPathEffect": "Config resolution must finish before dialing."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1613 _createNativeSSHAskpassBridge",
+            "Operation": "Create a per-attempt launcher/helper and local IPC endpoint, set restrictive permissions, and remove them on disposal.",
+            "Cardinality": "One bridge per proxied connection attempt; on POSIX this creates two files plus a Unix socket and applies permissions, while Windows creates a junction plus a named pipe.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No native proxy helper or askpass bridge existed because proxy configuration was dropped.",
+            "CriticalPathEffect": "Bridge creation is serialized before the proxy helper can spawn."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1882 _spawnProxyProcess",
+            "Operation": "Spawn the configured ProxyCommand shell/helper or native `ssh` for ProxyJump and expose its stdio as the ssh2 socket.",
+            "Cardinality": "Exactly one long-lived proxy process per active proxied host connection attempt; multi-hop ProxyJump is delegated to that one OpenSSH process rather than spawned per hop.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "ssh2 attempted a direct network connection and proxy-configured hosts generally failed; no proxy subprocess was spawned.",
+            "CriticalPathEffect": "The proxy process supplies the only network stream, so the SSH handshake waits on it."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1895 _connectSSH and connect",
+            "Operation": "Perform SSH handshake through the helper, then execute existing remote platform, CLI-installation, endpoint-discovery, and relay setup operations.",
+            "Cardinality": "One SSH connection per selected host; existing discovery operations remain grouped per host, not per ProxyJump hop.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same ssh2 handshake and remote bootstrap path existed, but proxy-only hosts could not reach it through their required proxy.",
+            "CriticalPathEffect": "These operations determine time until the remote agent is usable."
+          }
+        ],
+        "ScalingInput": "Number of selected hosts is one for this workflow; ProxyJump hop count is passed to one helper and does not multiply local process count.",
+        "EffectiveConcurrency": "One dial per normalized address is enforced by _pendingConnects; distinct configured hosts may connect concurrently. ProxyJump chains are handled by one native OpenSSH process.",
+        "CacheBehavior": "There is no SSH-config cache; `ssh -G` is rerun for each full connection. Same-address concurrent requests are coalesced, and a live connection is reused where possible.",
+        "MechanismConfidence": "High: changed lines directly add the bridge filesystem work and one proxy subprocess to this path.",
+        "MagnitudeUncertainty": "Local temporary-filesystem and native process startup latency varies by platform, but cardinality is one attempt and is small relative to the required SSH/bootstrap path.",
+        "Verdict": "No reportable regression. The added process is the required transport for the newly supported proxy scenario, bridge resources are attempt-scoped and cleaned up, and work is not multiplied by hop count or duplicate same-host requests."
+      },
+      {
+        "Scenario": "Startup auto-connect or full automatic reconnect for persisted proxied SSH hosts",
+        "CriticalPath": "Each configured auto-connect entry independently resolves SSH config and establishes a full proxy-backed SSH connection. A failed full dial retries with exponential backoff; successful relay-only restoration reuses the existing SSH client and proxy transport.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1227 reconnect",
+            "Operation": "Run `ssh -G` for each full reconnect attempt.",
+            "Cardinality": "Once per full attempt per configured host, with at most 10 serialized automatic attempts per address under the default reconnect policy.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Full reconnect already reran `ssh -G` with the same retry policy.",
+            "CriticalPathEffect": "Each host's attempt waits for resolution; different hosts can resolve concurrently."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1613 _createNativeSSHAskpassBridge",
+            "Operation": "Create attempt-isolated askpass artifacts and endpoint.",
+            "Cardinality": "Once per proxied full attempt; cleanup is initiated when the attempt fails, the connection closes, or ownership is disposed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No askpass artifacts were created.",
+            "CriticalPathEffect": "Runs before each proxy spawn and therefore precedes the handshake."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1882 _spawnProxyProcess",
+            "Operation": "Spawn one proxy helper for the host; cleanup may spawn one `taskkill` or terminate-process shell when a live helper tree must be stopped.",
+            "Cardinality": "One proxy helper per active attempt and at most one process-tree cleanup per transport; retries are serialized per address but different persisted hosts start concurrently.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Direct ssh2 dials used no proxy helper or helper-tree cleanup subprocess.",
+            "CriticalPathEffect": "Proxy startup is on each host's connection path; cleanup is asynchronous after the stream is destroyed."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/electron-browser/sshRemoteAgentHostServiceImpl.ts:346 reestablish",
+            "Operation": "For a relay drop with the underlying SSH connection still alive, create a replacement relay over the existing SSH client.",
+            "Cardinality": "One relay restoration attempt at a time; the existing proxy transport is carried into the replacement SSHConnection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Relay restoration already reused the SSH client; the diff preserves and reuses the proxy transport alongside it.",
+            "CriticalPathEffect": "Required for protocol recovery but does not create another proxy process."
+          }
+        ],
+        "ScalingInput": "Number of persisted auto-connect hosts H; added live proxy processes and bridge setup scale O(H), while failure work is bounded to 10 sequential attempts per address.",
+        "EffectiveConcurrency": "Per-address attempts are coalesced and retries are serialized with exponential backoff up to 10 attempts. Startup reconciliation has no global host limiter, so distinct configured entries connect concurrently, as before.",
+        "CacheBehavior": "No cache across full attempts. A warm live SSH connection avoids config resolution and proxy respawn during relay replacement; failed or dropped SSH connections require a cold full attempt.",
+        "MechanismConfidence": "High for per-host subprocess/filesystem cardinality and retry serialization; moderate for startup magnitude because configured-host counts are unknown.",
+        "MagnitudeUncertainty": "Users may persist from one to several hosts; very large host collections are possible but not established as a realistic dominant case. Existing remote bootstrap work already fans out across the same collection.",
+        "Verdict": "No finding. Cross-host concurrency is pre-existing, same-host work is coalesced, retries are bounded and backed off, and one proxy process per active proxied tunnel is intrinsic to the supported transport rather than avoidable per-item fan-out."
+      },
+      {
+        "Scenario": "Native proxy helper requests host confirmation, password, or key passphrase",
+        "CriticalPath": "OpenSSH launches the configured askpass executable, which connects to the attempt-local IPC server; the shared process emits a renderer IPC request and waits for user input before replying to the helper and allowing SSH authentication to continue.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1640 generated askpass helper",
+            "Operation": "OpenSSH launches the askpass executable for an interactive prompt.",
+            "Cardinality": "One short-lived askpass process per native OpenSSH prompt; prompts are normally sequential within one SSH attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Native proxy-helper prompts had no bridge and could not be handled by this UI.",
+            "CriticalPathEffect": "The handshake intentionally waits for the user's response."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1650-1725 _createNativeSSHAskpassBridge",
+            "Operation": "Exchange one bounded JSON request and response over a local pipe/socket, then bridge one event and response over shared-process IPC to the renderer.",
+            "Cardinality": "One local socket and one request/response pair per prompt; payload buffering is capped at 64 KiB.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No askpass IPC path existed.",
+            "CriticalPathEffect": "On the human-interaction critical path, but negligible relative to waiting for confirmation or a secret."
+          },
+          {
+            "Kind": "rendering",
+            "Location": "src/vs/platform/agentHost/electron-browser/sshRemoteAgentHostServiceImpl.ts:656 _handleNativeAskpassRequest",
+            "Operation": "Show one confirmation dialog or masked quick input and dismiss it if the owning attempt settles.",
+            "Cardinality": "One UI surface per prompt, with an attempt-specific cancellation listener disposed in finally.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The Agents UI did not surface proxy-helper prompts.",
+            "CriticalPathEffect": "The connection cannot continue until the user responds."
+          }
+        ],
+        "ScalingInput": "Number of interactive prompts P in one connection attempt; CPU, process, and IPC work scale O(P), while prompt payloads are bounded.",
+        "EffectiveConcurrency": "OpenSSH normally serializes authentication prompts. The implementation supports separate request IDs if multiple helpers prompt and cleans each listener/request when settled or cancelled.",
+        "CacheBehavior": "No prompt response caching, appropriately avoiding reuse of secrets or trust answers. Background reconnects fail closed without emitting UI requests.",
+        "MechanismConfidence": "High: the subprocess, local IPC, renderer IPC, cancellation, and payload bounds are explicit in the changed code.",
+        "MagnitudeUncertainty": "Authentication methods and jump chains determine P, but normal connections use a small bounded sequence.",
+        "Verdict": "No performance finding. Work is demand-driven per actual native prompt, bounded, and dominated by intentional human latency; requests and sockets are cleaned up on completion/cancellation."
+      },
+      {
+        "Scenario": "Disconnect, failed handshake, cancellation, or service disposal of a proxied connection",
+        "CriticalPath": "The proxy socket and streams are destroyed immediately; if the helper remains active, process-tree termination runs asynchronously. Askpass sockets, server, launcher files, helper file, and endpoint/junction are then closed or removed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1819-1849 _createProxyTransport.dispose",
+            "Operation": "Invoke process-tree termination for a still-live proxy helper, falling back to direct SIGKILL if tree termination fails.",
+            "Cardinality": "At most once per proxy transport because disposal is idempotent.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no native proxy process tree to terminate.",
+            "CriticalPathEffect": "Socket destruction is synchronous; the killTree subprocess is not awaited and is off the connection's immediate teardown path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:1762-1770 _createNativeSSHAskpassBridge.dispose",
+            "Operation": "Asynchronously unlink the POSIX launcher, helper, and socket path or recursively remove the Windows junction.",
+            "Cardinality": "A fixed number of removals once per bridge; disposal is idempotent.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No launch artifacts or askpass endpoint existed.",
+            "CriticalPathEffect": "Cleanup is off the immediate critical path after server/socket closure."
+          }
+        ],
+        "ScalingInput": "Number of concurrently closing proxied connections C; cleanup process and filesystem work scale O(C) with fixed work per connection.",
+        "EffectiveConcurrency": "Each transport owns one idempotent cleanup operation. Distinct host disconnects may clean up concurrently; repeated error/close/dispose signals collapse through the local disposed guard.",
+        "CacheBehavior": "No cache is involved. Ownership transfers preserve the live proxy transport during relay replacement, avoiding premature cleanup and respawn.",
+        "MechanismConfidence": "High: ownership is carried in SSHConnection, WeakMap handoff is deleted after adoption, and all failure/close/dispose paths call idempotent cleanup.",
+        "MagnitudeUncertainty": "Platform process-tree termination cost varies, but it occurs only for a still-live helper and does not block immediate stream teardown.",
+        "Verdict": "No leak or repeated-cleanup finding. The diff retains the transport only for the owning connection, disposes it on all traced terminal paths, and guards cleanup against duplicate signals."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files and all diff pages. Traced initial connect, startup/full reconnect, relay reuse, native askpass interaction, and teardown across IPC, subprocess, filesystem, network, and UI boundaries. The change adds required per-attempt proxy/askpass work but coalesces same-host dials, bounds retries and payloads, reuses live proxy transports for relay replacement, and has idempotent cleanup; no high-confidence actionable performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-07T14:35:47.007076934Z",
+    "CompletedAt": "2026-09-07T14:38:56.651403315Z",
+    "WallClockMilliseconds": 189644,
+    "ModelCalls": 14,
+    "InputTokens": 719062,
+    "OutputTokens": 9198,
+    "TotalTokens": 728260,
+    "ReasoningTokens": 3914,
+    "CacheReadTokens": 626225,
+    "CacheWriteTokens": 92795,
+    "APIDurationMilliseconds": 178201,
+    "ToolCalls": 54,
+    "NanoAIUnits": 89859300000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 626225,
+      "cache_write": 92795,
+      "input": 42,
+      "output": 9198
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
