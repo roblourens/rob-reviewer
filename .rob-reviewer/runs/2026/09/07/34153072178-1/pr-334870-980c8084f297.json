@@ -1,0 +1,141 @@
+{
+  "PullRequest": {
+    "Number": 334870,
+    "Title": "Fix agent host telemetry log collision to prevent rotation failures",
+    "Body": "This pull request addresses a critical issue with telemetry log rotation failures in the Agent Host due to a file collision. \n\n### Changes Made\n- Updated the `agentHostTelemetryService.ts` to write telemetry diagnostics to a new log file named `agentHostTelemetry.log`, preventing conflicts with the main process's `telemetry.log`.\n- Modified the `telemetryLogAppender.ts` to support an explicit logger ID while maintaining compatibility with existing callers.\n- Added a regression test in `telemetryLogAppender.test.ts` to ensure the new logging behavior is validated.\n\n### Validation\n- All TypeScript type-checks and tests for both `TelemetryLogAdapter` and `AgentHostTelemetryService` passed successfully.\n- This fix resolves the issue of multiple processes attempting to rotate the same log file, which was causing permission errors in recent Insiders logs. \n\nOther potential issues related to `agenthost.log` rotation failures and extension-host warnings were identified but not addressed in this PR, as their root causes were not clear enough for a safe fix.",
+    "URL": "https://github.com/microsoft/vscode/pull/334870",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ccfec4b8140e4c528f461689036917f51e7f4ca4",
+    "HeadRef": "agents/log-analysis-error-fix-prioritization-aae2a6b6",
+    "HeadSHA": "980c8084f2973731bb5b9a160f1b3d33f5452b1f",
+    "CreatedAt": "2026-09-07T09:07:17Z",
+    "UpdatedAt": "2026-09-07T10:20:59Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "boundary-fanout",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Desktop agent-host startup with telemetry enabled",
+        "CriticalPath": "createAgentHostRuntime awaits telemetry-service construction, but TelemetryLogAppender only starts the native rotating logger asynchronously; logger file creation is not awaited on the startup critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostTelemetryService.ts:255 via TelemetryLogAppender and LoggerService.createLogger",
+            "Operation": "Create a native async rotating spdlog logger backed by the logs directory.",
+            "Cardinality": "One logger creation per telemetry-enabled agent-host process startup.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same logger creation occurred once, using telemetry.log; the diff changes only the logger ID/path to agentHostTelemetry.log.",
+            "CriticalPathEffect": "Creation is initiated during startup but createAsyncRotatingLogger is not awaited, so native/file initialization is off the awaited startup critical path; early records buffer until ready."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostMain.ts and src/vs/platform/agentHost/node/agentHostService.ts",
+            "Operation": "Expose the agent-host logger registry to the parent through LoggerChannel/RemoteLoggerChannelClient.",
+            "Cardinality": "One logger-resource registration for this telemetry logger when a host connection starts, both before and after the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The telemetry logger resource was already present and registered under the telemetry ID.",
+            "CriticalPathEffect": "Connection setup installs the remote logger client after the agent host reports started; the changed ID does not add another registration or round trip."
+          }
+        ],
+        "ScalingInput": "One telemetry logger per agent-host process, plus the pre-existing telemetry logger owned through the main/shared-process logging path; process restarts recreate one logger each time.",
+        "EffectiveConcurrency": "The main/shared-process telemetry logger and agent-host telemetry logger can be active concurrently. Before the diff they targeted the same telemetry.log path; after the diff they target distinct files. No additional task fan-out or limiter change is introduced.",
+        "CacheBehavior": "No data cache is involved. ILoggerService reuses a logger by ID within one process; cold startup creates it once and subsequent event logging reuses the same instance.",
+        "MechanismConfidence": "High: the constructor-to-LoggerService-to-SpdLogLogger path and one-per-process cardinality are explicit in the repository.",
+        "MagnitudeUncertainty": "Exact native logger initialization and rotation duration varies by OS and telemetry volume, but the diff does not increase startup operation count or put awaited I/O on the critical path.",
+        "Verdict": "No regression. The diff preserves logger creation cardinality and scheduling while separating concurrent process output paths, removing rather than adding file contention."
+      },
+      {
+        "Scenario": "Agent-host telemetry event emission and log rotation",
+        "CriticalPath": "Each telemetry event synchronously validates/formats data and calls the existing logger trace method; native log persistence/rotation is handled by the existing spdlog logger. The changed option is consumed only in the appender constructor, not per event.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/telemetry/common/telemetryLogAppender.ts:29 and src/vs/platform/log/node/spdlogLog.ts",
+            "Operation": "Append telemetry records and rotate a six-file, 30 MB native log set.",
+            "Cardinality": "One trace call per emitted event; rotations are bounded by generated bytes. Call count and payload validation are unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same records were written through the same logger implementation to telemetry.log, which was also used by main/shared-process telemetry.",
+            "CriticalPathEffect": "The trace call remains on event emission, while the PR only selects a different already-supported file resource. There is no new filesystem call per event."
+          }
+        ],
+        "ScalingInput": "Cost scales linearly with emitted telemetry events. Rotation occurs as each file reaches its existing 5 MB segment threshold, with six segments per logger.",
+        "EffectiveConcurrency": "Main/shared-process and agent-host telemetry events may be written concurrently. The diff splits them across independent rotating files rather than having two process-local loggers operate on telemetry.log.",
+        "CacheBehavior": "The logger is retained and reused for the service lifetime. There are no event-result caches, misses, coalescing changes, or negative caches.",
+        "MechanismConfidence": "High: the changed logger ID maps deterministically to a different file, while the event hot path and rotation configuration are unchanged.",
+        "MagnitudeUncertainty": "Separating paths can raise the combined retention ceiling when both telemetry producers independently fill all rotations, but each set remains bounded at 30 MB and the diff does not increase bytes generated or writes per event; no concrete user-visible memory, latency, or throughput regression is established.",
+        "Verdict": "No reportable regression. Per-event CPU and I/O cardinality are unchanged, and independent paths avoid cross-process rotation contention."
+      },
+      {
+        "Scenario": "Standalone agent-host server startup and telemetry logging",
+        "CriticalPath": "When not in quiet mode, the server constructs a local LoggerService and then creates the telemetry service. Native telemetry logger initialization remains asynchronous and is not awaited by TelemetryLogAppender.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostServerMain.ts via createAgentHostTelemetryService",
+            "Operation": "Create and append to the rotating telemetry log file in the standalone server logs directory.",
+            "Cardinality": "One logger initialization per non-quiet server process and one existing append per event.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The standalone process used telemetry.log with the same rotation and write behavior.",
+            "CriticalPathEffect": "Initialization scheduling and event-write placement are unchanged; only the filename differs."
+          }
+        ],
+        "ScalingInput": "One telemetry logger for each standalone server process and one write per emitted event; quiet mode bypasses telemetry logging entirely.",
+        "EffectiveConcurrency": "A single standalone server logger service owns the custom telemetry logger. The changed ID does not add workers, promises, or concurrent boundary calls.",
+        "CacheBehavior": "ILoggerService creates the logger once on cold startup and reuses it for the process lifetime; no cache semantics change.",
+        "MechanismConfidence": "High: the same createAgentHostTelemetryService call path is used and only the selected ID changes.",
+        "MagnitudeUncertainty": "Standalone deployment volumes are unknown, but operation frequency and concurrency are demonstrably unchanged.",
+        "Verdict": "No performance regression; this is a filename/resource separation with unchanged boundary cardinality."
+      }
+    ],
+    "Summary": "Reviewed all three changed files and the complete diff. Traced logger construction, file-resource mapping, native rotation, shared logs-path forwarding, logger IPC registration, event emission, disposal, and standalone-server behavior. The change preserves work cardinality and hot-path cost while isolating agent-host telemetry from the existing telemetry.log; no actionable diff-introduced performance issue was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-07T19:01:19.71282981Z",
+    "CompletedAt": "2026-09-07T19:03:17.407111274Z",
+    "WallClockMilliseconds": 117694,
+    "ModelCalls": 10,
+    "InputTokens": 224744,
+    "OutputTokens": 5550,
+    "TotalTokens": 230294,
+    "ReasoningTokens": 2287,
+    "CacheReadTokens": 184832,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 101831,
+    "ToolCalls": 50,
+    "NanoAIUnits": 34458080000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 184832,
+      "cache_write": 0,
+      "input": 39912,
+      "output": 5550
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
