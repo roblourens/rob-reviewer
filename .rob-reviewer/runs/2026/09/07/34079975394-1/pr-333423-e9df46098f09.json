@@ -1,0 +1,184 @@
+{
+  "PullRequest": {
+    "Number": 333423,
+    "Title": "nes: let settings and experiments override baked strategy values",
+    "Body": "Follow-up to #332018 / #332316, addressing two problems with the `patchBased02Optimized` strategy.\n\nOriginally this was structured as a revert of e845953 plus a re-land. That is no longer possible: #332802 and its follow-ups have since merged on top of e845953, so reverting would take a colleague's merged work with it and leaves four commits that do not compile. The change is now expressed directly on top of current `main`, with the same end state.\n\n## 1. Model configuration outranked settings and experiments\n\nEvery baked knob was read as `modelConfig.x ?? getExperimentBasedConfig(x)`. Since `getExperimentBasedConfig` already resolves **user setting → experiment treatment → default**, putting the model configuration first placed it above *both*. Once a strategy baked a knob in, neither the user nor a flight could move it, and an A/B arm assigning one of these settings measured nothing.\n\nReads now go through `resolveModelConfigValue`:\n\n\u003e user setting → experiment treatment → **model configuration** → setting default\n\nThis needed a new configuration primitive, `getExperimentBasedConfigIfSet`, which reports only an explicitly provided value instead of falling back to the default — that is what makes \"is this setting actually driven?\" answerable. Registration-time reads use the observable form, since an imperative read inside an `autorun` would not subscribe and would miss a treatment arriving after the graph was built.\n\n## 2. Two definitions of \"unified\" that could disagree\n\n`supportsUnifiedCompletions` was resolved in `InlineEditProviderFeature` (for the provider `excludes`) and again per request in `InlineCompletionProviderImpl`. Nothing kept them in agreement, and disagreement is user-visible: if registration excludes the separate provider while a request declines to stand in for it, there is **no inline suggestion at all**. Both paths, plus the joint provider, now resolve through one `observeUnifiedCompletions`, which keeps the existing OR with the core `modelUnification` toggle.\n\n## Also\n\n- `defaultModelConfiguration()` applies `applyStrategyConfig`, so the `forceUseDefaultModel` (404) fallback stops silently dropping every baked knob.\n- Renamed `patchBased02Optimized` → `patchBased02Unified`. \"Optimized\" did not say what the variant does; \"unified\" names its defining property and matches the existing `xtabUnifiedModel`. The wire value is renamed with the identifier — see the reviewer thread on this.\n- Fixed a pre-existing bug where `updateExperimentBasedConfiguration` only matched `config.\u003cfullyQualifiedId\u003e`, so a treatment arriving under `copilotchat.config.\u003cid\u003e` never invalidated the setting's observers. This affects every existing `getExperimentBasedConfigObservable` consumer, not just this change, so it is a separate commit.\n\n## Commits\n\nEach compiles independently.\n\n1. `configuration: refactor:` — hoist the duplicated treatment lookup into the base class (no behavior change)\n2. `configuration: fix:` — invalidate observables for every treatment name a setting is published under\n3. `configuration: feat:` — add `getExperimentBasedConfigIfSet`\n4. `nes: fix:` — the precedence inversion, the single unified-completions definition, and the rename\n\n## Known limitations\n\n- **Flights win over baked values.** Experiments currently assigning these settings will override the strategy, so it only becomes self-contained for those users once those flights are retired. Values coincide today, so there is no behavior change.\n- **Startup window (#332837) unchanged.** `supportsUnifiedCompletions` is the only baked value read at provider-registration time rather than per request, so on the fetched `/models` path there is a brief window before the model list resolves. Measured at ~600 ms against a real account.\n\n## Testing\n\n- `npm run typecheck --prefix extensions/copilot`, and each commit typechecks independently\n- 2494 vitest tests pass across `platform/inlineEdits`, `platform/configuration`, `platform/proxyModels`, `extension/inlineEdits`, `extension/xtab`\n- Ran a Code OSS build from these sources: the extension activates cleanly, and a local model configuration is accepted with `patchBased02Unified` and rejected with `patchBased02Optimized` (`Expected undefined, but got string`), confirming the rename end to end\n",
+    "URL": "https://github.com/microsoft/vscode/pull/333423",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "ulugbekna",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e3ce07e8fe526cd0fdd39a4da95f376bf65cfa2d",
+    "HeadRef": "ulugbekna/agents/revert-commit-fix-config-issues",
+    "HeadSHA": "e9df46098f094ffa1080f6ee8031b421ce600c4d",
+    "CreatedAt": "2026-08-30T19:15:03Z",
+    "UpdatedAt": "2026-08-30T21:36:09Z",
+    "MergedAt": "2026-08-30T21:35:18Z",
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "eager-work",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Extension activation and provider registration, including late /models and experimentation updates",
+        "CriticalPath": "Initial provider/model construction and VS Code provider registration must complete before NES can serve requests. A later model-capability or explicit unification-setting change synchronously disposes and rebuilds the registration graph; recording cleanup is launched without awaiting it and is off the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/copilot/src/extension/inlineEdits/vscode-node/inlineEditProviderFeature.ts:173 and jointInlineCompletionProvider.ts:246",
+            "Operation": "Register the inline completion provider with VS Code, and unregister the previous provider through disposal on a reactive rerun.",
+            "Cardinality": "One registration per active provider mode initially, plus one replacement per actual model/core-unification/explicit-unification value change; joint and separate modes are mutually selected rather than both active.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Registration already reran for model-list capability and core unification changes. The diff additionally places explicit InlineEditsUnification setting/treatment changes on this path so registration and request behavior agree.",
+            "CriticalPathEffect": "Registration is required before suggestions can be served; replacement is synchronous and bounded to a state change."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/extension/inlineEdits/vscode-node/inlineEditProviderFeature.ts:140 and jointInlineCompletionProvider.ts:156 via LogContextRecorder.cleanupOldRecordings",
+            "Operation": "Read the recording directory and unlink matching old recording files when recording is disabled.",
+            "Cardinality": "One directory read per registration autorun execution and one unlink per matching recording; the diff can add one execution when an explicit unification treatment/setting changes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The cleanup operation and its placement in the registration autorun pre-existed; only the new explicit-unification dependency can cause an additional, infrequent rerun.",
+            "CriticalPathEffect": "The call is fire-and-forget and therefore does not block registration or request progress."
+          },
+          {
+            "Kind": "network",
+            "Location": "Transitive proxy model service feeding InlineEditsModelService._fetchedModelsObs",
+            "Operation": "Fetch the model list whose update can change the selected model capability.",
+            "Cardinality": "Existing model-list fetch behavior is unchanged; this diff consumes the resulting local observable and adds no fetch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same /models update already drove onModelListUpdated and provider re-registration.",
+            "CriticalPathEffect": "A cold model list can affect the eventual registration choice, but the network boundary itself is not introduced or made more frequent by the diff."
+          }
+        ],
+        "ScalingInput": "Actual changes to the selected model, core unification state, or explicit unification setting/treatment; normally startup plus infrequent configuration/model changes, not keystrokes or rows.",
+        "EffectiveConcurrency": "Reactive autoruns dispose the previous reader store before rebuilding; no new parallel registration burst or unbounded queue is introduced. Asynchronous recording cleanup may overlap but gains at most one invocation per relevant state change.",
+        "CacheBehavior": "Configuration observables are cached by accessor kind and setting ID; the selected-model capability is a derived observable. Cold model discovery may change the value once, while stable warm state performs no rebuild.",
+        "MechanismConfidence": "High confidence in the added reactive dependency and one extra rebuild on an actual explicit-unification change; low evidence of material latency or sustained resource growth.",
+        "MagnitudeUncertainty": "Constructor and registration cost is not benchmarked, and experiment refresh frequency varies, but the new trigger is bounded and infrequent and the filesystem work is off-path.",
+        "Verdict": "No reportable regression. The diff can add a bounded provider replacement for a real configuration transition, but this is required to apply immutable registration options and does not create hot-path fan-out, unbounded retention, or blocking I/O."
+      },
+      {
+        "Scenario": "Typing-triggered inline edit request on a cold cache miss",
+        "CriticalPath": "Request gating, delay calculation, prompt construction, debounce, then the existing model fetch must complete before a fresh suggestion is available. The changed resolution helpers execute before the existing debounce/network boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/xtab/node/xtabProvider.ts:_performFetch",
+            "Operation": "Send the constructed inline-edit prompt to the model endpoint and consume its streamed response.",
+            "Cardinality": "At most the existing fetch per uncached logical request, subject to existing pending-request reuse, cancellation, debounce, and speculative-request behavior; the diff does not add a fetch or loop over inputs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Cold misses already performed the same model request after debounce.",
+            "CriticalPathEffect": "This is the dominant cold-request critical path. The diff may intentionally alter configured debounce values but does not change fetch cardinality or scheduling absent an explicit setting/treatment override."
+          }
+        ],
+        "ScalingInput": "Keystroke/request frequency. Each changed resolver performs a constant number of local configuration/treatment lookups; prompt size, document count, and network request cardinality are unchanged.",
+        "EffectiveConcurrency": "Existing debounce, cancellation, live-dependent reuse, and speculative scheduling remain unchanged; no new Promise fan-out, queue, or unconstrained concurrency is added.",
+        "CacheBehavior": "A cold miss reaches one model request. Existing request/cache coalescing is unchanged. Baked strategy values remain the fallback on an unset configuration; only explicit user or experiment values supersede them.",
+        "MechanismConfidence": "High confidence that the helper adds only bounded local reads and no new expensive boundary on this path.",
+        "MagnitudeUncertainty": "VS Code configuration inspection cost is not measured, but it is synchronous local state and the added count is constant against a request path that already reads many settings.",
+        "Verdict": "No reportable regression. The added lookups are constant-size and implement the requested precedence without increasing network cardinality, prompt serialization scale, or concurrency."
+      },
+      {
+        "Scenario": "Warm cached suggestion response and cached-edit rendering",
+        "CriticalPath": "A cache hit computes its minimum response delay and returns without a model fetch; rendering checks the resolved ghost-text behavior before exposing an existing suggestion.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One constant-size model/config resolution per cache-delay or rendering decision; no work scales with cache size or document length.",
+        "EffectiveConcurrency": "Existing cache-hit delay and cancellation behavior are unchanged; no new asynchronous work is started.",
+        "CacheBehavior": "Warm cache avoids the model network request as before. Cache keys, retention, eviction, rebasing, and coalescing are unchanged; explicit configuration can intentionally override baked cache-delay values.",
+        "MechanismConfidence": "High confidence from the changed call sites in computeMinimumResponseDelay and the render suppression check.",
+        "MagnitudeUncertainty": "The local inspection overhead is unmeasured but bounded to a few reads per returned cached suggestion.",
+        "Verdict": "No reportable regression. There is no cache defeat, retention increase, or scaling work; only constant local precedence resolution."
+      },
+      {
+        "Scenario": "Streaming CustomDiffPatch response parsing",
+        "CriticalPath": "After the existing model fetch starts yielding, parser options are resolved once before constructing the streaming response handler; the handler then processes streamed lines.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/xtab/node/xtabProvider.ts:1014",
+            "Operation": "Existing model request and streamed response consumed by XtabPatchResponseHandler.",
+            "Cardinality": "One stream per existing request/retry. The two changed option resolutions occur once per response, not once per streamed line or patch item.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same fetch and parser ran with baked values taking precedence over experiment/user values.",
+            "CriticalPathEffect": "Network and parsing remain on the suggestion critical path; the diff adds only constant local option reads before parser construction."
+          }
+        ],
+        "ScalingInput": "Response line count controls existing parser work, but the added resolver work remains O(1) per response.",
+        "EffectiveConcurrency": "The single response stream is consumed by the existing handler; no parallel parse or boundary calls are introduced.",
+        "CacheBehavior": "Not cache-dependent after a cold fetch begins; changed option lookup does not alter response caching.",
+        "MechanismConfidence": "High confidence that no repeated-work regression exists in the streaming path.",
+        "MagnitudeUncertainty": "No parser benchmark is available, but code placement proves the lookup is outside the per-line streaming loop.",
+        "Verdict": "No reportable regression. The changed work does not scale with stream length and adds no boundary calls."
+      },
+      {
+        "Scenario": "Model-not-found fallback to the default inline-edit model",
+        "CriticalPath": "After an existing model-not-found response, the provider retries using defaultModelConfiguration; the diff now applies the selected prompting strategy's local configuration before the retry is prepared.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/xtab/node/xtabProvider.ts:1019 recursive doGetNextEdit retry",
+            "Operation": "Retry the model request with the default model after ModelNotFound.",
+            "Cardinality": "The existing single fallback retry behavior is unchanged; applying strategy configuration is local and does not add another retry.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The fallback already retried over the network, but defaultModelConfiguration returned the raw model configuration without applying baked strategy knobs.",
+            "CriticalPathEffect": "The fallback network request remains on the critical path after a 404; the diff changes only local option values used by that request."
+          }
+        ],
+        "ScalingInput": "One fallback per model-not-found flow; configuration merge size is fixed and independent of document or model-list size.",
+        "EffectiveConcurrency": "The fallback remains sequential after ModelNotFound; no additional concurrent request is introduced.",
+        "CacheBehavior": "No new cache is introduced. The default model list is already held in observables; strategy application creates a bounded configuration object.",
+        "MechanismConfidence": "High confidence from the fallback branch and defaultModelConfiguration change.",
+        "MagnitudeUncertainty": "The latency effect of preserving individual strategy knobs is model/configuration dependent, but there is no mechanism increasing retry count or retained state.",
+        "Verdict": "No reportable regression. The change preserves strategy defaults on an existing retry and does not add boundary fan-out or meaningful allocation scaling."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 24 changed files. Traced provider lifecycle, configuration invalidation, cold and warm inline-edit requests, streamed parsing, and model fallback. The diff adds bounded local configuration resolution and an infrequent registration refresh for explicit unification changes, but no high-confidence actionable performance regression, unbounded retention, cache defeat, or increased network/IPC fan-out was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-07T03:42:01.33283143Z",
+    "CompletedAt": "2026-09-07T03:44:40.648382187Z",
+    "WallClockMilliseconds": 159315,
+    "ModelCalls": 8,
+    "InputTokens": 382456,
+    "OutputTokens": 10373,
+    "TotalTokens": 392829,
+    "ReasoningTokens": 5178,
+    "CacheReadTokens": 308736,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 151122,
+    "ToolCalls": 69,
+    "NanoAIUnits": 62583440000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 308736,
+      "cache_write": 0,
+      "input": 73720,
+      "output": 10373
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
