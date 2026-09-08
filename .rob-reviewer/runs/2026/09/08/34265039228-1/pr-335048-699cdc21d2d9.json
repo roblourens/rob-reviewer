@@ -1,0 +1,183 @@
+{
+  "PullRequest": {
+    "Number": 335048,
+    "Title": "Preserve Git repository wrapper identity",
+    "Body": "I noticed that `GitRepository` extends `Disposable` but doesn't actually use. Then started looking if we actually need to replace those GitRepository instances in the map or can reuse -- from my understanding, we can reuse. \r\n\r\n## Summary\r\n\r\n- keep reopening repositories through the extension host so reopened repository listeners are refreshed\r\n- reuse the main-thread wrapper for its stable handle and apply the latest state\r\n- remove the wrapper's vestigial `Disposable` inheritance (TIL vesitigal - means a bodily part or trait that has lost most or all of its original function through the process of evolution)\r\n- verify repeated opens refresh one stable wrapper\r\n\r\nFollow-up to #335030 and #335029.\r\n\r\n## Testing\r\n\r\n- `npm run transpile-client`\r\n- ESLint on changed files\r\n- `./scripts/test.sh --run src/vs/workbench/api/test/browser/mainThreadGitExtensionService.test.ts`\r\n- `./scripts/test.sh --run src/vs/sessions/contrib/automations/test/browser/automationDialog.test.ts`\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/335048",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "ulugbekna",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "f3e4cb8b7e29118bc78ec631d4f5fc6fc51f9e12",
+    "HeadRef": "ulugbekna/reuse-git-repository-wrapper",
+    "HeadSHA": "699cdc21d2d93bdb3aa21759ac26c4354a4649a9",
+    "CreatedAt": "2026-09-08T12:55:24Z",
+    "UpdatedAt": "2026-09-08T13:02:17Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation",
+      "cleanup-lifecycle",
+      "cache-lifecycle",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Opening or reopening a local repository for session initialization and GitHub metadata resolution",
+        "CriticalPath": "GitService.openRepository waits for delegate readiness, MainThreadGitExtensionService serializes the request, performs extension-host IPC, converts the returned repository snapshot, updates or creates the wrapper, and waits for HEAD. All of this is on the caller's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadGitExtensionService.ts:106 openRepository",
+            "Operation": "Calls ExtHostGitExtensionService.$openRepository and returns a serialized repository-state snapshot.",
+            "Cardinality": "One IPC call per explicit open request, both before and after the diff; repeated requests are not coalesced but are serialized.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC call and full state payload occurred; the main thread then allocated and stored a new wrapper.",
+            "CriticalPathEffect": "The caller cannot receive the repository until the round trip and state conversion complete."
+          },
+          {
+            "Kind": "filesystem/subprocess",
+            "Location": "extensions/git/src/model.ts:600 Model.openRepository",
+            "Operation": "On a cold/non-exact repository path, resolves real paths and may run git rev-parse before opening the repository; an already-open exact root returns early.",
+            "Cardinality": "At most one open traversal per request; warm exact-root requests use the open-repository lookup and avoid these boundaries.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical Git API open path was invoked before the diff.",
+            "CriticalPathEffect": "Cold or non-exact paths block the extension-host response; warm exact-root opens do not perform this work."
+          }
+        ],
+        "ScalingInput": "Number of explicit repository-open requests and, for the returned snapshot, number of changed/untracked files. One stable wrapper is retained per extension-host handle rather than one new wrapper per reopen.",
+        "EffectiveConcurrency": "Main-thread opens are serialized globally by Sequencer; the Git extension model also sequentializes openRepository. There is no diff-introduced concurrency burst.",
+        "CacheBehavior": "The Git API is cached after first activation; extension-host URI/handle maps and the Git model cache already serve warm repositories. The PR adds reuse of the main-thread wrapper and structural equality suppresses observer notifications for unchanged snapshots.",
+        "MechanismConfidence": "High confidence in the call path, serialization, and global sequencing from the traced implementations.",
+        "MagnitudeUncertainty": "Repository snapshots can be large, but reopen frequency and snapshot size vary. The added structural comparison is linear in snapshot size, while serialization and conversion of the same full snapshot were already linear and dominant; no concrete regression is established.",
+        "Verdict": "No reportable regression: boundary count, critical-path placement, and serialization cardinality are unchanged; wrapper reuse removes allocation churn and only refreshes state in process."
+      },
+      {
+        "Scenario": "Resolving local session changesets",
+        "CriticalPath": "Each observed changeset recomputation calls openRepository and then diffBetweenWithStats2; the resulting file list is required before the changes view resolves.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/copilotChatSessions/browser/copilotChatSessionsChangesets.ts:41 GitRepositoryChangesetResolver.resolve",
+            "Operation": "One repository-open RPC followed by one diff RPC for each resolver invocation.",
+            "Cardinality": "One open and one diff per changeset recomputation; effective multiplicity depends on which of the uncommitted/all/last-turn observables are actively consumed.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two RPCs occurred; only the main-thread wrapper object returned by open changed identity.",
+            "CriticalPathEffect": "Both calls must complete before that changeset's files are available."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/git.ts:1840 diffBetweenWithStats",
+            "Operation": "Runs one git diff --raw --numstat command and parses output.",
+            "Cardinality": "One git subprocess per diff resolver invocation, not per changed file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same subprocess count and arguments before the diff.",
+            "CriticalPathEffect": "The subprocess is the principal blocking work for changeset resolution."
+          }
+        ],
+        "ScalingInput": "Number of active changeset recomputations and files emitted by git diff; there is no per-file IPC fan-out.",
+        "EffectiveConcurrency": "Repository opens are globally sequenced. Separate changeset observables may initiate independent diff requests, but this behavior and its concurrency are unchanged by the PR.",
+        "CacheBehavior": "Repository handles and wrappers are reused, but diff results are not cached here. The PR neither adds nor defeats result caching.",
+        "MechanismConfidence": "High confidence from direct resolver, RPC, and Git command traces.",
+        "MagnitudeUncertainty": "The UI's simultaneous observation count varies, but all boundary multiplicity is pre-existing.",
+        "Verdict": "No reportable regression: the PR does not change open/diff frequency, subprocess count, or output scaling."
+      },
+      {
+        "Scenario": "Reloading branches in the automation dialog after folder selection",
+        "CriticalPath": "A folder change opens the repository, attaches one observable watcher, then requests refs before branch controls become ready.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/automations/browser/automationDialog.ts:858 reloadRepository",
+            "Operation": "One repository-open RPC and then one getRefs RPC per accepted reload.",
+            "Cardinality": "One pair per selected-folder reload; stale requests are ignored and refs are requested once for the repository rather than per branch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same RPC pair was issued before the diff.",
+            "CriticalPathEffect": "The branch selector remains loading until these operations complete."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/git.ts:2941 getRefs",
+            "Operation": "Runs git for-each-ref and parses all matching local branches.",
+            "Cardinality": "One subprocess per accepted branch reload, with output proportional to local branch count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same subprocess and branch cardinality before the diff.",
+            "CriticalPathEffect": "Blocks readiness of the branch picker."
+          }
+        ],
+        "ScalingInput": "Folder-selection/retry frequency and number of local branches.",
+        "EffectiveConcurrency": "Each reload cancels the prior token and disposes its watcher; open calls remain serialized, while getRefs accepts cancellation. Wrapper reuse does not accumulate dialog watchers.",
+        "CacheBehavior": "Warm exact-root opens reuse the Git model repository; refs are freshly queried. The main-thread wrapper is now reused, and the previous autorun is explicitly disposed before each reload.",
+        "MechanismConfidence": "High confidence from reloadRepository cancellation/disposal and Git getRefs implementation.",
+        "MagnitudeUncertainty": "Branch counts and rapid folder changes vary, but no changed scheduling or fan-out mechanism exists.",
+        "Verdict": "No reportable regression: resource ownership remains bounded and all expensive boundary work is unchanged."
+      },
+      {
+        "Scenario": "Propagating Git repository state changes to existing consumers and enumerating known repositories",
+        "CriticalPath": "A Git state event triggers one main-thread notification, which requests and serializes the latest state; updating the stable observable synchronously notifies its currently registered consumers. Repository enumeration itself is in process and off any external boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/serialization",
+            "Location": "src/vs/workbench/api/browser/mainThreadGitExtensionService.ts:168 $onDidChangeRepository",
+            "Operation": "Fetches and converts one full repository-state snapshot after a Git state event.",
+            "Cardinality": "One RPC per state-change event, with payload proportional to changed/indexed/untracked entries.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same event-driven state fetch and observable update occurred.",
+            "CriticalPathEffect": "Consumers update after the snapshot returns; this path existed unchanged before the PR."
+          }
+        ],
+        "ScalingInput": "Git state-event frequency, number of files represented in state, number of live observable consumers, and number of distinct repository handles.",
+        "EffectiveConcurrency": "One state-fetch RPC is initiated per extension event as before; no new batching, parallelism, or fan-out across repositories is introduced. Observable fan-out is proportional only to live consumers of that repository.",
+        "CacheBehavior": "The map keeps one wrapper per handle and now updates it on reopen, so repeated opens do not grow wrapper cardinality. Structural equality avoids notifications for identical snapshots. No repository-removal lifecycle exists in either revision.",
+        "MechanismConfidence": "High confidence in one-wrapper-per-handle behavior and event flow; insufficient evidence for a post-disposal retention mechanism.",
+        "MagnitudeUncertainty": "Consumer count and repository-state size vary. Removing DisposableMap no longer explicitly clears entries on service disposal, but no independently rooted post-disposal service or disposable resource inside GitRepository was found, so retained-memory impact is not established.",
+        "Verdict": "No reportable regression: stable identity prevents replacement churn, notifications are bounded by live observers, and no concrete leak or new external work is introduced."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and traced repository open/reopen, state propagation, session changeset resolution, GitHub metadata resolution, and automation branch loading through IPC, filesystem, and Git subprocess boundaries. The change reuses one main-thread wrapper per handle and performs an in-process state refresh; it does not increase expensive-boundary cardinality, concurrency, or retained wrapper count. No high-confidence diff-introduced performance issue was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-08T18:55:58.595303521Z",
+    "CompletedAt": "2026-09-08T18:58:16.87303452Z",
+    "WallClockMilliseconds": 138277,
+    "ModelCalls": 18,
+    "InputTokens": 801441,
+    "OutputTokens": 8666,
+    "TotalTokens": 810107,
+    "ReasoningTokens": 3062,
+    "CacheReadTokens": 731030,
+    "CacheWriteTokens": 70357,
+    "APIDurationMilliseconds": 125354,
+    "ToolCalls": 92,
+    "NanoAIUnits": 81773300000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 731030,
+      "cache_write": 70357,
+      "input": 54,
+      "output": 8666
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
