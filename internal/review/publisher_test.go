@@ -12,6 +12,7 @@ type fakePublisherClient struct {
 	currents          []PullRequest
 	refreshCount      int
 	markerExists      bool
+	markerQueries     []string
 	markerReview      *ExistingReview
 	markerAfterSubmit *ExistingReview
 	pendingReview     *ExistingReview
@@ -35,7 +36,8 @@ func (client *fakePublisherClient) GetPullRequest(context.Context, string, strin
 	return client.current, nil
 }
 
-func (client *fakePublisherClient) FindReviewMarker(context.Context, string, string, int, string) (*ExistingReview, error) {
+func (client *fakePublisherClient) FindReviewMarker(_ context.Context, _, _ string, _ int, marker string) (*ExistingReview, error) {
+	client.markerQueries = append(client.markerQueries, marker)
 	if client.markerReview != nil {
 		return client.markerReview, nil
 	}
@@ -286,6 +288,28 @@ func TestPublisherSkipsCleanAndDuplicateReviews(t *testing.T) {
 	}, false)
 	if err != nil || published || client.published {
 		t.Fatalf("duplicate result: published = %v, err = %v", published, err)
+	}
+}
+
+func TestPublisherDoesNotPublishSecondReviewForNewHead(t *testing.T) {
+	pull := PullRequest{Number: 7, HeadSHA: "new-head", State: "open", AuthorAssociation: "MEMBER"}
+	client := &fakePublisherClient{
+		current: pull,
+		markerReview: &ExistingReview{
+			ID:    7,
+			State: "COMMENTED",
+			Body:  ReviewMarker(7, "old-head"),
+		},
+	}
+	published, err := NewPublisher(client, "microsoft", "vscode").Publish(context.Background(), Result{
+		PullRequest: pull,
+		Findings:    []Finding{{ID: "PERF-1234567890AB"}},
+	}, false)
+	if err != nil || published || client.published {
+		t.Fatalf("published=%v client.published=%v err=%v", published, client.published, err)
+	}
+	if len(client.markerQueries) != 1 || client.markerQueries[0] != ReviewMarkerPrefix(7) {
+		t.Fatalf("marker queries=%q", client.markerQueries)
 	}
 }
 

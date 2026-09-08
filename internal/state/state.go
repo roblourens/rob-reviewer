@@ -9,7 +9,7 @@ import (
 	"github.com/roblourens/rob-reviewer/internal/github"
 )
 
-const CurrentVersion = 2
+const CurrentVersion = 3
 
 type State struct {
 	Version      int                      `json:"version"`
@@ -20,6 +20,7 @@ type State struct {
 }
 
 type PullRequestState struct {
+	Reviewed        bool      `json:"reviewed,omitempty"`
 	ReviewedHeadSHA string    `json:"reviewedHeadSha,omitempty"`
 	PendingHeadSHA  string    `json:"pendingHeadSha,omitempty"`
 	PendingSince    time.Time `json:"pendingSince,omitempty"`
@@ -98,12 +99,22 @@ func (store *Store) Load(ctx context.Context) (State, string, bool, error) {
 		result := New()
 		return result, content.SHA, true, nil
 	}
-	if header.Version != CurrentVersion {
+	if header.Version != 2 && header.Version != CurrentVersion {
 		return State{}, "", false, fmt.Errorf("unsupported reviewer state version %d", header.Version)
 	}
 	var result State
 	if err := json.Unmarshal(content.Content, &result); err != nil {
 		return State{}, "", false, fmt.Errorf("decode reviewer state: %w", err)
+	}
+	if header.Version == 2 {
+		for number, tracked := range result.PullRequests {
+			tracked.Reviewed = tracked.ReviewedHeadSHA != ""
+			if tracked.Reviewed {
+				tracked.PendingHeadSHA = ""
+				tracked.PendingSince = time.Time{}
+			}
+			result.PullRequests[number] = tracked
+		}
 	}
 	result.normalize()
 	return result, content.SHA, true, nil

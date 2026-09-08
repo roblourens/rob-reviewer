@@ -153,6 +153,7 @@ func (poller *Poller) Run(ctx context.Context) (result Result, returnErr error) 
 			return result, fmt.Errorf("review PR %d at %s: %w", pull.Number, pull.HeadSHA, err)
 		}
 		tracked := current.PullRequests[pull.Number]
+		tracked.Reviewed = true
 		tracked.ReviewedHeadSHA = pull.HeadSHA
 		tracked.PendingHeadSHA = ""
 		tracked.PendingSince = time.Time{}
@@ -170,7 +171,8 @@ func (poller *Poller) Run(ctx context.Context) (result Result, returnErr error) 
 
 	boundary := now.Add(-poller.options.ScanWindow)
 	for number, tracked := range current.PullRequests {
-		if strings.EqualFold(tracked.State, "closed") && tracked.UpdatedAt.Before(boundary) && tracked.PendingHeadSHA == "" {
+		if !tracked.Reviewed && strings.EqualFold(tracked.State, "closed") &&
+			tracked.UpdatedAt.Before(boundary) && tracked.PendingHeadSHA == "" {
 			delete(current.PullRequests, number)
 		}
 	}
@@ -247,6 +249,9 @@ func (poller *Poller) observe(current *state.State, pull review.PullRequest, now
 	tracked.UpdatedAt = pull.UpdatedAt
 
 	switch {
+	case tracked.Reviewed:
+		tracked.PendingHeadSHA = ""
+		tracked.PendingSince = time.Time{}
 	case !pull.IsTeamAuthored():
 		tracked.ReviewedHeadSHA = pull.HeadSHA
 		tracked.PendingHeadSHA = ""
@@ -290,7 +295,8 @@ type candidate struct {
 func (poller *Poller) readyCandidates(current state.State, now time.Time) []candidate {
 	var result []candidate
 	for number, tracked := range current.PullRequests {
-		if tracked.PendingHeadSHA == "" || tracked.PendingSince.IsZero() || tracked.Draft || !strings.EqualFold(tracked.State, "open") {
+		if tracked.Reviewed || tracked.PendingHeadSHA == "" || tracked.PendingSince.IsZero() ||
+			tracked.Draft || !strings.EqualFold(tracked.State, "open") {
 			continue
 		}
 		if now.Sub(tracked.PendingSince) >= poller.options.QuietPeriod {
@@ -308,7 +314,7 @@ func (poller *Poller) readyCandidates(current state.State, now time.Time) []cand
 
 func (poller *Poller) stillReady(current *state.State, pull review.PullRequest, now time.Time, result *Result) bool {
 	tracked := current.PullRequests[pull.Number]
-	if !pull.IsTeamAuthored() || pull.HasAnyLabel(poller.options.SkipLabels) ||
+	if tracked.Reviewed || !pull.IsTeamAuthored() || pull.HasAnyLabel(poller.options.SkipLabels) ||
 		!strings.EqualFold(pull.State, "open") || pull.Draft || pull.HeadSHA != tracked.PendingHeadSHA {
 		poller.observe(current, pull, now, result)
 		return false

@@ -9,9 +9,9 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 - A GitHub Actions workflow polls every five minutes when the `ROB_REVIEWER_ENABLED` repository variable is `true`. Checked-in configuration also requires `automation.enabled: true`.
 - The first enabled poll records every current open team PR and its current head without reviewing that backlog.
 - Only PRs whose GitHub `author_association` is `MEMBER` or `OWNER` are eligible. Outside collaborators, contributors, bots, and other non-team authors are skipped.
-- The poller detects newly opened PRs, drafts becoming ready, reopened PRs, and new head SHAs on existing PRs by scanning recently updated PRs.
-- Every new head waits through a five-minute quiet period. Another push resets the clock, so rapid update bursts produce one review of the stable head.
-- The same head is reviewed at most once. State is keyed by PR number and exact head SHA rather than only by PR number.
+- The poller detects newly opened PRs and drafts becoming ready by scanning recently updated PRs.
+- Every unreviewed PR waits through a five-minute quiet period. Another push before its first review resets the clock, so rapid update bursts produce one review of the stable head.
+- Each PR is reviewed at most once. Later pushes, rebases, and reopenings do not trigger another review. Persistent PR-level completion state prevents repeat analysis, and an authenticated GitHub review marker independently prevents repeat publication.
 - `publication.mode: approval` writes JSON and Markdown reports for human selection. `publication.mode: automatic` publishes every validated finding after the report is durable. The checked-in mode is `automatic`.
 - Automatic publication requires the PR to remain open, non-draft, unsuppressed, team-authored, and on the reviewed base/head at the final GitHub refresh. Explicitly approved saved reports may still be published to a closed or merged PR when the reviewed head matches.
 - Per-run and per-UTC-day review caps bound model usage. A pending head older than the configured maximum age is skipped rather than producing a surprising late review.
@@ -20,7 +20,7 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 - Publication posts a non-blocking `COMMENT` review with inline comments.
 - Published summaries and inline comments begin with **Experimental performance review bot**.
 - Findings must be performance-only, high confidence, anchored to an added or deleted line, and explicitly prove through before/after evidence that the PR introduced or materially amplified the performance mechanism. Pre-existing non-critical optimization opportunities are rejected.
-- State is committed to a dedicated `reviewer-state` branch, including reviewed and pending heads plus daily review/publication counters.
+- State is committed to a dedicated `reviewer-state` branch, including PR-level review completion, reviewed and pending heads, and daily review/publication counters.
 
 Scheduled workflows are eventually consistent: GitHub may delay cron jobs. GitHub also disables scheduled workflows in an inactive public repository after 60 days, so keep the repository active or re-enable the workflow when needed.
 
@@ -268,7 +268,7 @@ go vet ./...
 go build ./cmd/rob-reviewer
 ```
 
-Tests cover safe configuration defaults, state migration, open-head bootstrap, new heads, quiet-period resets, drafts becoming ready, reopened PRs, failed-head retries, daily caps, stale-head expiration, suppression labels, focus loading, safe checkout behavior, diff parsing and changed-line anchors, path containment, bounded tools, finding validation/ranking, stale-head rejection, publication idempotency, and review formatting. Synthetic fixtures model known performance failure mechanisms without copying VS Code source.
+Tests cover safe configuration defaults, state migration, open-head bootstrap, PR-level review deduplication, quiet-period resets, drafts becoming ready, failed-head retries, daily caps, stale-head expiration, suppression labels, focus loading, safe checkout behavior, diff parsing and changed-line anchors, path containment, bounded tools, finding validation/ranking, stale-head rejection, publication idempotency, and review formatting. Synthetic fixtures model known performance failure mechanisms without copying VS Code source.
 
 Use a manual dry-run workflow for the real SDK smoke test. Publishing happens separately from an approved saved report.
 

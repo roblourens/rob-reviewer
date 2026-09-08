@@ -69,7 +69,7 @@ func TestStoreMigratesVersionOneByRequiringBootstrap(t *testing.T) {
 	}
 }
 
-func TestStoreLoadsVersionTwoState(t *testing.T) {
+func TestStoreMigratesVersionTwoStateToReviewedPullRequests(t *testing.T) {
 	client := &fakeContentClient{
 		exists: true,
 		content: github.FileContent{
@@ -77,7 +77,16 @@ func TestStoreLoadsVersionTwoState(t *testing.T) {
 			Content: []byte(`{
 				"version":2,
 				"initialized":true,
-				"pullRequests":{"7":{"reviewedHeadSha":"head","state":"open","draft":false}},
+				"pullRequests":{
+					"7":{
+						"reviewedHeadSha":"head",
+						"pendingHeadSha":"new-head",
+						"pendingSince":"2026-08-24T11:00:00Z",
+						"state":"open",
+						"draft":false
+					},
+					"8":{"pendingHeadSha":"pending","state":"open","draft":false}
+				},
 				"daily":{"date":"2026-08-24","reviews":3,"publications":1}
 			}`),
 		},
@@ -88,7 +97,10 @@ func TestStoreLoadsVersionTwoState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !loaded.Initialized || loaded.PullRequests[7].ReviewedHeadSHA != "head" || loaded.Daily.Reviews != 3 {
+	if !loaded.Initialized || !loaded.PullRequests[7].Reviewed ||
+		loaded.PullRequests[7].ReviewedHeadSHA != "head" ||
+		loaded.PullRequests[7].PendingHeadSHA != "" || loaded.PullRequests[8].Reviewed ||
+		loaded.Daily.Reviews != 3 || loaded.Version != CurrentVersion {
 		t.Fatalf("loaded state = %+v", loaded)
 	}
 }

@@ -22,10 +22,6 @@ type reviewResponse struct {
 	} `json:"user"`
 }
 
-func ReviewMarker(number int, headSHA string) string {
-	return fmt.Sprintf("<!-- rob-reviewer:v1 pr=%d head=%s -->", number, headSHA)
-}
-
 func (client *Client) HasReviewMarker(ctx context.Context, owner, repo string, number int, marker string) (bool, error) {
 	existing, err := client.FindReviewMarker(ctx, owner, repo, number, marker)
 	return existing != nil, err

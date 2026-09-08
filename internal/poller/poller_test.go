@@ -179,7 +179,7 @@ func TestRunBootstrapsOpenHeadsWithoutReviewingBacklog(t *testing.T) {
 	}
 }
 
-func TestRunReviewsNewHeadAfterQuietPeriod(t *testing.T) {
+func TestRunReviewsUntrackedPullAfterQuietPeriod(t *testing.T) {
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	changed := pull(12, "new", now)
 	client := &fakePullClient{
@@ -211,6 +211,39 @@ func TestRunReviewsNewHeadAfterQuietPeriod(t *testing.T) {
 	}
 	if store.current.PullRequests[12].ReviewedHeadSHA != "new" || store.current.Daily.Reviews != 1 {
 		t.Fatalf("state=%+v", store.current)
+	}
+}
+
+func TestRunDoesNotReviewNewHeadAfterPullRequestCompleted(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	current := initializedState()
+	current.PullRequests[12] = state.PullRequestState{
+		Reviewed:        true,
+		ReviewedHeadSHA: "old",
+		PendingHeadSHA:  "new",
+		PendingSince:    now.Add(-time.Hour),
+		State:           "open",
+	}
+	changed := pull(12, "new", now)
+	client := &fakePullClient{
+		updatedPages: map[int][]review.PullRequest{1: {changed}},
+		pulls:        map[int]review.PullRequest{12: changed},
+	}
+	store := &fakeStateStore{exists: true, current: current}
+	reviewCalls := 0
+	poller := New(client, store, testOptions(&now), func(context.Context, review.PullRequest) (ReviewOutcome, error) {
+		reviewCalls++
+		return ReviewOutcome{}, nil
+	})
+
+	result, err := poller.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracked := store.current.PullRequests[12]
+	if reviewCalls != 0 || len(result.Deferred) != 0 || tracked.PendingHeadSHA != "" ||
+		tracked.ReviewedHeadSHA != "old" {
+		t.Fatalf("calls=%d result=%+v state=%+v", reviewCalls, result, tracked)
 	}
 }
 
@@ -256,7 +289,7 @@ func TestRunResetsQuietPeriodWhenHeadChanges(t *testing.T) {
 	}
 }
 
-func TestRunReviewsDraftWhenItBecomesReadyAndReopenedPull(t *testing.T) {
+func TestRunReviewsDraftWhenItBecomesReadyButNotCompletedReopenedPull(t *testing.T) {
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	current := initializedState()
 	current.PullRequests[11] = state.PullRequestState{
@@ -265,6 +298,7 @@ func TestRunReviewsDraftWhenItBecomesReadyAndReopenedPull(t *testing.T) {
 		Draft:          true,
 	}
 	current.PullRequests[12] = state.PullRequestState{
+		Reviewed:        true,
 		ReviewedHeadSHA: "closed-head",
 		State:           "closed",
 	}
@@ -290,8 +324,44 @@ func TestRunReviewsDraftWhenItBecomesReadyAndReopenedPull(t *testing.T) {
 	if _, err := poller.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(reviewed, []int{11, 12}) {
+	if !slices.Equal(reviewed, []int{11}) {
 		t.Fatalf("reviewed=%v", reviewed)
+	}
+}
+
+func TestRunRetainsCompletedClosedPullRequests(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	current := initializedState()
+	current.PullRequests[11] = state.PullRequestState{
+		Reviewed:        true,
+		ReviewedHeadSHA: "reviewed",
+		State:           "closed",
+		UpdatedAt:       now.Add(-8 * 24 * time.Hour),
+	}
+	current.PullRequests[12] = state.PullRequestState{
+		ReviewedHeadSHA: "skipped",
+		State:           "closed",
+		UpdatedAt:       now.Add(-8 * 24 * time.Hour),
+	}
+	store := &fakeStateStore{exists: true, current: current}
+	poller := New(
+		&fakePullClient{updatedPages: map[int][]review.PullRequest{1: {}}},
+		store,
+		testOptions(&now),
+		func(context.Context, review.PullRequest) (ReviewOutcome, error) {
+			t.Fatal("unexpected review")
+			return ReviewOutcome{}, nil
+		},
+	)
+
+	if _, err := poller.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := store.current.PullRequests[11]; !exists {
+		t.Fatal("completed pull request state was pruned")
+	}
+	if _, exists := store.current.PullRequests[12]; exists {
+		t.Fatal("unreviewed closed pull request state was retained")
 	}
 }
 

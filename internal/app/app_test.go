@@ -4,10 +4,13 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/roblourens/rob-reviewer/internal/config"
+	"github.com/roblourens/rob-reviewer/internal/github"
 	"github.com/roblourens/rob-reviewer/internal/review"
 )
 
@@ -21,6 +24,47 @@ func TestPollIsNoOpWhenAutomationDisabled(t *testing.T) {
 	result, err := app.Poll(context.Background(), "", "")
 	if err != nil || len(result.Reviews) != 0 || len(result.Poll.Reviewed) != 0 {
 		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestReviewPullRequestSkipsWhenEarlierHeadWasReviewed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/microsoft/vscode/pulls/7":
+			io.WriteString(writer, `{
+				"number":7,
+				"state":"open",
+				"draft":false,
+				"author_association":"MEMBER",
+				"user":{"login":"member"},
+				"base":{"ref":"main","sha":"base"},
+				"head":{"ref":"feature","sha":"new-head"}
+			}`)
+		case "/user":
+			io.WriteString(writer, `{"login":"review-bot"}`)
+		case "/repos/microsoft/vscode/pulls/7/reviews":
+			io.WriteString(writer, `[{
+				"id":42,
+				"body":"<!-- rob-reviewer:v1 pr=7 head=old-head -->",
+				"state":"COMMENTED",
+				"user":{"login":"review-bot"}
+			}]`)
+		default:
+			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	app := &App{
+		config: config.Config{
+			Target: config.TargetConfig{Owner: "microsoft", Repo: "vscode"},
+		},
+		reviewClient: github.NewClientWithBaseURL(server.Client(), "token", server.URL),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	result, analyzed, err := app.ReviewPullRequest(context.Background(), 7, true)
+	if err != nil || analyzed || result.PullRequest.HeadSHA != "new-head" {
+		t.Fatalf("analyzed=%v result=%+v err=%v", analyzed, result, err)
 	}
 }
 

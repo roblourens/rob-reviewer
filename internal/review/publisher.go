@@ -59,6 +59,14 @@ type Publisher struct {
 	summary     string
 }
 
+func ReviewMarkerPrefix(number int) string {
+	return fmt.Sprintf("<!-- rob-reviewer:v1 pr=%d ", number)
+}
+
+func ReviewMarker(number int, headSHA string) string {
+	return ReviewMarkerPrefix(number) + fmt.Sprintf("head=%s -->", headSHA)
+}
+
 func NewPublisher(client PublisherClient, owner, repo string, skipLabels ...string) *Publisher {
 	return &Publisher{
 		client:      client,
@@ -94,14 +102,23 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 		return false, nil
 	}
 
-	marker := fmt.Sprintf("<!-- rob-reviewer:v1 pr=%d head=%s -->", result.PullRequest.Number, result.PullRequest.HeadSHA)
+	marker := ReviewMarker(result.PullRequest.Number, result.PullRequest.HeadSHA)
 	approvalMarker := publicationApprovalMarker(result)
-	existing, err := publisher.client.FindReviewMarker(ctx, publisher.owner, publisher.repo, result.PullRequest.Number, marker)
+	existing, err := publisher.client.FindReviewMarker(
+		ctx,
+		publisher.owner,
+		publisher.repo,
+		result.PullRequest.Number,
+		ReviewMarkerPrefix(result.PullRequest.Number),
+	)
 	if err != nil {
 		return false, fmt.Errorf("check existing review marker: %w", err)
 	}
 	if existing != nil && !strings.EqualFold(existing.State, "PENDING") {
 		return false, nil
+	}
+	if existing != nil && !strings.Contains(existing.Body, marker) {
+		return false, errors.New("a pending performance review exists for a different pull request revision")
 	}
 	if existing != nil && !strings.Contains(existing.Body, approvalMarker) {
 		return false, errors.New("a pending performance review exists with a different approved finding set")
@@ -189,7 +206,7 @@ func (publisher *Publisher) ResumePending(
 	if len(comments) == 0 {
 		return nil, fmt.Errorf("pending performance review %d has no inline comments", reviewID)
 	}
-	marker := fmt.Sprintf("<!-- rob-reviewer:v1 pr=%d head=%s -->", analyzed.Number, analyzed.HeadSHA)
+	marker := ReviewMarker(analyzed.Number, analyzed.HeadSHA)
 	if err := publisher.submitPendingReview(ctx, analyzed.Number, reviewID, marker); err != nil {
 		return nil, fmt.Errorf("resume pending performance review %d: %w", reviewID, err)
 	}
@@ -232,7 +249,7 @@ func (publisher *Publisher) PrepareAutomaticReview(
 	ctx context.Context,
 	analyzed PullRequest,
 ) (*ExistingReview, error) {
-	marker := fmt.Sprintf("<!-- rob-reviewer:v1 pr=%d head=%s -->", analyzed.Number, analyzed.HeadSHA)
+	marker := ReviewMarker(analyzed.Number, analyzed.HeadSHA)
 	pending, err := publisher.client.FindPendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number)
 	if err != nil {
 		return nil, fmt.Errorf("find pending automatic review: %w", err)
@@ -242,7 +259,13 @@ func (publisher *Publisher) PrepareAutomaticReview(
 			return nil, fmt.Errorf("delete stale pending review %d: %w", pending.ID, err)
 		}
 	}
-	existing, err := publisher.client.FindReviewMarker(ctx, publisher.owner, publisher.repo, analyzed.Number, marker)
+	existing, err := publisher.client.FindReviewMarker(
+		ctx,
+		publisher.owner,
+		publisher.repo,
+		analyzed.Number,
+		ReviewMarkerPrefix(analyzed.Number),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("find automatic review marker: %w", err)
 	}

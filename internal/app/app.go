@@ -328,13 +328,18 @@ func (app *App) ReviewHistoricalPullRequest(ctx context.Context, number int) (re
 }
 
 func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish bool) (_ review.Result, analyzed bool, returnErr error) {
-	marker := github.ReviewMarker(pull.Number, pull.HeadSHA)
-	existing, err := app.reviewClient.FindReviewMarker(ctx, app.config.Target.Owner, app.config.Target.Repo, pull.Number, marker)
+	existing, err := app.reviewClient.FindReviewMarker(
+		ctx,
+		app.config.Target.Owner,
+		app.config.Target.Repo,
+		pull.Number,
+		review.ReviewMarkerPrefix(pull.Number),
+	)
 	if err != nil {
 		return review.Result{}, false, fmt.Errorf("check review idempotency marker: %w", err)
 	}
-	if existing != nil && !strings.EqualFold(existing.State, "PENDING") {
-		app.logger.Info("pull request already reviewed", "pr", pull.Number, "head", pull.HeadSHA)
+	if existing != nil {
+		app.logger.Info("pull request already reviewed or pending", "pr", pull.Number, "head", pull.HeadSHA, "reviewState", existing.State)
 		return review.Result{PullRequest: pull}, false, nil
 	}
 
