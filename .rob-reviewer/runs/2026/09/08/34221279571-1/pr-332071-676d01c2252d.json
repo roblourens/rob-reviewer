@@ -1,0 +1,188 @@
+{
+  "PullRequest": {
+    "Number": 332071,
+    "Title": "chat: support selective customization lockdown",
+    "Body": "Fixes microsoft/vscode-internalbacklog#8826\n\nDependency microsoft/vscode-policy-watcher#75 is merged and `@vscode/policy-watcher@1.5.0` is published.\n\n## Summary\n\nAdds the canonical selective form of `strictPluginOnlyCustomization` while preserving existing boolean behavior:\n\n- `true` continues to block standalone skills, agents, hooks, instructions, and MCP servers.\n- arrays containing `skills`, `agents`, `hooks`, and/or `mcp` block only those standalone surfaces.\n- plugin-provided customizations remain eligible.\n- malformed or partially unknown arrays fail closed instead of applying a weaker partial policy.\n- selective arrays intentionally do not map to VS Code instructions; boolean `true` remains the instruction lockdown.\n\n## Implementation\n\n- carries boolean or selective values through server, file, and native managed-settings projection\n- keeps the named VS Code policy boolean-only for existing administrative templates\n- uses the scalar-union managed-setting API from policy-watcher 1.5.0\n- remains compatible with watcher 1.4 by retrying only the first declared scalar type (`boolean`) when the legacy addon rejects a union\n- reuses prompt discovery gates for skills, agents, hooks, and embedded agent hooks\n- applies MCP selection at registry lookup/start and live-server policy boundaries\n- preserves managed-hook, managed-MCP allowlist, strict-marketplace, and plugin provenance behavior\n- documents selective semantics, rollout compatibility, and control composition\n\n## Review fixes\n\nAddressed all automated review findings:\n\n- model scalar unions as non-empty tuples\n- make native watcher replacement transactional so failed replacement preserves the active watcher\n- reject same-ID MCP collection/definition swaps during async connection resolution\n\n## Validation\n\n- merged current `main` and resolved managed-settings changes from upstream\n- `npm run export-policy-data` (clean generated policy result; named policy remains boolean)\n- 271 targeted policy, account, prompt, hook, and MCP unit tests\n- 14 native managed-settings service tests, including legacy fallback and failed replacement\n- published policy-watcher 1.5.0 installed and built locally\n- policy-watcher Linux, macOS, and Windows Azure builds\n\nLocal `typecheck-client` after merging main is blocked by unavailable private SDK packages in this checkout; the pre-merge typecheck passed, and the fresh PR Compile \u0026 Hygiene job is the authoritative post-merge validation.",
+    "URL": "https://github.com/microsoft/vscode/pull/332071",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "digitarald",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "abb16775f3ac861fdc281f8c1ef5d4e744f6c84a",
+    "HeadRef": "digitarald/agents/rubber-duck-review-fix-8826",
+    "HeadSHA": "676d01c2252dab6d85ee418070eb1ba59f880761",
+    "CreatedAt": "2026-08-22T01:22:33Z",
+    "UpdatedAt": "2026-09-08T04:39:59Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Desktop startup and policy-definition registration with native managed settings",
+        "CriticalPath": "Policy configuration submits changed definitions through renderer/main-process IPC; native watcher creation and its initial callback must complete before the update resolves. The background initial native-settings read is otherwise not always on UI startup's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/policy/common/nativeManagedSettingsIpc.ts:94 NativeManagedSettingsChannelClient.updatePolicyDefinitions",
+            "Operation": "Send policy definitions from the workbench client to the main-process native managed-settings service and return current values.",
+            "Cardinality": "One IPC call per distinct submitted definition batch; unchanged policy definitions are filtered by PolicyConfiguration and equal aggregate definitions are skipped by the native service.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same definition updates crossed IPC and were awaited before this PR.",
+            "CriticalPathEffect": "The call is awaited before policy configuration/account policy refresh completes."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/policy/node/nativeManagedSettingsService.ts:134 updateWatcher",
+            "Operation": "Create/replace the @vscode/policy-watcher native watcher, which reads OS-managed policy storage and subscribes for changes.",
+            "Cardinality": "Normally one native watcher creation per distinct definition set. A legacy 1.4 addon can cause one rejected creation plus one compatibility retry; the declared runtime dependency is upgraded to 1.5, so normal installations remain one creation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One watcher was created per distinct definition set. The diff adds a bounded compatibility retry only when an older addon synchronously rejects scalar unions.",
+            "CriticalPathEffect": "Initial callback resolves the queued update; creation is awaited by the policy-definition update."
+          }
+        ],
+        "ScalingInput": "Number of registered managed-setting definitions (tens in normal use) and number of definition-change events during contribution registration; equality checks suppress unchanged replacements.",
+        "EffectiveConcurrency": "Definition updates cross IPC and are serialized by the native service Throttler; each replacement keeps only one active watcher and callbacks from superseded versions are ignored.",
+        "CacheBehavior": "The client memoizes initializationPromise and the service skips replacement when definitions are deeply equal. A changed definition rebuilds the watcher; there is no separate cold data cache. The pending initial callback list exists only during synchronous watcher creation and remains bounded by watcher initialization callbacks.",
+        "MechanismConfidence": "High confidence from the IPC client, equality guards, Throttler, and watcher replacement implementation.",
+        "MagnitudeUncertainty": "Exact native watcher creation cost and frequency of dynamic contribution registration vary by platform, but the changed work is bounded and serialized.",
+        "Verdict": "No reportable regression: normal 1.5 watcher creation cardinality is unchanged; the legacy fallback is a one-time bounded retry, and transactional replacement avoids leaked or concurrently active watchers."
+      },
+      {
+        "Scenario": "Managed-settings refresh and selective prompt/agent/skill/hook discovery",
+        "CriticalPath": "Server responses or managed-settings file changes are normalized, projected, and applied to configuration. Prompt filesystem discovery/parsing occurs later on demand after cache invalidation; selected blocked surfaces return before discovery.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/accounts/browser/managedSettings.ts:145 adaptManagedSettings (transitively fed by default-account network policy data)",
+            "Operation": "Fetch account managed_settings data before adaptManagedSettings normalizes it.",
+            "Cardinality": "One existing managed-settings response normalization per account policy refresh, independent of the number of selectors.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The server fetch and whole-response normalization already occurred; a non-boolean selective value was previously omitted rather than canonically serialized.",
+            "CriticalPathEffect": "Normalization is on the policy refresh path, but the diff adds one key deletion, validation of at most the selector array, and JSON serialization only for this setting."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/policy/common/fileManagedSettingsService.ts:72 refresh",
+            "Operation": "Watch and read managed-settings.json, parse it, and normalize settings.",
+            "Cardinality": "One read at startup and one coalesced read per burst of file-change events, capped at 1 MB.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same file read/JSON parse occurred. The diff performs bounded additional validation/serialization for one field.",
+            "CriticalPathEffect": "Initial service initialization waits for the first read; later refreshes run through the existing delayer."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts:507 areStandalonePromptFilesBlocked and discovery callers",
+            "Operation": "Resolve prompt source folders and read/parse prompt, skill, agent, or hook files.",
+            "Cardinality": "Cold discovery scales with allowed source folders and files; blocked selected surfaces perform zero discovery reads. Warm discovery is served by existing caches until relevant changes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "With no full boolean lockdown, allowed surfaces already performed the same discovery. Selective lockdown reduces work for named surfaces and leaves non-selected surfaces at the prior no-lockdown cost.",
+            "CriticalPathEffect": "On-demand prompt/agent listing awaits discovery for allowed surfaces; policy normalization itself does not await these reads."
+          }
+        ],
+        "ScalingInput": "Managed-settings object size (file capped at 1 MB), selector array size (canonical schema has four selectors), number of prompt source folders/files on an allowed surface, and number of policy refreshes.",
+        "EffectiveConcurrency": "File refreshes are coalesced by a 500 ms ThrottledDelayer. Prompt file parsing uses the existing discovery queue/Promise.all behavior; the selector checks add only bounded in-process scans.",
+        "CacheBehavior": "Prompt location and custom-agent caches are invalidated on a relevant configuration change. Cold access rediscovers allowed surfaces; warm access uses existing CachedPromise/location caches. Selected blocked surfaces short-circuit before filesystem work.",
+        "MechanismConfidence": "High confidence from normalization, file refresh coalescing, prompt cache invalidation, and early discovery gates.",
+        "MagnitudeUncertainty": "Enterprise prompt collections and refresh cadence vary, but the added selector processing is bounded by a four-value domain and does not multiply filesystem operations.",
+        "Verdict": "No reportable regression: the diff adds constant-size in-memory validation and can only remove filesystem discovery for selected surfaces; it does not add file or network calls."
+      },
+      {
+        "Scenario": "MCP collection visibility, connection resolution/start, and live policy tightening",
+        "CriticalPath": "A server start is sequenced per McpServer, may activate an extension, prompt for trust, read stored inputs/secrets, resolve variables, and prepare sandbox launch before creating the connection. The diff revalidates collection identity and policy after those awaits and before connection creation. Live policy changes synchronously recompute derived state and may dispose a running connection.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpServer.ts:777 start",
+            "Operation": "Activate extension-provided MCP registrations and wait for host delegate providers when required.",
+            "Cardinality": "At most once per not-yet-activated extension event before a server start; provider waits are grouped with Promise.all.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same extension activation/provider wait occurred before resolution.",
+            "CriticalPathEffect": "Must complete before connection resolution for extension-backed servers."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpRegistry.ts:465 _replaceVariablesInLaunch",
+            "Operation": "Read/update persisted MCP input and secret storage and resolve configuration variables.",
+            "Cardinality": "One existing input-map read and secret update per connection resolution that uses variable replacement, independent of collection count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same storage and variable-resolution work occurred.",
+            "CriticalPathEffect": "Awaited before sandbox preparation and connection creation."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpRegistry.ts:549 resolveConnection; src/vs/workbench/contrib/mcp/common/mcpServer.ts:797 start",
+            "Operation": "Prepare sandbox launch and ultimately create/start the MCP server connection.",
+            "Cardinality": "One preparation/start per server connection attempt, sequenced per server but potentially concurrent across distinct servers.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Sandbox preparation and connection creation were already on this path; the diff adds only an in-memory final collection lookup/check after preparation.",
+            "CriticalPathEffect": "Required for MCP tools to become available. The added identity/policy scan executes before connection creation and can prevent the subprocess when policy changed."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpServer.ts:569 policy autorun",
+            "Operation": "Dispose and stop a live MCP connection when current policy blocks or removes its collection.",
+            "Cardinality": "At most once for each running server affected by a policy transition; disposal is per live connection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The autorun and stop-on-policy-block mechanism already existed; the diff makes selective MCP lockdown participate through the existing observable collection filter.",
+            "CriticalPathEffect": "Runs on a policy-change path, not normal tool-call/render paths."
+          }
+        ],
+        "ScalingInput": "Number of registered MCP collections for lookup, definitions in the selected collection, simultaneously starting servers, and frequency of enterprise policy/configuration changes.",
+        "EffectiveConcurrency": "Starts for one server are serialized by _connectionSequencer; separate servers may resolve concurrently. Existing trust interaction coalesces participants, while the added final check is local and does not fan out boundaries.",
+        "CacheBehavior": "Lazy collections load only when needed and cached lazy collections are skipped by discovery. Existing stored variable/input maps and cached server metadata remain unchanged. Policy checks read current observable/config values without a new cache.",
+        "MechanismConfidence": "High confidence from McpServer.start sequencing, resolveConnection call flow, observable collection filtering, and the post-await checks.",
+        "MagnitudeUncertainty": "Very large installations may have more collections and concurrent server starts, but the added post-resolution work is one linear in-memory lookup plus membership/policy checks per start, dwarfed by existing awaited boundaries.",
+        "Verdict": "No reportable regression: no new subprocess, IPC, filesystem, or network operation is introduced. The extra O(collections) scan occurs once per connection resolution and prevents stale/blocked launches; policy tightening can reduce resource use by stopping affected servers."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 21 changed files and all diff pages. Traced startup/native watcher replacement, managed-settings normalization and prompt discovery, and MCP start/live-policy paths. No high-confidence diff-introduced performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-08T11:37:21.423204578Z",
+    "CompletedAt": "2026-09-08T11:38:56.328230536Z",
+    "WallClockMilliseconds": 94905,
+    "ModelCalls": 7,
+    "InputTokens": 305685,
+    "OutputTokens": 5951,
+    "TotalTokens": 311636,
+    "ReasoningTokens": 1632,
+    "CacheReadTokens": 231889,
+    "CacheWriteTokens": 73775,
+    "APIDurationMilliseconds": 75697,
+    "ToolCalls": 56,
+    "NanoAIUnits": 58073460000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 231889,
+      "cache_write": 73775,
+      "input": 21,
+      "output": 5951
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

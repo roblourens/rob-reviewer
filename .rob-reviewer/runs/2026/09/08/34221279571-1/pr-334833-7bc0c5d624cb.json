@@ -1,0 +1,219 @@
+{
+  "PullRequest": {
+    "Number": 334833,
+    "Title": "ci: Reduce test runner startup overhead",
+    "Body": "## Summary\r\n\r\n- skip redundant prelaunch synchronization in already-prepared Linux, macOS, and Windows test jobs\r\n- avoid compiling the Copilot extension in Browser smoke jobs, which do not register Chat or Agents Window suites\r\n- skip login-shell environment probing for deterministic Browser integration, Browser smoke, and Remote test servers\r\n- use Mocha's Dot console reporter for Browser unit tests while preserving full JUnit test results\r\n\r\n## Expected impact\r\n\r\nA focused Browser smoke run took 15.4 seconds with prelaunch synchronization and 12.2 seconds without it. Browser jobs start 17-18 test servers, projecting approximately 50-60 seconds saved per Browser job.\r\n\r\nSkipping Browser-only Copilot compilation removes another 5-8 seconds of unnecessary work. The Browser unit reporter benchmark reduced console output from 2,761 to 263 lines and from 177KB to 80KB for the same 2,700-test subset.\r\n\r\nThe workflow job matrix and test coverage are unchanged.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/334833",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "17c5935aa72fa5bfb3ea2c6f07c49280cc276a3c",
+    "HeadRef": "agents/ci-performance-optimization",
+    "HeadSHA": "7bc0c5d624cb0883fb813373a23aa7fc41544184",
+    "CreatedAt": "2026-09-06T22:24:27Z",
+    "UpdatedAt": "2026-09-08T03:14:04Z",
+    "MergedAt": null,
+    "Labels": [
+      "vscode-build",
+      "engineering"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "test/unit/browser/index.js",
+      "FixedSide": "RIGHT",
+      "FixedLine": 94,
+      "BasePath": "test/unit/browser/index.js",
+      "BaseLine": 94,
+      "IntroducingPath": "test/unit/browser/index.js",
+      "IntroducingCommit": "cf4e4c17544486f6442cb91eeb8f1acfc36d1339",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceCategory": "io",
+      "Mechanism": "The CI Browser unit runner attached Mocha's verbose Spec reporter in addition to the JUnit reporter, serializing and writing full suite/test descriptions to the captured console for every test result.",
+      "Symptom": "A representative 2,700-test Browser subset produced 2,761 console lines and 177 KB of captured output, adding unnecessary CI logging and ingestion work.",
+      "FixedBehavior": "Browser CI now emits compact dot progress to stdout while preserving the full JUnit artifact, reducing per-test console serialization and log ingestion volume.",
+      "Evidence": "The changed CI-only branch replaces Mocha's Spec console reporter at test/unit/browser/index.js:94 with Dot while leaving MochaJUnitReporter attached immediately below, so detailed test results remain in JUnit. The Browser unit workflows invoke this branch with --tfs. Spec serializes suite and test titles for each result; the PR's same-2,700-test comparison records 2,761 lines/177 KB before versus 263 lines/80 KB with Dot, directly tying the old reporter to repeated CI log output.",
+      "Confidence": 0.92
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "eager-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Browser integration and Browser smoke server startup on Linux, macOS, and Windows PR jobs",
+        "CriticalPath": "Each source server must start and print its endpoint before Playwright can navigate and the suite can begin. The removed prelaunch synchronization and Unix login-shell probe were therefore directly on every server-start critical path; none was deferred.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/integration/browser/src/index.ts:launchServer and test/automation/src/playwrightBrowser.ts:launchServer",
+            "Operation": "Launch the VS Code server process for each Browser integration section and Web smoke suite.",
+            "Cardinality": "One required server subprocess per section/suite; eight fixed integration launches plus one per registered Web smoke suite.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same required server subprocess count existed, but each source launcher inherited no global skip and entered preLaunch before starting.",
+            "CriticalPathEffect": "The browser waits for the server endpoint before navigation, so server startup is blocking."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "scripts/code-server.sh:code / scripts/code-server.bat and build/lib/preLaunch.ts:main",
+            "Operation": "Run node build/lib/preLaunch.ts, which checks dependencies/Electron/output and synchronizes all built-in extensions.",
+            "Cardinality": "Previously once per source server launch; now zero in these prepared PR jobs because VSCODE_SKIP_PRELAUNCH is job-wide.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every source code-server invocation ran preLaunch. Warm runs still performed filesystem reads across every configured built-in extension and rewrote the control file; cold/stale runs could additionally invoke npm/Electron work or marketplace/GitHub downloads.",
+            "CriticalPathEffect": "Previously blocked each server before its Node process could start; the diff removes it from the path."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/shell/node/shellEnv.ts:getResolvedShellEnv, reached from src/vs/server/node/extensionHostConnection.ts",
+            "Operation": "Spawn an interactive login shell to resolve the user environment.",
+            "Cardinality": "Previously once per fresh Linux/macOS server process because the promise cache is process-local; Windows already skipped it. Now zero for the changed deterministic test launchers.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The Browser server launchers omitted --force-disable-user-env, so Linux/macOS servers spawned a login shell before establishing the extension-host environment.",
+            "CriticalPathEffect": "The extension-host connection awaited resolution, with a configured default timeout of up to 10 seconds; the added server argument short-circuits it."
+          }
+        ],
+        "ScalingInput": "Eight sequential Browser integration sections plus one server launch for each registered Web smoke suite; cost scales with server launches (the PR benchmark describes 17-18 total starts per Browser job).",
+        "EffectiveConcurrency": "The integration shell script runs its eight sections serially. Smoke suites install a per-suite Application start/stop handler and Mocha runs them serially by default, so startup work is repeated rather than overlapped; there is no concurrency burst.",
+        "CacheBehavior": "Electron/version and built-in-extension state is already prepared by explicit workflow steps. The old prelaunch still re-entered filesystem/version/control-file checks for every source server, with network downloads possible only on a cold or stale built-in cache. Shell-environment caching is process-local, so each fresh server previously spawned its own login shell on Linux/macOS; the new flag bypasses it on both cold and warm starts.",
+        "MechanismConfidence": "High: workflow inheritance, both launch call paths, the preLaunch guard, eight sequential integration invocations, per-suite smoke lifecycle, and shellEnv's process-local cache/short-circuit were all traced.",
+        "MagnitudeUncertainty": "Exact savings vary with runner filesystem speed, shell startup files, and whether built-in extensions are warm; the removal and per-server multiplicity are explicit.",
+        "Verdict": "No reportable regression. The diff removes repeated blocking subprocess/filesystem work from already-prepared CI launches without increasing boundary cardinality."
+      },
+      {
+        "Scenario": "Remote integration tests using vscode-test-resolver",
+        "CriticalPath": "Each of the eight sequential remote integration sections launches Electron, resolves the test authority, starts one server, and waits for its listening port before that section can run. Server and shell-environment startup are on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/vscode-test-resolver/src/extension.ts:activate",
+            "Operation": "Spawn the resolver-owned VS Code server.",
+            "Cardinality": "One server subprocess per remote integration section, eight sequentially.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same server subprocess was started with the same data directory and connection setup, but without the new environment-disable argument.",
+            "CriticalPathEffect": "Authority resolution waits for 'Extension host agent listening' before the test can proceed."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/shell/node/shellEnv.ts:getResolvedShellEnv",
+            "Operation": "Spawn a Unix login shell for server-side environment resolution.",
+            "Cardinality": "Previously once for each Linux/macOS resolver server process; zero after the changed argument. Windows already short-circuited.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Each fresh resolver server could perform its own login-shell probe because caching did not cross process boundaries.",
+            "CriticalPathEffect": "Previously awaited during extension-host connection; now bypassed."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/vscode-test-resolver/src/extension.ts:activate",
+            "Operation": "Use or, in built mode only when absent, install the VS Code server under the resolver data folder.",
+            "Cardinality": "At most one installation on a cold missing built-server path, then reused; source PR jobs do not add this operation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical download/path selection and reuse semantics.",
+            "CriticalPathEffect": "Installation, when needed, blocks first authority resolution; it is unchanged by the diff."
+          }
+        ],
+        "ScalingInput": "Eight fixed remote extension-host test sections per OS workflow.",
+        "EffectiveConcurrency": "The remote integration scripts invoke sections serially and kill the app between sections. One resolver-owned server is launched per section; there is no parallel fan-out.",
+        "CacheBehavior": "TESTRESOLVER_DATA_FOLDER is reused within the script, but each Electron/server process has a fresh in-memory shell-environment cache. Source jobs use the already-built source server; built-server mode uses VSCODE_REMOTE_SERVER_PATH or downloads only when absent, behavior unchanged by this diff.",
+        "MechanismConfidence": "High: the remote scripts enumerate eight serial app launches, each resolver spawns a server, and the added argument reaches the explicit shellEnv short-circuit.",
+        "MagnitudeUncertainty": "Shell startup duration depends on runner dotfiles; Windows receives no speedup because the implementation already skips there.",
+        "Verdict": "No reportable regression. Required server cardinality is unchanged and the only runtime behavioral addition removes one process-local shell probe per Unix server."
+      },
+      {
+        "Scenario": "Browser smoke workflow preparation and Copilot extension compilation",
+        "CriticalPath": "Workflow steps execute serially, so the Copilot npm compile previously had to finish before Browser smoke could start. The changed condition removes it only when browser_tests is true.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": ".github/workflows/pr-linux-test.yml:Compile Copilot Chat extension for smoke tests (and Darwin/Windows equivalents)",
+            "Operation": "Run npm run compile in extensions/copilot, invoking its compiler/build pipeline.",
+            "Cardinality": "Previously once in every smoke-enabled job, including each of the three Browser jobs; now omitted for Browser jobs and retained for Electron/Remote smoke configurations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "inputs.smoke_tests alone enabled the compile, even though Web smoke registration excludes all Copilot-dependent suites.",
+            "CriticalPathEffect": "Previously serialized before smoke startup; now absent from Browser job latency."
+          }
+        ],
+        "ScalingInput": "One Copilot compile step per Browser workflow on each of three operating systems; compiler cost scales with the Copilot extension source graph, not test count.",
+        "EffectiveConcurrency": "One workflow step per OS job; no coalescing or overlap with smoke execution.",
+        "CacheBehavior": "There is no within-job result cache around this explicit compile step. Root dependencies and transpiled client/extensions are prepared earlier. Browser smoke excludes Chat, Chat Sandbox, Chat Sessions, Chat Model Configuration, Agents Window, and other non-Web-only suites via opts.web guards, so the skipped artifact has no first-use fallback on this path.",
+        "MechanismConfidence": "High: workflow conditions and smoke suite registration guards were directly inspected.",
+        "MagnitudeUncertainty": "Compile duration varies with runner and filesystem cache; dependency on the skipped output is conclusively absent from currently registered Web suites.",
+        "Verdict": "No reportable regression. This is bounded eager-work removal, and non-Browser jobs that register Copilot suites still compile it."
+      },
+      {
+        "Scenario": "Browser unit-test result reporting in CI",
+        "CriticalPath": "Mocha invokes the console and JUnit reporters synchronously as each test completes; captured stdout and final JUnit generation are part of runner/job completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "test/unit/browser/index.js:withReporter",
+            "Operation": "Format test progress for the captured CI console.",
+            "Cardinality": "One reporter event stream per Browser runner with output proportional to test results; Spec emitted full hierarchy/title text while Dot emits compact progress.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The CI --tfs branch attached Spec plus MochaJUnitReporter. The diff replaces only Spec with Dot.",
+            "CriticalPathEffect": "Reporter formatting/writes occur during test execution; changing reporters reduces synchronous output volume without delaying artifact availability."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "test/unit/browser/index.js:withReporter",
+            "Operation": "Write the detailed Mocha JUnit XML result artifact.",
+            "Cardinality": "One XML report per platform/architecture/browser/test label.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same MochaJUnitReporter and output path were used.",
+            "CriticalPathEffect": "Remains part of result reporting and preserves detailed diagnostics."
+          }
+        ],
+        "ScalingInput": "Approximately 2,700 Browser tests in the cited subset, with console work growing per emitted test result and suite transition.",
+        "EffectiveConcurrency": "Each OS Browser job runs one configured browser runner; reporter callbacks serialize on the Mocha event stream.",
+        "CacheBehavior": "Reporting has no result cache. The compact console stream is regenerated every run; the detailed JUnit artifact remains unchanged and is written once for the runner.",
+        "MechanismConfidence": "High: the reporter branch is selected by --tfs in every Browser unit workflow, and the detailed JUnit reporter is unchanged. The old mechanism was recorded as an internal regression fix after blame identified its introducing commit.",
+        "MagnitudeUncertainty": "Wall-clock savings depend on CI log transport; the same-test comparison establishes a reduction from 2,761 to 263 console lines and 177 KB to 80 KB.",
+        "Verdict": "No reportable regression. The change reduces per-test console serialization while preserving the full machine-readable report."
+      }
+    ],
+    "Summary": "Completed the performance pass across all seven changed files and their workflow callers, launchers, server environment resolution, smoke-suite registration, and reporters. No diff-introduced performance regression met the reporting threshold. The Browser reporter change was recorded as a concrete regression fix; other changes remove redundant startup, shell, and compile work but lacked the required introducing-regression evidence for additional fix records."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-08T11:46:07.783320314Z",
+    "CompletedAt": "2026-09-08T11:48:57.103851744Z",
+    "WallClockMilliseconds": 169320,
+    "ModelCalls": 10,
+    "InputTokens": 412339,
+    "OutputTokens": 8772,
+    "TotalTokens": 421111,
+    "ReasoningTokens": 3855,
+    "CacheReadTokens": 343951,
+    "CacheWriteTokens": 68358,
+    "APIDurationMilliseconds": 145074,
+    "ToolCalls": 67,
+    "NanoAIUnits": 65493040000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 343951,
+      "cache_write": 68358,
+      "input": 30,
+      "output": 8772
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
