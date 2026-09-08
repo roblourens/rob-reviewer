@@ -1,0 +1,410 @@
+{
+  "PullRequest": {
+    "Number": 330529,
+    "Title": "agentHost: add session and chat rename tools",
+    "Body": "Fixes #329380\n\nAdds Agent Host server-side tools for renaming a session and an individual chat.\n\n- Adds `rename_session` and `rename_chat` with target validation, live state propagation, persistence, and provider-neutral display.\n- Tracks title provenance so provisional/generated, agent-authored, and user-authored titles remain distinguishable. Tool calls themselves are authoritative, allowing explicit later rename requests to replace existing titles.\n- Adds an experimental active-agent naming flow. It defaults off on Stable and on for non-Stable builds, synchronizes live for newly created sessions/chats, and retains utility-model title generation when disabled.\n- Gives new conversations a readable provisional title and instructs the active agent to gather context, then rename before its first final response.\n- Dynamically filters server tools per newly materialized provider session across Copilot, Claude, and Codex.\n- Preserves complete agent-supplied titles while retaining concise 1–4 word guidance.\n\nValidation:\n- `npm run compile-client`\n- `npm run hygiene`\n- `npm run typecheck-client`\n- `npm run valid-layers-check`\n- Targeted Agent Host title, service, protocol, provider, and server-tool tests\n- Coverage tests for dynamic advertisement/disabled execution and end-to-end rename propagation/persistence",
+    "URL": "https://github.com/microsoft/vscode/pull/330529",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3f5e862837114d8f7475471e0e765a5f658a78f1",
+    "HeadRef": "agents/agent-host-session-chat-renaming",
+    "HeadSHA": "c022559c68e8846c60fc37c67732ad52e6d8de2a",
+    "CreatedAt": "2026-08-12T19:55:17Z",
+    "UpdatedAt": "2026-08-17T21:30:04Z",
+    "MergedAt": "2026-08-13T06:33:30Z",
+    "Labels": [
+      "on-testplan"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-455073BB7F77",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts",
+      "Side": "RIGHT",
+      "Line": 174,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The synchronous call path, ordering before eligibility, and unbounded Array.from/slice/join allocations are explicit. Prompt prevalence affects severity, not the mechanism.",
+      "PerformanceCategory": "gc",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "Per-code-point JavaScript array entries, copied arrays/strings, and synchronous CPU work",
+      "PerformanceScaling": "The temporary allocation and traversal grow linearly with the full user-prompt length on every ChatTurnStarted, even though at most 40 or 200 code points can become a title and most turns are rejected as no longer eligible only afterward.",
+      "PerformanceOutcome": "Large pasted prompts create avoidable CPU and GC pressure and can pause synchronous turn dispatch before provider work starts.",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "The previous normalization collapsed whitespace and used string slice(0, 200); it did not allocate an array element for every code point. There was also no active-mode helper that slices and rejoins the entire suffix.",
+      "ChangedBehavior": "Normalization now calls Array.from over the entire normalized prompt before taking the bounded prefix. Active mode additionally creates `characters.slice(40).join('')` and may convert the crossing word again. seedTitleFromFirstMessage is called for every user turn and performs this work before checking `_canSeedFirstMessageTitle`.",
+      "CausalDiffEvidence": "The changed return expression at line 174 replaces the bounded string slice with `Array.from(...).slice(...)`; the newly added active helper similarly materializes the whole prompt and suffix before the eligibility check later in seedTitleFromFirstMessage.",
+      "Title": "Check title eligibility before materializing the whole prompt",
+      "Impact": "A multi-megabyte pasted log or generated prompt can produce a multi-megabyte array of per-code-point strings plus copied suffixes on the event-loop path, increasing turn-start latency and GC pauses.",
+      "Evidence": "AgentSideEffects.handleAction calls seedTitleFromFirstMessage synchronously for every ChatTurnStarted. In that method fallbackTitle is normalized before state and turn-count eligibility are checked, so a long prompt on an already-titled conversation still incurs the full new allocation.",
+      "Recommendation": "Move the state/turn eligibility check ahead of normalization, then collect code points with a bounded iterator that stops after the title cap (and only scans enough to finish the crossing word) instead of materializing the full prompt."
+    },
+    {
+      "ID": "PERF-7561AC60CCB9",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotPluginConverters.ts",
+      "Side": "RIGHT",
+      "Line": 438,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The always-provided callback and unconditional serialization path are directly visible; only the exact prompt-size distribution is uncertain.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "A full JSON string copy of each Copilot UserPromptSubmittedHookInput plus serialization CPU",
+      "PerformanceScaling": "Cost grows linearly with prompt bytes and repeats for every Copilot turn, including sessions with no UserPromptSubmit plugin commands and turns with no rename instruction.",
+      "PerformanceOutcome": "Every Copilot prompt pays additional CPU, allocation/GC, and awaited hook latency before model processing.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Without configured UserPromptSubmit commands, no onUserPromptSubmitted handler was installed and the prompt input was not JSON.stringify'd by this converter.",
+      "ChangedBehavior": "The broadened condition installs the handler whenever the internal callback exists. CopilotSessionLauncher now always supplies that callback, so the handler unconditionally JSON.stringify's input before iterating an empty command list, even when handleUserPromptSubmitted returns undefined.",
+      "CausalDiffEvidence": "The changed condition at line 438 adds `|| editTrackingHooks?.onUserPromptSubmitted`; the launcher always passes this callback, making the unchanged `const stdin = JSON.stringify(input)` newly reachable for ordinary prompts.",
+      "Title": "Skip prompt serialization when no plugin hook consumes it",
+      "Impact": "Long prompts are copied and serialized on every Copilot turn for no consumer, increasing prompt-submit latency and transient heap usage.",
+      "Evidence": "CopilotSessionLauncher supplies onUserPromptSubmitted for every launched session. In the handler, serialization occurs before `for (const cmd of promptCommands ?? [])`, while the callback only joins optional host instructions and commonly returns undefined after rename or when active naming is disabled.",
+      "Recommendation": "Only create `stdin` inside a `promptCommands?.length` branch, then invoke the internal additional-context callback separately without serializing the SDK input."
+    },
+    {
+      "ID": "PERF-2003155A41A9",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/shared/sessionServerTools.ts",
+      "Side": "RIGHT",
+      "Line": 825,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The unconditional added call, the reminder's current-session usage, and the full listSessions call path are directly traced. Exact duration varies by provider/cache state, but the O(S) boundary fan-out and its placement on tool completion are certain.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Registry SQLite queries, per-session provider SDK/IPC lookups, filesystem existence checks, and per-session metadata queries",
+      "PerformanceScaling": "Each current-session rename scales with the total registered session history S, issuing one global registry read plus concurrent provider and metadata work for each of the S sessions instead of O(1) work for the current session.",
+      "PerformanceOutcome": "The rename tool response and therefore the first active-agent response are delayed, while large histories cause a burst of SDK and filesystem/database work.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, first-turn title handling did not invoke a full session listing; catalog enumeration occurred only in tools/workflows that actually needed a catalog.",
+      "ChangedBehavior": "Every rename_session invocation now awaits accessor.listSessions() before resolving the target, including the normal reminder-driven call where session is omitted and currentSession already identifies the target. rename_chat repeats the same pattern for the current peer chat.",
+      "CausalDiffEvidence": "The added line `const sessions = await accessor.listSessions();` runs unconditionally in applyRenameSessionTool before getRenameSessionArgs can take its currentSession branch; the analogous added call is present in applyRenameChatTool.",
+      "Title": "Avoid listing every session to rename the current one",
+      "Impact": "With tens or hundreds of stored Copilot/Claude/Codex sessions, the automatic rename requested during a new session's first response waits for unrelated sessions' SDK and disk metadata. The Promise.all loops also issue those per-session operations as a concurrency burst.",
+      "Evidence": "AgentService.listSessions first reads the global session registry, then Promise.all-maps every registered session through provider getChatMetadata and default-chat provider-data reads, and then Promise.all-maps the resulting catalog through tryOpenDatabase/getMetadataObject. SessionDataService.tryOpenDatabase itself performs a filesystem exists check. Thus the ordinary current-target rename introduced here fans out across the entire stored history.",
+      "Recommendation": "Resolve omitted/current targets from the current channel and live session state through a targeted accessor; only enumerate the catalog when an explicit cross-session target must be validated. If project-title normalization needs metadata, expose a targeted current-session metadata lookup rather than listing all sessions."
+    },
+    {
+      "ID": "PERF-3F00B654518C",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts",
+      "Side": "RIGHT",
+      "Line": 213,
+      "Severity": "low",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The exact call sequence and duplicate key writes are explicit in the controller. They are off the immediate send await chain, so severity is low, but the I/O amplification is certain.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "SQLite INSERT OR REPLACE operations and database references",
+      "PerformanceScaling": "The added writes scale with every automatic fallback/generated title phase and peer chat: a normal utility-generated title now causes four metadata writes across fallback and final application instead of the previous single final-title write; provisional flows add still more.",
+      "PerformanceOutcome": "Excessive serialized SQLite I/O increases background load and lengthens session idle/deletion drains.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Applying an in-memory fallback did not write metadata; once utility generation completed, only the final title was persisted once.",
+      "ChangedBehavior": "Each `_applySeedTitle` now persists the auto source immediately, while the subsequent active `markTitleAuto` or utility completion `_persistAutoTitle` persists that same source again alongside the title. Each call opens/acquires a database reference and queues a separate setMetadata write.",
+      "CausalDiffEvidence": "The added `_persistAutoTitleSource` call at line 213 (and its session branch counterpart) writes provenance during in-memory application, duplicating the source write already added in `_persistAutoTitle`.",
+      "Title": "Persist automatic title provenance only once",
+      "Impact": "Creating/titling many sessions or peer chats generates multiple redundant disk writes per title and can delay cleanup that waits for SessionDatabase.whenIdle.",
+      "Evidence": "For utility mode, seedTitleFromFirstMessage applies the fallback (one source write), then generated-title apply writes source again and its persist callback writes title plus source, totaling four INSERTs versus the old one. SessionDatabase now globally sequences metadata writes, and dispose/eviction waits for pending database work.",
+      "Recommendation": "Keep `_applySeedTitle` in-memory-only and persist title plus source once at the durable persistence point, preferably through the new atomic setMetadataValues helper."
+    },
+    {
+      "ID": "PERF-EF39572439FF",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentSideEffects.ts",
+      "Side": "RIGHT",
+      "Line": 2033,
+      "Severity": "low",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The awaited critical path and both boundary operations are directly traced, and the in-memory auto provenance is set before this call. Storage latency magnitude varies, hence low severity.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Filesystem existence checks and SQLite metadata reads",
+      "PerformanceScaling": "At least one stat/query pair is added for every newly auto-titled session or peer chat, and it repeats once per sent turn until a rename succeeds because persisted `auto` provenance is not cached as a resolved state.",
+      "PerformanceOutcome": "Cold or contended storage delays checkpointing, provider dispatch, and time to first model response.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Turn dispatch proceeded from attachment resolution to checkpoint capture and provider send without reading title provenance from disk.",
+      "ChangedBehavior": "Every active-naming send now awaits prepareInstructionForAgent. That method reads persisted provenance before consulting the already-populated `_autoTitles` set; for restored auto titles it also does not cache the `auto` result, so subsequent turns repeat the lookup until renamed.",
+      "CausalDiffEvidence": "The added awaited call at line 2033 places title-provenance resolution directly on `_sendTurnMessage`'s critical path before captureTurnStartCheckpoint and agent.chats.sendMessage.",
+      "Title": "Use cached title provenance before reading the session database",
+      "Impact": "Every new active-agent conversation waits for local filesystem and database boundaries before its first request can reach Copilot, Claude, or Codex; failures to rename repeat the delay on later turns.",
+      "Evidence": "prepareInstructionForAgent calls `_readPersistedTitleSource` first, and SessionDataService.tryOpenDatabase performs `_fileService.exists` before the controller issues getMetadata. New-session seeding has already called markTitleAuto, so the disk lookup is provably unnecessary for that common first send.",
+      "Recommendation": "Return the reminder directly when `_autoTitles` contains the key. For restored sessions, cache the persisted user/agent/auto source after the first read (or hydrate provenance during restore) so later turns do not hit disk."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "serialization-allocation",
+      "repeated-work",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Send the first or a later user message in a session/peer chat with active-agent title generation enabled",
+        "CriticalPath": "ChatTurnStarted synchronously calls seedTitleFromFirstMessage before asynchronous turn dispatch. `_sendTurnMessage` then resolves working directories/model/attachments, awaits title provenance, captures the turn-start checkpoint, and finally calls the provider send. The newly awaited provenance read and Copilot hook serialization are on this path; fire-and-forget title writes and disabled-mode utility title generation are off the direct send path, though writes can contend with/checkpoint or cleanup database work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sessionDataService.ts:104, called from agentHostSessionTitleController.ts:792 and agentSideEffects.ts:2033",
+            "Operation": "Check whether the per-session SQLite file exists before opening a reference",
+            "Cardinality": "One check per active-naming send until title state is marked renamed; at least one for every newly auto-titled session/chat under the changed path",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No title-provenance filesystem check occurred on turn dispatch",
+            "CriticalPathEffect": "Awaited before checkpoint capture and provider send, so it delays model dispatch"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:799",
+            "Operation": "SELECT one title-source metadata key",
+            "Cardinality": "One query following each successful tryOpenDatabase until renamed; repeats for persisted auto titles",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No title-source query occurred on the message-send path",
+            "CriticalPathEffect": "Awaited before checkpoint capture and provider send"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:210-229",
+            "Operation": "Persist automatic title/source metadata with separate INSERT OR REPLACE calls",
+            "Cardinality": "Utility mode performs four writes for fallback/final title where the old final-title path performed one; active mode performs three writes for its fallback",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Fallback application did not persist; final utility title persisted once",
+            "CriticalPathEffect": "Fire-and-forget, so not directly awaited by send, but it consumes SQLite work and is included in idle/deletion drains"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostCheckpointService.ts via AgentSideEffects._sendTurnMessage",
+            "Operation": "Capture a turn-start checkpoint",
+            "Cardinality": "One per sent turn",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same checkpoint boundary existed before the PR",
+            "CriticalPathEffect": "Awaited before provider send"
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:2893, claude/claudeAgent.ts:2223, codex/codexAgent.ts:4444",
+            "Operation": "Submit the prompt/turn to the selected provider SDK/runtime",
+            "Cardinality": "One provider request per turn; host instructions add bounded context but no additional provider call",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One provider send already occurred; the PR only adds transient context",
+            "CriticalPathEffect": "Authoritative model-processing boundary after host preparation"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts title utility generation path",
+            "Operation": "Generate a title with the Copilot utility model when active-agent naming is disabled",
+            "Cardinality": "At most one small-model call per title-generation key after coalescing/cancellation",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same utility call existed; active-agent mode now skips it",
+            "CriticalPathEffect": "Scheduled off the initial send critical path"
+          }
+        ],
+        "ScalingInput": "Raw prompt code-point/byte length N on every turn; number of turns before a successful rename R; one target session/chat per send. The title cap is only 40/200, but current conversion work remains O(N).",
+        "EffectiveConcurrency": "Title normalization is synchronous on the agent-host event loop. Provenance filesystem/SQLite reads are awaited serially before checkpoint/send. Automatic title writes are queued fire-and-forget but SessionDatabase now serializes metadata writes globally. Provider dispatch remains one SDK request per turn.",
+        "CacheBehavior": "The live `_autoTitles` set already identifies newly seeded automatic titles, but the code reads disk before consulting it. User/agent provenance is cached in `_renamedTitles` after the first read; persisted `auto` provenance is not cached, so reads repeat until rename. Warm database references do not avoid `tryOpenDatabase`'s filesystem existence check.",
+        "MechanismConfidence": "High: the ordering, per-turn call sites, full-prompt allocations, filesystem stat, SQLite query, and provider-send placement are explicit.",
+        "MagnitudeUncertainty": "Prompt sizes and local storage latency vary, and active naming defaults off on Stable, but long pasted prompts are realistic and non-Stable defaults enable the disk-read path. Exact milliseconds are uncertain; the synchronous allocation and awaited boundaries are not.",
+        "Verdict": "Reportable regressions: whole-prompt allocation occurs before eligibility on every turn, Copilot serializes every prompt after the always-installed callback, and active sends await avoidable provenance I/O. Duplicate title writes independently amplify SQLite work."
+      },
+      {
+        "Scenario": "Agent calls rename_session for the current session or rename_chat inside the current peer chat",
+        "CriticalPath": "The server-tool dispatcher enters applyRenameSessionTool/applyRenameChatTool, unconditionally awaits AgentService.listSessions, resolves/normalizes the target, then persists title and source in a SQLite transaction before publishing live state and returning the tool result. The full catalog listing and rename transaction both must finish before the agent can continue/finalize.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostDatabase.ts:196 via AgentService.listSessions",
+            "Operation": "Read the complete global session registry",
+            "Cardinality": "One registry query per rename invocation",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Current-session title handling did not enumerate the global registry",
+            "CriticalPathEffect": "Blocks target resolution and tool completion"
+          },
+          {
+            "Kind": "IPC/other",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:1295-1312",
+            "Operation": "Fetch provider metadata for each registered session, including provider SDK lookups and default-chat provider-data reads",
+            "Cardinality": "Up to one provider metadata lookup plus provider-data read for each of S registered sessions, issued concurrently",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No provider-catalog fan-out was on a current rename path",
+            "CriticalPathEffect": "The slowest unrelated session/provider lookup gates Promise.all and rename completion"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:1326 and sessionDataService.ts:104",
+            "Operation": "Check for each session's metadata database",
+            "Cardinality": "Up to S filesystem existence checks per rename",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No per-history filesystem scan was required to rename the current target",
+            "CriticalPathEffect": "All checks must settle before title resolution"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:1342",
+            "Operation": "Read batched metadata overlay keys for every session",
+            "Cardinality": "Up to S SQLite SELECTs per rename after existence checks",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No per-history metadata read was required for current target rename",
+            "CriticalPathEffect": "All queries gate listSessions and tool completion"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:1027-1057 and shared/persistSessionMetadata.ts:52",
+            "Operation": "Persist title and source atomically",
+            "Cardinality": "One transaction containing two INSERT OR REPLACE statements per successful rename",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The rename server tools and their authoritative transaction did not exist",
+            "CriticalPathEffect": "Intentionally awaited before live state publication and tool completion"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_peerChatExists",
+            "Operation": "Read persisted peer-chat catalog when the target chat is not materialized",
+            "Cardinality": "At most one catalog read per unloaded-chat rename, serving the whole owning session rather than per chat",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No rename_chat existence check existed",
+            "CriticalPathEffect": "Awaited before the rename transaction"
+          }
+        ],
+        "ScalingInput": "Total registered top-level sessions S across all providers; explicit current-target calls normally need one session/chat. For rename_chat, peer catalog size C matters only if the chat is not live and existence falls back to persisted catalog lookup.",
+        "EffectiveConcurrency": "AgentService uses Promise.all over all registered sessions for provider metadata and again for per-session overlays, producing up to O(S) concurrent provider/filesystem/database operations. The final two title writes are serialized inside one SQLite transaction.",
+        "CacheBehavior": "The global registry is queried each call. Live state is overlaid only after provider and persisted metadata have already been fetched. Per-session `tryOpenDatabase` always performs an existence check; there is no catalog result cache/coalescing for repeated rename calls.",
+        "MechanismConfidence": "High: the unconditional listSessions call and its two O(S) Promise.all stages are directly traced; currentSession/currentChannel already identify the normal target.",
+        "MagnitudeUncertainty": "The number of stored sessions and provider SDK cost vary. Warm SDK/database state may reduce duration, but every call still scales with S and issues the per-session existence/metadata work.",
+        "Verdict": "Reportable boundary fan-out: current-target renames perform global O(S) catalog work and a concurrency burst that can delay the first active-agent response."
+      },
+      {
+        "Scenario": "Create, fork, import, restore, or provisionally title a session/chat while utility-model naming is disabled or enabled",
+        "CriticalPath": "Title fallback application is synchronous. Utility-model generation when active naming is disabled is delayed/coalesced and off the initial send path; active mode skips that network call. Metadata persistence is fire-and-forget, except authoritative agent rename transactions. Fork/create provider metadata stores may await their own writes before materialization completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:_generateTitleSoon",
+            "Operation": "Copilot utility-model title generation",
+            "Cardinality": "At most one active call per session/chat key after cancellation; skipped entirely in active-agent mode",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One coalesced utility request existed; the PR removes it in active mode",
+            "CriticalPathEffect": "Off initial message dispatch and therefore not blocking first provider send"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:210-229",
+            "Operation": "Persist fallback/generated title provenance and title",
+            "Cardinality": "Multiple separate writes per phase; four on an ordinary utility fallback/final sequence instead of one prior final-title write",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only durable title values were written, once at the prior persistence point",
+            "CriticalPathEffect": "Background for automatic titles, but cleanup waits for completion and writes contend on the session database"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeSessionMetadataStore.ts:90-121, codex/codexSessionMetadataStore.ts:96-135, copilot/copilotAgent.ts:4067-4113",
+            "Operation": "Persist provider overlay fields during materialization/fork/adoption",
+            "Cardinality": "Bounded batches of up to about 6 Claude/Codex or 10 Copilot keys per affected session",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same SQL operations existed, though this PR changes their sequencing from per-key to global",
+            "CriticalPathEffect": "Some create/fork/materialize paths await these batches; Codex materialized-session persistence is fire-and-forget"
+          }
+        ],
+        "ScalingInput": "Number of newly titled sessions/chats T and automatic title phases per target; provider overlay field count is bounded (roughly 1-10 keys), while imported conversation context is separately capped by existing title-context limits.",
+        "EffectiveConcurrency": "Automatic title metadata writes are now globally serialized per SessionDatabase. Utility title generation remains one coalesced/cancellable request per title key. Provider overlay callers use Promise.all, although the changed global metadata sequencer serializes their writes.",
+        "CacheBehavior": "Generation cancellation and last-applied title maps coalesce utility calls; new auto/renamed sets are cleared on session eviction/disposal. No unbounded retained-state issue remains because clearSession and dispose clear all keys.",
+        "MechanismConfidence": "High for redundant title I/O and bounded lifecycle cleanup; insufficient evidence that global metadata sequencing alone materially changes native SQLite throughput, so no separate finding was filed for that sequencing change.",
+        "MagnitudeUncertainty": "Automatic-title creation frequency is usually low, and provider metadata batches are bounded. The redundant write count is exact, but user-visible contention depends on storage speed and concurrent session activity.",
+        "Verdict": "One low-severity reportable I/O amplification from duplicate provenance persistence. Active mode's removal of a utility-model request is a performance improvement, not a regression-fix signal with sufficient shipped-regression evidence."
+      },
+      {
+        "Scenario": "Advertise/execute server tools across provider session materialization and later configuration changes",
+        "CriticalPath": "At materialization, AgentServerToolHost filters definitions according to the root setting and providers project the resulting tool definitions into their SDK sessions. During execution, the host validates against the session's advertised tools before dispatch.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Small bounded number of tool groups/definitions; repeated tool executions per turn may recompute filtered toolNames arrays, but cardinality is currently bounded by the server-tool registry.",
+        "EffectiveConcurrency": "Synchronous filtering/allocation; no new subprocess, filesystem, database, IPC, or network boundary is added by advertisement itself. Provider SDK launch/registration boundaries already existed.",
+        "CacheBehavior": "Definitions are no longer cached globally because newly materialized sessions must observe current configuration; each materialized session stores its advertised snapshot in state. Existing sessions retain that snapshot.",
+        "MechanismConfidence": "High that advertisement is bounded and boundary-free; low evidence of material regression from the small synchronous array allocations.",
+        "MagnitudeUncertainty": "Tool-call counts can be high, but the filtered collection is small and no evidence establishes user-visible cost from getter recomputation, so it was not reported.",
+        "Verdict": "No additional reportable performance regression beyond the prompt-hook serialization that the provider projection enables."
+      },
+      {
+        "Scenario": "Dispose a session or evict an idle materialized session",
+        "CriticalPath": "Disposal now clears title-controller state and awaits SessionDatabase.whenIdle before deleting session data; idle eviction likewise awaits database idle, rechecks subscribers/active turn, clears title state, removes state, and releases provider memory. Destructive disposal then performs existing filesystem/session/provider/worktree cleanup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:2838-2847 and 3157",
+            "Operation": "Drain pending per-session database writes",
+            "Cardinality": "One drain per explicit disposal or idle eviction, waiting on W pending writes",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Cleanup did not explicitly await this per-session drain at these points",
+            "CriticalPathEffect": "Blocks destructive deletion; for idle eviction it delays releasing provider/state memory but is off active user-turn progress"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:2829 via SessionDataService.deleteSessionData",
+            "Operation": "Delete the per-session data directory",
+            "Cardinality": "One recursive deletion per explicit session disposal",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same filesystem deletion already occurred",
+            "CriticalPathEffect": "Part of explicit disposal completion"
+          },
+          {
+            "Kind": "subprocess/filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts worktree removal after session data deletion",
+            "Operation": "Remove an isolated session worktree when present",
+            "Cardinality": "At most one worktree cleanup per disposed worktree session",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same worktree cleanup already occurred",
+            "CriticalPathEffect": "Part of explicit disposal completion"
+          }
+        ],
+        "ScalingInput": "Pending write count W for the one session, number of peer chats C cleared from controller sets, and any existing worktree/filesystem size. Redundant title writes increase W by a small bounded amount per automatic title phase.",
+        "EffectiveConcurrency": "whenIdle waits for all tracked writes; metadata writes are globally sequenced, while other tracked writes may proceed according to their own sequencers. Idle eviction is asynchronous and revalidates state after the wait.",
+        "CacheBehavior": "All title-generation cancellation sources and title-state sets are deleted for the session and its C chats. No unbounded retention was found. Durable data is retained for idle eviction and deleted for explicit disposal.",
+        "MechanismConfidence": "High that title state is released and no leak remains. The wait can delay cleanup, but the correctness-preserving ordering and bounded scope do not by themselves establish a reportable regression.",
+        "MagnitudeUncertainty": "Pending write latency and worktree size vary. The new drain is intentional for persistence/cleanup ordering and bounded to one session; no independent cleanup performance bug was reported.",
+        "Verdict": "No standalone cleanup-lifecycle finding; the duplicate title writes are reported because they unnecessarily enlarge the newly awaited drain."
+      }
+    ],
+    "Summary": "Reviewed all 37 changed files and traced title seeding, active-agent instruction delivery across Copilot/Claude/Codex, rename-tool execution, metadata persistence, dynamic tool advertisement, and disposal/idle eviction. Reported five diff-caused performance regressions: O(history) session enumeration for current-target renames, whole-prompt code-point allocations before eligibility checks, unconditional Copilot prompt serialization, critical-path title-provenance disk reads despite in-memory state, and duplicate automatic-title metadata writes."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-08T15:25:28.117746841Z",
+    "CompletedAt": "2026-09-08T15:32:15.492983718Z",
+    "WallClockMilliseconds": 407375,
+    "ModelCalls": 14,
+    "InputTokens": 1336983,
+    "OutputTokens": 21539,
+    "TotalTokens": 1358522,
+    "ReasoningTokens": 10912,
+    "CacheReadTokens": 1204744,
+    "CacheWriteTokens": 132197,
+    "APIDurationMilliseconds": 393870,
+    "ToolCalls": 108,
+    "NanoAIUnits": 157383060000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1204744,
+      "cache_write": 132197,
+      "input": 42,
+      "output": 21539
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
