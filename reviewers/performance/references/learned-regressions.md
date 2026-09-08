@@ -26,3 +26,8 @@ Count effective subprocess, IPC, filesystem, database, and network operations af
 ## Repeated work revealed by shipped fixes
 
 When a fix removes repeated work, reconstruct the pre-fix multiplicity explicitly. Check whether the introducing diff placed collection-wide work inside an incremental, per-item, per-event, or per-frame path, including work hidden behind helpers.
+
+<!-- learned-family:serialization-allocation -->
+## Serialization and allocation revealed by shipped fixes
+
+Check whether changed telemetry, logging, protocol, or storage paths sanitize, clone, encode, or buffer unbounded data before a downstream cap. Bound work before allocation and transformation whenever only a prefix can be consumed.
