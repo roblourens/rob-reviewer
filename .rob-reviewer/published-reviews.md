@@ -2,6 +2,27 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#333196 — chat: add customization migration assessment telemetry](https://github.com/microsoft/vscode/pull/333196)
+
+- Published comments: **1**
+- Head: `cd4d9a1f199af5462d0e97190012a87f28eca618`
+- Completed: `2026-09-08T11:50:47Z`
+- Run: [34221279571 attempt 1](runs/2026/09/08/34221279571-1/run.md)
+
+### `src/vs/sessions/services/sessions/browser/sessionsService.ts:939`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+Startup restore now queues a full customization migration assessment for every restored session. Although each enqueue receives the restore cancellation token, queued and running factories discard it once admitted by the limiter.
+
+If the user opens a session while startup is restoring several persisted sessions—especially while agent/customization state is cold—all stale restore assessments continue in the background. They consume filesystem/extension-provider I/O and MCP assessment CPU after the restore was abandoned, contending with the newly opened session and prolonging post-navigation activity.
+
+**Suggested fix:** Recheck the restore token inside the limiter factory and pass it to `reportCustomizationMigrationTelemetry`; make the MCP assessment wait cancellation-aware as well so already-running work releases its scope promptly. This preserves the concurrency limit and telemetry for restores that remain active while dropping only superseded work.
+
+(Written by Copilot)
+
 ## [#334369 — Add MCP customization migration](https://github.com/microsoft/vscode/pull/334369)
 
 - Published comments: **1**
