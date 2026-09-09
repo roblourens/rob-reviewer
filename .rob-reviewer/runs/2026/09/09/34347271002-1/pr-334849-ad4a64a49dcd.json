@@ -1,0 +1,196 @@
+{
+  "PullRequest": {
+    "Number": 334849,
+    "Title": "agentHost: honor SSH ProxyJump when connecting",
+    "Body": "Fixes #317445\r\n\r\n## Problem\r\n\r\nAgent Host resolves effective OpenSSH configuration with `ssh -G`, but did not carry `ProxyJump` into the `ssh2` connection. A host reachable only through its configured jump host was therefore dialed directly from the Agents window and failed with `ENOTFOUND` or `EHOSTUNREACH`, while native OpenSSH and Remote SSH succeeded against the same config.\r\n\r\n## Change\r\n\r\nPreserve the resolved `ProxyJump` value through initial and reconnect configuration. For a single jump host, start native OpenSSH with `BatchMode=yes` and `-W`, pass its standard streams to `ssh2` through `ConnectConfig.sock`, and stop the owned helper when the SSH connection closes. The destination is passed after `--` so a config-derived value can never be read as an `ssh` option.\r\n\r\nThe jump alias, not a pre-resolved hostname, is handed to OpenSSH, so the jump host's own `HostName`, `User`, `Port` and `IdentityFile` still apply. Final-host authentication, host-key verification, Agent Host bootstrap and WebSocket handling are untouched.\r\n\r\nSingle-hop only. Comma-separated chains, `ProxyCommand`, interactive jump-host authentication, askpass IPC and `HostKeyAlias` behavior are unchanged, and there are no dependency, build or pipeline changes.\r\n\r\n## Validation\r\n\r\n- `npm run compile-client`, `typecheck-client`, `valid-layers-check`, full `eslint`, and hygiene on the changed files — all clean\r\n- Focused `vs/platform/agentHost/test/{common,node}` suite — 5245 passing. Unpatched `main` control runs the same suite at 5237 passing with the same two pre-existing `CopilotAgent` failures, so those are unrelated to this change.\r\n- Live built Code OSS A/B, captured on commit `dca870d` (base `7b763e653ee2`), using disposable profiles, real key-authenticated jump and target SSH servers, and the actual Agent Host WebSocket relay:\r\n  - Native OpenSSH reached `proxyjump-target.invalid:2222` through the configured jump host.\r\n  - Unpatched `main` used the same Agents UI action, dialed the target directly, failed with `getaddrinfo ENOTFOUND`, and never contacted the jump or target servers.\r\n  - Patched Code OSS contacted the jump, forwarded to the target, authenticated, launched the real Agent Host, and completed the SSH-forwarded WebSocket connection.\r\n  - A direct-host control completed the same Agent Host flow without starting a jump helper.\r\n  - All owned helper and Agent Host processes exited after the UI closed.\r\n- The `--` terminator was added after that run, so this revision is not byte-identical to the Electron-tested one and the Electron harness was not re-run. It is covered separately: against OpenSSH 9.5p2, `ssh -o BatchMode=yes -W target.invalid:22 -V` prints the version and exits 0, while the same command with `-- -V` treats it as a hostname and exits 255; ordinary `host` and `user@host` destinations are unaffected. A unit regression asserts `--` is always immediately before the destination, and it fails without the production change.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/334849",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "kondv",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b4e90b1a76bcb6e9b07adbee522d75a7fa4a5b1d",
+    "HeadRef": "dev/kondv/agent-host-ssh-proxy-config",
+    "HeadSHA": "ad4a64a49dcdfc2e5572d2b207ca99c3a195ca77",
+    "CreatedAt": "2026-09-07T05:17:03Z",
+    "UpdatedAt": "2026-09-09T03:55:15Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "concurrency-burst",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "User connects from the Agents UI to a configured direct SSH host without ProxyJump.",
+        "CriticalPath": "The renderer resolves the alias, stages the configuration, and waits for the main-process connection. Existing `ssh -G` resolution, ssh2 network handshake, remote platform probes, CLI installation check, endpoint discovery, and relay setup remain on the critical path; the new proxy transport returns immediately without spawning anything.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/remoteAgentHost/browser/remoteAgentHostActions.ts:connectToConfiguredSSHHost",
+            "Operation": "Renderer-to-main calls to resolve SSH configuration and establish the connection.",
+            "Cardinality": "One resolve request and one staged connection request per coalesced user connect.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC sequence existed before the diff.",
+            "CriticalPathEffect": "Both must complete before the UI receives a usable connection."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:resolveSSHConfig",
+            "Operation": "Run `ssh -G \u003calias\u003e` to resolve effective OpenSSH configuration.",
+            "Cardinality": "One process per fresh configured-host resolution; no cache, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one-per-resolution subprocess ran before the diff.",
+            "CriticalPathEffect": "Configuration resolution blocks dialing."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:connect/_connectSSH",
+            "Operation": "ssh2 connects directly to the target and performs existing remote exec/relay setup.",
+            "Cardinality": "One SSH transport per fresh logical host connection, followed by a bounded sequence of existing remote commands on that transport.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Direct hosts used the same ssh2 transport and bootstrap sequence.",
+            "CriticalPathEffect": "Handshake and bootstrap must complete before the host is usable."
+          }
+        ],
+        "ScalingInput": "One logical host connection. Repeated clicks/retry requests for the same normalized address are coalesced by `RemoteAgentHostService._pendingConnects`; active connections are keyed and reused.",
+        "EffectiveConcurrency": "At most one in-flight dial per normalized address through the browser service. Different hosts can connect independently, as before.",
+        "CacheBehavior": "Resolved SSH config is not cached and `ssh -G` runs for each fresh connect/reconnect, unchanged by the diff. The active main-process `_connections` map reuses an established SSH client; relay-only reconnects reuse that client.",
+        "MechanismConfidence": "High: the new guard requires both `sshConfigHost` and `proxyJump`, so direct configurations do not call `cp.spawn`.",
+        "MagnitudeUncertainty": "Remote bootstrap duration varies by target and whether the CLI is already installed, but the diff adds no work on this path.",
+        "Verdict": "No performance regression: direct-host execution and boundary cardinality are unchanged apart from carrying one optional string."
+      },
+      {
+        "Scenario": "User establishes a fresh Agent Host connection to a target whose resolved SSH config contains one ProxyJump.",
+        "CriticalPath": "After the existing `ssh -G` resolution and auth-attempt preparation, the main process starts one native OpenSSH `ssh -W` helper. Its spawn and jump-host/target forwarding are on the handshake critical path, and the existing ssh2 handshake plus remote bootstrap run over the helper's stdio.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:resolveSSHConfig",
+            "Operation": "Run `ssh -G \u003ctarget alias\u003e` to obtain the resolved target, identity, and ProxyJump settings.",
+            "Cardinality": "One subprocess per fresh configured-host resolution.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same resolution subprocess ran, but its ProxyJump value was discarded.",
+            "CriticalPathEffect": "Must finish before the ProxyJump transport can be constructed."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:_createProxyTransport",
+            "Operation": "Start native OpenSSH with `BatchMode=yes -W target:port -- jump` and use its stdin/stdout as ssh2's socket.",
+            "Cardinality": "Exactly one long-lived helper per fresh coalesced SSH session with a supported single-hop ProxyJump.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No helper was started; ssh2 attempted a direct target connection, so ProxyJump-only targets failed instead of establishing a session.",
+            "CriticalPathEffect": "The process must spawn and establish forwarding before ssh2 can complete its handshake; it remains the session transport afterward."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:_createProxyTransport/_connectSSH",
+            "Operation": "Open the jump-host SSH connection and forward one byte stream to the resolved target; ssh2 then authenticates to the target over that stream.",
+            "Cardinality": "One jump connection and one forwarded target stream per fresh logical session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The target was dialed directly and the supported ProxyJump-only scenario could not progress.",
+            "CriticalPathEffect": "Adds the required network hop to make progress for hosts that are not directly reachable."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:connect",
+            "Operation": "Run the existing target-side platform probes, CLI check/install, endpoint discovery, liveness filtering, and relay setup over the established SSH client.",
+            "Cardinality": "The same bounded bootstrap sequence per fresh session; endpoint checks scale with discovered endpoint count as before.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same operations followed successful direct SSH handshakes; ProxyJump-only hosts previously never reached them.",
+            "CriticalPathEffect": "Existing bootstrap remains on the connection critical path after the tunnel succeeds."
+          }
+        ],
+        "ScalingInput": "One helper and one forwarded transport per fresh, effectively deduplicated host connection, not per authentication attempt, endpoint, message, or remote command.",
+        "EffectiveConcurrency": "Same-address connect requests are coalesced before reaching the factory. Connections to distinct configured hosts can each own one helper concurrently, matching independent user sessions.",
+        "CacheBehavior": "There is no transport cache across fully closed SSH sessions. While connected, the main `_connections` map retains and reuses the single SSH client/helper; reconnecting only the WebSocket relay does not spawn another helper. Stderr retention is capped at 4096 characters and keeps only the tail.",
+        "MechanismConfidence": "High: the changed guard, single `cp.spawn`, assignment to `ConnectConfig.sock`, same-address coalescing, and active-connection reuse directly establish cardinality and lifetime.",
+        "MagnitudeUncertainty": "OpenSSH startup and extra-hop latency depend on host configuration and network topology. This is intentional, restricted to ProxyJump-configured hosts, and replaces a failed direct dial rather than slowing a previously successful supported path.",
+        "Verdict": "No reportable regression. The added subprocess and network hop are necessary to enable the requested scenario, remain one-per-session, and are not multiplied by auth attempts, endpoint count, or protocol messages."
+      },
+      {
+        "Scenario": "Automatic or user-initiated reconnect and teardown of a ProxyJump-backed Agent Host.",
+        "CriticalPath": "Every reconnect first performs the pre-existing `ssh -G`. If the main service still owns the SSH client, `connect(..., replaceRelay=true)` replaces only the relay and reuses the existing proxy helper. If the SSH session has closed, a fresh coalesced dial creates one new helper. Teardown destroys streams immediately; process-tree termination is fire-and-forget and off the reconnect/UI critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:reconnect/resolveSSHConfig",
+            "Operation": "Run `ssh -G` during reconnect configuration resolution.",
+            "Cardinality": "One per reconnect invocation that reaches the main service; duplicate same-address dials are coalesced at the browser layer.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Reconnect already resolved SSH config with one subprocess.",
+            "CriticalPathEffect": "Blocks deciding whether to reuse or establish the connection, as before."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:_createProxyTransport",
+            "Operation": "Create a new `ssh -W` helper only when no active SSH connection exists.",
+            "Cardinality": "Zero for warm relay-only reconnect; one for a cold/fresh reconnect attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Cold reconnect attempted direct ssh2 networking and warm relay reconnect reused the existing direct SSH client.",
+            "CriticalPathEffect": "Cold reconnect waits for helper spawn and forwarding; warm relay reconnect does not."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:_createProxyTransport dispose",
+            "Operation": "Terminate the owned OpenSSH helper process tree when its ssh2 client closes or connection setup fails.",
+            "Cardinality": "At most one kill operation for each still-running owned helper due to the `disposed` guard; none when the helper has already exited.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no native proxy helper requiring process cleanup.",
+            "CriticalPathEffect": "Stream destruction is synchronous, while `killTree` is intentionally not awaited and therefore does not block connection close or retry progress."
+          }
+        ],
+        "ScalingInput": "One active helper per live SSH session and at most one in-flight reconnect per normalized address. Failed fresh handshakes are bounded by the existing 30-second handshake deadline (or interactive timeout while a prompt is open).",
+        "EffectiveConcurrency": "The browser service joins duplicate reconnect requests through `_pendingConnects`; retries for one address are sequential. Different addresses may reconnect concurrently and each can own one helper.",
+        "CacheBehavior": "The active connection map is the warm-session cache: relay reconnection preserves the SSH client and proxy helper. A cold reconnect resolves config again and creates a fresh helper. Diagnostic stderr remains capped; no history accumulates across sessions.",
+        "MechanismConfidence": "High for normal connect, retry, and disposal paths: coalescing and connection reuse are explicit, and helper disposal is idempotent and registered on socket/client failure and close.",
+        "MagnitudeUncertainty": "OS process-tree termination cost varies by platform, but it is once per still-running helper and off the critical path. Parent shutdown behavior outside normal connection disposal was not directly exercised in repository tests, though normal close/error ownership is explicit.",
+        "Verdict": "No performance finding: warm reconnect avoids repeated helper creation, cold retries are coalesced and bounded, and helper lifetime plus diagnostic memory are explicitly capped."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and all diff pages. Traced initial direct connections, fresh ProxyJump sessions, reconnect reuse/retry behavior, subprocess/network cardinality, stderr retention, and helper cleanup. The only new expensive work is one required OpenSSH forwarding helper per supported ProxyJump session plus bounded asynchronous cleanup; no actionable diff-introduced performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-09T11:50:49.572090333Z",
+    "CompletedAt": "2026-09-09T11:52:29.114728511Z",
+    "WallClockMilliseconds": 99542,
+    "ModelCalls": 8,
+    "InputTokens": 264091,
+    "OutputTokens": 6202,
+    "TotalTokens": 270293,
+    "ReasoningTokens": 2329,
+    "CacheReadTokens": 205824,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 72869,
+    "ToolCalls": 36,
+    "NanoAIUnits": 43943760000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 205824,
+      "cache_write": 0,
+      "input": 58267,
+      "output": 6202
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
