@@ -1,0 +1,211 @@
+{
+  "PullRequest": {
+    "Number": 335259,
+    "Title": "agentHost: change default settings for Codex harness",
+    "Body": "Enable the Agent Host Codex provider by default in VS Code Insiders while keeping it disabled by default in VS Code Stable.\n\nAlso prefer the Agent Host Codex implementation in regular editor windows by default in Insiders. Both settings retain their existing startup experiment hooks so Stable can be rolled out progressively later.\n\nValidation:\n- npm run hygiene\n- npm run eslint -- src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts\n- npm run eslint -- src/vs/workbench/contrib/chat/browser/chat.shared.contribution.ts\n- pre-commit hygiene\n- git diff --check\n\nnpm run compile was also attempted. It is currently blocked in this worktree by missing electron/original-fs dependencies and unrelated existing Copilot SDK type mismatches; neither changed configuration contribution reports a compile error.",
+    "URL": "https://github.com/microsoft/vscode/pull/335259",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "Giuspepe",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "25623c7ee8265f8acc657a503436e425393cd5c8",
+    "HeadRef": "agents/enable-codex-harness-vscode-insiders",
+    "HeadSHA": "3c57460a5e57b3fa4a8788d8c73c0a81204600e0",
+    "CreatedAt": "2026-09-09T13:45:43Z",
+    "UpdatedAt": "2026-09-09T22:28:57Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-F84CA9A04BD5",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts",
+      "Side": "RIGHT",
+      "Line": 295,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The setting-to-env-to-registration call path and unconditional constructor microtask are explicit. The warm-cache guard bounds the trigger rather than making it speculative; exact wall-clock cost varies by machine and account state, which is reflected in medium severity.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "A native Codex app-server subprocess, proxy resources, temporary-directory filesystem operations, and account-probe IPC/network work",
+      "PerformanceScaling": "The added cost occurs once per agent-host process lifetime for every eligible Insiders window/remote host with AI enabled and a warm Codex SDK cache, including users who never open Codex; concurrent editor starts each repeat it in their own host.",
+      "PerformanceOutcome": "Increased startup CPU, memory, filesystem I/O, and process contention, with the probe allowed to run for up to 30 seconds.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "With the default false, ordinary Insiders startup did not register Codex unless the user or an experiment explicitly enabled it, so constructing the provider and its startup account probe were absent for default users.",
+      "ChangedBehavior": "The new non-Stable default is forwarded by the starter, causes agentHostMain to instantiate CodexAgent during agent-host prewarm, and the constructor immediately queues _probeAccountAtStartup.",
+      "CausalDiffEvidence": "RIGHT line 295 changes the provider setting from default false to product.quality !== 'stable'; this is the gate consumed by the starter and registration path that newly constructs CodexAgent for default Insiders users.",
+      "Title": "Defer the Codex account probe until Codex is used",
+      "Impact": "On an Insiders startup where AI features are enabled and the Codex SDK is already cached, BlockRestore prewarming now launches a native Codex process even if the user never selects Codex. _probeAccountAtStartup resolves the SDK, creates proxy/temp resources, spawns the binary, performs the initialize/account handshake (and signed-in account metadata requests), then tears it down, potentially contending with editor restoration for up to the 30-second timeout.",
+      "Evidence": "AgentHostPrewarmContribution runs at WorkbenchPhase.BlockRestore and calls startAgentHost. ElectronAgentHostStarter forwards AgentHostCodexAgentEnabledSettingId; agentHostMain registers new CodexAgent when true. CodexAgent's constructor queueMicrotask-calls _probeAccountAtStartup, which on a warm SDK invokes _startRawConnection with CODEX_STARTUP_ACCOUNT_PROBE_TIMEOUT_MS=30_000. _startRawConnection creates a sandbox temp directory and calls child_process.spawn for the native Codex app-server before the account handshake and cleanup.",
+      "Recommendation": "Keep the provider/routing defaults if desired, but make registration passive: do not run _probeAccountAtStartup merely because the provider is enabled. Trigger the one-off account probe lazily when a Codex account surface or Codex session is first requested, and coalesce that first-use probe with persistent connection startup."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "VS Code Insiders startup/prewarm with AI enabled, locally or on a remote agent host",
+        "CriticalPath": "At WorkbenchPhase.BlockRestore, AgentHostPrewarmContribution starts the agent host. Editor restoration does not await the Codex probe, but the newly constructed provider queues it immediately, so it runs concurrently with startup and first Codex use waits for it through _startupAccountProbe.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/electron-main/electronAgentHostStarter.ts:start and src/vs/platform/agentHost/node/nodeAgentHostStarter.ts:start",
+            "Operation": "Start the agent-host utility/Node child process",
+            "Cardinality": "One per agent-host manager lifecycle, shared by connected windows where applicable",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The agent host already started under the same enablement/prewarm conditions.",
+            "CriticalPathEffect": "Required for agent-host readiness and already initiated during BlockRestore prewarm"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentSdkDownloader.ts:isSdkResolvableWithoutDownload and src/vs/platform/agentHost/node/codex/codexAgent.ts:_startRawConnection",
+            "Operation": "Check the Codex SDK cache sentinel, resolve the binary, create and later recursively remove a sandbox temp directory",
+            "Cardinality": "One cache check per provider construction; one temp-directory lifecycle when warm",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Default users did not construct CodexAgent, so these Codex-specific startup operations were absent.",
+            "CriticalPathEffect": "Runs off the editor-restore await chain but contends with startup; first Codex use waits for completion"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_probeAccountAtStartup/_startRawConnection",
+            "Operation": "Spawn and initialize a one-off native Codex app-server, then terminate it after probing the account",
+            "Cardinality": "One per warm-cache agent-host lifecycle, even with zero Codex sessions",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The false default prevented Codex provider construction and no native Codex startup probe ran.",
+            "CriticalPathEffect": "Not awaited by editor restoration, but consumes CPU/memory during BlockRestore and can delay first Codex work for up to 30 seconds"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_startRawConnection/_probeAccountAtStartup",
+            "Operation": "Codex JSON-RPC initialize and account metadata requests over child stdio",
+            "Cardinality": "One initialize/account sequence per warm startup probe, with additional rate-limit/profile requests for a signed-in ChatGPT account",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Codex child IPC for default users at startup.",
+            "CriticalPathEffect": "Runs with the startup probe; first Codex action is sequenced behind it"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_probeAccountAtStartup/authenticate",
+            "Operation": "Fetch signed-in account rate-limit/profile metadata and resolve Codex/Copilot provider metadata when credentials are forwarded",
+            "Cardinality": "Account-dependent, normally bounded to the startup/authentication sequence rather than per item",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Codex was not registered for default users, so it did not participate in startup account probing or authentication fan-out.",
+            "CriticalPathEffect": "Mostly concurrent with startup; account/profile display and authentication completion wait on the relevant requests"
+          }
+        ],
+        "ScalingInput": "One probe per agent-host process lifetime; separate local/remote hosts and concurrent VS Code instances each repeat it. The realistic trigger is a supported host with a completed Codex SDK cache or development override.",
+        "EffectiveConcurrency": "The existing agent-host process is one-per-manager and its start is coalesced. The added native Codex app-server runs concurrently with workbench restoration, is sequenced as the single startup account probe within that provider, and has a 30-second timeout.",
+        "CacheBehavior": "A cold SDK cache performs one .complete sentinel filesystem check and skips the native probe without downloading. A warm cache or dev override resolves the SDK and launches the probe on every new agent-host lifetime; there is no cross-process cache/coalescing of the probe itself.",
+        "MechanismConfidence": "High: the changed setting is forwarded directly to the host registration gate, and CodexAgent unconditionally queues the warm-cache startup probe from its constructor.",
+        "MagnitudeUncertainty": "Exact duration and external network activity depend on cache warmth, account state, platform, and SDK startup time; the extra process/filesystem mechanism and BlockRestore reachability are certain.",
+        "Verdict": "Reportable medium eager-startup regression: making the provider default-on also makes an otherwise unused native account probe default-on."
+      },
+      {
+        "Scenario": "Opening or resuming a Codex session from the regular Insiders workbench",
+        "CriticalPath": "The changed preference hides the extension-host Codex contribution and surfaces the agent-host provider. Session creation/restoration activates Codex, ensures the persistent app-server connection, then network model/turn work must complete before useful progress.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentSdkDownloader.ts and src/vs/platform/agentHost/node/codex/codexAgent.ts",
+            "Operation": "Resolve/read the SDK cache and Codex session/configuration data",
+            "Cardinality": "One SDK resolution per connection plus session-dependent reads, with cache reuse",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The regular window routed Codex to the OpenAI extension by default; the agent-host filesystem path was opt-in.",
+            "CriticalPathEffect": "SDK availability and required session reads precede app-server/session readiness"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentSdkDownloader.ts and src/vs/platform/agentHost/node/codex/codexAgent.ts",
+            "Operation": "Optionally download the SDK, enumerate models/accounts, and execute Codex turns",
+            "Cardinality": "At most one deduplicated cold SDK download per package/cache key, coalesced model refreshes, and expected per-turn service requests",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Equivalent Codex functionality was supplied by the OpenAI extension route; the diff changes ownership but does not establish greater request cardinality or cost for an actively chosen Codex session.",
+            "CriticalPathEffect": "First-use download/initialization and per-turn service calls block their respective workflow progress"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_ensureConnection/_startConnection",
+            "Operation": "Run the persistent native Codex app-server",
+            "Cardinality": "One retained process per active agent-host provider, shared across its Codex sessions",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The default extension implementation owned the Codex execution path; repository evidence does not prove the new selected-session path is more expensive.",
+            "CriticalPathEffect": "Initialization precedes session materialization and turns"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts and src/vs/platform/agentHost/electron-browser/localAgentHostService.ts",
+            "Operation": "Exchange Codex JSON-RPC messages over child stdio and agent-host protocol messages with the renderer",
+            "Cardinality": "Bounded protocol operations per session/turn, with one shared host connection",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The OpenAI extension used its own implementation boundary; no evidence shows increased fan-out.",
+            "CriticalPathEffect": "Required for session and turn progress"
+          }
+        ],
+        "ScalingInput": "Per selected Codex session/turn, with one persistent Codex app-server shared by sessions in an agent-host process; model refreshes are coalesced and gated by activity.",
+        "EffectiveConcurrency": "One persistent app-server connection is shared; connection creation and model refresh use sequencers/coalescing, while session lifecycle is sequenced per chat.",
+        "CacheBehavior": "A cold SDK requires explicit consent/first-use download and concurrent downloads for the same package are deduplicated. A warm SDK starts directly; model refresh promises coalesce and periodic refresh only follows provider activity.",
+        "MechanismConfidence": "High that routing changes; low that active-session performance worsens because the old implementation's equivalent costs are not shown to be smaller.",
+        "MagnitudeUncertainty": "The extension implementation's exact process and request profile was not changed here, so relative active-session cost cannot be established from this diff.",
+        "Verdict": "No additional finding: changing the preferred Codex implementation is intentional behavior, and no higher call cardinality, concurrency, or retained-state cost is proven for users who select Codex."
+      },
+      {
+        "Scenario": "Stable builds and generated enterprise policy metadata",
+        "CriticalPath": "Stable keeps both runtime setting defaults false. The policy JSON change is build/distribution metadata and performs no editor runtime work by itself.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One static policy entry at build/package time; no runtime collection or event multiplicity.",
+        "EffectiveConcurrency": "No changed runtime scheduling or concurrency.",
+        "CacheBehavior": "No runtime cache behavior is affected by the policy artifact. Stable's product-quality condition leaves the provider and editor preference disabled unless explicitly configured or overridden.",
+        "MechanismConfidence": "High from the product.quality !== 'stable' guards and static JSON artifact.",
+        "MagnitudeUncertainty": "None material for runtime performance; policy deployment semantics may change feature enablement administratively, but the JSON edit itself has no execution path.",
+        "Verdict": "No performance finding: documentation/comment and generated policy-default changes add no independent runtime work in Stable."
+      }
+    ],
+    "Summary": "Completed the performance pass across all five changed files. One medium eager-work regression was reported for default-on Codex registration causing a warm-cache native account probe during Insiders startup; editor routing and policy metadata had no separately provable performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-09T23:20:31.20267419Z",
+    "CompletedAt": "2026-09-09T23:23:15.382740362Z",
+    "WallClockMilliseconds": 164180,
+    "ModelCalls": 12,
+    "InputTokens": 659406,
+    "OutputTokens": 9106,
+    "TotalTokens": 668512,
+    "ReasoningTokens": 2901,
+    "CacheReadTokens": 560053,
+    "CacheWriteTokens": 99317,
+    "APIDurationMilliseconds": 146898,
+    "ToolCalls": 81,
+    "NanoAIUnits": 90287020000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 560053,
+      "cache_write": 99317,
+      "input": 36,
+      "output": 9106
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
