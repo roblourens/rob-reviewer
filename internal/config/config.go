@@ -18,7 +18,6 @@ const (
 	DefaultStatePath       = ".rob-reviewer/state.json"
 	DefaultMaxPerRun       = 5
 	DefaultMaxPerDay       = 25
-	DefaultQuietMinutes    = 5
 	DefaultScanHours       = 168
 	DefaultMaxPendingHours = 24
 	DefaultMaxFindings     = 10
@@ -44,7 +43,6 @@ type TargetConfig struct {
 type PollConfig struct {
 	MaxPerRun       int `yaml:"maxPerRun"`
 	MaxPerDay       int `yaml:"maxPerDay"`
-	QuietMinutes    int `yaml:"quietPeriodMinutes"`
 	ScanWindowHours int `yaml:"scanWindowHours"`
 	MaxPendingHours int `yaml:"maxPendingAgeHours"`
 }
@@ -101,7 +99,6 @@ func Decode(reader io.Reader) (Config, error) {
 		Poll: PollConfig{
 			MaxPerRun:       DefaultMaxPerRun,
 			MaxPerDay:       DefaultMaxPerDay,
-			QuietMinutes:    DefaultQuietMinutes,
 			ScanWindowHours: DefaultScanHours,
 			MaxPendingHours: DefaultMaxPendingHours,
 		},
@@ -148,14 +145,11 @@ func (cfg Config) Validate() error {
 	if cfg.Poll.MaxPerDay < cfg.Poll.MaxPerRun {
 		validationErrors = append(validationErrors, errors.New("poll.maxPerDay must be at least poll.maxPerRun"))
 	}
-	if cfg.Poll.QuietMinutes < 1 {
-		validationErrors = append(validationErrors, errors.New("poll.quietPeriodMinutes must be at least 1"))
+	if cfg.Poll.ScanWindowHours < 1 {
+		validationErrors = append(validationErrors, errors.New("poll.scanWindowHours must be at least 1"))
 	}
-	if cfg.Poll.ScanWindowHours < 1 || cfg.Poll.ScanWindowHours*60 < cfg.Poll.QuietMinutes {
-		validationErrors = append(validationErrors, errors.New("poll.scanWindowHours must cover the quiet period"))
-	}
-	if cfg.Poll.MaxPendingHours < 1 || cfg.Poll.MaxPendingHours*60 < cfg.Poll.QuietMinutes {
-		validationErrors = append(validationErrors, errors.New("poll.maxPendingAgeHours must cover the quiet period"))
+	if cfg.Poll.MaxPendingHours < 1 {
+		validationErrors = append(validationErrors, errors.New("poll.maxPendingAgeHours must be at least 1"))
 	}
 	seenSkipLabels := make(map[string]struct{}, len(cfg.Automation.SkipLabels))
 	for _, label := range cfg.Automation.SkipLabels {

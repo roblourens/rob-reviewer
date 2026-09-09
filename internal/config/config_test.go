@@ -26,7 +26,6 @@ review:
 		t.Fatalf("maxPerRun = %d, want %d", cfg.Poll.MaxPerRun, DefaultMaxPerRun)
 	}
 	if cfg.Poll.MaxPerDay != DefaultMaxPerDay ||
-		cfg.Poll.QuietMinutes != DefaultQuietMinutes ||
 		cfg.Poll.ScanWindowHours != DefaultScanHours ||
 		cfg.Poll.MaxPendingHours != DefaultMaxPendingHours {
 		t.Fatalf("poll defaults = %+v", cfg.Poll)
@@ -83,8 +82,7 @@ target:
 poll:
   maxPerRun: 5
   maxPerDay: 4
-  quietPeriodMinutes: 61
-  scanWindowHours: 1
+  scanWindowHours: 0
   maxPendingAgeHours: 0
 automation:
   skipLabels:

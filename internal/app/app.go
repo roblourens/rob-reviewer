@@ -143,7 +143,6 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 			Repo:          app.config.Target.Repo,
 			MaxPerRun:     app.config.Poll.MaxPerRun,
 			MaxPerDay:     app.config.Poll.MaxPerDay,
-			QuietPeriod:   time.Duration(app.config.Poll.QuietMinutes) * time.Minute,
 			ScanWindow:    time.Duration(app.config.Poll.ScanWindowHours) * time.Hour,
 			MaxPendingAge: time.Duration(app.config.Poll.MaxPendingHours) * time.Hour,
 			SkipLabels:    slices.Clone(app.config.Automation.SkipLabels),

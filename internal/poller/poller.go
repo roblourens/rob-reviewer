@@ -34,7 +34,6 @@ type Options struct {
 	Repo          string
 	MaxPerRun     int
 	MaxPerDay     int
-	QuietPeriod   time.Duration
 	ScanWindow    time.Duration
 	MaxPendingAge time.Duration
 	SkipLabels    []string
@@ -280,9 +279,6 @@ func (poller *Poller) observe(current *state.State, pull review.PullRequest, now
 			tracked.PendingHeadSHA = pull.HeadSHA
 			tracked.PendingSince = now
 		}
-		if now.Sub(tracked.PendingSince) < poller.options.QuietPeriod {
-			appendUnique(&result.Deferred, pull.Number)
-		}
 	}
 	current.PullRequests[pull.Number] = tracked
 }
@@ -299,9 +295,7 @@ func (poller *Poller) readyCandidates(current state.State, now time.Time) []cand
 			tracked.Draft || !strings.EqualFold(tracked.State, "open") {
 			continue
 		}
-		if now.Sub(tracked.PendingSince) >= poller.options.QuietPeriod {
-			result = append(result, candidate{number: number, pendingSince: tracked.PendingSince})
-		}
+		result = append(result, candidate{number: number, pendingSince: tracked.PendingSince})
 	}
 	slices.SortFunc(result, func(left, right candidate) int {
 		if compared := left.pendingSince.Compare(right.pendingSince); compared != 0 {

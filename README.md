@@ -10,7 +10,7 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 - The first enabled poll records every current open team PR and its current head without reviewing that backlog.
 - Only PRs whose GitHub `author_association` is `MEMBER` or `OWNER` are eligible. Outside collaborators, contributors, bots, and other non-team authors are skipped.
 - The poller detects newly opened PRs and drafts becoming ready by scanning recently updated PRs.
-- Every unreviewed PR waits through a five-minute quiet period. Another push before its first review resets the clock, so rapid update bursts produce one review of the stable head.
+- Newly eligible PRs are reviewed in the same poll, subject to the per-run and per-day caps.
 - Each PR is reviewed at most once. Later pushes, rebases, and reopenings do not trigger another review. Persistent PR-level completion state prevents repeat analysis, and an authenticated GitHub review marker independently prevents repeat publication.
 - `publication.mode: approval` writes JSON and Markdown reports for human selection. `publication.mode: automatic` publishes every validated finding after the report is durable. The checked-in mode is `automatic`.
 - Automatic publication requires the PR to remain open, non-draft, unsuppressed, team-authored, and on the reviewed base/head at the final GitHub refresh. Explicitly approved saved reports may still be published to a closed or merged PR when the reviewed head matches.
@@ -52,7 +52,6 @@ target:
 poll:
   maxPerRun: 5
   maxPerDay: 25
-  quietPeriodMinutes: 5
   scanWindowHours: 168
   maxPendingAgeHours: 24
 automation:
@@ -159,7 +158,7 @@ The model, PR text, and mutable state ledger cannot authorize arbitrary instruct
 
 The checked-in configuration enables automatic analysis and publication. The two Actions secrets must be configured and the `ROB_REVIEWER_ENABLED` repository variable must be `true` for scheduled runs.
 
-The first enabled run bootstraps state and reviews no existing non-draft backlog. Later runs analyze new stable heads, write reports, and publish host-validated findings automatically.
+The first enabled run bootstraps state and reviews no existing non-draft backlog. Later runs analyze newly eligible PRs immediately, write reports, and publish host-validated findings automatically.
 
 To return to analysis-only operation, change `publication.mode` to `approval`.
 

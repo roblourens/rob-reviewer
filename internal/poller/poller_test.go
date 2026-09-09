@@ -58,7 +58,6 @@ func testOptions(now *time.Time) Options {
 		Repo:          "vscode",
 		MaxPerRun:     5,
 		MaxPerDay:     25,
-		QuietPeriod:   5 * time.Minute,
 		ScanWindow:    7 * 24 * time.Hour,
 		MaxPendingAge: 24 * time.Hour,
 		SkipLabels:    []string{"performance-reviewer:skip"},
@@ -179,7 +178,7 @@ func TestRunBootstrapsOpenHeadsWithoutReviewingBacklog(t *testing.T) {
 	}
 }
 
-func TestRunReviewsUntrackedPullAfterQuietPeriod(t *testing.T) {
+func TestRunReviewsUntrackedPullImmediately(t *testing.T) {
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	changed := pull(12, "new", now)
 	client := &fakePullClient{
@@ -197,17 +196,8 @@ func TestRunReviewsUntrackedPullAfterQuietPeriod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reviewed) != 0 || !slices.Equal(first.Deferred, []int{12}) {
+	if !slices.Equal(reviewed, []string{"new"}) || !slices.Equal(first.Published, []int{12}) {
 		t.Fatalf("first=%+v reviewed=%v", first, reviewed)
-	}
-
-	now = now.Add(6 * time.Minute)
-	second, err := poller.Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(reviewed, []string{"new"}) || !slices.Equal(second.Published, []int{12}) {
-		t.Fatalf("second=%+v reviewed=%v", second, reviewed)
 	}
 	if store.current.PullRequests[12].ReviewedHeadSHA != "new" || store.current.Daily.Reviews != 1 {
 		t.Fatalf("state=%+v", store.current)
@@ -247,48 +237,6 @@ func TestRunDoesNotReviewNewHeadAfterPullRequestCompleted(t *testing.T) {
 	}
 }
 
-func TestRunResetsQuietPeriodWhenHeadChanges(t *testing.T) {
-	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
-	first := pull(12, "head-1", now)
-	client := &fakePullClient{
-		updatedPages: map[int][]review.PullRequest{1: {first}},
-		pulls:        map[int]review.PullRequest{12: first},
-	}
-	store := &fakeStateStore{exists: true, current: initializedState()}
-	var reviewed []string
-	poller := New(client, store, testOptions(&now), func(_ context.Context, pull review.PullRequest) (ReviewOutcome, error) {
-		reviewed = append(reviewed, pull.HeadSHA)
-		return ReviewOutcome{}, nil
-	})
-	if _, err := poller.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	now = now.Add(4 * time.Minute)
-	second := pull(12, "head-2", now)
-	client.updatedPages[1] = []review.PullRequest{second}
-	client.pulls[12] = second
-	if _, err := poller.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	now = now.Add(4 * time.Minute)
-	if _, err := poller.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(reviewed) != 0 {
-		t.Fatalf("reviewed too early: %v", reviewed)
-	}
-
-	now = now.Add(2 * time.Minute)
-	if _, err := poller.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(reviewed, []string{"head-2"}) {
-		t.Fatalf("reviewed=%v", reviewed)
-	}
-}
-
 func TestRunReviewsDraftWhenItBecomesReadyButNotCompletedReopenedPull(t *testing.T) {
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	current := initializedState()
@@ -317,10 +265,6 @@ func TestRunReviewsDraftWhenItBecomesReadyButNotCompletedReopenedPull(t *testing
 		reviewed = append(reviewed, pull.Number)
 		return ReviewOutcome{}, nil
 	})
-	if _, err := poller.Run(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	now = now.Add(6 * time.Minute)
 	if _, err := poller.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
