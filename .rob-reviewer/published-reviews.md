@@ -2,6 +2,27 @@
 
 Newest publications are listed first. This index retains the newest 200 publications; complete history remains in the run archive.
 
+## [#332410 — agentHost: centralize session and chat catalog metadata](https://github.com/microsoft/vscode/pull/332410)
+
+- Published comments: **1**
+- Head: `b095443a4fb1395b984619437dcf2b371d114e8d`
+- Completed: `2026-09-09T01:40:11Z`
+- Run: [34299341451 attempt 1](runs/2026/09/09/34299341451-1/run.md)
+
+### `src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:5342`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+Tool completion callbacks are now tracked in one set for the lifetime of the session wrapper, and every normal idle waits for all entries in that set, regardless of which turn created them.
+
+After aborting an edit and immediately sending a replacement prompt, the replacement turn can appear stuck at completion until unrelated cleanup from the cancelled turn finishes, increasing end-of-turn latency in proportion to the slowest outstanding prior edit.
+
+**Suggested fix:** Track completion promises by their captured turn and await only the current turn's set. On abort, detach that turn's entries from the idle barrier while still allowing their cleanup/persistence promises to settle.
+
+(Written by Copilot)
+
 ## [#334341 — Add opt-in auto-archive/delete inactive sessions with merged pull requests](https://github.com/microsoft/vscode/pull/334341)
 
 - Published comments: **2**
