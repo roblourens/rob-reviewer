@@ -5,6 +5,27 @@ Newest publications are listed first. This index retains the newest 200 publicat
 ## [#332410 — agentHost: centralize session and chat catalog metadata](https://github.com/microsoft/vscode/pull/332410)
 
 - Published comments: **1**
+- Head: `fd5d3014f165531587976426e03479c6653599af`
+- Completed: `2026-09-09T15:31:51Z`
+- Run: [34369527186 attempt 1](runs/2026/09/09/34369527186-1/run.md)
+
+### `src/vs/platform/agentHost/node/agentService.ts:821`
+
+**[Experimental performance review bot]**
+
+**Severity: medium**
+
+The constructor now schedules reconciliation on a fixed 1-second timer independently of the startup-settled barrier. On a fresh version marker, the pass dirties the whole catalog and reprojects the first 50 sessions.
+
+After upgrading to this schema/version, users with a sizable session history can have up to 50 session databases statted/opened/read and catalog rows verified or rewritten beginning one second after Agent Host construction, while startup or the first session list/load is still in progress. On slower or busy disks this can delay the first useful interaction.
+
+**Suggested fix:** Queue the initial reconciliation through `_runWhenStartupSettled` (or otherwise gate `start`/`schedule` on the same barrier), then begin its periodic schedule after that deferred pass so repair remains automatic without competing with startup.
+
+(Written by Copilot)
+
+## [#332410 — agentHost: centralize session and chat catalog metadata](https://github.com/microsoft/vscode/pull/332410)
+
+- Published comments: **1**
 - Head: `b095443a4fb1395b984619437dcf2b371d114e8d`
 - Completed: `2026-09-09T01:40:11Z`
 - Run: [34299341451 attempt 1](runs/2026/09/09/34299341451-1/run.md)
