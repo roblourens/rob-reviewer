@@ -1,0 +1,150 @@
+{
+  "PullRequest": {
+    "Number": 335173,
+    "Title": "nes: fix: encode paths in inline suggestion requests",
+    "Body": "Fixes #325491.\n\nRelated: #334759, #334523, #335001.\n\n## Root cause\n\nNES inserts file paths into unquoted, line-oriented prompt fields and diff-patch headers. Those paths were raw filesystem text. The Windows drive-letter fix in #333429 corrects workspace-relative path selection, but does not make the resulting path safe for the model protocol.\n\nI reproduced the remaining failure on macOS in Code OSS with C# 2.140.9, without Unity Editor or C# Dev Kit. With `copilot-nes-lysithea-24`, the same C# source works under `Weekly-Material/Week-8` and fails under `Weekly Material/Week 8`. Adding a space to a plain C# filename also reproduces it. The separate completions panel still works.\n\nThe distinction is present in the incoming SSE choices, before client accumulation or patch parsing:\n\n```text\nBefore, with the literal spaced path:\n{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}\n\nAfter, with an encoded path token:\n{\"delta\":{\"content\":\"Assets/Weekly%20Material/Week%208/Scripts/UnityProbe.cs:11\\n\"},\"finish_reason\":null}\n```\n\nThe encoded request receives the subsequent deletion/addition chunks and produces ghost text. This is not a renderer change or a fallback to classic completions.\n\n## Changes\n\n- Percent-encode path segments in the shared prompt-path formatter. This covers the current file, recent/context files, edit history, and predicted output while preserving path separators and the previous Windows normalization.\n- Resolve returned path tokens through one decode-once helper, shared by diff-patch targets and cross-file cursor jumps.\n- Preserve literal percent sequences, filename delimiters, Unicode, and notebook-cell fragments. Reject malformed encoding explicitly rather than silently targeting a different file.\n- Add regression coverage for serialization consistency, round trips, active-document progressive reveal, cross-file targets, malformed tokens, and cursor-target resolution.\n\nNo filesystem paths are renamed, no new setting is introduced, and unified NES remains the suggestions provider.\n\n## Validation\n\n- Focused Vitest suites: **430 passed; 4 Windows-only tests skipped on macOS**.\n- Copilot extension TypeScript check passed.\n- ESLint passed for all changed files.\n- Live Code OSS before/after test, using the same profile and model configuration:\n  - Before: spaced paths fail both automatic and explicit triggers; hyphenated control works.\n  - After: **12/12 cases show ghost text**: automatic and explicit triggers for nested spaces, a hyphenated control, a filename space, literal `%20` plus a space, `#`/`?` delimiters, and a Unicode filename.\n  - Successful items are from the NES provider, not classic completions.\n\nThe live test used the dev checkout and miscellaneous C# files in an MIT-licensed Unity sample, not a running Unity 6 project. It establishes the path-sensitive case, not that every related report has the same cause. Native Windows execution remains for CI.\n\n\n## Before / after\n\nTop: before the fix. Bottom: after the fix, on the same space-containing path. Cropped to the editor; both captures are from real OSS requests.\n\n![Before and after: unified NES suggestions in the same C# file with spaces in its path](https://github.com/user-attachments/assets/61aa98ef-82c4-4777-a337-959641f78570)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/335173",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "ulugbekna",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b3250dc968c51e8a0440dc4c11f13050428d33be",
+    "HeadRef": "ulugbekna/agents/vscode-issue-investigation-335001-334523-334759",
+    "HeadSHA": "25a5a5eb7703832e3001b55accce505555b58437",
+    "CreatedAt": "2026-09-08T23:21:00Z",
+    "UpdatedAt": "2026-09-09T00:50:53Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "repeated-work",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Typing-triggered NES prompt construction and inline-edit request",
+        "CriticalPath": "Context gathering and bounded prompt construction complete before the existing debounce and model request; path encoding runs synchronously while rendering the current file, up to five default recent documents, and up to 25 token-bounded history entries. The model network request remains the dominant critical-path boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/xtab/node/xtabProvider.ts:_performFetch",
+            "Operation": "Send the constructed NES prompt and stream a model response.",
+            "Cardinality": "One request per non-cancelled inline-edit attempt; path metadata appears once for the active file and in bounded recent/history sections.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single request carried raw path strings; the diff only percent-encodes those strings before the request.",
+            "CriticalPathEffect": "The request and first streamed response gate suggestion display."
+          }
+        ],
+        "ScalingInput": "One active path, at most the configured recent-document count (default 5), and token/count-bounded edit history (default maximum 25 entries); work scales with their path characters.",
+        "EffectiveConcurrency": "Language and neighbor context may be gathered by existing provider logic, but prompt rendering is synchronous and one model fetch is issued after debounce for the surviving request; existing cancellation/debounce behavior is unchanged.",
+        "CacheBehavior": "No path cache is added or invalidated. Existing request debounce/cancellation and any upstream edit caching remain unchanged; cold and warm prompt construction both perform bounded O(total rendered path characters) encoding.",
+        "MechanismConfidence": "High confidence that the added split/map/encode work is linear in bounded path text and does not add an expensive boundary or multiply model requests.",
+        "MagnitudeUncertainty": "Exact path lengths and frequency of escapable characters vary, but prompt sections are count/token bounded and the whole request has a 120,000-character hard limit, so no realistic unbounded allocation or material latency mechanism is established.",
+        "Verdict": "No reportable regression: percent encoding increases prompt bytes and local CPU only in proportion to bounded path metadata, while preserving request cardinality and budget enforcement."
+      },
+      {
+        "Scenario": "Streaming custom diff-patch responses into inline edits",
+        "CriticalPath": "Each model-emitted patch is parsed sequentially from the existing response stream before its edit can be yielded. Active-document patches use identity comparison and skip decoding; cross-file patch targets perform one decode and URI construction before yield.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/xtab/node/xtabProvider.ts:_performFetch and XtabPatchResponseHandler.handleResponse",
+            "Operation": "Consume the existing model SSE/line stream and convert emitted patches to edits.",
+            "Cardinality": "One network stream per request and one local path resolution per cross-file patch; active-file patches do not invoke the new decoder.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same model stream and one URI resolution per cross-file patch existed; resolution previously used isAbsolute plus URI.file/joinPath without decodeURIComponent.",
+            "CriticalPathEffect": "Streaming gates each progressive edit, but the added work is only linear string decoding and URI construction for cross-file patch headers."
+          }
+        ],
+        "ScalingInput": "The number of cross-file patches in one bounded model response and each target path's character length.",
+        "EffectiveConcurrency": "A single async response stream is consumed serially with for-await; no new task fan-out, queue, subprocess, filesystem operation, or concurrent boundary is introduced.",
+        "CacheBehavior": "No cache participates in patch target decoding, and the diff neither adds retained keys nor changes warm/cold behavior.",
+        "MechanismConfidence": "High confidence from the sequential handler loop that added work is O(cross-file patches × path length), with no added I/O or concurrency.",
+        "MagnitudeUncertainty": "Model patch counts and path lengths vary, but they are bounded by one response and response token limits; decode cost is small relative to network streaming and existing patch/diff processing.",
+        "Verdict": "No reportable regression: decoding replaces the prior target-path resolution step with bounded local CPU/allocation and does not amplify boundary calls."
+      },
+      {
+        "Scenario": "Next-cursor prediction and optional cross-file edit",
+        "CriticalPath": "After the initial edit stream, one existing cursor-prediction model request may run. For a different-file OnlyWithEdit result, the decoded target is resolved before one awaited document open; if valid, an existing retry obtains the edit. Jump-only results perform no document open.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/xtab/node/xtabNextCursorPredictor.ts:predictNextCursorPosition",
+            "Operation": "Request one next-cursor prediction from the configured model endpoint.",
+            "Cardinality": "At most one cursor-prediction request for an eligible non-retry edit request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cursor-prediction request occurred before path decoding was added.",
+            "CriticalPathEffect": "Awaited before a cursor jump or cursor-jump edit can be returned."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/extension/xtab/node/xtabProvider.ts:handleCrossFilePrediction",
+            "Operation": "Open the predicted target text document for OnlyWithEdit mode.",
+            "Cardinality": "At most one open for one cross-file prediction; none for Jump mode.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same URI target was opened once; the diff decodes the model token before constructing the equivalent URI.",
+            "CriticalPathEffect": "The open must finish before validating the line and constructing the synthetic retry request."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/xtab/node/xtabProvider.ts:handleCrossFilePrediction -\u003e doGetNextEditWithSelection",
+            "Operation": "Obtain the optional edit at the predicted cross-file cursor location.",
+            "Cardinality": "At most one retry after one successful target-document open; existing edit caching may satisfy it.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same optional retry existed and used the original edit window for cache reuse.",
+            "CriticalPathEffect": "Gates delivery of an OnlyWithEdit cross-file suggestion when not served from cache."
+          }
+        ],
+        "ScalingInput": "One model-returned target path per eligible cursor prediction; no collection multiplicity.",
+        "EffectiveConcurrency": "Cursor prediction, target resolution, document open, and optional edit retry are sequential and cancellation/user-typing checks remain between stages; no burst or new parallelism is introduced.",
+        "CacheBehavior": "Target-path decoding itself is uncached but constant-cardinality. A warm/open document can be served by the workspace service rather than cold filesystem loading, and the existing retry passes the original edit window so the edit cache can serve either location; cache keys and coalescing are not changed.",
+        "MechanismConfidence": "High confidence that resolveUniquePath executes once before the same pre-existing open/retry boundaries and cannot fan them out.",
+        "MagnitudeUncertainty": "Cold document-open and model latency vary by provider and workspace, but their count and critical-path placement are unchanged; added decoding is one bounded path operation.",
+        "Verdict": "No reportable regression: the diff changes only target-token decoding and leaves the existing one-open/one-retry maximum, cancellation checks, and cache reuse intact."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files and all diff pages. The PR adds bounded percent-encoding/decoding of document paths but no new I/O, network calls, subprocesses, cache retention, concurrency, or collection-wide repeated work. No actionable performance regression met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-09T01:38:52.593193391Z",
+    "CompletedAt": "2026-09-09T01:40:08.236883938Z",
+    "WallClockMilliseconds": 75643,
+    "ModelCalls": 9,
+    "InputTokens": 293037,
+    "OutputTokens": 4765,
+    "TotalTokens": 297802,
+    "ReasoningTokens": 1276,
+    "CacheReadTokens": 240579,
+    "CacheWriteTokens": 52431,
+    "APIDurationMilliseconds": 65442,
+    "ToolCalls": 44,
+    "NanoAIUnits": 45379460000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 240579,
+      "cache_write": 52431,
+      "input": 27,
+      "output": 4765
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
