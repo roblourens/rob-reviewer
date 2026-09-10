@@ -1,0 +1,175 @@
+{
+  "PullRequest": {
+    "Number": 335525,
+    "Title": "agentHost: update bundled Codex SDK to 0.153.0",
+    "Body": "Updates bundled `@openai/codex` from `0.149.1` to `0.153.0`, regenerates the app-server protocol, and includes the guardian/test compatibility fixes.\n\nReplaces #335474 under my account for normal team-member review. The automation-produced branch and head commit are unchanged: `9805e0f253c0cf75e885e3cfbc3d8c904c71fd04`. The original PR preserves the updater and repair history.\n\nValidation on this commit:\n- All 89 non-policy GitHub checks passed, including Compile \u0026 Hygiene.\n- [Product build 472857](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=472857\u0026view=results): platform, publishing, and sanity-test stages passed. Overall status is `partiallySucceeded` because Copilot NOTICE generation failed. Release was disabled.\n\nAuthenticated Codex Agent Host launch remains a manual sign-off.",
+    "URL": "https://github.com/microsoft/vscode/pull/335525",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "Giuspepe",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e796db35e9a5a60237f63233edf4a2c54963cbec",
+    "HeadRef": "automation/bump-codex-sdk-0.153.0",
+    "HeadSHA": "93e0e8779facbf4b5f6d7ccf899661ad570bf814",
+    "CreatedAt": "2026-09-10T18:15:22Z",
+    "UpdatedAt": "2026-09-10T19:51:41Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-14B61121C0DB",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/codex/codexGuardianReview.ts",
+      "Side": "RIGHT",
+      "Line": 157,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The added branch, unbounded string type, and call path are explicit: `summarizeGuardianReviewAction` feeds `formatGuardianDenialNotification`/`formatGuardianReviewStatusNotification`; the denial path emits a durable `ChatResponsePart` and two tool-card actions; the state reducer retains both response and invocation text; `ProtocolServerHandler` broadcasts each envelope. Only the prevalence and typical size of large interactive stdin payloads is uncertain.",
+      "PerformanceCategory": "rendering",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "String bytes and allocations in Markdown formatting, AHP protocol payload bytes, retained chat/replay objects, and rendered Markdown nodes.",
+      "PerformanceScaling": "Cost is O(n) in the unbounded stdin length for formatting and retention, and broadcast serialization scales further with the number of connected relevant clients; one denial emits the large content in a durable Markdown action and again through tool-call actions.",
+      "PerformanceOutcome": "Synchronous CPU/GC pressure and UI rendering latency, with retained chat memory proportional to the stdin payload.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, the protocol union and summary switch had no `writeStdin` action, so terminal-input payloads were not copied into durable Markdown or approval-card messages by this path.",
+      "ChangedBehavior": "Denied, timed-out, or aborted write-to-stdin reviews now surface the complete stdin payload as UI detail. `_handleGuardianReviewCompleted` synchronously formats that detail into Markdown and also sends it as both the tool-call intention and invocation message.",
+      "CausalDiffEvidence": "The added `case 'writeStdin'` at line 157 assigns the entire unbounded `action.stdin` string to the display `detail`; the preceding SDK type diff adds `writeStdin` to `GuardianApprovalReviewAction`, so this is a newly reachable path.",
+      "Title": "Bound stdin before copying it into review UI state",
+      "Impact": "If an agent sends a large script, generated data, or other bulk content to an interactive process and guardian denies or times out the write, the agent-host performs synchronous full-input scans/copies and the workbench receives and renders the entire payload. This can stall the review UI, increase IPC cost, and retain substantial duplicate text in chat/replay state.",
+      "Evidence": "`GuardianApprovalReviewAction` newly permits `{ type: 'writeStdin', stdin: string }` with no size limit. At line 157 the full string becomes `summary.detail`. `formatGuardianDenialNotification` then calls `trim`, scans all text with `/`+/g`, interpolates another full Markdown string, and prefixes every line. `_handleGuardianReviewCompleted` stores that Markdown as a durable response part and reuses the raw detail in `ChatToolCallStart` and `ChatToolCallReady`; each action is dispatched into chat state and broadcast over the AHP transport. Thus one denied large stdin write creates multiple O(n) strings, protocol payloads, retained state entries, and a large Markdown render.",
+      "Recommendation": "Create a bounded, escaped preview for the `writeStdin` summary (with a truncation indicator) before it reaches Markdown/tool-card state, while keeping the original `params.action.stdin` only for the exact `approveGuardianDeniedAction` round-trip."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "synchronous-ui-work",
+      "boundary-fanout",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Surfacing and optionally overriding a denied/timed-out write-to-stdin guardian review",
+        "CriticalPath": "On an `item/guardianApprovalReview/completed` notification, summarization, Markdown construction, state reduction, and AHP broadcast all occur synchronously before the denial/status is visible. The reverse request to Codex is off this initial display path and occurs only after the user approves anyway.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_handleGuardianReviewCompleted",
+            "Operation": "Receives the newly supported writeStdin guardian action from the Codex app-server JSON-RPC stream.",
+            "Cardinality": "One inbound app-server notification per distinct review; duplicate IDs are suppressed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Codex 0.149.1 and the generated action union did not expose the writeStdin review variant.",
+            "CriticalPathEffect": "Starts the synchronous review-display path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:_broadcastAction",
+            "Operation": "Broadcasts chat response/tool actions carrying the raw or formatted stdin text over AHP.",
+            "Cardinality": "Three display envelopes for a denied review (durable Markdown, tool-call start, and tool-call ready), sent to each relevant connected client.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This existing broadcast path did not receive writeStdin-derived display payloads.",
+            "CriticalPathEffect": "Transfers the full stdin-derived text to UI clients and triggers live state updates/rendering."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_handleGuardianReviewCompleted",
+            "Operation": "Serializes the full original guardian event to `thread/approveGuardianDeniedAction`.",
+            "Cardinality": "At most one request for the review when the user selects accept or accept-for-session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No writeStdin event could be round-tripped by this adapter; other guardian action kinds already used the same single request.",
+            "CriticalPathEffect": "Not on initial review rendering; it gates applying the user's override."
+          }
+        ],
+        "ScalingInput": "The effective input is one deduplicated guardian review, with cost proportional to `action.stdin` length and secondarily to the number of relevant connected UI clients.",
+        "EffectiveConcurrency": "Each distinct review notification is handled independently; duplicate review IDs are suppressed. A denial emits one durable response action plus tool-call start/ready actions serially, and each envelope is synchronously broadcast to every relevant connected client.",
+        "CacheBehavior": "No cache participates in rendering a guardian review. `handledGuardianReviews` deduplicates by review ID, but the complete display payload is retained in chat state; the protocol replay buffer also keeps up to 1,000 recent envelopes.",
+        "MechanismConfidence": "High: the added branch forwards the entire string, downstream formatters perform full-string scans/copies, reducers retain it, and protocol code broadcasts it.",
+        "MagnitudeUncertainty": "Typical writeStdin payloads may be short, but the protocol type imposes no bound and interactive processes can receive large scripts or generated data. This uncertainty limits severity to medium; it does not affect the established linear work and retention mechanism.",
+        "Verdict": "Reportable: the new variant copies unbounded stdin into durable Markdown and approval-card state, causing linear synchronous allocation, IPC, retention, and rendering work. The display can be safely bounded without changing the exact approval round-trip."
+      },
+      {
+        "Scenario": "Cold and warm Codex agent-host startup",
+        "CriticalPath": "Cold agent-host launch resolves the bundled Codex executable and starts one app-server subprocess. Warm session operations reuse that connection. The changed manifests select version 0.153.0 but do not alter launch scheduling in repository code.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:spawn at line 2519",
+            "Operation": "Starts the platform-specific bundled Codex app-server binary.",
+            "Cardinality": "One subprocess launch per cold Codex connection; reused while warm.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same launch path and cardinality used Codex 0.149.1; the diff only changes the pinned binary version to 0.153.0.",
+            "CriticalPathEffect": "The app-server must become ready before Codex sessions can progress."
+          }
+        ],
+        "ScalingInput": "One cold connection versus reuse on warm sessions; no collection-sized fan-out was added.",
+        "EffectiveConcurrency": "One app-server child process is started for the active Codex connection; existing connection generation/reuse behavior is unchanged.",
+        "CacheBehavior": "The app-server process is reused once connected; no changed cache key, negative cache, or prewarm policy is evidenced by the dependency metadata update.",
+        "MechanismConfidence": "High that repository-level launch cardinality and scheduling are unchanged; no claim is made about opaque binary internals.",
+        "MagnitudeUncertainty": "Binary-internal startup cost and package size are not observable from the supplied source diff, so no performance regression can be established from the version number alone.",
+        "Verdict": "No additional finding: the dependency version changes the executable contents but provides no diff evidence of extra startup work, process fan-out, or cache defeat."
+      },
+      {
+        "Scenario": "Normal Codex protocol request and notification processing",
+        "CriticalPath": "Protocol declarations affect build/type-check compatibility, not runtime message processing after erasure. Runtime requests still serialize once to the existing app-server stdin and notifications still arrive on its stdout.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAppServerClient.ts:_writeMessage",
+            "Operation": "Serializes JSON-RPC messages and writes them to the Codex subprocess.",
+            "Cardinality": "One JSON serialization/stdin write per existing client request and one parse/dispatch per incoming message; method cardinality is caller-controlled and unchanged by the type regeneration.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical client transport behavior existed before; regenerated unions only describe additional fields and methods.",
+            "CriticalPathEffect": "These existing subprocess IPC operations remain on request/event critical paths, but the declarations add no executable work."
+          }
+        ],
+        "ScalingInput": "Build-time declaration count grows modestly; runtime cost does not scale with the 827 generated declaration-file changes.",
+        "EffectiveConcurrency": "Existing JSON-RPC request concurrency and notification dispatch are unchanged by the generated type-only declarations.",
+        "CacheBehavior": "Generated protocol files contain TypeScript type declarations and type-only imports/exports; they create no runtime cache. Existing request correlation and event mapping behavior remains in handwritten code.",
+        "MechanismConfidence": "High: repository search found only type exports/imports in the generated protocol tree, so these changes are erased at runtime.",
+        "MagnitudeUncertainty": "The SDK binary may internally implement new methods, but generated type declarations alone do not establish execution frequency or cost.",
+        "Verdict": "No additional finding: generated protocol changes are type-only and do not themselves add runtime serialization, IPC, I/O, or retained objects."
+      }
+    ],
+    "Summary": "Completed the performance pass over the 840-file inventory. Most changes are generated type-only protocol updates plus dependency pins and test fixture adjustments. One medium-severity serialization/rendering regression was submitted for copying unbounded writeStdin content into durable UI state and multiple protocol actions; no other diff-backed runtime performance regression or regression fix was established."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-10T20:13:57.033728741Z",
+    "CompletedAt": "2026-09-10T20:16:26.988426197Z",
+    "WallClockMilliseconds": 149954,
+    "ModelCalls": 26,
+    "InputTokens": 2075245,
+    "OutputTokens": 10655,
+    "TotalTokens": 2085900,
+    "ReasoningTokens": 3869,
+    "CacheReadTokens": 1954816,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 136474,
+    "ToolCalls": 109,
+    "NanoAIUnits": 147674240000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1954816,
+      "cache_write": 0,
+      "input": 120429,
+      "output": 10655
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

@@ -1,0 +1,315 @@
+{
+  "PullRequest": {
+    "Number": 335501,
+    "Title": "agentHost: improve Agent Merge CI diagnostics",
+    "Body": "## Summary\n\nAgent Merge previously returned only the first 100,000 characters of job logs whose downloads were already limited to a 2 MiB prefix. This could hide the actual failing-test summary with no supported way to read further.\n\n- Make `readAgentMergeCI` summary-first, with failed checks, annotations, jobs/steps, and bounded failure excerpts under a 48,000-byte response budget.\n- Add job selection, line-numbered tail/range reads, literal search with context, and actionable continuation cursors to the same authorized tool.\n- Capture workflow logs up to 16 MiB with the existing 30-second download deadline. Preserve whole-capture redaction, bound mask-processing work, and report incomplete prefixes explicitly instead of presenting them as true tails.\n- Cache redacted evidence with repository/account, PR/head, turn, workflow-attempt, and job identity; revalidate authorization on every read. Keep the cache bounded to eight logs / 32 Mi UTF-16 characters, expiring five minutes after their last summary or on eviction.\n- Queue concurrent reads cancellably and paginate summaries within cache capacity, so assembling a page cannot evict its own advertised evidence. Retain transport cancellation, cleanup, and credential/redirect safeguards.\n\nNo GitHub permission expansion, repair retry scheduling / blocked-outcome changes, or archive-nudge/onboarding changes.\n\n## Validation\n\n- `npm run gulp compile-client` — passed with zero errors.\n- `npm run typecheck-client` — passed.\n- Repository hygiene — all 12 changed files passed.\n- 115 focused unit tests passed across Agent Merge diagnostics, server tools, reruns, restrictions, GitHub transport, and PR mutation service.\n- Coverage includes failure summaries beyond both old cutoffs, exact-cap EOF versus incomplete downloads, redaction/chunk boundaries, stable range/search pagination, stale/unauthorized evidence, expiry/eviction, queued cancellation/disposal, six failed jobs, and cache-aware paging of four 12 MiB logs and twenty small logs.\n\nThe aggregate `npm run compile-client` also builds unrelated extensions and encountered a missing extension-side `esbuild` dependency in this isolated worktree. The source-only compile task above and the final compiled unit tests passed. No remote CI logs were retrieved for this change.",
+    "URL": "https://github.com/microsoft/vscode/pull/335501",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "1efa8b317e0d479d189913feb2cd84e6f5d52cf6",
+    "HeadRef": "agents/agent-merge-ci-diagnostics-improvements",
+    "HeadSHA": "27a14a419cb9a60b96b2da3e68bc27a57814d8a4",
+    "CreatedAt": "2026-09-10T16:23:46Z",
+    "UpdatedAt": "2026-09-10T18:44:19Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-2B55639C0A64",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentMergeTools.ts",
+      "Side": "RIGHT",
+      "Line": 144,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "All five awaited boundaries are directly traced in the changed call path and authoritative refresh bypasses the warm resource result. The exact latency is network-dependent, but the request multiplicity is deterministic.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "GitHub GraphQL/REST requests and serialized network round-trip time",
+      "PerformanceScaling": "At least five remote requests per evidence page, multiplied by range pages or each 50,000-line search page; jobs pagination increases the count further.",
+      "PerformanceOutcome": "Increased latency, excessive network/API I/O, and lower diagnostic throughput",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR there were no paginated cached-evidence reads; reading CI was a single pass. The new continuation path was intended to reuse cached logs, but it now pays repeated remote validation on every response page.",
+      "ChangedBehavior": "Every cached tail/range/search request first performs the outer authoritative core refresh, then lists workflow runs and jobs, then line 144 performs a second authoritative core refresh and line 145 lists workflow runs a second time before serving local cached text.",
+      "CausalDiffEvidence": "RIGHT lines 144-145 add a second authoritative head refresh and second workflow-run listing after the same request already performed those operations on RIGHT lines 81 and 140.",
+      "Title": "Collapse duplicate revalidation on every evidence page",
+      "Impact": "Inspecting a cached long log is dominated by serial GitHub round trips rather than local range/search work, consuming API capacity and adding latency to every continuation; pagination multiplies this cost and can approach the three-minute call deadline.",
+      "Evidence": "_readFailedCI calls _validateCIHead before dispatch at line 81. _readCIEvidence then awaits _ciRuns at line 140 and _ciJobs at line 141, followed by the added _validateCIHead at line 144 and another _ciRuns at line 145. _validateCIHead uses authoritative:true, which forces PullRequestResourceService._refreshFragment to call PullRequestQueryService.fetch; _ciRuns and _ciJobs each call paginated GitHub REST APIs. Thus a one-page local range/search read performs at least five serialized network requests (two core, two runs, one jobs). The added 500,000-line search test requires 10 pages, making this at least 50 requests for one cached-log search.",
+      "Recommendation": "Perform one coherent authorization snapshot per evidence request: keep one authoritative head refresh, fetch runs once and jobs once, and use those same results for both authorization and attempt checks. Reserve post-operation revalidation for paths that actually cross a slow mutable boundary such as downloading a new log."
+    },
+    {
+      "ID": "PERF-C208F68B2A6A",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentMergeTools.ts",
+      "Side": "RIGHT",
+      "Line": 225,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The admission checks and unchanged loop index make the duplicate download deterministic, and the PR's 12 MiB paging fixture supplies a realistic size/cardinality trigger; only actual network duration varies.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "GitHub network bytes, full-log strings/allocations, redaction CPU, and line-indexing CPU",
+      "PerformanceScaling": "The waste is one candidate log per cache-limited page transition; its cost grows up to the 16 MiB/job cap and repeats as the failed-job set spans additional 32 Mi-character cache pages.",
+      "PerformanceOutcome": "Excessive network I/O, CPU/GC pressure, and increased summary latency",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The previous summary loop downloaded each failed job log once and emitted its bounded prefix directly; there was no cache-admission failure that caused the same job to be downloaded again on a continuation page.",
+      "ChangedBehavior": "Summary paging now downloads and fully redacts a job log before asking tryAdd whether that log fits alongside the evidence IDs already retained for the page. If retained logs plus this log exceed the 32 Mi-character cache budget, tryAdd returns undefined and the loop breaks without caching or advertising the downloaded log.",
+      "CausalDiffEvidence": "RIGHT line 225 newly performs the job-log download inside a page loop whose following RIGHT-side tryAdd can reject the result without advancing the page index.",
+      "Title": "Avoid downloading evidence that this page cannot retain",
+      "Impact": "Large-log summary pages waste a full GitHub log transfer plus whole-log decoding, redaction, and line indexing at every cache boundary. Four 12 MiB jobs waste 12 MiB; eight near-16 MiB jobs can waste three downloads (about 48 MiB and up to 90 seconds of download deadlines), increasing latency and risking the three-minute tool timeout.",
+      "Evidence": "canAdd(retainedEvidence) at line 221 checks only the already-retained entries, not the unknown candidate size. The changed line 225 then performs the up-to-16 MiB network download and redaction; tryAdd at line 227 rechecks with log.text.length and can return undefined at line 228. Because index is not advanced, the continuation retries that same job. The added test fixture explicitly uses four 12 MiB logs with a 32 Mi-character cache: after two retained logs, the third is downloaded, rejected because 24+12\u003e32 Mi, and downloaded again on the next page.",
+      "Recommendation": "Reserve capacity using the maximum possible candidate size before starting another download, or keep the just-downloaded redacted log in a bounded pending slot/continuation so the next page can admit it without redownloading it."
+    },
+    {
+      "ID": "PERF-291707085D75",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentMergeTools.ts",
+      "Side": "RIGHT",
+      "Line": 40,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The queue ownership and degree-one semantics are direct, and the new test demonstrates cross-session timeout behavior. The prevalence of simultaneous sessions is uncertain, which limits severity, but the mechanism and worst-case impact are explicit.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "Agent-host CI-read execution slots and wall-clock time while network downloads occupy the sole slot",
+      "PerformanceScaling": "Effective concurrency is fixed at one process-wide; wait time grows with the sum of preceding sessions' validation, annotation, and up-to-16 MiB log downloads, with each queued caller timing out after 180 seconds including queue wait.",
+      "PerformanceOutcome": "Head-of-line blocking, increased latency, and collapsed cross-session throughput",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The prior readFailedCI implementation had no process-wide queue, so independent authorized sessions could perform their GitHub reads concurrently subject to the existing transport scheduler/rate limiter.",
+      "ChangedBehavior": "A single Queue instance owned by AgentMergeTools limits all readAgentMergeCI calls in the agent-host process to concurrency one, regardless of session, repository, or evidence scope. The three-minute deadline starts before admission to that queue.",
+      "CausalDiffEvidence": "RIGHT line 40 introduces one process-wide degree-one Queue, and all session reads are newly enqueued through it at RIGHT line 67.",
+      "Title": "Do not serialize unrelated sessions behind one CI read",
+      "Impact": "One slow or stalled repository blocks diagnostics for every other active Agent Merge session in the host; unrelated reads can wait their entire deadline and fail without issuing any request.",
+      "Evidence": "The changed field at line 40 constructs one Queue for the composition, and line 67 routes every session through it. A summary can sequentially download multiple 16 MiB logs with 30-second per-download deadlines. The added cross-session tests confirm maximumActive=1 and explicitly confirm that when one read occupies the queue for 180 seconds, both it and a peer session waiting behind it hit the three-minute timeout while only one download ever starts.",
+      "Recommendation": "Serialize per CI scope/session instead of process-wide, with a small global limiter or explicit cache-capacity reservations to bound memory and network concurrency without blocking unrelated scopes behind one FIFO."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Build the initial or continued failed-CI summary for an Agent Merge turn",
+        "CriticalPath": "The tool waits for a process-wide queue slot, an authoritative PR-core refresh, workflow-run listing, per-run job listing, per-check annotation listing for displayed checks, sequential cache-miss job-log downloads/redaction/indexing, then a second core refresh and workflow-run listing before returning the summary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:_validateCIHead",
+            "Operation": "Authoritative pull-request core refresh",
+            "Cardinality": "Twice per summary page: once before dispatch and once after page assembly",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old CI summary did not perform these authoritative core refreshes.",
+            "CriticalPathEffect": "Both serialized refreshes must complete before the page returns"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:_ciRuns",
+            "Operation": "List workflow runs for the authorized head",
+            "Cardinality": "Twice per summary page when jobs exist; each call may paginate",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old implementation derived run IDs from checks and did not list workflow runs.",
+            "CriticalPathEffect": "Both listings are awaited serially to build and then revalidate the page"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:_ciJobs",
+            "Operation": "List jobs for a pinned workflow attempt",
+            "Cardinality": "Once per distinct workflow run per summary page, with up to 100 REST pages each",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old implementation listed jobs once per run for its single unpaginated read; continuation pages did not exist.",
+            "CriticalPathEffect": "All jobs are enumerated before pagination can choose page items"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:_readCISummary",
+            "Operation": "List check-run annotations",
+            "Cardinality": "Once per displayed check-run item, up to 12 per page and up to 100 REST pages per check",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old implementation also listed annotations once per failed check.",
+            "CriticalPathEffect": "Sequentially awaited while assembling summary items"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:225",
+            "Operation": "Download a failed job log",
+            "Cardinality": "One per cold displayed job plus one discarded candidate at each cache-limited page boundary; each captures up to 16 MiB and may follow redirects",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old implementation downloaded each failed job once with a 2 MiB cap and did not discard a download on cache admission.",
+            "CriticalPathEffect": "Sequential download, redaction, and indexing block summary completion"
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/github/common/pullRequestMutationService.ts:downloadWorkflowJobLog; src/vs/platform/agentHost/node/agentMergeCIEvidence.ts:indexLines/ciFailureExcerpt",
+            "Operation": "Decode, redact, regex-scan, line-index, failure-scan, and JSON-encode workflow evidence",
+            "Cardinality": "Linear in each cold log, up to 16 MiB/job and 32 Mi characters retained per page",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Logs were capped at 2 MiB and only the first 100,000 characters were emitted; no persistent line index or whole-log failure scan existed.",
+            "CriticalPathEffect": "Runs synchronously after each download before the next job can proceed"
+          }
+        ],
+        "ScalingInput": "Failed required checks, distinct workflow runs, failed jobs, REST pagination pages, and redacted log characters. Summary output is capped at 12 items/48 KB; evidence is capped at 8 logs/32 Mi UTF-16 characters, but metadata for all runs/jobs is rebuilt before each page.",
+        "EffectiveConcurrency": "All readAgentMergeCI calls across all sessions share one Queue with effective concurrency 1. Within one summary, run job listings, annotations, and log downloads are also awaited serially.",
+        "CacheBehavior": "Cold jobs download up to 16 MiB and are cached for five minutes. Warm matching job/run/attempt entries avoid log downloads, but every summary page still refetches runs/jobs and revalidates core. At a 32 Mi-character page boundary, candidate size is omitted from the precheck, so a downloaded/redacted log can fail admission and be downloaded again on the next page.",
+        "MechanismConfidence": "High: cache admission, page index behavior, serialization, and all network awaits are explicit in changed code.",
+        "MagnitudeUncertainty": "Typical failed-job count and log sizes vary, but the PR tests explicitly exercise four 12 MiB logs, six 250,000-line logs, and 20 jobs. Network latency determines elapsed severity.",
+        "Verdict": "Reportable: cache-boundary candidates are downloaded and processed before rejection, causing deterministic duplicate transfers; unrelated sessions also serialize behind this entire path."
+      },
+      {
+        "Scenario": "Read a cached tail/range page or search a cached CI log",
+        "CriticalPath": "After waiting for the global queue, every page performs an authoritative core refresh, lists runs and jobs, performs a second core refresh and second run listing, then executes the local indexed range/tail/search and serializes the bounded response.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:81,144",
+            "Operation": "Authoritative PR-core fetch",
+            "Cardinality": "Two per evidence page",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Cached evidence pages did not exist.",
+            "CriticalPathEffect": "Both round trips precede local cached-text access"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:140,145",
+            "Operation": "Workflow-run listing",
+            "Cardinality": "Two per evidence page, potentially paginated",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Cached evidence pages did not exist.",
+            "CriticalPathEffect": "Both are serialized on the response critical path"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:141",
+            "Operation": "Pinned workflow-job listing",
+            "Cardinality": "One per evidence page, potentially paginated",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Cached evidence pages did not exist.",
+            "CriticalPathEffect": "Must finish before local text is read"
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/agentMergeCIEvidence.ts:readCIRange/readCITail/searchCIEvidence",
+            "Operation": "Indexed local range/tail/search and response JSON encoding",
+            "Cardinality": "Range/tail output is bounded; search scans up to 50,000 lines and five matches per page",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No local paginated evidence reader existed.",
+            "CriticalPathEffect": "Local CPU work occurs only after all remote revalidation"
+          }
+        ],
+        "ScalingInput": "Number of continuation pages: range output is limited by a 6 KB budget/200 parts, while search scans at most 50,000 lines per page. The included 500,000-line test requires 10 pages; newline-dense 16 MiB evidence can require hundreds.",
+        "EffectiveConcurrency": "One request at a time globally. Within a request, at least five network operations are awaited serially; job/run endpoint pagination adds more.",
+        "CacheBehavior": "Warm evidence avoids re-downloading the log and line checkpoints bound local seeking, but does not cache or coalesce authorization metadata calls. Evidence lookup is LRU-like and expires after five minutes from its last summary refresh, not each detail read.",
+        "MechanismConfidence": "High: call flow and authoritative refresh semantics prove the boundaries execute on every page.",
+        "MagnitudeUncertainty": "Actual GitHub round-trip duration and how often agents traverse many pages vary. Request count is deterministic: at least five network calls per page, so the supplied 10-page search entails at least 50.",
+        "Verdict": "Reportable: duplicate core/run validation makes cached local reads network-bound and scales multiplicatively with continuation count."
+      },
+      {
+        "Scenario": "Concurrent CI diagnostic reads from different Agent Merge sessions",
+        "CriticalPath": "Each call starts its 180-second deadline, then waits for the single AgentMergeTools queue before any validation or download can begin.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:40,67",
+            "Operation": "Process-wide Queue admission",
+            "Cardinality": "Every CI diagnostic read uses the same degree-one queue",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Independent readFailedCI calls were not globally serialized.",
+            "CriticalPathEffect": "All network and local work for preceding sessions blocks the next session before it starts"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeTools.ts:_readFailedCI/_readCISummary",
+            "Operation": "Validation, metadata calls, and job-log downloads performed by the leading queued read",
+            "Cardinality": "Potentially multiple API pages and up to eight cached log downloads per admitted summary page",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Another session could execute its own reads concurrently under existing GitHub transport scheduling.",
+            "CriticalPathEffect": "These unrelated boundaries become queue wait for every following session"
+          }
+        ],
+        "ScalingInput": "Number and duration of earlier active reads. A leading summary may perform multiple sequential 16 MiB downloads with 30-second per-download deadlines.",
+        "EffectiveConcurrency": "Exactly one across the agent-host composition, including unrelated sessions/repositories; queued cancellation rejects the caller but the queued factory later only exits when admitted and observes the aborted signal.",
+        "CacheBehavior": "Evidence is scoped per turn/repository/head and therefore cannot be shared across the unrelated sessions that block each other. The shared cache motivates coordination but provides no coalescing benefit across these scopes.",
+        "MechanismConfidence": "High: Queue has degree one, is composition-owned, and tests prove a peer can expire while no second download starts.",
+        "MagnitudeUncertainty": "Simultaneous Agent Merge sessions may be less common than single-session use, so severity is medium. The test suite directly models peer sessions and a 180-second leading read.",
+        "Verdict": "Reportable: the process-wide queue creates cross-session head-of-line blocking and can consume an unrelated caller's entire deadline."
+      },
+      {
+        "Scenario": "Download and redact one workflow job log",
+        "CriticalPath": "GitHub transport follows redirects, streams up to 16 MiB under a 30-second deadline, concatenates and UTF-8 decodes the prefix, then the mutation service trims an incomplete line and performs whole-log mask/token redaction before returning.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubTransport.ts:GitHubTransport.download",
+            "Operation": "Fetch authenticated GitHub log endpoint and redirected storage body",
+            "Cardinality": "One initial request plus redirects per invocation, reading up to 16 MiB",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same download path and redirect structure existed, but the requested byte cap was 2 MiB rather than 16 MiB.",
+            "CriticalPathEffect": "The complete bounded prefix must arrive before redaction and summary progress"
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/github/common/githubTransport.ts:readBoundedResponse; src/vs/platform/github/common/pullRequestMutationService.ts:redactWorkflowLog",
+            "Operation": "Concatenate chunks, decode bytes, redact masks and token patterns",
+            "Cardinality": "Multiple full linear passes over up to 16 MiB, with mask matching explicitly bounded",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Whole-log processing was limited to 2 MiB; mask replacement previously used one split/join per mask without the new explicit work bounds.",
+            "CriticalPathEffect": "Synchronous processing occurs before evidence can be cached"
+          }
+        ],
+        "ScalingInput": "Compressed/uncompressed response chunking, captured bytes up to 16 MiB, distinct add-mask values up to 128 and a 512 MiB mask-work guard.",
+        "EffectiveConcurrency": "Transport uses the existing GitHub request queue/rate limiter. Agent Merge additionally serializes these downloads both within a summary and globally across read calls.",
+        "CacheBehavior": "Transport requests use no-store for the body; successful redacted logs are cached only by AgentMergeCIEvidenceStore. Redaction failure or cache-admission rejection leaves no reusable result.",
+        "MechanismConfidence": "High for the changed 8x bound and linear processing; insufficient evidence that the bounded intentional cost alone is a bug.",
+        "MagnitudeUncertainty": "Large logs incur materially more allocation than the former cap, but this is an intentional requirement and the work is bounded; no independent regression beyond the reported discarded-download case was established.",
+        "Verdict": "No additional finding: larger capture and whole-capture redaction are intentional and bounded, while cancellation/redirect cleanup avoids retained readers."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 12 changed files. Submitted three findings: duplicate cache-boundary downloads, redundant per-page GitHub revalidation, and process-wide cross-session serialization. No concrete shipped-regression fix requiring blame was established."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-10T20:11:02.713398775Z",
+    "CompletedAt": "2026-09-10T20:13:53.888595561Z",
+    "WallClockMilliseconds": 171175,
+    "ModelCalls": 14,
+    "InputTokens": 934491,
+    "OutputTokens": 12412,
+    "TotalTokens": 946903,
+    "ReasoningTokens": 5419,
+    "CacheReadTokens": 828416,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 157630,
+    "ToolCalls": 66,
+    "NanoAIUnits": 100390640000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 828416,
+      "cache_write": 0,
+      "input": 106075,
+      "output": 12412
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
