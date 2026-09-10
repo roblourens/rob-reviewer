@@ -1,0 +1,196 @@
+{
+  "PullRequest": {
+    "Number": 335073,
+    "Title": "Add migration page for agent file compatibility in chat customization",
+    "Body": "This pull request introduces a new migration page specifically for agent file compatibility within the chat customization dialog. The key changes include:\n\n- **New Migration Category**: An \"Update Agent Files\" migration category has been added to handle agent files with unsupported `handoffs` frontmatter.\n- **In-Place Migration**: The migration process removes the `handoffs` attribute and replaces it with natural-language instructions, while preserving other frontmatter and model arrays.\n- **UI Enhancements**: Integrated confirmation dialogs, migration hints, and error reporting to improve user experience during the migration process.\n- **Testing**: Added comprehensive tests for discovery, transformation, and error handling to ensure robustness.\n\nThe implementation focuses on maintaining compatibility with existing agent models and enhancing the migration experience for users. All relevant unit tests have passed, and the new functionality has been validated against the existing codebase.",
+    "URL": "https://github.com/microsoft/vscode/pull/335073",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "aeschli",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "5f69114aac25a6e448654eb288a912109056f90f",
+    "HeadRef": "aeschli/agents/add-migration-page-agent-files",
+    "HeadSHA": "9aed9e96e31727483b758c96d5ebdf372faac53f",
+    "CreatedAt": "2026-09-08T14:44:27Z",
+    "UpdatedAt": "2026-09-10T17:07:53Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-BEE906E50589",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigrationServiceImpl.ts",
+      "Side": "RIGHT",
+      "Line": 89,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The direct filesystem fallback in `parseNew`, lack of closed-file parse caching, unbounded `Promise.all`, existing limiter rationale, and blocking chat call path are all explicit in repository code. Only the typical number and latency of user agent files are uncertain, which limits severity rather than mechanism confidence.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "filesystem reads, parser CPU, and file handles for every local/user agent file",
+      "PerformanceScaling": "Each migration assessment launches one `parseNew` per local/user agent file simultaneously, so read/parse work is O(N) and peak filesystem concurrency is N; closed files are reread on every assessment because `parseNew` only caches open text models.",
+      "PerformanceOutcome": "increased first-request latency and bursty filesystem/CPU load, with file-handle exhaustion risk for large agent collections",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Migration hint computation and customization-editor refreshes did not parse agent-file contents to assess this category, so these paths incurred no per-agent content reads for handoff detection.",
+      "ChangedBehavior": "The added `Promise.all(...map(...parseNew))` reads and parses every eligible agent file during each AgentFiles migration computation, without using the service-wide discovery limiter or cached agent discovery result.",
+      "CausalDiffEvidence": "Added line 89 invokes `this.promptsService.parseNew(file.uri, token)` for every local/user agent produced by the added `Promise.all` map; this per-file content read did not exist on migration assessment paths before the PR.",
+      "Title": "Route agent-file migration discovery through bounded cached parsing",
+      "Impact": "With the feature enabled, opening the Chat Customizations editor scans all local/user agents; when migration hints are set to `once` or `always`, the first or every agent-host chat request performs the same scan. `sendRequest` awaits `collectCustomizationMigrationHint()` in its context `Promise.all` before agent invocation, so slow or remote files directly delay the request. Large agent collections also open all reads concurrently.",
+      "Evidence": "`PromptsService.parseNew` calls `fileService.readFile` for every URI without an open text model and does not cache that result. The surrounding prompt discovery code explicitly routes such reads through a service-wide `Limiter` capped at 10 because unbounded discovery can exhaust file handles, but this new call site invokes `parseNew` directly under `Promise.all`. The editor invokes `computeMigration` on initial load and customization changes, while `ChatService.sendRequest` awaits `computeMigrationHint` before invoking the agent.",
+      "Recommendation": "Reuse or extend the cached, limiter-backed agent discovery result to expose whether each file has handoffs, or add a bounded/coalesced migration scan with invalidation on agent-file changes. Ensure concurrent editor/hint assessments share one in-flight result rather than issuing another read per file."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "boundary-fanout",
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Send an agent-host chat request while customization migration hints are configured to `once` or `always`",
+        "CriticalPath": "`ChatService.sendRequest` collects hooks, instructions, and the migration hint in parallel, but awaits all three before agent invocation. The new AgentFiles computation therefore places its complete agent-file scan on request latency; with the default `never` setting this path is skipped.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigrationServiceImpl.ts:83",
+            "Operation": "Discover agent-file URIs through `listPromptFiles(PromptsType.agent)`",
+            "Cardinality": "One logical discovery call per AgentFiles assessment; underlying directory scans occur on a cold/invalidated file-location cache.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "With the other agent migration categories disabled, migration-hint assessment did not request the agent-file list.",
+            "CriticalPathEffect": "Must finish before candidate parsing and therefore before the chat request can proceed."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigrationServiceImpl.ts:89",
+            "Operation": "Read each closed agent file through `promptsService.parseNew`",
+            "Cardinality": "N reads per assessment, where N is the number of local/user agent files; all N can be in flight together.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Migration-hint assessment did not read every agent file to inspect handoffs.",
+            "CriticalPathEffect": "The slowest read/parse delays agent invocation because hint collection is awaited by the request context barrier."
+          }
+        ],
+        "ScalingInput": "Number of discovered local/user agent files across workspace and user locations; effective cardinality is one parse/read per eligible URI, with no content-level deduplication or result reuse.",
+        "EffectiveConcurrency": "All eligible agent files are passed directly to `Promise.all`, so effective read concurrency is N. This bypasses the shared prompt discovery limiter capped at 10; overlapping request assessments in `always` mode can multiply the burst.",
+        "CacheBehavior": "The file-location list may be cached/coalesced after its locator event is initialized, and open text models reuse a parsed-model cache. Closed-file `parseNew` results are not cached, so warm assessments still reread and reparse every eligible file; only OS/filesystem caches may reduce physical I/O.",
+        "MechanismConfidence": "High: the direct `parseNew` call, its `fileService.readFile` fallback, lack of closed-file cache, unbounded `Promise.all`, and request-path await are explicit.",
+        "MagnitudeUncertainty": "The hint setting defaults to `never`, but it is experiment-controlled and explicitly supports `once` and `always`; user agent counts and remote filesystem latency vary. These affect severity, not the established blocking fan-out.",
+        "Verdict": "Reportable medium-severity regression: the diff adds an unbounded per-agent filesystem/parse burst to a chat request critical path."
+      },
+      {
+        "Scenario": "Open or refresh the Chat Customizations management editor for an agent-host harness",
+        "CriticalPath": "The editor renders a loading migration state and awaits all enabled category computations before updating migration cards and shortcuts. AgentFiles is enabled by default, so its complete scan participates in every refresh.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigrationServiceImpl.ts:84-102",
+            "Operation": "Read and parse every local/user agent file to detect the handoffs header",
+            "Cardinality": "N reads per refresh, potentially multiplied by overlapping event-triggered refreshes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Editor migration refreshes did not inspect every agent file's contents for this category.",
+            "CriticalPathEffect": "Blocks completion of the editor's migration loading state and availability of migration cards/shortcuts, while consuming filesystem and parser resources alongside normal editor work."
+          }
+        ],
+        "ScalingInput": "Number of local/user agent files; repeated refresh events from prompt changes, harness/session changes, configuration changes, and customization/MCP changes can start additional full scans.",
+        "EffectiveConcurrency": "N file parses run concurrently inside each AgentFiles computation. Refresh sequencing discards stale results but does not cancel or coalesce their I/O, so overlapping refreshes can have aggregate concurrency above N.",
+        "CacheBehavior": "Agent URI discovery can become cached because editor listeners initialize prompt-file events. File contents for closed models are still reread and reparsed on every refresh; there is no AgentFiles result or in-flight scan cache.",
+        "MechanismConfidence": "High: editor refresh call sites, stale-result-only sequencing, and direct unbounded reads are explicit.",
+        "MagnitudeUncertainty": "Most users may have few agents, but repositories and user profiles can aggregate many files, and remote providers increase latency. Exact refresh overlap depends on emitted events.",
+        "Verdict": "Covered by the reported bounded/cached-discovery finding; no separate duplicate finding."
+      },
+      {
+        "Scenario": "Confirm in-place migration of selected agent files",
+        "CriticalPath": "After confirmation, each selected file is read, transformed, and written before the completion notification; an explicit migration refresh then verifies remaining candidates.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigration.ts:135-137",
+            "Operation": "Read and overwrite each selected agent file in place",
+            "Cardinality": "One read and one write per selected file, sequentially.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No in-place agent handoff migration existed.",
+            "CriticalPathEffect": "User-confirmed migration waits for all selected writes; this is expected for completion and error reporting."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/aiCustomizationManagementEditor.ts:1665",
+            "Operation": "Refresh candidate discovery after migration",
+            "Cardinality": "One explicit full category refresh after a successful in-place migration, plus file-system events suppressed while writes are in progress.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Refresh was awaited only when original files were deleted; in-place migration did not exist.",
+            "CriticalPathEffect": "Awaited before the success notification and reveal action."
+          }
+        ],
+        "ScalingInput": "Number and size of user-selected candidate agent files and number of handoff entries in each file.",
+        "EffectiveConcurrency": "The migration loop is sequential, giving bounded filesystem concurrency of one; the post-write discovery refresh uses the AgentFiles scan behavior described above.",
+        "CacheBehavior": "Migration intentionally rereads current file contents to avoid transforming stale discovery content. There is no write cache; changed-file events are suppressed during writes and one explicit refresh follows successful in-place migration.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Selection sizes are user-controlled, but this is an explicit, infrequent migration action and sequential I/O bounds resource pressure.",
+        "Verdict": "No separate finding: the per-selected-file read/write cost is necessary and bounded; the post-write scan is subsumed by the discovery finding."
+      },
+      {
+        "Scenario": "Migrate agents through existing user-data or configured-location categories",
+        "CriticalPath": "For selected agent customizations, the already-read source content is additionally parsed and rewritten before the existing destination write/delete flow.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigration.ts:206",
+            "Operation": "Existing source read, destination write, and optional source deletion for each selected customization",
+            "Cardinality": "Existing sequential per-selected-file boundary operations; unchanged by the added agent transform.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same source reads and destination writes/deletes occurred, but agent content was copied without the added in-memory handoff transformation.",
+            "CriticalPathEffect": "User-confirmed migration already waited for these operations."
+          }
+        ],
+        "ScalingInput": "Number and byte size of selected agent files, and handoff count per file.",
+        "EffectiveConcurrency": "The existing migration loop remains sequential; no new boundary concurrency is introduced.",
+        "CacheBehavior": "The source content is already loaded by the existing migration operation, so the new transform does not add a filesystem read. Parsing allocates transient AST/line/string data per selected agent and releases it after each sequential iteration.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Selected migration sets are usually small; very large files increase transient string allocation but the sequential path bounds peak memory.",
+        "Verdict": "No finding: added linear parsing/allocation is required for the requested transformation, does not add an I/O boundary, and occurs only during an explicit migration."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 12 changed files. One actionable regression was submitted: AgentFiles discovery performs uncached, unbounded per-file reads/parses on editor refreshes and, when hints are enabled, on the pre-invocation chat request path, bypassing the existing service-wide discovery limiter."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-10T17:55:29.641311692Z",
+    "CompletedAt": "2026-09-10T17:58:27.668133305Z",
+    "WallClockMilliseconds": 178026,
+    "ModelCalls": 13,
+    "InputTokens": 779177,
+    "OutputTokens": 8245,
+    "TotalTokens": 787422,
+    "ReasoningTokens": 2598,
+    "CacheReadTokens": 690013,
+    "CacheWriteTokens": 89125,
+    "APIDurationMilliseconds": 162268,
+    "ToolCalls": 71,
+    "NanoAIUnits": 88668620000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 690013,
+      "cache_write": 89125,
+      "input": 39,
+      "output": 8245
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
