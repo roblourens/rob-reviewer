@@ -12,7 +12,7 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 - The poller detects newly opened PRs and drafts becoming ready by scanning recently updated PRs.
 - Newly eligible PRs are reviewed in the same poll, subject to the per-run and per-day caps.
 - Each PR is reviewed at most once. Later pushes, rebases, and reopenings do not trigger another review. Persistent PR-level completion state prevents repeat analysis, and an authenticated GitHub review marker independently prevents repeat publication.
-- `publication.mode: approval` writes JSON and Markdown reports for human selection. `publication.mode: automatic` publishes every validated finding after the report is durable. The checked-in mode is `automatic`.
+- `publication.mode: approval` writes and archives JSON and Markdown reports without commenting on the PR. `publication.mode: automatic` publishes every validated finding after the report is durable. The checked-in mode is `approval`.
 - Automatic publication requires the PR to remain open, non-draft, unsuppressed, team-authored, and on the reviewed base/head at the final GitHub refresh. Explicitly approved saved reports may still be published to a closed or merged PR when the reviewed head matches.
 - Per-run and per-UTC-day review caps bound model usage. A pending head older than the configured maximum age is skipped rather than producing a surprising late review.
 - Adding the configured `performance-reviewer:skip` label suppresses that head.
@@ -62,7 +62,7 @@ learning:
   enabled: true
   maxCasesPerRun: 1
 publication:
-  mode: automatic
+  mode: approval
 review:
   model: gpt-5.6-sol
   reasoningEffort: high
@@ -198,13 +198,13 @@ A separate `Apply reviewer learnings` workflow is triggered after the reviewer w
 
 The model, PR text, and mutable state ledger cannot authorize arbitrary instructions. Each mechanism family maps to a predefined, host-owned guidance paragraph; arbitrary mechanism/evidence prose remains only in the JSON case ledger. Updates are idempotent, modify only `learned-regressions.md`, use the GitHub Contents API with optimistic SHA checks, and carry the Copilot commit disclosure. The separate workflow can be rerun against the same immutable artifact if an update fails transiently.
 
-## Automatic operation
+## Scheduled operation
 
-The checked-in configuration enables automatic analysis and publication. The two Actions secrets must be configured and the `ROB_REVIEWER_ENABLED` repository variable must be `true` for scheduled runs.
+The checked-in configuration enables scheduled analysis without publication. The two Actions secrets must be configured and the `ROB_REVIEWER_ENABLED` repository variable must be `true` for scheduled runs.
 
-The first enabled run bootstraps state and reviews no existing non-draft backlog. Later runs analyze newly eligible PRs immediately, write reports, and publish host-validated findings automatically.
+The first enabled run bootstraps state and reviews no existing non-draft backlog. Later runs analyze newly eligible PRs immediately, write reports, upload them as workflow artifacts, and archive them on the `reviewer-state` branch without commenting on PRs.
 
-To return to analysis-only operation, change `publication.mode` to `approval`.
+To enable automatic publication again, change `publication.mode` to `automatic`.
 
 Either switch is a kill switch:
 
