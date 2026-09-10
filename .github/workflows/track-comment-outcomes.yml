@@ -1,0 +1,94 @@
+name: Track review comment outcomes
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Optional PR to import, including a manually published review
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reviewer-comment-outcomes
+  cancel-in-progress: false
+
+jobs:
+  track:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.ROB_REVIEWER_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: source
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: reviewer-state
+          path: reviewer-history
+          token: ${{ github.token }}
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+          cache-dependency-path: source/go.sum
+      - run: go mod download
+        working-directory: source
+      - run: go tool bundler
+        working-directory: source/cmd/rob-reviewer
+      - name: Refresh thread facts and author feedback
+        env:
+          REVIEW_GITHUB_TOKEN: ${{ secrets.REVIEW_GITHUB_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_NAME: ${{ github.event_name }}
+        working-directory: source
+        run: |
+          args=()
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            args+=(--automatic)
+          fi
+          if [[ -n "$PR_NUMBER" ]]; then
+            args+=(--pr "$PR_NUMBER")
+          fi
+          go run ./cmd/rob-reviewer track-comment-outcomes \
+            --ledger ../reviewer-history/.rob-reviewer/comment-outcomes.json \
+            --markdown ../reviewer-history/.rob-reviewer/comment-outcomes.md \
+            --runs-root ../reviewer-history/.rob-reviewer/runs \
+            "${args[@]}"
+      - name: Preserve outcome snapshot artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: comment-outcomes-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reviewer-history/.rob-reviewer/comment-outcomes.*
+          include-hidden-files: true
+          if-no-files-found: ignore
+      - name: Commit outcomes, including partial failures
+        if: ${{ always() && hashFiles('reviewer-history/.rob-reviewer/comment-outcomes.json') != '' }}
+        working-directory: reviewer-history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .rob-reviewer/comment-outcomes.json .rob-reviewer/comment-outcomes.md
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit \
+            -m "Update review comment outcomes (Written by Copilot)" \
+            -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:reviewer-state; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              exit 1
+            fi
+            git pull --rebase origin reviewer-state
+          done

@@ -126,6 +126,50 @@ A separate, rerunnable `Index published reviews` workflow reconciles each immuta
 
 `published-reviews.md` is the easiest place to skim. It retains the newest 200 publications, listed newest first, and includes the PR link, exact head, comment count, run-archive link, locations, severities, and exact public comment bodies. Runs with zero publications do not appear, and complete history remains in the per-run archives. Each update reconciles every archived `run.json`, so a later run repairs an index update that was superseded in the Actions queue. Because indexing also consumes the triggering immutable artifact, rerunning this workflow can recover a publication even if the source workflow failed after submitting its GitHub review.
 
+## Tracking comment outcomes
+
+The hourly `Track review comment outcomes` workflow keeps two additional files on `reviewer-state`:
+
+```text
+.rob-reviewer/comment-outcomes.json
+.rob-reviewer/comment-outcomes.md
+```
+
+The versioned JSON ledger retains stable GitHub thread/comment IDs, public links, complete observed conversations, timestamps, resolution/outdated status, resolver, PR state, and AI author-feedback assessments with exact supporting quotes, confidence, model, and assessment time. The Markdown report provides counts, percentages, per-comment outcomes, and evidence. Git history and per-run Actions artifacts preserve earlier snapshots; these are observations, not a complete real-time event log.
+
+Two independent dimensions prevent misleading acceptance statistics:
+
+| Thread outcome | Meaning |
+| --- | --- |
+| `resolved` | GitHub marks the thread resolved. This does **not** prove the code was fixed or the feedback accepted. |
+| `replied` | Unresolved, with a human reply other than the reviewer. |
+| `ignored` | Closed or merged, unresolved, with no human reply other than the reviewer. This is a measurable proxy, not proof of intent. |
+| `pending` | Still open, unresolved, and no human reply. Silence on an open PR is never counted as ignored. |
+| `unavailable` | A previously tracked thread is missing, or the PR refresh failed. Last-known evidence is retained but not counted as a current resolution or disagreement. |
+
+PR-author feedback is assessed separately as `accepted`, `disagreed`, `mixed`, or `unclear`. Only human replies by the PR author support this assessment; a maintainer's reply does not imply author agreement. `mixed` preserves pushback even when the author later agrees. Results below 80% confidence count as `unclear`. A resolved thread can still count as `disagreed` or `mixed`; an outdated diff never implies acceptance. Claimed fixes are not independently verified.
+
+Other feedback categories are `no-author-reply`, `awaiting-assessment` (budget deferred), `error`, and `unavailable`. Both statistics tables use all tracked comments as their denominator and show these categories explicitly. Each PR records its last successful check, so reports distinguish stale observations from fresh data.
+
+The tracker discovers publications from the **full** run archive, not the newest-200 publication index. It verifies the authenticated review identity and the reviewer's hidden PR marker before importing GitHub threads, excludes pending reviews, and paginates both threads and replies. Existing ledger entries are never evicted when an index entry ages out. Missing threads remain unavailable rather than disappearing from the denominator. Closed PRs continue to be refreshed, including later replies, reopened PRs, and unresolved/re-resolved threads.
+
+Each run refreshes at most 100 PRs, least recently attempted first, and makes at most 10 feedback assessments. Unchanged conversations reuse their assessment; changed replies, the configured model/reasoning effort, or the assessment prompt version invalidate it. Copilot starts lazily only when classification is needed, in an isolated `ModeEmpty` session with only a typed assessment tool. It cannot run shell commands, read repository files, or follow instructions in replies. Evidence must exactly match a PR-author reply. Conversations over 128 KiB fail assessment explicitly rather than being silently truncated.
+
+Scheduled tracking respects `ROB_REVIEWER_ENABLED` and `automation.enabled`. It requires the existing `reviewer-state` branch/run archive from the poller and uses the same review and Copilot credentials. GitHub/model failures fail the job while still saving partial observations and explicit errors; retries repair them. No comments, reactions, resolutions, or other PR mutations are made.
+
+To refresh a local checkout of the history branch:
+
+```bash
+REVIEW_GITHUB_TOKEN=... \
+COPILOT_GITHUB_TOKEN=... \
+go run ./cmd/rob-reviewer track-comment-outcomes \
+  --ledger ../reviewer-history/.rob-reviewer/comment-outcomes.json \
+  --markdown ../reviewer-history/.rob-reviewer/comment-outcomes.md \
+  --runs-root ../reviewer-history/.rob-reviewer/runs
+```
+
+For a review published manually with `publish-report` (which has no polling archive), supply `--pr 123456`, or the optional PR number when dispatching the tracking workflow. Repeat `--pr` for multiple imports. `--runs-root` is optional for explicit imports or refreshing an existing ledger; once imported, PRs remain tracked. The review token must belong to the identity that published the reviews. `--max-prs` and `--max-assessments` adjust the positive per-run limits. Manual tracking remains available when automation is disabled.
+
 ## Learning from shipped performance fixes
 
 The performance skill also looks for PRs that remove a concrete, evidenced performance regression. This signal is separate from normal review findings and never creates a comment on the fixing PR.
@@ -268,6 +312,8 @@ go build ./cmd/rob-reviewer
 ```
 
 Tests cover safe configuration defaults, state migration, open-head bootstrap, PR-level review deduplication, quiet-period resets, drafts becoming ready, failed-head retries, daily caps, stale-head expiration, suppression labels, focus loading, safe checkout behavior, diff parsing and changed-line anchors, path containment, bounded tools, finding validation/ranking, stale-head rejection, publication idempotency, and review formatting. Synthetic fixtures model known performance failure mechanisms without copying VS Code source.
+
+Outcome-tracking tests additionally cover paginated thread/reply discovery, authenticated publication provenance, resolution versus disagreement, pending versus ignored, missing data and partial failures, exact author evidence, confidence thresholds, assessment caching/budgets, durable JSON round-trips, and full-archive discovery.
 
 Use a manual dry-run workflow for the real SDK smoke test. Publishing happens separately from an approved saved report.
 

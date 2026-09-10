@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/roblourens/rob-reviewer/internal/outcomes"
 	"github.com/roblourens/rob-reviewer/internal/review"
 )
 
@@ -42,6 +43,14 @@ func WritePublishedReviewIndex(jsonPath, markdownPath, runPath string) error {
 }
 
 func WritePublishedReviewIndexFromArchive(jsonPath, markdownPath, archiveRoot string) error {
+	runPaths, err := archivedRunPaths(archiveRoot)
+	if err != nil {
+		return err
+	}
+	return writePublishedReviewIndex(jsonPath, markdownPath, runPaths)
+}
+
+func archivedRunPaths(archiveRoot string) ([]string, error) {
 	var runPaths []string
 	err := filepath.WalkDir(archiveRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -53,10 +62,10 @@ func WritePublishedReviewIndexFromArchive(jsonPath, markdownPath, archiveRoot st
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("find archived poll run records: %w", err)
+		return nil, fmt.Errorf("find archived poll run records: %w", err)
 	}
 	slices.Sort(runPaths)
-	return writePublishedReviewIndex(jsonPath, markdownPath, runPaths)
+	return runPaths, nil
 }
 
 func writePublishedReviewIndex(jsonPath, markdownPath string, runPaths []string) error {
@@ -181,7 +190,7 @@ func loadPublishedReviewIndex(path string) (PublishedReviewIndex, error) {
 }
 
 type strictJSONTarget interface {
-	PollRunRecord | PublishedReviewIndex
+	PollRunRecord | PublishedReviewIndex | outcomes.Ledger
 }
 
 func decodeStrictJSONFile[T strictJSONTarget](path string, target *T, maxBytes int64) error {

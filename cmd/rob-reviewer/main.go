@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/roblourens/rob-reviewer/internal/app"
+	"github.com/roblourens/rob-reviewer/internal/config"
 	"github.com/roblourens/rob-reviewer/internal/poller"
 	"github.com/roblourens/rob-reviewer/internal/review"
 )
@@ -28,7 +29,7 @@ func main() {
 
 func run(logger *slog.Logger) (returnErr error) {
 	if len(os.Args) < 2 {
-		return errors.New("usage: rob-reviewer <poll|review|publish-report|apply-learnings|update-published-index> [options]")
+		return errors.New("usage: rob-reviewer <poll|review|publish-report|apply-learnings|update-published-index|track-comment-outcomes> [options]")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -249,8 +250,51 @@ func run(logger *slog.Logger) (returnErr error) {
 		}
 		return app.WritePublishedReviewIndex(*indexPath, *markdownPath, *runPath)
 
+	case "track-comment-outcomes":
+		flags := flag.NewFlagSet("track-comment-outcomes", flag.ContinueOnError)
+		configPath := flags.String("config", "reviewer.yaml", "path to reviewer configuration")
+		jsonPath := flags.String("ledger", "", "durable comment outcome JSON ledger")
+		markdownPath := flags.String("markdown", "", "generated Markdown statistics")
+		runsRoot := flags.String("runs-root", "", "full archived run tree for publication discovery")
+		maxPulls := flags.Int("max-prs", 100, "maximum PRs to refresh, least recently attempted first")
+		maxAssessments := flags.Int("max-assessments", 10, "maximum changed conversations to classify")
+		automatic := flags.Bool("automatic", false, "respect automation.enabled for scheduled operation")
+		var pullRequests stringListFlag
+		flags.Var(&pullRequests, "pr", "additional published PR to track; repeat for multiple PRs")
+		if err := flags.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		if *automatic {
+			cfg, err := config.Load(*configPath)
+			if err != nil {
+				return err
+			}
+			if !cfg.Automation.Enabled {
+				logger.Info("automatic comment tracking is disabled by configuration")
+				return nil
+			}
+		}
+		var numbers []int
+		for _, value := range pullRequests {
+			number, err := app.ParsePullRequestNumber(value)
+			if err != nil {
+				return err
+			}
+			numbers = append(numbers, number)
+		}
+		reviewer, err := newApp(*configPath, logger)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			returnErr = errors.Join(returnErr, reviewer.Close())
+		}()
+		return reviewer.TrackCommentOutcomes(ctx, app.OutcomePaths{
+			JSON: *jsonPath, Markdown: *markdownPath, RunsRoot: *runsRoot,
+		}, numbers, *maxPulls, *maxAssessments)
+
 	default:
-		return fmt.Errorf("unknown command %q; use poll, review, publish-report, apply-learnings, or update-published-index", os.Args[1])
+		return fmt.Errorf("unknown command %q; use poll, review, publish-report, apply-learnings, update-published-index, or track-comment-outcomes", os.Args[1])
 	}
 }
 
