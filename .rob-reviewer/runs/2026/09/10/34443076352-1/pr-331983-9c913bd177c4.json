@@ -1,0 +1,166 @@
+{
+  "PullRequest": {
+    "Number": 331983,
+    "Title": "agentHost: measure time to first edit",
+    "Body": "## Why\n\nAgent Host needs an authoritative time-to-first-edit measurement for Copilot SDK turns. Joining the existing SDK usage, failure, cancellation, and assistant-message events cannot reproduce the historical metric because those signals have different lifecycle boundaries and incomplete correlation.\n\nUses the atomic per-attempt lifecycle event from github/copilot-agent-runtime#16674, which is present in the runtime now bundled on main.\n\n## What\n\nQualifying `agentHost.turnCompleted` events now include cumulative provider-dispatch time through the first accepted response requesting a built-in file edit. For example:\n\n```json\n{\n  \"timeToFirstEdit\": 700,\n  \"timeToFirstEditClassifierVersion\": 1\n}\n```\n\nErrors, cancellations, post-request rejections, and accepted non-edit responses contribute to the prefix. Root and subagent turns are tracked independently. Turns without a qualifying edit leave both fields absent rather than reporting zero. Shell-based file writes are outside the built-in edit classifier.\n\nSteering turns receive their own completion telemetry and edit timing, including when steering is promoted before the next SDK assistant turn starts. Resumed subagents begin tracking at turn start so their initial failed or rejected attempts contribute too.\n\n## How\n\nThe session wrapper validates the raw `model.call_finished` stream into a precise local type because the pinned SDK TypeScript union predates the event. Agent Host maps these events to their owning turns, rejecting duplicates and stale correlation IDs. Provider-promoted steering turns are registered with the telemetry tracker, and their user-message interaction ID is bound immediately.\n\n## Manual validation\n\nIn an isolated Windows Code OSS Agents window, submitted a steering message during an active PowerShell wait, approved the requested built-in file edit, and verified both the resulting file contents and trace telemetry. The steering completion logged `timeToFirstEdit: 2353`, classifier version `1`, and `modelCallCount: 5` after merging current main (04f75c749f83). Trace logging was enabled with `--log trace`; no source instrumentation was needed.\n\nThis probe explicitly requested a built-in edit tool; it does not establish shell-edit coverage. The specific before-next-turn-start event ordering is covered by a regression test rather than forced by the live smoke scenario.",
+    "URL": "https://github.com/microsoft/vscode/pull/331983",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "amunger",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "585a254fad3a58b3d454622a9a1cf61358e5fc58",
+    "HeadRef": "aamunger/agent-host-time-to-first-edit",
+    "HeadSHA": "9c913bd177c4aa377c9ff1f8601cc3227974cc9f",
+    "CreatedAt": "2026-08-21T15:05:13Z",
+    "UpdatedAt": "2026-09-10T05:28:15Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-3994892C73E7",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts",
+      "Side": "RIGHT",
+      "Line": 6587,
+      "Severity": "low",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The writes are directly on the normal root-turn path, repository-wide searches show no deletion or clearing for either new map, and `CopilotAgent` retains live `CopilotAgentSession` instances until chat release/destruction. The exact heap cost per real-world session is uncertain, but the linear retention mechanism and lifecycle are explicit.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "unbounded-retention",
+      "PerformanceResource": "Map entries and retained SDK interaction/turn ID plus host-turn ID strings",
+      "PerformanceScaling": "O(U + T) retained entries for U unique root interaction IDs and T unique SDK root-turn IDs over the lifetime of one live chat session; completed turns do not reduce either cardinality.",
+      "PerformanceOutcome": "retained memory and increasing GC pressure over long-running sessions",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff, the session did not allocate or retain these root-turn correlation maps, so completed root interactions added no such session-lifetime state.",
+      "ChangedBehavior": "Every root `assistant.turn_start` with an interaction ID now retains the interaction-to-host-turn pair, and distinct SDK turn IDs are retained as well, even after the protocol turn completes.",
+      "CausalDiffEvidence": "The diff adds `_hostTurnIdsBySdkTurnId`/`_hostTurnIdsByInteractionId` and inserts a new interaction entry at line 6587 (also for steering at line 4913), but there is no corresponding delete or clear anywhere in `CopilotAgentSession`; `resetTurnState` only clears streaming state, and the maps survive until the whole session object is disposed.",
+      "Title": "Prune completed turn correlations",
+      "Impact": "A long-lived Copilot chat accumulates unreachable historical correlation keys and host-turn UUID values, increasing agent-host heap retention and eventual GC pressure until the chat/session is released.",
+      "Evidence": "`onTurnStart` stores both SDK turn and interaction correlations; the steering user-message path stores another interaction correlation. `_completeActiveTurn`, `failActiveTurn`, `discardActiveTurn`, `onTurnEnd`, and `resetTurnState` do not remove them. Tests exercise distinct `interaction-1` and `interaction-2`, demonstrating cardinality grows with interactions rather than remaining a single active entry.",
+      "Recommendation": "Expire correlations when their host protocol turn completes, aborts, or is discarded. Maintain reverse keys per host turn (or a bounded active/recent correlation set if late-event rejection requires it) so cleanup is O(entries for that turn) rather than scanning the full maps."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "unbounded-retention",
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Run many normal or steering turns in a long-lived Copilot chat and record time to first built-in edit.",
+        "CriticalPath": "Provider dispatch is pre-existing and completes before `model.call_finished`; the added parsing, correlation lookup, signal routing, and Set update run synchronously on the SDK event callback. Turn completion then emits the existing telemetry event.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_emitModelCallFinished",
+            "Operation": "Observe completion metadata for the already-dispatched provider model call.",
+            "Cardinality": "One existing provider dispatch per model-call attempt; this diff only observes its completion and does not add a dispatch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider attempts occurred, but their finished lifecycle event was not routed into host telemetry bookkeeping.",
+            "CriticalPathEffect": "The provider call remains the dominant turn critical path; the new bookkeeping runs after each attempt."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostTelemetryReporter.ts:turnCompleted",
+            "Operation": "Submit the existing completed-turn telemetry event with time-to-first-edit fields.",
+            "Cardinality": "One existing `agentHost.turnCompleted` telemetry submission per completed protocol turn; two scalar fields are added to its payload.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One completed-turn telemetry event was already submitted without these two fields.",
+            "CriticalPathEffect": "Submission occurs after tracker completion and does not add another telemetry event; payload growth is constant."
+          }
+        ],
+        "ScalingInput": "Unique root interaction IDs and SDK root-turn IDs accumulated across all user, resumed, and steering turns in one live Copilot chat; model-call handling itself is one in-memory update per attempt.",
+        "EffectiveConcurrency": "SDK events are handled synchronously on the JavaScript event loop; there is no added fan-out, queue, or parallel boundary call. One callback is processed per model-call attempt.",
+        "CacheBehavior": "No result cache is involved. Correlation lookups are warm in-memory Map reads and model-call IDs are deduplicated per active tracker turn; the new root correlation maps never evict completed entries.",
+        "MechanismConfidence": "High: normal root turn-start and steering paths insert correlation entries, repository-wide inspection finds no delete/clear, and the owning session remains registered until release or destruction.",
+        "MagnitudeUncertainty": "The number of turns in typical live chats and bytes retained per identifier vary, so the unbounded map issue is low severity; the lack of cleanup and linear lifetime scaling are certain.",
+        "Verdict": "Reportable low-severity unbounded retention: completed root-turn correlations remain in two session-lifetime maps. Per-attempt CPU and telemetry boundary cardinality remain bounded and do not independently regress performance."
+      },
+      {
+        "Scenario": "Resume a subagent and attribute failed/rejected attempts through its first accepted built-in edit.",
+        "CriticalPath": "A subagent `assistant.turn_start` may synchronously emit one resume signal, then each `model.call_finished` is routed in memory to the active subagent tracker. This work is downstream of the pre-existing provider call and off any additional I/O path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:onTurnStart/onModelCallFinished",
+            "Operation": "Route completed subagent model-attempt timing to its existing host subagent turn.",
+            "Cardinality": "One pre-existing provider network call per subagent model attempt; no extra call is made by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Subagent provider calls already occurred; their per-attempt dispatch durations were not accumulated for this metric.",
+            "CriticalPathEffect": "The changed code consumes the completion event after the network operation and performs only in-process routing."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostTelemetryReporter.ts:turnCompleted",
+            "Operation": "Submit subagent turn completion telemetry.",
+            "Cardinality": "One existing completed-turn telemetry submission per completed subagent protocol turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The completion event was already submitted without edit timing.",
+            "CriticalPathEffect": "No extra event is emitted; only constant-size fields are attached."
+          }
+        ],
+        "ScalingInput": "Number of model-call attempts in the active subagent turn after duplicate IDs are removed.",
+        "EffectiveConcurrency": "Events are serialized by the SDK callback/event loop. Different subagents may produce events interleaved, but the diff starts no tasks and adds no concurrency burst.",
+        "CacheBehavior": "Subagent ownership uses existing session-lifetime agent-ID mappings; model-call deduplication is local to the active subagent turn and is released by `AgentHostTurnTracker.turnCompleted`. No new external cache reads occur.",
+        "MechanismConfidence": "High: the call flow from SDK event through parent-tool routing to `AgentHostTurnTracker.modelCallFinished` is direct, and tracker disposal removes the per-turn sets.",
+        "MagnitudeUncertainty": "Subagent attempt counts vary, but active tracker state is explicitly disposed at turn completion, bounding the new Set and counters to one in-flight turn.",
+        "Verdict": "No additional finding: work is O(unique attempts) in memory, adds no provider/IPC/filesystem fan-out, and per-turn allocations are cleaned up on completion."
+      },
+      {
+        "Scenario": "Process the raw SDK stream while an assistant response emits many message-delta and tool events.",
+        "CriticalPath": "Every SDK event now performs an object/type discriminator before normal wrapper dispatch; for nonmatching events it exits after checking `event.type`. Valid model-call events synchronously notify one registered listener.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Total SDK event count, including streaming deltas; only valid model-call-finished events incur full field validation and object allocation.",
+        "EffectiveConcurrency": "Single synchronous event callback; no batching change and no spawned asynchronous work.",
+        "CacheBehavior": "No cache is populated. The raw event validator performs type checks directly on each event and allocates a small normalized object only for a valid `model.call_finished` event.",
+        "MechanismConfidence": "High from the wrapper constructor and parser implementation.",
+        "MagnitudeUncertainty": "SDK event rates can be high for streaming deltas, but nonmatching validation is a constant-time type comparison and does not allocate, so there is no credible user-visible CPU regression.",
+        "Verdict": "No finding: the added per-event discriminator is constant-time and allocation-free on the high-frequency nonmatching path."
+      }
+    ],
+    "Summary": "Completed the performance pass across all nine changed files. One low-severity unbounded-retention regression was submitted for root-turn correlation maps. Provider and telemetry boundaries retain their pre-diff cardinality, subagent tracker state is cleaned up per turn, and raw event validation adds only constant-time nonmatching work."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-10T06:00:25.704072799Z",
+    "CompletedAt": "2026-09-10T06:02:37.869392768Z",
+    "WallClockMilliseconds": 132165,
+    "ModelCalls": 11,
+    "InputTokens": 574973,
+    "OutputTokens": 8024,
+    "TotalTokens": 582997,
+    "ReasoningTokens": 3303,
+    "CacheReadTokens": 491101,
+    "CacheWriteTokens": 83839,
+    "APIDurationMilliseconds": 118174,
+    "ToolCalls": 65,
+    "NanoAIUnits": 77624740000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 491101,
+      "cache_write": 83839,
+      "input": 33,
+      "output": 8024
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

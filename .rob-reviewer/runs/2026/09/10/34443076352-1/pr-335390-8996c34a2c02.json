@@ -1,0 +1,142 @@
+{
+  "PullRequest": {
+    "Number": 335390,
+    "Title": "mcp: Await workspace .mcp.json discovery before autostart",
+    "Body": "## Summary\n\n- register the workspace-root `.mcp.json` initial scan as a lazy MCP collection\n- let the existing collection discovery barrier await that scan before autostart selects candidates\n- preserve eager file discovery and subsequent file watching\n- add regression coverage with a deliberately delayed initial file read\n\nFixes #335389\n\n## Validation\n\n- `npm run compile-client`\n- `npm run eslint -- src\\vs\\workbench\\contrib\\mcp\\common\\discovery\\workspaceDotMcpDiscovery.ts src\\vs\\workbench\\contrib\\mcp\\test\\common\\workspaceDotMcpDiscovery.test.ts`\n- `node .\\test\\unit\\node\\index.js --run src\\vs\\workbench\\contrib\\mcp\\test\\common\\workspaceDotMcpDiscovery.test.ts`\n- `node .\\test\\unit\\node\\index.js --run src\\vs\\workbench\\contrib\\mcp\\test\\common\\mcpRegistry.test.ts`\n- `git diff --check`\n\nFull `npm run hygiene` is blocked in this checkout by an existing Windows path-resolution failure: it attempts to open `Q:\\Q:\\src\\vscode\\remote\\package.json`. Targeted ESLint passes for both changed files.",
+    "URL": "https://github.com/microsoft/vscode/pull/335390",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "digitarald",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "a0a429cd4ac624c0add568597f00b052c225ae56",
+    "HeadRef": "fix/workspace-dot-mcp-autostart",
+    "HeadSHA": "8996c34a2c020caab36bb6c1ea7a1d5f22ec6fbb",
+    "CreatedAt": "2026-09-10T04:02:59Z",
+    "UpdatedAt": "2026-09-10T05:34:54Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "eager-work",
+      "repeated-work",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Workbench AfterRestored startup discovers workspace-root .mcp.json files across a multi-root workspace",
+        "CriticalPath": "McpDiscovery.start synchronously installs one watcher and starts one read per workspace folder, but does not await any read, so workbench restoration remains off this filesystem critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/mcp/common/discovery/workspaceDotMcpDiscovery.ts:104",
+            "Operation": "create a non-recursive watcher for \u003cfolder\u003e/.mcp.json",
+            "Cardinality": "One watcher per workspace folder for the folder lifetime.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same watcher was created once per workspace folder before the diff.",
+            "CriticalPathEffect": "Watcher setup is synchronous during AfterRestored discovery, while file-change processing is deferred by a 500 ms scheduler."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/mcp/common/discovery/workspaceDotMcpDiscovery.ts:79",
+            "Operation": "read and parse \u003cfolder\u003e/.mcp.json",
+            "Cardinality": "One eager initial read per workspace folder, issued independently; later change events are coalesced for 500 ms per folder.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same eager updateFile call issued one initial read per workspace folder; the diff memoizes that initial invocation rather than adding another read.",
+            "CriticalPathEffect": "The initial reads are started but not awaited by discovery startup, so they do not block workbench restoration."
+          }
+        ],
+        "ScalingInput": "Workspace-folder count N. Initial filesystem concurrency is N in both versions; registry placeholder registration/replacement also scales with N, while McpService's existing 500 ms scheduler coalesces collection updates.",
+        "EffectiveConcurrency": "Initial reads run in parallel across workspace folders, as before. Each folder's watcher uses its own RunOnceScheduler to coalesce changes.",
+        "CacheBehavior": "loadInitial memoizes the initial update promise, so registry discovery and the eager kickoff share one read. After resolution, the lazy collection is replaced by a normal collection or removed; watcher updates remain independently throttled.",
+        "MechanismConfidence": "High confidence that no filesystem call or startup wait was added, based on the before/after updateFile call and the non-awaited void loadInitial invocation.",
+        "MagnitudeUncertainty": "Very large multi-root workspaces cause extra in-memory placeholder registry churn, but the operations are small and downstream server recomputation is already coalesced; evidence does not establish a user-visible regression.",
+        "Verdict": "No reportable startup regression. The diff preserves eager I/O cardinality and keeps it off the workbench restoration critical path."
+      },
+      {
+        "Scenario": "A cold first native chat request autostarts MCP servers while workspace .mcp.json discovery is still pending",
+        "CriticalPath": "chatServiceImpl awaits ChatMcpServersStarting.wait before invoking the agent; McpService._autostart awaits registry.discoverCollections, whose Promise.all now includes each pending workspace lazy collection load. Progress therefore waits for the slowest pending workspace read before candidate selection.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/mcp/common/discovery/workspaceDotMcpDiscovery.ts:106-116",
+            "Operation": "complete the already-started read of each workspace-root .mcp.json",
+            "Cardinality": "At most one memoized initial read per workspace folder; effective cold fan-out is N folders and warm fan-out is zero.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Reads were still eagerly issued, but workspace-dot-MCP discovery was not represented in discoverCollections, so chat autostart did not await their completion and could omit those servers.",
+            "CriticalPathEffect": "The diff moves completion of pending reads onto cold MCP autostart and therefore the first tool-capable chat request's critical path; parallel Promise.all latency is governed by the slowest pending read, not the sum."
+          }
+        ],
+        "ScalingInput": "Number of workspace folders whose initial reads are still pending when the first tool-capable chat request is sent; effective latency is the maximum remaining read duration because loads run in parallel.",
+        "EffectiveConcurrency": "All pending folder reads were already started eagerly and discoverCollections awaits them concurrently with other lazy collections using Promise.all. The diff does not add I/O concurrency.",
+        "CacheBehavior": "The promise is memoized per folder and the lazy placeholder is replaced or removed after the initial read, so subsequent requests do not repeat or await this initial read. There is no negative cache beyond completion because watcher events remain authoritative.",
+        "MechanismConfidence": "High confidence in the changed critical-path wait from the added lazy.load through discoverCollections, McpService._autostart, and chatServiceImpl's await.",
+        "MagnitudeUncertainty": "The delay is observable only when a request arrives before AfterRestored discovery finishes, especially on slow remote filesystems; typical local reads likely complete first.",
+        "Verdict": "No finding. The cold wait is the intentional bounded ordering needed to make workspace MCP servers available before autostart selects tools; it is memoized, parallel, and does not add boundary calls. No behavior-preserving narrower operation is established."
+      },
+      {
+        "Scenario": "Adding or removing a workspace folder while the workbench is running",
+        "CriticalPath": "The workspace-folder event synchronously disposes removed folder state or creates watcher/placeholder state for an added folder, then starts the new folder's initial read without awaiting it. A concurrent later collection activation can await that one memoized read.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/mcp/common/discovery/workspaceDotMcpDiscovery.ts:39-46,104-116",
+            "Operation": "watch and initially read the added folder's .mcp.json",
+            "Cardinality": "One watcher and one initial read per added folder; one disposal per removed folder.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Added folders already created a watcher and started an initial read; removed folders already disposed their watcher and registration.",
+            "CriticalPathEffect": "The folder-change handler does not await the read. Only MCP collection activation occurring while it is pending waits for completion."
+          }
+        ],
+        "ScalingInput": "Number of folders in a single workspace-folder change event; each added folder receives one independent read and watcher.",
+        "EffectiveConcurrency": "Added-folder reads run independently in parallel; each folder's subsequent watcher events are coalesced by its scheduler.",
+        "CacheBehavior": "Each added folder gets a fresh memoized initial promise. Removal disposes its watcher and current registry registration; no long-lived initial promise is retained by the discovery map after removal.",
+        "MechanismConfidence": "High confidence from the workspace event loop, disposable map ownership, and memoized load path.",
+        "MagnitudeUncertainty": "Bulk folder additions are uncommon, and no evidence shows the small added registry placeholder work causing measurable latency.",
+        "Verdict": "No reportable regression. Boundary cardinality and lifecycle are unchanged, and the new awaitability applies only if MCP activation races the initial read."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and traced startup discovery, cold chat autostart, and workspace-folder lifecycle paths. The PR adds an intentional cold-path barrier but no new filesystem operation, repeated read, unbounded retention, serialization growth, or concurrency burst. No valid performance finding or shipped performance-regression fix was identified."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-10T06:05:07.040674885Z",
+    "CompletedAt": "2026-09-10T06:06:39.769150943Z",
+    "WallClockMilliseconds": 92728,
+    "ModelCalls": 9,
+    "InputTokens": 247160,
+    "OutputTokens": 5025,
+    "TotalTokens": 252185,
+    "ReasoningTokens": 1738,
+    "CacheReadTokens": 201278,
+    "CacheWriteTokens": 45855,
+    "APIDurationMilliseconds": 84169,
+    "ToolCalls": 41,
+    "NanoAIUnits": 41039420000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 201278,
+      "cache_write": 45855,
+      "input": 27,
+      "output": 5025
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

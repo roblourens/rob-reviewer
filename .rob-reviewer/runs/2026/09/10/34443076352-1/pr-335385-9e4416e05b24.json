@@ -1,0 +1,163 @@
+{
+  "PullRequest": {
+    "Number": 335385,
+    "Title": "Auto mode: support server-owned Hydra-RL multi-turn routing",
+    "Body": "## Summary\n\nAdd VS Code client support for the server-owned Hydra-RL multi-turn protocol on the current `POST /auto` path.\n\n- Advertise `hydra_rl_multi_turn` capability whenever routing reaches `/auto`, without a second client rollout flag. Activate local scheduling only when CAPI returns valid controller state; control and older servers keep sticky Auto behavior.\n- Keep the opaque controller token and a bounded skip budget in the existing conversation cache. Honor exactly the authorized number of subsequent user turns, then use the server's selected model. The client does not implement model ranking, drift, or upgrade policy.\n- Count distinct chat request IDs rather than prompt text or endpoint resolutions. Serialize identified turns, deduplicate repeated resolutions, and send `advance: false` for ancillary calls and renewals. Expiry inside a skip window cannot refill the consumed budget.\n- Reset applicable state on compaction, authentication changes, disposal/eviction, tier or incompatible vision changes, and leaving or falling back from Auto. Typed model rejections invalidate active Hydra selections without retrying the model call or falling back to a rejected endpoint.\n- Recover once without state after a state-bearing `/auto` request is rejected with HTTP 400. Preserve compatible cached state across transient routing errors, and guard in-flight invalidation/account races.\n- Record server activation and authorized skips on `automode.autoV2Decision`, plus a per-user-turn `automode.hydraRlMultiTurnSkip` event. Opaque controller and model-session tokens are not logged.\n\n## Protocol And Rollout\n\nThis implements the merged server contract in github/copilot-api#37326 and follows the runtime transport in github/copilot-agent-runtime#17183. Related VS Code routing work: #324613.\n\nThe implementation targets current `main`; it does not depend on or port the older client-owned capability-drift state machine from #324613. `skip_turns` is validated as an integer in `[0, 7]`, matching the merged runtime contract. Server decision labels are not interpreted by the client.\n\nCAPI remains the only experiment assignment point. This PR enables protocol support, not the production experiment. Prompt/history preparation is unchanged. This is an experimental efficiency treatment, not a claim of improved answer quality.\n\nClient protocol and lifecycle details are documented in `extensions/copilot/docs/auto-mode/hydra-rl-multi-turn-routing.md`.\n\n## Validation\n\n- **120 tests passed** across the affected Auto service and endpoint suites plus the neighboring `vscode.lm` integration suite:\n  ```sh\n  cd extensions/copilot\n  npm run test:unit -- src/platform/endpoint/node/test/automodeService.spec.ts src/platform/endpoint/node/test/copilotChatEndpoint.spec.ts src/extension/conversation/vscode-node/test/languageModelAccessPrompt.spec.ts\n  ```\n- Semantic TypeScript check of all six changed TypeScript files and their transitive dependencies, using the extension's actual compiler configuration: passed.\n- Repository ESLint on all changed TypeScript files, with zero warnings: passed.\n- Exact CI telemetry gate (`@vscode/telemetry-extractor@1.20.4`): passed.\n- Documentation JSON examples, local links, and `git diff --check`: passed.\n- Rebased onto `main` at `a0a429cd4ac624c0add568597f00b052c225ae56`; the extension tree was unchanged by the rebase and the 120 tests were rerun afterward.\n\nThe local machine was disk-constrained, so validation used a shallow, blob-filtered sparse checkout and extension-only dependencies with install scripts disabled. A full editor build, desktop smoke test, and live CAPI experiment exercise were not run locally; broader platform checks remain for CI/review.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/335385",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "batuozt",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "a0a429cd4ac624c0add568597f00b052c225ae56",
+    "HeadRef": "bozturkler/hydra-rl-multi-turn",
+    "HeadSHA": "9e4416e05b2472ad298b4ac5f8e8fcea9601f23b",
+    "CreatedAt": "2026-09-10T01:49:58Z",
+    "UpdatedAt": "2026-09-10T01:57:05Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "repeated-work",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Panel or inline Auto conversation negotiating and consuming a Hydra-RL skip schedule",
+        "CriticalPath": "Endpoint resolution must complete before prompt rendering/model invocation can use the selected endpoint. On a cold conversation or after the skip budget reaches zero, POST /auto is on this critical path; authorized warm skips return the cached endpoint without that network round trip.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/endpoint/node/autoV2Fetcher.ts:107, AutoV2Fetcher.getAutoDecision",
+            "Operation": "POST /auto with prompt, tier/image metadata, and optional opaque controller state",
+            "Cardinality": "One cold call, then at most one call per distinct identified user turn when skipRemaining is zero; duplicate resolutions of the same request ID coalesce, while a server-authorized skip window removes up to seven subsequent calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "POST /auto was already required for a cold, expired, incompatible, or explicitly invalidated session, but the endpoint then remained sticky; the diff intentionally allows additional server-directed checkpoints after bounded skip windows.",
+            "CriticalPathEffect": "Blocks endpoint selection and therefore the start of the model request, with a five-second timeout."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/endpoint/node/autoChatEndpoint.ts:70, AutoChatEndpoint.makeChatRequest2",
+            "Operation": "Selected model chat request through the existing Copilot endpoint",
+            "Cardinality": "One model request per normal chat invocation; the new wrapper inspects the returned response once and does not retry it.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same model request occurred before the diff; rejected responses did not invalidate an active Hydra selection because that state did not exist.",
+            "CriticalPathEffect": "This remains the main response-generation critical path; the diff adds only constant-time rejection classification after completion."
+          }
+        ],
+        "ScalingInput": "Distinct chat request IDs in one conversation and the server-provided skip_turns value, bounded to 0..7. Same-ID duplicate endpoint resolutions are coalesced, and different conversations use independent queues.",
+        "EffectiveConcurrency": "Distinct identified turns are serialized per conversation by SequencerByKey; same conversation/tier/image/request-ID resolutions share TaskSingler promises. Different conversations remain concurrent, and settled queue keys are removed.",
+        "CacheBehavior": "Cold routing populates a cache capped at 50 conversations. Warm authorized skips mutate a bounded counter and avoid POST /auto. Tier/vision incompatibility, compaction, authentication changes, model rejection, disposal, and eviction clear or invalidate applicable state; transient failures preserve a compatible warm endpoint.",
+        "MechanismConfidence": "High: the changed scheduling, deduplication key, queue cleanup, skip decrement, cache cap, and POST /auto call path are directly visible and covered by focused tests.",
+        "MagnitudeUncertainty": "Server assignment prevalence and the distribution of skip_turns are unknown, so exact latency savings or added checkpoint frequency cannot be quantified. The per-conversation call bounds and five-second timeout are explicit.",
+        "Verdict": "No reportable regression. Added checkpoint calls are the required server-owned routing behavior, are serialized only where controller ordering requires it, and are bounded/deduplicated; skip turns reduce rather than multiply network work."
+      },
+      {
+        "Scenario": "vscode.lm Auto requests and other ancillary endpoint resolutions without a chat request ID",
+        "CriticalPath": "A cold or expired extension-scoped Auto selection must complete POST /auto before the language-model response starts. Warm compatible resolutions use the cached endpoint; these calls send advance:false and do not consume user-turn skips.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/conversation/vscode-node/languageModelAccess.ts:552 -\u003e extensions/copilot/src/platform/endpoint/node/autoV2Fetcher.ts:107",
+            "Operation": "Resolve Auto through POST /auto for the extension-scoped vscode.lm session",
+            "Cardinality": "One cold call per effective requestInitiator/tier/image key; concurrent no-ID cold resolutions with the same key coalesce through TaskSingler, and warm compatible calls make no routing request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cold POST /auto and extension-scoped cache existed before; the diff adds a small capability object and advance:false but does not increase effective cold-call cardinality.",
+            "CriticalPathEffect": "Cold selection blocks the extension's model response; warm calls are local cache reads."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/conversation/vscode-node/languageModelAccess.ts:581, provideLanguageModelResponse",
+            "Operation": "Invoke the selected language model",
+            "Cardinality": "One per vscode.lm response request, unchanged by this diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged model invocation count and placement.",
+            "CriticalPathEffect": "Main generation boundary after endpoint resolution."
+          }
+        ],
+        "ScalingInput": "Concurrent requests from an extension, grouped by requestInitiator-derived session, tier, and image compatibility; request IDs are absent, so ancillary calls never advance controller state.",
+        "EffectiveConcurrency": "Equivalent cold calls coalesce. If a conversation already has controller state or queued work, ancillary resolution joins the per-conversation sequence to observe ordered state; unrelated extension sessions remain parallel.",
+        "CacheBehavior": "One cache entry per request initiator, within the global 50-entry bound. Warm compatible endpoints are reused; expiry renews through /auto with advance:false and retained controller token without refilling a consumed skip budget.",
+        "MechanismConfidence": "High: buildAutoRoutingContext omits request IDs and keys by requestInitiator, while the changed resolver's TaskSingler and cache branches establish coalescing and warm behavior.",
+        "MagnitudeUncertainty": "The number and concurrency of third-party extension requests varies, but grouping and cache behavior make the effective routing cardinality bounded by extension-scoped sessions rather than messages.",
+        "Verdict": "No reportable regression. The diff preserves cold-call coalescing for no-ID callers and does not add per-message routing fan-out."
+      },
+      {
+        "Scenario": "Hydra controller-state rejection, compaction, account change, explicit model switch, or selected-model rejection",
+        "CriticalPath": "Invalidation itself is local. The next Auto resolution places POST /auto on the endpoint-selection critical path. A state-bearing HTTP 400 performs one additional sequential recovery request without the token; selected-model rejection does not retry the failed model call.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/endpoint/node/automodeService.ts:341-353, AutomodeService._route",
+            "Operation": "POST /auto and, only for a state-bearing HTTP 400, one retry without controller state",
+            "Cardinality": "Normally one request after invalidation; at most two for one state-rejection attempt. The recursion is bounded because the retry omits state_token.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no controller token to reject and therefore no state-stripping retry; ordinary invalidation already caused one reroute.",
+            "CriticalPathEffect": "Both calls are sequential and block endpoint selection in the 400 recovery case."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/endpoint/node/autoChatEndpoint.ts:70-76",
+            "Operation": "Existing model chat call whose typed rejection marks the active Hydra selection invalid for the next resolution",
+            "Cardinality": "One existing model call; no automatic retry. Multiple late rejection callbacks cannot repeatedly invalidate after Hydra state is cleared, and callbacks from replaced endpoints are ignored.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The model call already occurred; only next-resolution cache invalidation is new.",
+            "CriticalPathEffect": "The rejected model call completes with its original response; rerouting is deferred to the next endpoint resolution."
+          }
+        ],
+        "ScalingInput": "Lifecycle events and typed model failures per conversation. Recovery is bounded to one extra /auto call per state-bearing 400, not proportional to history or model count.",
+        "EffectiveConcurrency": "Queued turns remain ordered per conversation. Authentication generation and routing epoch checks prevent stale in-flight responses from repopulating invalidated state; different conversations remain concurrent.",
+        "CacheBehavior": "Compaction clears active controller state and marks reevaluation; model switches/rejections do so only for active Hydra entries. Authentication and disposal clear the bounded cache, and transient routing errors retain only compatible cached endpoints.",
+        "MechanismConfidence": "High: the catch predicate, token-free recursive call, epoch guards, endpoint-identity callback guard, and tests directly establish the behavior.",
+        "MagnitudeUncertainty": "Actual frequency of server state rejection and model rejection is unknown. The maximum additional boundary count and retry sequencing are explicit.",
+        "Verdict": "No reportable regression. The sole newly introduced extra network call is a bounded one-time compatibility recovery; invalidation avoids repeated use of rejected selections and does not retry model generation."
+      }
+    ],
+    "Summary": "Completed the performance pass over all seven changed files. Traced panel/inline Auto routing, vscode.lm ancillary routing, invalidation/recovery, network cardinality, per-conversation sequencing, same-request coalescing, cache bounds, token serialization, and lifecycle cleanup. No actionable high-confidence performance regression was introduced, and this PR does not provide sufficient evidence of fixing a previously shipped performance regression requiring blame attribution."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-10T06:03:23.483271916Z",
+    "CompletedAt": "2026-09-10T06:05:02.942661099Z",
+    "WallClockMilliseconds": 99459,
+    "ModelCalls": 8,
+    "InputTokens": 294444,
+    "OutputTokens": 6257,
+    "TotalTokens": 300701,
+    "ReasoningTokens": 2576,
+    "CacheReadTokens": 232473,
+    "CacheWriteTokens": 61947,
+    "APIDurationMilliseconds": 91174,
+    "ToolCalls": 41,
+    "NanoAIUnits": 52796020000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 232473,
+      "cache_write": 61947,
+      "input": 24,
+      "output": 6257
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
