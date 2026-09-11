@@ -1,0 +1,223 @@
+{
+  "PullRequest": {
+    "Number": 335475,
+    "Title": "agentHost: prevent duplicate Codex skills across sessions",
+    "Body": "## Summary\n\nStop registering client-synced plugin skill caches through the process-global `skills/extraRoots/set` API. Those caches are scoped by workspace and revision, so registering their union makes native discovery expose duplicate copies and skills from unrelated sessions.\n\nReplace that delivery path with supported session-scoped behavior:\n\n- Advertise the enabled client skills' names, descriptions, and synced file paths through `turn/start.additionalContext`. Send the current catalogue on every turn, including an explicit empty catalogue after removal.\n- Grant read-only access to the session's skill directories through the existing thread permission profiles. Reuse start/resume reconciliation when the directories or permission profile change; preserve existing filesystem restrictions and profile inheritance.\n- Keep native skill discovery, including `~/.agents/skills`, separate and unchanged. Do not register generated bundles in the global native catalogue.\n\nThe review identified a real gap in the original draft: `thread/resume` cannot update `selectedCapabilityRoots`, and the pinned SDK did not advertise client skills through that path. The revised implementation no longer relies on those roots for client skills. It also avoids `turn/start.permissions` while thread-specific read grants are active, because that field reloads the process-wide profile and drops those grants.\n\nThis uses the existing session lifecycle and the pinned SDK; it does not add a new manager, SDK upgrade, or cache migration.\n\n## Validation\n\n- Merged `origin/main` through `978cb41d811` and rebuilt the complete product successfully with the corresponding dependencies.\n- **529 Codex unit tests pass.**\n- **All 4 Codex provider integration tests pass** with the repository-pinned **Codex 0.149.1**, including the original failing CI assertion that plugin skills reach the actual model request.\n- New integration coverage checks add/remove after the first turn, workspace isolation, native user skills, actual shell reads outside workspace/temp roots, read-grant preservation across permission changes, denied unrelated reads and skill writes, preserved workspace writes, and revocation while the cached file remains on disk.\n- Launch + dap-cli verification in an isolated Code OSS Agents window with a real ChatGPT-backed Codex model: add one skill to an existing thread, read its body, disable it, and verify that both its current catalogue entry and read grant disappear without replacing the thread. Built-in client skills remain single entries.\n- Targeted ESLint, hygiene, and `git diff --check` pass.\n\nThe fix takes effect when running the updated agent host; it does not retroactively rewrite skill listings already present in chat history.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/335475",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "Giuspepe",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "978cb41d811b306e53b79a650f73f7a478e0eb52",
+    "HeadRef": "agents/fix-duplicate-skills-bug",
+    "HeadSHA": "dcb7fae71ca24d4a1d7e0916350bb2648a95922f",
+    "CreatedAt": "2026-09-10T14:25:31Z",
+    "UpdatedAt": "2026-09-11T00:45:40Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-CDF5A6053BE0",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/codex/codexAgent.ts",
+      "Side": "RIGHT",
+      "Line": 5930,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The per-turn insertion, full-catalog serialization, normal send path, and persistence of older catalogs are all directly evidenced by changed source, changed subsystem documentation, and the integration-test request inspection. Exact latency depends on chat length and catalog size, which affects severity rather than mechanism confidence.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Serialized prompt bytes and model input tokens retained in thread history and transmitted/processed by subsequent model requests.",
+      "PerformanceScaling": "For S bytes of catalog and T turns, the Tth request can contain O(S*T) historical catalog bytes and the session cumulatively processes O(S*T^2) catalog bytes; S grows with enabled skill count and description/path lengths.",
+      "PerformanceOutcome": "Increasing network payload, token-processing latency, and context-window pressure over the lifetime of a chat.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Client skills were registered through `skills/extraRoots/set` when roots changed or a connection started; `turn/start` did not append a client-skill catalog to each turn's persisted conversation history.",
+      "ChangedBehavior": "Every normal turn now adds a `vscode.clientSkills` application-context entry containing the entire current client-skill catalog, even when the catalog is empty or unchanged.",
+      "CausalDiffEvidence": "RIGHT line 5930 unconditionally inserts the full `clientSkillInstructions` value into `turn/start.additionalContext`; previously no per-turn client-skill context entry existed.",
+      "Title": "Avoid appending the skill catalog on every turn",
+      "Impact": "Long Codex chats repeatedly resend and reprocess unchanged skill metadata, increasing request bytes, input-token usage, and model latency; sufficiently long chats or large plugin catalogs reach the context limit earlier. This also affects sessions with no client skills because the empty-catalog block is still appended every turn.",
+      "Evidence": "The changed `turn/start` payload unconditionally includes `currentCustomizationLaunch.clientSkillInstructions`. `codexClientSkillInstructions` serializes every model-invokable skill name, description, and absolute file path. The updated agent-host documentation explicitly states that every turn receives this catalog and that older catalogs can remain in conversation history; the provider integration test searches all developer-role input in a later model request and selects the last `\u003cclient_skills\u003e` block, corroborating that these entries reach the model request history.",
+      "Recommendation": "Track the last catalog/signature advertised for each backing thread and add this context only on the first turn and when the enabled catalog changes, including one explicit empty update for removal; reset that state only when a new thread/history requires it."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Sending successive turns in a Codex chat with client skills enabled, disabled, or absent",
+        "CriticalPath": "Before each normal `turn/start`, `_ensureCurrentLaunchBeforeTurn` rebuilds the current launch, then `turn/start` must complete before the turn progresses. The app-server incorporates `additionalContext` into the model request, so the newly added full skill catalog and all retained prior catalogs are on the model critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_buildCustomizationLaunch",
+            "Operation": "Discover workspace agents and workspace skills while rebuilding customization launch",
+            "Cardinality": "One pair of discovery operations per turn; cardinality scales with configured workspace roots.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same per-turn launch reconciliation performed workspace discovery before the PR.",
+            "CriticalPathEffect": "Completes before `turn/start`; this discovery was already present and is not a diff-introduced regression."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:5923-5931",
+            "Operation": "Send `turn/start` with the full client-skill catalog in `additionalContext`",
+            "Cardinality": "One IPC per turn; the added payload contains every enabled skill or an explicit empty catalog.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One `turn/start` IPC already occurred, but it did not carry a per-turn client-skill catalog.",
+            "CriticalPathEffect": "The IPC must complete before asynchronous turn processing begins, and its context becomes model input."
+          },
+          {
+            "Kind": "network",
+            "Location": "Transitive Codex app-server model request, corroborated by codexCustomizations.integrationTest.ts request capture",
+            "Operation": "Send the assembled conversation, including retained application-context catalogs, to the model responses endpoint",
+            "Cardinality": "One or more model requests per turn; each later request can include every earlier catalog snapshot in thread history.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Client skills were registered through process-global extra roots, so no client-skill application message was appended to each turn's history.",
+            "CriticalPathEffect": "Direct model-response critical path; larger token payload raises transfer and inference latency and consumes context."
+          }
+        ],
+        "ScalingInput": "Enabled model-invokable skill count and description/path length determine catalog size; chat turn count determines how many historical catalog snapshots can be retained. Even the empty catalog is appended once per turn.",
+        "EffectiveConcurrency": "Turns for a thread are issued sequentially; there is no coalescing or unchanged-catalog suppression. Each turn adds one catalog snapshot.",
+        "CacheBehavior": "The parsed plugin store is reused, but the catalog string is rebuilt and appended every turn. No per-thread last-advertised signature suppresses unchanged catalogs; cold, warm, and empty catalogs all take the new path.",
+        "MechanismConfidence": "High: unconditional per-turn insertion, full-catalog construction, normal-turn reachability, and historical persistence are directly evidenced.",
+        "MagnitudeUncertainty": "Exact token and latency growth depends on skill catalog size, turn count, provider history handling, and compaction frequency; the changed documentation and integration request inspection establish that older catalogs can persist and reach model input.",
+        "Verdict": "Reportable medium-severity repeated prompt serialization: unchanged full or empty catalogs accumulate in history and increase later model-request cost."
+      },
+      {
+        "Scenario": "Adding, removing, or changing client-synced skills after a thread already has history",
+        "CriticalPath": "Customization sync/copy and parsing complete first; reconciliation marks an existing materialized thread for reload when skill roots/profile change. The next turn resumes the thread before sending one new current-catalog application context.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_syncClientCustomizations/_parseClientPlugin",
+            "Operation": "Sync and parse client plugin bundles",
+            "Cardinality": "Once per changed client customization set, across the changed plugins rather than per chat turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Plugin bundles were already copied and parsed before computing process-global skill roots.",
+            "CriticalPathEffect": "Precedes customization publication/reconciliation; existing behavior, not newly introduced by this diff."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_ensureCurrentLaunchBeforeTurn/_resumeSession",
+            "Operation": "Unsubscribe and resume a materialized thread with updated permission-profile filesystem roots",
+            "Cardinality": "At most one serialized reload per converged customization/profile state before a turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Skill-root changes already altered selected capability roots/signatures and triggered thread reconciliation; the diff changes the config/profile payload and removes the global roots update.",
+            "CriticalPathEffect": "Blocks the first turn after a relevant customization or permission change."
+          }
+        ],
+        "ScalingInput": "Number of client plugin revisions, enabled skills, and changed session permission profiles; effective roots are deduplicated absolute skill directories.",
+        "EffectiveConcurrency": "Customization reconciliation is serialized per session by a `Sequencer`; thread resume is awaited before the next turn, avoiding concurrent reload bursts.",
+        "CacheBehavior": "Synced plugin files and parsed plugin state are retained by the per-session store. Signature comparison avoids resume when launch-relevant state is unchanged, but catalog advertisement itself has no unchanged-state suppression.",
+        "MechanismConfidence": "High for call path and serialization; low evidence of harmful fan-out because signature checks and the per-session sequencer bound reload work.",
+        "MagnitudeUncertainty": "Plugin revision frequency and catalog size vary, but reconciliation is bounded and serialized; no independent regression beyond the repeated catalog-history issue was established.",
+        "Verdict": "No additional finding: dynamic changes are serialized and reload only when launch state differs; the significant regression is the catalog copies retained per turn."
+      },
+      {
+        "Scenario": "Starting or reconnecting the shared Codex app-server and materializing sessions",
+        "CriticalPath": "Connection startup no longer waits for `skills/extraRoots/set`; each session later sends one `thread/start` or `thread/resume` with its own permission-root config. Connection establishment remains required before thread operations.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_ensureConnection and deleted _applySkillExtraRoots path",
+            "Operation": "Removed process-global `skills/extraRoots/set` request during connection startup and customization refresh",
+            "Cardinality": "Previously one request per process startup plus serialized requests after client customization changes/disposal; now zero.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Startup awaited a global skill-root IPC before publishing the connection ready.",
+            "CriticalPathEffect": "The startup request was removed from the connection critical path, improving rather than regressing startup."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_materialize/_resumeSession",
+            "Operation": "Start or resume each session thread with session-scoped permission profile overrides",
+            "Cardinality": "One thread IPC per materialization or required reload; config size scales with deduplicated skill directories for that session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Thread start/resume already occurred and carried selected capability roots; client skill roots were also registered globally.",
+            "CriticalPathEffect": "Required before that session can send a turn; the boundary existed previously, with changed payload only."
+          }
+        ],
+        "ScalingInput": "Number of live sessions and enabled skill directories per session; read roots are deduplicated before serialization.",
+        "EffectiveConcurrency": "Connection startup is represented by one shared promise. Session materializations may proceed independently after readiness; no new process-global roots sequencer remains.",
+        "CacheBehavior": "The live connection is reused. Per-session plugin state supplies current roots; no process-global skill-root cache is populated on reconnect.",
+        "MechanismConfidence": "High that global startup IPC is removed and session thread payload changes are bounded.",
+        "MagnitudeUncertainty": "Large per-session skill sets enlarge thread config, but no repository evidence establishes a realistic size causing a separate material regression.",
+        "Verdict": "No finding: startup removes a blocking IPC, while session-scoped permission serialization does not have enough evidence for a separate actionable regression."
+      },
+      {
+        "Scenario": "Model invocation of a selected client skill outside the workspace",
+        "CriticalPath": "The model receives the catalog, then may issue a shell/file-reading tool call for the advertised SKILL.md. That subprocess/filesystem read is required only when a task matches a skill, not on every turn.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "Transitive Codex tool execution exercised by codexCustomizations.integrationTest.ts",
+            "Operation": "Run shell/file tool to read the selected SKILL.md",
+            "Cardinality": "On demand per selected skill/tool call, not per catalog entry.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Codex native skill handling also read selected skill files on demand; this diff changes discovery/permission delivery rather than proving additional body reads.",
+            "CriticalPathEffect": "Blocks the model step that needs the skill body."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "Path emitted by src/vs/platform/agentHost/node/codex/codexClientCustomizations.ts:codexClientSkillInstructions",
+            "Operation": "Read the selected synced SKILL.md from its cache path",
+            "Cardinality": "One read per model-issued file command in the tested path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Client skills were discovered from registered extra roots and their bodies remained file-backed.",
+            "CriticalPathEffect": "Required for the model to use that skill, but remains lazy."
+          }
+        ],
+        "ScalingInput": "Number of skills actually selected by the model, normally one matching skill per task; catalog construction includes all enabled skills but body reads are on demand.",
+        "EffectiveConcurrency": "Tool calls follow Codex turn execution and approval/sandbox sequencing; tests exercise one shell invocation, with no diff-added parallel fan-out.",
+        "CacheBehavior": "Synced skill files remain on disk. Metadata is advertised each turn, but skill bodies are read lazily only on invocation; removal revokes read permission while the cached file remains.",
+        "MechanismConfidence": "High that body reads are lazy and permission-scoped; no evidence of changed read fan-out.",
+        "MagnitudeUncertainty": "Actual model skill-selection frequency is workload-dependent.",
+        "Verdict": "No separate finding: the expensive file boundary remains demand-driven rather than eager or per-catalog-item."
+      }
+    ],
+    "Summary": "Completed the performance pass over all nine changed files and relevant Codex lifecycle paths. Reported one introduced repeated-work regression: unconditional per-turn skill catalogs accumulate in conversation/model history, causing prompt bytes, token cost, and latency to grow with both skills and turns. No additional boundary-fanout, startup, cache-lifecycle, or subprocess regression met the evidence threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-11T05:07:29.854766865Z",
+    "CompletedAt": "2026-09-11T05:09:17.383906621Z",
+    "WallClockMilliseconds": 107529,
+    "ModelCalls": 10,
+    "InputTokens": 456455,
+    "OutputTokens": 7684,
+    "TotalTokens": 464139,
+    "ReasoningTokens": 2679,
+    "CacheReadTokens": 384000,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 94825,
+    "ToolCalls": 51,
+    "NanoAIUnits": 59710000000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 384000,
+      "cache_write": 0,
+      "input": 72455,
+      "output": 7684
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

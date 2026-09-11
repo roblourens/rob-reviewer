@@ -1,0 +1,227 @@
+{
+  "PullRequest": {
+    "Number": 335610,
+    "Title": "authentication: Express token expiry in milliseconds",
+    "Body": "## Summary\n\n- rename the proposed authentication session lifetime from `expiresIn` to `expiresAfter` and define it as milliseconds\n- convert GitHub OAuth `expires_in` values at the provider boundary and recompute remaining lifetimes for cached transient sessions\n- preserve the Agent Host protocol's seconds-based `expiresIn` field by converting at the workbench bridge\n- expose MSAL token expiration from the built-in Microsoft Authentication extension\n\nCloses #335184.\n\nRelated to #152517.\n\n## Testing\n\n- `npm --prefix extensions\\github-authentication run compile`\n- `npm --prefix extensions\\microsoft-authentication run compile`\n- ESLint on all eight changed TypeScript files\n- GitHub Authentication extension-host tests: 25 passing\n- Agent Host authentication unit tests: 2 passing\n- interactive Code OSS Microsoft sign-in with dap-cli: verified MSAL `expiresOn` becomes a positive integer millisecond `AuthenticationSession.expiresAfter` value and flows through the returned session\n- `git diff --check origin/main...HEAD`\n\nA full `npm run compile` reached the changed extensions successfully but is currently blocked by unrelated markdown editor type errors involving `IframeEmbeddedEditorHostTransport` and `iframeBootstrapUrl`.",
+    "URL": "https://github.com/microsoft/vscode/pull/335610",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "TylerLeonhardt",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d20c17c04ce1d7ba5f549658bfb48d30854eb3eb",
+    "HeadRef": "tyleonha/github-auth-expires-after",
+    "HeadSHA": "e40616e8c7709404ca24d7fd197c603e7ec51482",
+    "CreatedAt": "2026-09-11T01:23:20Z",
+    "UpdatedAt": "2026-09-11T03:39:46Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Interactive GitHub sign-in brokered through Microsoft Entra",
+        "CriticalPath": "Microsoft token acquisition, GitHub discovery token exchange, GitHub user lookup, user confirmation, final token exchange, final user verification, and account-link persistence must complete before the session is published. The changed seconds-to-milliseconds multiplication and property propagation are constant-time work on this existing path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/github-authentication/src/entraTokenExchange.ts EntraTokenExchange.getMicrosoftToken/login",
+            "Operation": "Acquire a Microsoft authentication session/token through the Microsoft authentication provider.",
+            "Cardinality": "Normally one acquisition per login attempt; another only when the user explicitly chooses a different account.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same Microsoft token acquisition occurred before the diff.",
+            "CriticalPathEffect": "Required before either GitHub exchange can begin."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/github-authentication/src/entraTokenExchange.ts EntraTokenExchange.exchange",
+            "Operation": "POST Microsoft token to GitHub's OAuth token-exchange endpoint.",
+            "Cardinality": "Two exchanges for a completed interactive login: one discovery grant and one requested-scope grant; retries are disabled, excluding explicit account reselection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two exchanges occurred; only the returned expiration value was represented in seconds.",
+            "CriticalPathEffect": "Both requests are on the sign-in critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/github-authentication/src/entraTokenExchange.ts discoverAccount/verifyAccount",
+            "Operation": "Fetch GitHub user information for discovery and final account verification.",
+            "Cardinality": "Two GET /user lookups per completed login.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same account lookups occurred before the diff.",
+            "CriticalPathEffect": "Both lookups must complete before publication."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/github-authentication/src/common/accountLinks.ts AccountLinks.link",
+            "Operation": "Persist the confirmed Microsoft-to-GitHub account link in extension global state.",
+            "Cardinality": "One bounded table update per successful confirmed login.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same persistence write occurred before the diff.",
+            "CriticalPathEffect": "Awaited before the session is returned."
+          }
+        ],
+        "ScalingInput": "Explicit login attempts and explicit account reselections; expiration conversion remains O(1) per successful exchange.",
+        "EffectiveConcurrency": "The exchanges and user lookups are intentionally serialized around confirmation. Selecting a different Microsoft account repeats the flow only on explicit user choice. The diff does not change concurrency.",
+        "CacheBehavior": "A remembered Microsoft account may avoid account selection but does not remove required identity verification. No cache key or invalidation behavior is changed.",
+        "MechanismConfidence": "High: the complete login call path and all changed expiration operations were traced.",
+        "MagnitudeUncertainty": "Network timings vary by provider and geography, but the diff adds no network calls and only one numeric multiplication per exchanged token.",
+        "Verdict": "No reportable regression; boundary count, ordering, and concurrency are unchanged."
+      },
+      {
+        "Scenario": "GitHub cached transient-session lookup, restoration, and near-expiry renewal",
+        "CriticalPath": "A getSessions call filters persisted and transient candidates, checks expiration, renews only requested sessions inside the renewal window, and restores missing linked accounts. A valid warm transient session performs only in-memory collection work; stale or cold-restored sessions wait for Microsoft token acquisition, GitHub exchange, and GitHub user verification.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/github-authentication/src/github.ts restoreNow/renewNow and extensions/github-authentication/src/entraTokenExchange.ts renew",
+            "Operation": "Read Microsoft accounts and silently acquire a Microsoft token for restoration or renewal.",
+            "Cardinality": "At most once per effective missing account/scope restore or stale requested session; concurrent duplicates share one promise.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same Microsoft account and token operations occurred under the seconds-based lifetime.",
+            "CriticalPathEffect": "Only cold restoration and near-expiry renewal await it; warm valid sessions do not."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/github-authentication/src/entraTokenExchange.ts renew/exchange/verifyAccount",
+            "Operation": "Exchange a Microsoft token for a GitHub token and verify it with GET /user.",
+            "Cardinality": "One exchange plus one verification per effective restore or renewal after coalescing.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same pair of GitHub calls occurred; expiry arithmetic used seconds when storing the deadline.",
+            "CriticalPathEffect": "Blocks only restoration or renewal for the requested session."
+          }
+        ],
+        "ScalingInput": "Number of requested matching transient sessions and missing linked accounts after scope/account filtering and per-key coalescing.",
+        "EffectiveConcurrency": "Missing linked accounts and stale sessions are processed with Promise.all. Concurrent work for the same account/scope restore key or session ID is coalesced by _restores and _renewals maps. The diff preserves these controls.",
+        "CacheBehavior": "Warm sessions outside the renewal window cause no network work. Deadlines remain absolute milliseconds internally; returned remaining lifetime is recomputed once using a shared Date.now value. Restore attempts and in-flight renewals remain cached/coalesced exactly as before.",
+        "MechanismConfidence": "High: filtering, deadline checks, Promise.all fan-out, and both coalescing maps were inspected.",
+        "MagnitudeUncertainty": "Account counts can vary, but effective boundary cardinality is unchanged and the new expiration arithmetic is constant-time per returned session.",
+        "Verdict": "No reportable regression; the unit change preserves renewal timing and slightly reduces repeated Date.now calls in transient-session projection."
+      },
+      {
+        "Scenario": "Microsoft Authentication session creation and scoped session retrieval",
+        "CriticalPath": "Interactive creation awaits the selected MSAL flow. Scoped retrieval obtains a cached PCA and calls acquireTokenSilent once for each deduplicated home account, serially; conversion of expiresOn to remaining milliseconds happens only after an AuthenticationResult is available.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/microsoft-authentication/src/node/authProvider.ts createSession/createSessionFromChallenges",
+            "Operation": "Run an interactive MSAL authentication flow when creating a session.",
+            "Cardinality": "One successful flow per session creation, with existing fallback flows only after failures.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same flow ran; the returned session omitted known expiration metadata.",
+            "CriticalPathEffect": "Required before session creation completes."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/microsoft-authentication/src/node/authProvider.ts getAllSessionsForPca",
+            "Operation": "Acquire a token silently through MSAL for each deduplicated account.",
+            "Cardinality": "One acquireTokenSilent call per unique homeAccountId for a scoped query; MSAL may satisfy warm calls from cache and may use the network on a miss or forced refresh.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same calls, account grouping, cache policy, and serialization existed.",
+            "CriticalPathEffect": "The serial loop must finish before scoped sessions are returned."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostAuthentication.ts $getSessions",
+            "Operation": "Return authentication sessions from the extension host to workbench consumers.",
+            "Cardinality": "One response per provider getSessions request containing one object per resulting session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same session objects crossed the boundary without the expiration number.",
+            "CriticalPathEffect": "Existing authentication-service boundary; the changed Microsoft session adds one optional numeric field."
+          }
+        ],
+        "ScalingInput": "Unique MSAL home accounts after grouping; the added Date conversion and property allocation are O(1) per returned scoped session.",
+        "EffectiveConcurrency": "Accounts are deduplicated by homeAccountId and processed serially. The diff does not alter this existing serialization or MSAL's internal cache behavior.",
+        "CacheBehavior": "MSAL's existing token cache remains authoritative. All-session account-menu reads still use sessionFromAccountInfo and do not acquire tokens or add expiration. Scoped warm-cache and cold-cache behavior are unchanged.",
+        "MechanismConfidence": "High: all three call sites of sessionFromAuthenticationResult and the account loop were inspected.",
+        "MagnitudeUncertainty": "IPC payload grows by one number only for sessions with a valid expiresOn; this is bounded and negligible relative to existing token/session payloads.",
+        "Verdict": "No reportable regression; no new acquisition or changed cache policy is introduced."
+      },
+      {
+        "Scenario": "Agent Host startup/session-change authentication and token refresh",
+        "CriticalPath": "For each declared protected resource, workbench resolves an authentication provider and session, converts remaining milliseconds back to protocol seconds, and forwards an authenticate RPC unless the same resource/scope/token is already completed or in flight. On the host, matching providers receive the token in parallel; known expiration can enable the existing threshold-based refresh path when an SDK later asks for a near-expiry token.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostAuth.ts resolveAuthenticationSessionForResource",
+            "Operation": "Activate/resolve an authentication provider and request exact-scope sessions, falling back to all sessions only when exact lookup is empty.",
+            "Cardinality": "Per authorization server, one exact lookup; a second all-session lookup only on an exact miss. Repeated provider operations are queued by provider.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same lookup sequence occurred and returned seconds-based expiration when a provider supplied it.",
+            "CriticalPathEffect": "Session resolution must complete before a token can be forwarded."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostAuth.ts forwardAuthenticationToken",
+            "Operation": "Send authenticate request to the Agent Host, now converting expiresAfter milliseconds to protocol expiresIn seconds.",
+            "Cardinality": "At most one completed RPC per distinct resource/scope/token per connection until cache invalidation; same-token concurrent calls share one promise.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same authenticate RPC was sent with the prior expiresIn value; the diff only converts the renamed millisecond value back to seconds.",
+            "CriticalPathEffect": "Required for initial credential installation, but skipped on warm same-token reconciliation."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/agentHostAuthenticationService.ts authenticate and src/vs/platform/agentHost/node/copilot/copilotGitHubCredentials.ts update/tokenProvider",
+            "Operation": "Fan the authenticated token to matching Agent Host providers and optionally install a refreshable Copilot credential.",
+            "Cardinality": "One call per matching provider for each non-deduplicated authenticate RPC; providers run in parallel. Refresh requests are coalesced by a single pending refresh promise.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The protocol already supported expiration and the same provider fan-out/refresh machinery; sessions that already supplied expiration used it directly.",
+            "CriticalPathEffect": "Initial provider setup awaits matching providers. Future refresh is requested only near expiry or when explicitly requested by the SDK."
+          }
+        ],
+        "ScalingInput": "Distinct protected resource/scope/token tuples after cache normalization, multiplied by authorization servers attempted and matching host providers; expiration conversion remains O(1) per forwarded token.",
+        "EffectiveConcurrency": "Agents and resources are traversed serially. Same-token authenticate calls are coalesced by AgentHostAuthTokenCache. The host fans one accepted RPC to matching providers in parallel, and Copilot authentication updates are sequenced. The diff does not alter these controls.",
+        "CacheBehavior": "Cold connections forward each distinct token once. Warm same-token calls skip the RPC regardless of the recomputed remaining lifetime, preserving prior behavior. Pending same-token calls are coalesced; cache clears on restart, revocation, and recovery. Known Microsoft-session expiry may activate the existing bounded refresh mode rather than leaving a token static until failure.",
+        "MechanismConfidence": "High: session resolution, token-cache keys, RPC forwarding, host fan-out, and refresh coalescing were traced.",
+        "MagnitudeUncertainty": "The number of agents/resources varies, but the diff neither increases that cardinality nor changes the token cache key. The optional numeric protocol field has negligible serialization cost.",
+        "Verdict": "No reportable regression; protocol compatibility is preserved without increasing RPC or refresh fan-out."
+      }
+    ],
+    "Summary": "Completed the performance review of all 11 changed files. The PR changes expiration naming/units, adds constant-time deadline arithmetic, and exposes one bounded numeric field. Existing network, storage, IPC, renewal, and Agent Host paths retain their prior cardinality, caching, serialization, and concurrency behavior; no actionable performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-11T05:14:40.770415859Z",
+    "CompletedAt": "2026-09-11T05:16:17.981702044Z",
+    "WallClockMilliseconds": 97211,
+    "ModelCalls": 10,
+    "InputTokens": 394287,
+    "OutputTokens": 7257,
+    "TotalTokens": 401544,
+    "ReasoningTokens": 2181,
+    "CacheReadTokens": 328192,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 87749,
+    "ToolCalls": 59,
+    "NanoAIUnits": 54079680000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 328192,
+      "cache_write": 0,
+      "input": 66095,
+      "output": 7257
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
