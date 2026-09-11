@@ -1,0 +1,159 @@
+{
+  "PullRequest": {
+    "Number": 335659,
+    "Title": "authentication: release provider activation listeners",
+    "Body": "`tryActivateProvider` raced provider registration against the authentication service lifetime token. When called repeatedly and registration timed out, each pending race retained a listener on that long-lived token, eventually triggering listener-leak warnings.\n\nThis uses an operation-scoped cancellation source so each listener is released when the activation attempt completes or times out, and adds regression coverage for repeated timeouts.\n\nTests: `npm run compile`; focused authentication test; ESLint on changed files.",
+    "URL": "https://github.com/microsoft/vscode/pull/335659",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "05e414c309fa121dc9a2046946a38534b32d4180",
+    "HeadRef": "agents/log-analysis-error-fix-prioritization-0e9648d3",
+    "HeadSHA": "51a27363b46ade695f226e670f458708431bdf7d",
+    "CreatedAt": "2026-09-11T09:23:25Z",
+    "UpdatedAt": "2026-09-11T09:28:11Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/services/authentication/browser/authenticationService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 459,
+      "BasePath": "src/vs/workbench/services/authentication/browser/authenticationService.ts",
+      "BaseLine": 468,
+      "IntroducingPath": "src/vs/workbench/services/authentication/browser/authenticationService.ts",
+      "IntroducingCommit": "184d76ec60143813b7cc2f20b6ca267f3f9cdb4a",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "memory",
+      "Mechanism": "Timed-out provider activation attempts leave raceCancellation promises pending and retain one cancellation listener on the AuthenticationService lifetime token per attempt until service shutdown.",
+      "Symptom": "Repeated requests for unavailable authentication providers accumulate listeners and retained promise closures for the lifetime of the workbench, eventually triggering listener-leak warnings and increasing memory/dispatch work.",
+      "FixedBehavior": "Each activation attempt now owns a linked CancellationTokenSource whose dispose(true) runs from tryActivateProvider's finally block. Successful registration, activation failure, and the 5-second timeout all cancel the operation token and remove the registrations from the long-lived service token, bounding retained listeners to currently active attempts.",
+      "Evidence": "Before this change, tryActivateProvider passed the AuthenticationService lifetime token directly to raceCancellation. raceCancellation registers token.onCancellationRequested and disposes that registration only when its input promise settles or the token is cancelled. On the 5-second missing-provider timeout, Event.toPromise is disposed without settling, so providerRegistered remains pending and its cancellation listener remains attached until the whole service is disposed. getSessions/createSession and the declared-provider scan can invoke this path repeatedly; the added regression test exercises repeated missing-provider timeouts and verifies that listener-leak warnings no longer occur. The changed lines create a child source linked to the service token and register dispose(true) in the operation store, so finally cancellation settles raceCancellation and removes both its listener and the child source's parent listener.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "unbounded-retention",
+      "boundary-fanout",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold and warm getSessions/createSession calls for an authentication provider",
+        "CriticalPath": "A cold request waits for either aggregate extension activation or provider registration. If activation completes without registration, it then waits up to 5 seconds for registration. Once registered, getSessions/createSession awaits the provider RPC. The added CancellationTokenSource creation/disposal is synchronous constant work and adds no expensive boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/extensions/common/extensionHostManager.ts:327-354",
+            "Operation": "Activate the provider's extension event in each relevant extension host via proxy.activateByEvent.",
+            "Cardinality": "Cold: at most one underlying activation IPC per relevant extension-host manager for a unique provider activation event; same-event concurrent and warm calls reuse the manager cache. Warm registered-provider calls perform none.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same activation fan-out and per-event manager coalescing occurred before the diff.",
+            "CriticalPathEffect": "Cold activation participates in the initial race and can unblock the request; registration can unblock it first. It was already on this path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadAuthentication.ts:78-84",
+            "Operation": "Invoke the registered extension provider's getSessions or createSession method and deserialize/revive the returned session data.",
+            "Cardinality": "One provider RPC per successful authentication request; response work scales with returned sessions for getSessions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider RPC occurred after successful activation before the diff.",
+            "CriticalPathEffect": "This RPC must complete after provider activation/registration before the authentication request returns."
+          }
+        ],
+        "ScalingInput": "Active concurrent cold requests and the number of distinct provider IDs; underlying activation IPC scales by distinct activation event times relevant extension-host managers, not by every same-provider caller.",
+        "EffectiveConcurrency": "AbstractExtensionService fans activation concurrently to the relevant extension-host managers with Promise.all, while each manager coalesces a given activation event in _cachedActivationEvents. Separate tryActivateProvider callers retain independent waits and operation tokens, but the new tokens are bounded to active calls.",
+        "CacheBehavior": "A registered provider is served from _authenticationProviders and bypasses tryActivateProvider entirely. On a cold request, each extension-host manager caches activation by activation-event string, so concurrent or repeated calls for the same provider coalesce the underlying host activation per manager. Missing providers have no negative cache and can be retried; the changed operation token is disposed after every attempt.",
+        "MechanismConfidence": "High: provider-map bypass, activation-event caching, IPC fan-out, operation-token ownership, and finally-block disposal are explicit in the traced code.",
+        "MagnitudeUncertainty": "Provider request prevalence and extension-host activation duration vary, but the new per-attempt objects and listeners are promptly released and do not change boundary cardinality.",
+        "Verdict": "No reportable regression. The diff adds constant per-active-attempt bookkeeping and fixes lifetime retention without changing activation or provider-RPC cardinality."
+      },
+      {
+        "Scenario": "Repeated requests for an unavailable or non-registering provider",
+        "CriticalPath": "Each request waits for activation and, when no provider registers, up to the existing 5-second registration timeout. The cleanup runs in finally after success, error, service cancellation, or timeout and is not an additional awaited step.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/extensions/common/abstractExtensionService.ts:989-1042",
+            "Operation": "Request authentication-provider activation from relevant extension hosts when the registry contains the activation event.",
+            "Cardinality": "For a declared unavailable provider, one cold underlying call per relevant extension-host manager and activation event; repeated same-ID failures reuse host-manager promises. Undeclared/no-interest events return without host IPC. Distinct declared IDs can each have one cold activation fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical activation requests, coalescing, and timeout behavior existed; only listener cleanup after the timeout differed.",
+            "CriticalPathEffect": "Activation is in the request race; if it completes without registration, the request remains blocked on the existing timeout."
+          }
+        ],
+        "ScalingInput": "Number of timed-out attempts over the AuthenticationService lifetime and number of simultaneously active attempts. The fixed retained-resource cost previously grew linearly with cumulative failures; it now grows only with active calls.",
+        "EffectiveConcurrency": "Concurrent failed callers have independent 5-second waits and child cancellation sources. Same-provider activation IPC is coalesced per extension-host manager; listener count is now bounded by currently active callers instead of cumulative failures.",
+        "CacheBehavior": "There is no negative provider cache, so each failed request retries tryActivateProvider. Extension-host managers still cache a repeated provider's activation event, while distinct provider IDs use distinct activation keys. Before the diff, each timeout left one listener on the service lifetime token; after the diff, finally disposes and cancels the child source, removing both child and parent registrations.",
+        "MechanismConfidence": "Very high: raceCancellation's token listener survives while Event.toPromise remains pending; timeout does not settle that promise; dispose(true) on the operation source cancels the race and unlinks its parent listener.",
+        "MagnitudeUncertainty": "The frequency of unavailable-provider requests in production is workload-dependent, but the old retention mechanism and the new bounded lifecycle are directly established and covered by the added repeated-timeout test.",
+        "Verdict": "This is a concrete cleanup-lifecycle performance fix, recorded through report_regression_fix. It introduces no new performance issue."
+      },
+      {
+        "Scenario": "Authorization-server provider discovery across declared candidates",
+        "CriticalPath": "Candidate activation is sequential. For each candidate, activation/provider registration and any existing 5-second timeout must finish before the next candidate is tried. The new child token is disposed at the end of each candidate attempt and does not add an awaited boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/authentication/browser/authenticationService.ts:351-363; src/vs/workbench/services/extensions/common/abstractExtensionService.ts:1023-1042",
+            "Operation": "Activate each matching declared authentication provider across relevant extension hosts.",
+            "Cardinality": "Up to one cold activation IPC per relevant extension-host manager for each distinct matching candidate; candidates are serialized. Warm activation-event caches avoid repeating host work.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same sequential candidate loop, host fan-out, cache behavior, and timeouts existed before the diff.",
+            "CriticalPathEffect": "Each candidate's activation/registration result gates checking the next candidate and therefore provider discovery completion."
+          }
+        ],
+        "ScalingInput": "Number of unregistered declared providers whose authorization-server globs match, after filtering already registered providers.",
+        "EffectiveConcurrency": "Candidates are serialized by the for/await loop. Within one candidate, relevant extension hosts are activated concurrently and cache/coalesce that event per manager.",
+        "CacheBehavior": "Already registered providers are checked first. Remaining declared provider candidates are filtered, then activated sequentially. Each candidate uses a distinct activation-event cache key in extension-host managers; later discovery calls benefit from those activation caches and from any successful provider registration, but failed providers have no negative cache.",
+        "MechanismConfidence": "High: the sequential loop and transitive concurrent/cached extension-host activation are explicit.",
+        "MagnitudeUncertainty": "Typical matching-candidate counts are not established here; this pre-existing serialized behavior is unchanged by the PR.",
+        "Verdict": "No reportable regression. The changed cleanup prevents listeners from accumulating across candidate failures and leaves existing critical-path and boundary behavior unchanged."
+      }
+    ],
+    "Summary": "Completed the performance pass over all changed files and relevant call paths. No diff-introduced performance findings were found. The PR fixes a verified cleanup-lifecycle regression by bounding cancellation listeners to active provider-activation attempts; the introducing commit was recorded."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-11T09:41:04.776767074Z",
+    "CompletedAt": "2026-09-11T09:44:31.150823069Z",
+    "WallClockMilliseconds": 206374,
+    "ModelCalls": 12,
+    "InputTokens": 248272,
+    "OutputTokens": 5917,
+    "TotalTokens": 254189,
+    "ReasoningTokens": 2330,
+    "CacheReadTokens": 216560,
+    "CacheWriteTokens": 31676,
+    "APIDurationMilliseconds": 195141,
+    "ToolCalls": 38,
+    "NanoAIUnits": 36348800000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 216560,
+      "cache_write": 31676,
+      "input": 36,
+      "output": 5917
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

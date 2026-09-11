@@ -1,0 +1,155 @@
+{
+  "PullRequest": {
+    "Number": 316386,
+    "Title": "fix: race activateByEvent with provider registration to prevent auth deadlock",
+    "Body": "Fixes #315841\r\n\r\nWhen connecting to a remote tunnel, the webworker extension host can deadlock waiting for `_installedExtensionsReady` (which requires a remote connection), while the remote connection needs auth. Previously, `tryActivateProvider` exclusively awaited `activateByEvent`, blocking until all extension hosts responded.\r\n\r\nFix by `Promise.race`-ing `activateByEvent` against the auth provider registering itself. This allows the local process extension host to deliver the provider and unblock auth without waiting for a stuck webworker host.\r\n\r\nfyi @TylerLeonhardt -- there is now a race between the `activateByEvent` promise and the provider registering. This avoids deadlocks in a certain scenario where there are web worker extensions installed on the desktop.\r\n\r\n\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/316386",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "8dee56f8d105a532279bcee5cd9fe3f3664888e3",
+    "HeadRef": "petite-angelfish",
+    "HeadSHA": "32cb8221d680b8478bdb46c51616c7ce4598c9cd",
+    "CreatedAt": "2026-05-14T09:41:01Z",
+    "UpdatedAt": "2026-06-28T23:43:36Z",
+    "MergedAt": "2026-05-14T10:40:54Z",
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/services/authentication/browser/authenticationService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 454,
+      "BasePath": "src/vs/workbench/services/authentication/browser/authenticationService.ts",
+      "BaseLine": 421,
+      "IntroducingPath": "src/vs/workbench/services/authentication/browser/authenticationService.ts",
+      "IntroducingCommit": "4e81df7ea90350b1c2205e39c4e5a1a4197432c0",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceCategory": "latency",
+      "Mechanism": "An all-extension-host activation barrier was placed before observing successful authentication-provider registration, so one blocked host could indefinitely hold the tunnel authentication and connection critical path even after another host had supplied the provider.",
+      "Symptom": "Connecting to a remote tunnel can deadlock indefinitely while obtaining cached authentication sessions when the local webworker extension host is blocked on remote authority setup.",
+      "FixedBehavior": "The changed code starts activation but races its aggregate promise against the provider-registration event, then reads the provider map immediately. Tunnel authentication can therefore continue as soon as any host registers the requested provider, without waiting for an unrelated blocked host; host activation itself remains cached and continues in the background.",
+      "Evidence": "Before this PR, AuthenticationService.tryActivateProvider awaited activateByEvent before checking the provider map. AbstractExtensionService._activateByEvent returns Promise.all over the selected extension-host managers, each manager crosses its extension-host proxy via activateByEvent. The remote-tunnel connect critical path calls _getTokenForProvider -\u003e AuthenticationService.getSessions(..., activateImmediate=true) before it can call the tunnel main service. A local process host can register MainThreadAuthenticationProvider and fire onDidRegisterAuthenticationProvider while a local webworker host's activation remains blocked; the added test reproduces that aggregate activation promise never settling despite successful provider registration.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Connect to a remote tunnel using GitHub or Microsoft authentication while a local webworker extension host is blocked during remote-authority setup.",
+        "CriticalPath": "TunnelAgentHostService.connect waits for _getToken/_getTokenForProvider, which waits for AuthenticationService.getSessions and cold-provider activation before _mainService.connect and protocol setup can begin. After the diff, provider registration from the local process host releases this path even if the aggregate activation promise remains blocked.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/extensions/common/abstractExtensionService.ts:_activateByEvent and extensionHostManager.ts:_activateByEvent",
+            "Operation": "Dispatch the authentication activation event to each selected extension host.",
+            "Cardinality": "Cold path: one effective proxy activation per selected host manager and provider activation event; manager-level promise caching coalesces concurrent duplicate requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same activation IPC fan-out occurred, but AuthenticationService exclusively awaited its Promise.all result.",
+            "CriticalPathEffect": "Previously all selected hosts had to settle before AuthenticationService could observe an already registered provider. The diff lets provider registration remove that aggregate IPC barrier while activation continues."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadAuthentication.ts:MainThreadAuthenticationProvider.getSessions",
+            "Operation": "Query exact-scope sessions and optionally all sessions from the registered extension-host authentication provider.",
+            "Cardinality": "One query per attempted provider, plus one fallback query only when the exact-scope result is empty; provider attempts are sequential.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same session RPCs ran only after aggregate activation completed.",
+            "CriticalPathEffect": "These calls remain on the token-acquisition critical path after provider activation/registration."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/remoteAgentHost/electron-browser/tunnelAgentHostServiceImpl.ts:connect",
+            "Operation": "Connect the authenticated tunnel and establish its protocol client.",
+            "Cardinality": "One tunnel connect and one protocol connection for a successful user connection attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A blocked extension-host activation could prevent this boundary from being reached indefinitely.",
+            "CriticalPathEffect": "This work starts only after token acquisition; the diff can unblock reaching it sooner."
+          }
+        ],
+        "ScalingInput": "At most the configured GitHub and Microsoft providers are attempted sequentially; each provider can perform an exact-scope session query and, only when empty, one all-sessions fallback. Cold activation fans out to the selected extension-host managers, while the effective IPC cardinality is one cached activation per provider event per host manager.",
+        "EffectiveConcurrency": "Providers and exact/all session queries are sequential. Extension-host activation is concurrent via Promise.all, but the changed Promise.race no longer makes every host's completion a barrier. ExtensionHostManager caches each activation-event promise, so concurrent callers do not multiply extension-host IPC for the same host/event.",
+        "CacheBehavior": "A registered provider is a warm map hit and skips tryActivateProvider entirely. On a cold provider, each host manager caches the activation event; the registration event is the new early completion signal. There is no negative provider cache, and a completed activation without registration retains the existing five-second wait.",
+        "MechanismConfidence": "High: getSessions is directly on tunnel connection's critical path, activation is a Promise.all over extension hosts, and the test proves registration can occur while that promise never resolves.",
+        "MagnitudeUncertainty": "The prevalence of the blocked-webworker configuration and wall-clock delay varies, but the indefinite barrier and its removal are directly established by the call path and regression test.",
+        "Verdict": "No introduced regression. The change removes an all-host latency barrier without increasing effective boundary cardinality; it is recorded as a regression fix."
+      },
+      {
+        "Scenario": "An extension or workbench action gets/creates sessions for an authentication provider that is not yet registered.",
+        "CriticalPath": "getSessions/createSession waits for tryActivateProvider, then invokes the provider RPC. The diff races activation completion with registration; if activation completes first without registration, the existing five-second registration timeout still applies.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/extensions/common/abstractExtensionService.ts:_activateByEvent",
+            "Operation": "Activate the provider extension in selected extension hosts.",
+            "Cardinality": "One effective activation IPC per selected host manager for a cold provider event; duplicate requests reuse manager-cached promises.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "AuthenticationService awaited all selected hosts before checking registration or beginning the timeout.",
+            "CriticalPathEffect": "The diff shortens the wait when registration arrives before all hosts settle and otherwise preserves the prior activation-plus-timeout path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadAuthentication.ts:MainThreadAuthenticationProvider",
+            "Operation": "Get or create authentication sessions through the extension-host provider proxy.",
+            "Cardinality": "One provider RPC for the requested operation after successful registration.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider RPC followed activation.",
+            "CriticalPathEffect": "Unchanged and remains after provider readiness."
+          }
+        ],
+        "ScalingInput": "One provider ID per request. getOrActivateProviderIdForServer can examine the filtered set of matching, unregistered declared providers sequentially; that loop and its candidate cardinality are unchanged.",
+        "EffectiveConcurrency": "Activation fans out concurrently to selected extension hosts. Concurrent requests can each hold a registration listener, but the underlying host activation is cached per event/manager; listeners are disposed in tryActivateProvider's finally block as soon as each request completes.",
+        "CacheBehavior": "Warm provider-map hits avoid activation. Cold activation is coalesced by ExtensionHostManager's event cache. No new persistent cache or negative cache is introduced.",
+        "MechanismConfidence": "High: listener ownership, activation caching, and all completion branches are visible in the implementation.",
+        "MagnitudeUncertainty": "The number of concurrent cold requests is workload-dependent, but each added listener is bounded by an in-flight call and synchronously registered providers are caught by the map check; disposal is explicit.",
+        "Verdict": "No reportable performance regression. Temporary listener lifetime is bounded, effective IPC count is unchanged, and the main behavioral change reduces cold-path latency."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and all diff pages. Traced authentication activation through extension-host IPC, provider RPC, and the remote-tunnel connection path; checked warm/cold provider state, activation coalescing, concurrency, timeout, cancellation, and listener disposal. No diff-introduced performance finding was found; the PR fixes a concrete boundary-fanout latency regression and that fix was recorded."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-11T09:44:33.180594663Z",
+    "CompletedAt": "2026-09-11T09:46:25.26770335Z",
+    "WallClockMilliseconds": 112087,
+    "ModelCalls": 13,
+    "InputTokens": 318738,
+    "OutputTokens": 5315,
+    "TotalTokens": 324053,
+    "ReasoningTokens": 2007,
+    "CacheReadTokens": 283232,
+    "CacheWriteTokens": 35467,
+    "APIDurationMilliseconds": 93260,
+    "ToolCalls": 37,
+    "NanoAIUnits": 39708380000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 283232,
+      "cache_write": 35467,
+      "input": 39,
+      "output": 5315
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
