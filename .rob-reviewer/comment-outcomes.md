@@ -1,6 +1,6 @@
 # Review comment outcomes
 
-Repository: `microsoft/vscode`. Updated: 2026-09-12T05:53:01Z.
+Repository: `microsoft/vscode`. Updated: 2026-09-12T10:53:37Z.
 
 Tracked comments: **54**. PR refresh errors: **0**.
 
@@ -37,7 +37,7 @@ Author feedback is independent of resolution. AI assessments below 80% confidenc
 
 [microsoft/vscode#331983](https://github.com/microsoft/vscode/pull/331983)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3976023683](https://github.com/microsoft/vscode/pull/331983#discussion_r3976023683) at `src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts`: **ignored**; author feedback: **no-author-reply**; outdated: false.
 
@@ -45,7 +45,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#332410](https://github.com/microsoft/vscode/pull/332410)
 
-State: OPEN. Checked: 2026-09-12T05:53:01Z.
+State: OPEN. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3927027002](https://github.com/microsoft/vscode/pull/332410#discussion_r3927027002) at `src/vs/platform/agentHost/node/chatContributions/sessionTitle/sessionTitleContribution.ts`: **resolved**; author feedback: **error**; outdated: false.
   - Assessment error: model did not submit author feedback
@@ -72,7 +72,7 @@ State: OPEN. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#333185](https://github.com/microsoft/vscode/pull/333185)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3978244783](https://github.com/microsoft/vscode/pull/333185#discussion_r3978244783) at `src/vs/editor/common/cursor/cursorTypeEditOperations.ts`: **ignored**; author feedback: **no-author-reply**; outdated: false.
 
@@ -80,7 +80,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#333196](https://github.com/microsoft/vscode/pull/333196)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3940127585](https://github.com/microsoft/vscode/pull/333196#discussion_r3940127585) at `src/vs/sessions/services/sessions/browser/sessionsService.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 - [Comment 3940127588](https://github.com/microsoft/vscode/pull/333196#discussion_r3940127588) at `src/vs/sessions/services/sessions/browser/sessionsService.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
@@ -92,7 +92,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#333859](https://github.com/microsoft/vscode/pull/333859)
 
-State: OPEN. Checked: 2026-09-12T05:53:01Z.
+State: OPEN. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3928248069](https://github.com/microsoft/vscode/pull/333859#discussion_r3928248069) at `src/vs/platform/extensionManagement/common/extensionGalleryService.ts`: **pending**; author feedback: **no-author-reply**; outdated: false.
 
@@ -100,7 +100,7 @@ State: OPEN. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334022](https://github.com/microsoft/vscode/pull/334022)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3934429723](https://github.com/microsoft/vscode/pull/334022#discussion_r3934429723) at `src/vs/editor/common/viewModel/monospaceLineBreaksComputer.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 - [Comment 3938054229](https://github.com/microsoft/vscode/pull/334022#discussion_r3938054229) at `src/vs/editor/browser/view/domLineBreaksComputer.ts`: **resolved**; author feedback: **no-author-reply**; outdated: false.
@@ -109,7 +109,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334255](https://github.com/microsoft/vscode/pull/334255)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3927602257](https://github.com/microsoft/vscode/pull/334255#discussion_r3927602257) at `src/vs/sessions/browser/workbench.ts`: **ignored**; author feedback: **no-author-reply**; outdated: false.
 
@@ -117,7 +117,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334303](https://github.com/microsoft/vscode/pull/334303)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3927621592](https://github.com/microsoft/vscode/pull/334303#discussion_r3927621592) at `src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigrationServiceImpl.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 
@@ -125,7 +125,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334341](https://github.com/microsoft/vscode/pull/334341)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3938520539](https://github.com/microsoft/vscode/pull/334341#discussion_r3938520539) at `src/vs/platform/agentHost/node/agentHostSessionLifecycle.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 - [Comment 3938520544](https://github.com/microsoft/vscode/pull/334341#discussion_r3938520544) at `src/vs/platform/agentHost/node/agentHostSessionLifecycle.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
@@ -138,7 +138,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334369](https://github.com/microsoft/vscode/pull/334369)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3950680821](https://github.com/microsoft/vscode/pull/334369#discussion_r3950680821) at `src/vs/workbench/contrib/chat/browser/aiCustomization/mcpServerCustomizationMigration.ts`: **ignored**; author feedback: **no-author-reply**; outdated: false.
 - [Comment 3950680828](https://github.com/microsoft/vscode/pull/334369#discussion_r3950680828) at `src/vs/workbench/contrib/chat/browser/aiCustomization/aiCustomizationManagementEditor.ts`: **ignored**; author feedback: **no-author-reply**; outdated: false.
@@ -148,7 +148,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334375](https://github.com/microsoft/vscode/pull/334375)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3929811789](https://github.com/microsoft/vscode/pull/334375#discussion_r3929811789) at `package-lock.json`: **ignored**; author feedback: **no-author-reply**; outdated: true.
 
@@ -156,7 +156,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334513](https://github.com/microsoft/vscode/pull/334513)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3961236084](https://github.com/microsoft/vscode/pull/334513#discussion_r3961236084) at `src/vs/editor/browser/viewParts/wordWrapIndicator/wordWrapIndicator.ts`: **resolved**; author feedback: **no-author-reply**; outdated: true.
 
@@ -164,7 +164,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334521](https://github.com/microsoft/vscode/pull/334521)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3938538688](https://github.com/microsoft/vscode/pull/334521#discussion_r3938538688) at `src/vs/sessions/contrib/providers/copilotChatSessions/browser/copilotChatSessionsProvider.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 - [Comment 3944866851](https://github.com/microsoft/vscode/pull/334521#discussion_r3944866851) at `src/vs/sessions/contrib/automations/browser/automationDialog.ts`: **ignored**; author feedback: **no-author-reply**; outdated: false.
@@ -173,7 +173,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334591](https://github.com/microsoft/vscode/pull/334591)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3938553861](https://github.com/microsoft/vscode/pull/334591#discussion_r3938553861) at `src/vs/sessions/contrib/chat/browser/sessionWorkspacePicker.ts`: **ignored**; author feedback: **no-author-reply**; outdated: false.
 
@@ -181,7 +181,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334594](https://github.com/microsoft/vscode/pull/334594)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3938576877](https://github.com/microsoft/vscode/pull/334594#discussion_r3938576877) at `extensions/copilot/src/platform/git/vscode-node/gitServiceImpl.ts`: **resolved**; author feedback: **no-author-reply**; outdated: false.
 
@@ -189,7 +189,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334694](https://github.com/microsoft/vscode/pull/334694)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3940677712](https://github.com/microsoft/vscode/pull/334694#discussion_r3940677712) at `src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionContribution.ts`: **resolved**; author feedback: **no-author-reply**; outdated: false.
 
@@ -197,7 +197,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334696](https://github.com/microsoft/vscode/pull/334696)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3940687906](https://github.com/microsoft/vscode/pull/334696#discussion_r3940687906) at `src/vs/sessions/contrib/chat/browser/newChatInput.ts`: **ignored**; author feedback: **no-author-reply**; outdated: false.
 
@@ -205,7 +205,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334705](https://github.com/microsoft/vscode/pull/334705)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3944036105](https://github.com/microsoft/vscode/pull/334705#discussion_r3944036105) at `src/vs/platform/actionWidget/browser/actionList.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 
@@ -213,7 +213,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334833](https://github.com/microsoft/vscode/pull/334833)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3947977703](https://github.com/microsoft/vscode/pull/334833#discussion_r3947977703) at `.github/workflows/pr.yml`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 - [Comment 3947977686](https://github.com/microsoft/vscode/pull/334833#discussion_r3947977686) at `.github/workflows/pr.yml`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
@@ -222,7 +222,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#334889](https://github.com/microsoft/vscode/pull/334889)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3952121926](https://github.com/microsoft/vscode/pull/334889#discussion_r3952121926) at `src/vs/workbench/contrib/browserView/common/browserView.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: false.
 
@@ -230,7 +230,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#335053](https://github.com/microsoft/vscode/pull/335053)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3961301190](https://github.com/microsoft/vscode/pull/335053#discussion_r3961301190) at `src/vs/platform/agentHost/node/codex/codexCustomizations.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: false.
 
@@ -238,7 +238,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#335070](https://github.com/microsoft/vscode/pull/335070)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3961320899](https://github.com/microsoft/vscode/pull/335070#discussion_r3961320899) at `src/vs/editor/browser/widget/multiDiffEditor/multiDiffEditorWidget.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 
@@ -246,7 +246,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#335259](https://github.com/microsoft/vscode/pull/335259)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3973906136](https://github.com/microsoft/vscode/pull/335259#discussion_r3973906136) at `src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts`: **ignored**; author feedback: **no-author-reply**; outdated: false.
 
@@ -254,7 +254,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#335303](https://github.com/microsoft/vscode/pull/335303)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3973924504](https://github.com/microsoft/vscode/pull/335303#discussion_r3973924504) at `src/vs/sessions/contrib/chat/browser/sessionWorkspacePicker.ts`: **resolved**; author feedback: **no-author-reply**; outdated: false.
 - [Comment 3973924510](https://github.com/microsoft/vscode/pull/335303#discussion_r3973924510) at `src/vs/sessions/contrib/chat/browser/sessionWorkspacePicker.ts`: **resolved**; author feedback: **no-author-reply**; outdated: false.
@@ -263,7 +263,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#335329](https://github.com/microsoft/vscode/pull/335329)
 
-State: OPEN. Checked: 2026-09-12T05:53:01Z.
+State: OPEN. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3973945173](https://github.com/microsoft/vscode/pull/335329#discussion_r3973945173) at `build/gulpfile.vscode.ts`: **resolved**; author feedback: **no-author-reply**; outdated: true.
 - [Comment 3973945176](https://github.com/microsoft/vscode/pull/335329#discussion_r3973945176) at `build/dictation-runtime/package.ts`: **resolved**; author feedback: **no-author-reply**; outdated: true.
@@ -273,7 +273,7 @@ State: OPEN. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#335366](https://github.com/microsoft/vscode/pull/335366)
 
-State: MERGED. Checked: 2026-09-12T05:53:01Z.
+State: MERGED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3974620479](https://github.com/microsoft/vscode/pull/335366#discussion_r3974620479) at `src/vs/workbench/contrib/chat/browser/aiCustomization/mcpListWidget.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 - [Comment 3974620480](https://github.com/microsoft/vscode/pull/335366#discussion_r3974620480) at `src/vs/workbench/contrib/chat/browser/aiCustomization/mcpListWidget.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
@@ -282,7 +282,7 @@ State: MERGED. Checked: 2026-09-12T05:53:01Z.
 
 [microsoft/vscode#335391](https://github.com/microsoft/vscode/pull/335391)
 
-State: CLOSED. Checked: 2026-09-12T05:53:01Z.
+State: CLOSED. Checked: 2026-09-12T10:53:37Z.
 
 - [Comment 3976061160](https://github.com/microsoft/vscode/pull/335391#discussion_r3976061160) at `src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigrationServiceImpl.ts`: **resolved**; author feedback: **awaiting-assessment**; outdated: true.
 
