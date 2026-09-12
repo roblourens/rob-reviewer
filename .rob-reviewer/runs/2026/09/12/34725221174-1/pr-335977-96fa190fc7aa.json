@@ -1,0 +1,152 @@
+{
+  "PullRequest": {
+    "Number": 335977,
+    "Title": "chat: reduce picker layout measurement work",
+    "Body": "## Summary\n\nReduce repeated DOM measurement in the chat picker responsive-layout path identified during startup profiling:\n\n- Reject rendered overflow/overlap before cloning the lane for preferred-width measurement.\n- Capture each visible item's bounds once per snapshot rather than rereading geometry while sorting.\n- Prepare all measurement styles on the detached clone, then attach it and read geometry without interleaved style writes.\n- Add regression tests for measurement count, detached preparation, reverse visual order, hidden pickers, and non-picker contents. Preserve the measurement clone's `aria-hidden`/`inert` behavior and cleanup.\n\nThis is based on current `main` and preserves its newer shrinkable-picker, compact/minimal-state, and overflow restoration behavior. No activity-bar changes, persistent sizing cache, or observer-scheduling changes.\n\n## Performance\n\nComponent microbenchmark against current `main`, Windows + Chromium 149: 12 alternating before/after pairs of 80 calls per scenario, excluding two warmup pairs. All compact-state sequences matched.\n\n| Scenario | Before, ms/call | After, ms/call |\n| --- | ---: | ---: |\n| Three pickers, narrow | 1.076 | 0.414 |\n| Three pickers, resizing | 0.689 | 0.287 |\n| Three pickers, wide | 0.248 | 0.173 |\n\nFor the narrow case, measurement clones drop from **5 to 2** and Chromium layout count from approximately **21 to 7** per call. These are synthetic component measurements, **not an end-to-end startup improvement claim**.\n\n## Validation\n\n- `npm run transpile-client`\n- `npm run typecheck-client -- --pretty false`\n- Targeted `build/hygiene.ts` checks on both changed files, including ESLint/formatting\n- Picker and responsive toolbar browser suites: **45 passing in Chromium and 45 passing in WebKit**, including shrinkable/minimal states, repeated overflow restoration, and toolbar keyboard/focus behavior\n- Before/after benchmark: 9,600 measured calls across five scenarios, identical compact-state output, no retained measurement hosts",
+    "URL": "https://github.com/microsoft/vscode/pull/335977",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3879d0e80faeaeb351bbb44dd0f74f1bac12fc0a",
+    "HeadRef": "agents/chat-picker-layout-performance",
+    "HeadSHA": "96fa190fc7aa917f21f80b259dd169b78d008cb7",
+    "CreatedAt": "2026-09-12T21:29:03Z",
+    "UpdatedAt": "2026-09-12T23:05:41Z",
+    "MergedAt": null,
+    "Labels": [
+      "perf",
+      "perf-startup",
+      "chat"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/browser/widget/input/chatInputPickerResponsiveLayout.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 145,
+      "BasePath": "src/vs/workbench/contrib/chat/browser/widget/input/chatInputPickerResponsiveLayout.ts",
+      "BaseLine": 142,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/browser/widget/input/chatInputPickerResponsiveLayout.ts",
+      "IntroducingCommit": "d77fa1711fcb0501c1049795fd8fbaddfb3a57ea",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "layout",
+      "Mechanism": "The responsive chat picker layout sorted items by repeatedly reading live DOM geometry in the comparator and then reread every item's geometry for fit checks, multiplying synchronous layout-sensitive reads on startup, resize, and picker-content mutations.",
+      "Symptom": "Excessive synchronous DOM measurement increased responsive picker layout latency; profiling/benchmark evidence in the reviewed change shows lower layout counts and per-call time after snapshotting bounds.",
+      "FixedBehavior": "The new _getVisibleItemBounds snapshots each connected visible picker's bounds once per check and sorts those snapshots, removing O(n log n) repeated synchronous geometry reads from comparator execution while preserving visual ordering.",
+      "Evidence": "On chat input construction and every ResizeObserver/MutationObserver-triggered layout, layout() orders visible picker items and repeatedly calls _fitsAvailableWidth while compacting. In the base revision, _getOrderedVisibleItems filtered with getClientRects(), then its sort comparator called getBoundingClientRect() for both operands on every comparison; _fitsAvailableWidth subsequently measured every item again. The changed helper records one DOMRect per visible item and all ordering/fit checks reuse that snapshot. The added tests cover right-to-left/reverse ordering and hidden items, while the PR's measured scenario reports reduced Chromium layout count on three-picker narrow/resizing paths.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Initial chat input construction renders and responsively lays out the primary and secondary picker lanes.",
+        "CriticalPath": "ChatInputPart constructs both ChatInputPickerResponsiveLayout instances and immediately calls layout() for each before continuing input-model setup. Each call synchronously restores overflowed items, expands visible pickers, checks fit, and compacts as needed; DOM geometry and any preferred-width clone measurement are on this critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/input/chatInputPickerResponsiveLayout.ts:60-230, ChatInputPickerResponsiveLayout.layout/_fitsAvailableWidth/_measurePreferredLayout",
+            "Operation": "Synchronous browser DOM geometry/style/layout resolution via getClientRects() and getBoundingClientRect(), including temporary preferred-width clone attachment.",
+            "Cardinality": "Two lanes at construction. Within a lane, visible picker geometry is now captured once per fit check; preferred-width clone measurement occurs only after current rendered picker bounds fit. The compaction loop can perform up to roughly one expanded check plus compact/minimal checks per visible picker, but overflowing intermediate states now skip clone creation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two lanes and fit loop existed, but sorting reread item geometry in its comparator and every fit check cloned/measured before rejecting obvious rendered overflow; clone style writes were also interleaved with attached geometry reads. The diff reduces these costs.",
+            "CriticalPathEffect": "These synchronous reads determine whether each lane can finish responsive compaction, so they block initial chat input construction."
+          }
+        ],
+        "ScalingInput": "The effective input is the number of visible responsive picker actions/chips in each primary or secondary lane. Toolbar grouping and overflow can hide items; only connected items with client rects are measured. Cost remains proportional to the number of visible picker states tried, with snapshot sorting O(v log v) in-memory comparisons over v cached DOMRects rather than O(v log v) live geometry reads.",
+        "EffectiveConcurrency": "The two explicit layout calls run serially on the UI thread. Within each layout, item-state trials and measurements are serial; _isLayouting prevents reentrancy and the MutationObserver is disconnected during self-induced changes.",
+        "CacheBehavior": "There is no persistent width cache; every layout reflects current DOM and creates a short-lived clone only when preferred dimensions are needed. This avoids stale cache invalidation concerns. Hidden/overflowing intermediate states bypass clone measurement after the diff.",
+        "MechanismConfidence": "High: construction call sites, serial layout loops, geometry APIs, clone attachment, and changed before/after ordering are directly visible in code and covered by targeted tests.",
+        "MagnitudeUncertainty": "Exact picker cardinality and construction time vary by session type, contributed actions, and Chromium layout state, but the synchronous call path and removed repeated geometry/layout work are explicit. The PR benchmark is supporting magnitude evidence rather than an end-to-end startup claim.",
+        "Verdict": "No reportable regression. The diff reduces synchronous layout work and clone count on the existing construction path while preserving bounded temporary-clone cleanup."
+      },
+      {
+        "Scenario": "Window/sidebar/chat-panel resize and picker subtree content/style changes trigger responsive relayout.",
+        "CriticalPath": "DisposableResizeObserver invokes layout() for lane size changes, and MutationObserver invokes it for relevant subtree mutations. The callback performs synchronous geometry checks and state changes before the corresponding browser task/microtask completes; ResizeObserver delivery is browser-batched and MutationObserver records in the same checkpoint are coalesced into one callback.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/input/chatInputPickerResponsiveLayout.ts:52-230",
+            "Operation": "Synchronous browser style/layout measurement of the lane and visible picker elements, plus conditional detached-clone preparation, live attachment, and width reads.",
+            "Cardinality": "One callback per delivered resize notification or mutation batch for each affected lane. Each fit trial snapshots each visible picker once; preferred clone reads scale with visible picker count but are skipped while rendered items overflow.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Observers and synchronous layout already existed. Previously each sort comparison reread live bounds, fit checks reread bounds, and attached clone styling alternated writes with per-picker reads. The diff removes those repeated reads/layout invalidations and rejects overflow before cloning.",
+            "CriticalPathEffect": "The observer callback consumes UI-thread time during resizing or picker updates and can affect frame responsiveness if repeated."
+          }
+        ],
+        "ScalingInput": "Cost scales with delivered resize/mutation frequency, visible picker count after toolbar overflow, and the number of compact/minimal states attempted. Effective concurrency is one UI-thread layout at a time; observer batching and reentrancy suppression bound bursts.",
+        "EffectiveConcurrency": "All work is serialized on the UI thread. Browser observers batch notifications; _isLayouting drops reentrant calls, and observer disconnection suppresses callbacks from layout's own DOM mutations. No explicit cross-callback queue or worker concurrency exists.",
+        "CacheBehavior": "No geometry cache survives callbacks, so cold and warm behavior both remeasure authoritative DOM. Temporary measurement hosts are removed in finally and are not retained. The change adds no cache keys or negative-cache state.",
+        "MechanismConfidence": "High: observer registrations and synchronous callback path are explicit, temporary-host cleanup is unconditional, and tests exercise mutation isolation, resize-relevant states, clone counts, hidden items, and cleanup.",
+        "MagnitudeUncertainty": "Actual resize frequency and picker count depend on user interaction, extension-contributed menu contents, and session configuration. The mechanism reduction is certain; exact frame-time savings are environment-dependent.",
+        "Verdict": "No reportable regression. The changed code lowers geometry-read multiplicity and forced-layout opportunities on this hot observer path without adding retention or external work."
+      },
+      {
+        "Scenario": "Toolbar overflow restoration and progressive right-to-left picker compaction on a narrow lane.",
+        "CriticalPath": "layout() first asks the toolbar whether actions overflow, repeatedly compacts disconnected items and calls toolbar.relayout() until restoration stops, then expands visible items and tries compact/minimal states until _fitsAvailableWidth succeeds. All relayout and geometry checks are synchronous and required before the lane state is settled.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/input/chatInputPickerResponsiveLayout.ts:67-175",
+            "Operation": "Toolbar relayout plus synchronous browser geometry reads used to establish restored item count, visual order, overlap, lane escape, and preferred widths.",
+            "Cardinality": "Restoration can iterate once per newly restored picker; compaction can try compact and optionally minimal state per visible picker. The diff does not increase relayout count. Bounds snapshots replace comparator rereads, and obviously overflowing states avoid one full clone/measurement each.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same restoration and state-transition cardinality existed. Preferred-width measurement was eagerly performed before checking rendered escape/overlap, so narrow three-picker cases cloned once for each failed state. The diff checks the already-rendered snapshot first and only clones states that visually fit.",
+            "CriticalPathEffect": "Each iteration blocks responsive state settlement and can contribute to resize/input-toolbar jank, making reductions directly beneficial."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is the number of responsive actions/chips that remain or become visible after toolbar overflow handling, not all menu actions. Work scales linearly with restored/compacted states, plus in-memory sorting of each visible snapshot; clone count is reduced for failed overflow states.",
+        "EffectiveConcurrency": "The restoration and compaction loops are strictly serial. Toolbar relayout is called once per attempted state; there is no Promise-based fan-out. Reentrancy is guarded and self-mutations are not observed during the operation.",
+        "CacheBehavior": "No persistent cache is used because toolbar relayout changes item connection and dimensions each iteration. Each needed clone is fresh and removed in finally. Failed rendered-overflow states act as immediate negative fit results without allocating a clone.",
+        "MechanismConfidence": "High: loop termination, state cardinality, relayout calls, and early-return placement are directly traceable and covered by overflow-restoration and progressive-compaction tests.",
+        "MagnitudeUncertainty": "The largest real toolbar population and frequency of repeated overflow cycles are configuration-dependent. Tests establish multi-item restoration and narrow-lane clone cardinality, while absolute latency remains browser/hardware-dependent.",
+        "Verdict": "No reportable regression. The diff preserves loop concurrency/cardinality while eliminating eager clone work and repeated live geometry reads. It also fixes a concrete previously introduced performance mechanism, recorded separately for internal learning."
+      }
+    ],
+    "Summary": "Completed the performance pass over the full two-file diff. Traced initial construction, observer-driven relayout, overflow restoration, progressive compaction, DOM measurement, clone lifecycle, effective picker cardinality, and all transitive expensive boundaries. No diff-introduced performance issue met the reporting threshold. The PR is a performance improvement; one validated regression-fix record was accepted for the prior repeated geometry-read mechanism."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-12T23:25:47.731767461Z",
+    "CompletedAt": "2026-09-12T23:27:11.727107842Z",
+    "WallClockMilliseconds": 83995,
+    "ModelCalls": 7,
+    "InputTokens": 159621,
+    "OutputTokens": 5633,
+    "TotalTokens": 165254,
+    "ReasoningTokens": 1857,
+    "CacheReadTokens": 122880,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 66881,
+    "ToolCalls": 23,
+    "NanoAIUnits": 30877600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 122880,
+      "cache_write": 0,
+      "input": 36741,
+      "output": 5633
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

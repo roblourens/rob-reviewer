@@ -1,0 +1,158 @@
+{
+  "PullRequest": {
+    "Number": 335979,
+    "Title": "agentHost: Reconcile retained-child status after stale reads",
+    "Body": "## Summary\r\n\r\n- Capture task-status freshness when `tasks.list` actually starts, rather than when the throttler queues it.\r\n- Drain invalidated reads through the existing single-flight scheduler so a stable final revision reconciles without a rescue notification.\r\n- Recheck freshness while applying completions and stop pending work on cancellation or disposal.\r\n- Add six deterministic delayed-query/lifecycle regressions and include child turn IDs, states, responses, and active-turn state in retained-child E2E failures.\r\n\r\n## Why\r\n\r\nA retained-child resume advances the existing status revision. Previously, it could invalidate the last in-flight read without scheduling another one. A read queued before resume could also return current state and then discard it using its obsolete enqueue-time revision. The new gated-query tests reproduce both lost-completion paths on unchanged main.\r\n\r\nThe CI audit found five retained-child state assertion failures; a representative failure is [this Linux execution](https://github.com/microsoft/vscode/actions/runs/34438163030/job/102747545318), followed by a [successful same-source rerun](https://github.com/microsoft/vscode/actions/runs/34438163030/job/102765196641).\r\n\r\nRelated to #335458. That issue tracks duplicate child turns and is **not closed by this standalone PR**. Child execution identity and late-event start/resume classification remain separate work; the existing active-child set and resume revision integration are unchanged.\r\n\r\n## Validation\r\n\r\n- Before the production change: 4 passing / 3 failing in the initial targeted regression run.\r\n- After the change: 9 focused reconciliation tests passing; 42 related tests passing (overlapping sets).\r\n  ```powershell\r\n  .\\scripts\\test.bat --run src\\vs\\platform\\agentHost\\test\\node\\copilotAgentSession.test.ts --grep \"subagent task status|stale idle status|resumed subagent when\"\r\n  .\\scripts\\test.bat --run src\\vs\\platform\\agentHost\\test\\node\\copilotAgentSession.test.ts --grep \"subagent|child|detached shell\"\r\n  ```\r\n- Two strict, tokenless Windows source-Electron runs of the exact retained-child E2E: 1 passing each. Recording and snapshot-update flags were disabled and token environment variables cleared.\r\n  ```powershell\r\n  .\\scripts\\test-integration.bat --run src\\vs\\platform\\agentHost\\test\\node\\e2e\\providers\\copilotAgentHostE2E.integrationTest.ts --grep \"retained background subagent completes repeated follow-up turns\"\r\n  ```\r\n- Both runs preserve exactly one/two/three completed child turns containing `CHILD_INITIAL_DONE`, `CHILD_FOLLOWUP_ONE_DONE`, and `CHILD_FOLLOWUP_TWO_DONE`, with no active turn and the existing AHP snapshot unchanged.\r\n- Targeted TypeScript dependency-closure check: 1,131 files, zero diagnostics. Targeted transpilation, ESLint, four-path hygiene, and `git diff --check` passed.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/335979",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3879d0e80faeaeb351bbb44dd0f74f1bac12fc0a",
+    "HeadRef": "agents/retained-child-state-fix-validation",
+    "HeadSHA": "d79781af8a4555f301eb466ed4bf85d5bd63fec7",
+    "CreatedAt": "2026-09-12T21:47:28Z",
+    "UpdatedAt": "2026-09-12T22:07:41Z",
+    "MergedAt": null,
+    "Labels": [
+      "vscode-build",
+      "engineering",
+      "agent-host"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cleanup-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Background task status notification reconciles retained subagent completion",
+        "CriticalPath": "The SDK `session.background_tasks_changed` event queues reconciliation; the serialized `rpc.tasks.list` result must complete before terminal child states emit `subagent_completed` progress. This is on the child-status update path, not editor startup/render/input.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:1600 `_reconcileSubagentTaskStatuses`",
+            "Operation": "Lists authoritative SDK background tasks through `session.rpc.tasks.list()`.",
+            "Cardinality": "One active call at a time. Notification bursts during an active call coalesce; at most one stable trailing list is needed after one or more invalidations, with further calls only if each read is invalidated again before completion.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same RPC ran for each active/coalesced reconciliation. The prior throttler already produced an active call plus one coalesced queued call for notification bursts, but a resume-only revision change could invalidate the active result without guaranteeing the trailing authoritative call.",
+            "CriticalPathEffect": "A stable list response is required before terminal subagent completion can be reconciled and published."
+          }
+        ],
+        "ScalingInput": "Frequency of background-task notifications and resumes while an RPC is in flight; task processing scales with the task list returned by the SDK. Effective RPC concurrency is one.",
+        "EffectiveConcurrency": "`Throttler` enforces one active RPC. The new loop absorbs stale revisions serially, while any already queued throttler factory becomes a no-op once the reconciled revision catches up.",
+        "CacheBehavior": "No result cache is used because status must be authoritative. Warm/cold behavior is the same; revisions coalesce invalidations, and only a stable final read is applied.",
+        "MechanismConfidence": "High: the changed loop, revision checks, throttler implementation, and deterministic call-count tests directly establish the call path and concurrency.",
+        "MagnitudeUncertainty": "SDK RPC duration and real notification burst frequency are not measured, but tests establish single-flight behavior and coalesced call counts.",
+        "Verdict": "No reportable regression. The additional serialized read occurs only when an otherwise-lost resume invalidates a read, and preserves the prior active-plus-trailing cardinality for notification bursts."
+      },
+      {
+        "Scenario": "A status completion synchronously resumes another retained child while applying a task list",
+        "CriticalPath": "Applying terminal tasks emits progress synchronously; a listener may resume another child and advance the revision. The current collection scan stops and a fresh authoritative task-list RPC must complete before applying the new stable state.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:1600 `_reconcileSubagentTaskStatuses`",
+            "Operation": "Repeats `rpc.tasks.list()` after the current result is invalidated during completion application.",
+            "Cardinality": "One serialized retry for the resulting revision, coalescing multiple synchronous or queued invalidations; never concurrent.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The prior implementation continued applying the fetched collection without an intra-loop freshness check; if only the resume advanced freshness, it did not perform a required follow-up authoritative read.",
+            "CriticalPathEffect": "The retry delays final completion reconciliation but prevents applying the remainder of a stale collection."
+          }
+        ],
+        "ScalingInput": "Number of distinct resume/status revisions that occur before each list response stabilizes, not raw task count or duplicate notifications after coalescing.",
+        "EffectiveConcurrency": "Strictly serialized by the existing `Throttler`; the test asserts maximum active calls of one.",
+        "CacheBehavior": "No cache is appropriate for this authoritative state transition. Duplicate invalidations share the newest revision and do not each force a call.",
+        "MechanismConfidence": "High: production revision checks and the new two-child deterministic test prove the mechanism.",
+        "MagnitudeUncertainty": "The prevalence of synchronous cross-child resumes is uncertain, but the extra boundary operation is limited to actual invalidation races.",
+        "Verdict": "No reportable regression. The bounded extra RPC is necessary to replace stale data, and duplicates are coalesced rather than fanned out."
+      },
+      {
+        "Scenario": "Session abort or disposal while a task-status list call is pending",
+        "CriticalPath": "An already-started SDK list call may finish, but cancellation/disposal checks prevent applying it or starting retry work. Session teardown does not wait for a new reconciliation loop iteration.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:1600 `_reconcileSubagentTaskStatuses`",
+            "Operation": "Potentially in-flight `rpc.tasks.list()` begun before abort/disposal.",
+            "Cardinality": "At most the single already-active call; no trailing call after cancellation or disposal.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "An in-flight list could also remain until its promise settled; the old post-await disposal check prevented application but had no abort-token check.",
+            "CriticalPathEffect": "The existing in-flight operation is not newly cancellable, but the diff prevents additional list calls and completion processing after teardown."
+          }
+        ],
+        "ScalingInput": "One active reconciliation per session because of throttling; teardown does not scale retries with queued notifications.",
+        "EffectiveConcurrency": "One active RPC; cancellation/disposal terminates the loop and queued factories cannot issue another call for the captured canceled token.",
+        "CacheBehavior": "No cache. Reconciled state is abandoned on teardown.",
+        "MechanismConfidence": "High: token capture, loop guards, post-await checks, throttler disposal, and lifecycle tests establish the behavior.",
+        "MagnitudeUncertainty": "Underlying RPC cancellation support is not visible, but no changed line increases retained work after teardown.",
+        "Verdict": "No regression; cleanup behavior is improved by suppressing trailing work."
+      },
+      {
+        "Scenario": "Retained-child E2E polling failure diagnostics",
+        "CriticalPath": "The existing test polls `subscribe` and, only while assertions fail, builds an expanded error message containing active-turn state and up to the expected one-to-three child turns. This affects test failure diagnostics, not product runtime.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/suites/subagentSuite.ts:321 polling callback",
+            "Operation": "Calls the existing test client's `subscribe` method once per polling attempt.",
+            "Cardinality": "Unchanged: one subscribe call per existing polling attempt, at 50 ms intervals for up to 100 attempts.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same subscribe polling occurred and failures constructed a constant error string.",
+            "CriticalPathEffect": "The boundary call already governed each E2E polling attempt; the diff only enriches a locally constructed failure message after the response."
+          }
+        ],
+        "ScalingInput": "At most the test's expected one, two, or three turns per failure message and up to the existing bounded 100 polling attempts.",
+        "EffectiveConcurrency": "Sequential polling through the existing assertion helper; no new concurrency.",
+        "CacheBehavior": "No cache; each poll intentionally requests current test state. The diff does not alter polling or subscription behavior.",
+        "MechanismConfidence": "High: the changed hunk only maps turns and JSON-stringifies diagnostics after the existing subscribe result.",
+        "MagnitudeUncertainty": "Markdown response size can vary, but this is bounded test-only failure work over at most three turns.",
+        "Verdict": "No reportable product performance regression; added serialization is bounded and test-only."
+      }
+    ],
+    "Summary": "Completed the performance review of all four changed files and every diff page. The production change preserves single-flight/coalesced RPC behavior while adding only the authoritative trailing read required after a stale revision, and it stops retries on abort/disposal. Added trace and test diagnostic work does not establish a realistic user-facing performance regression. No findings submitted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-12T23:29:34.786454708Z",
+    "CompletedAt": "2026-09-12T23:31:07.375569717Z",
+    "WallClockMilliseconds": 92589,
+    "ModelCalls": 7,
+    "InputTokens": 145428,
+    "OutputTokens": 5156,
+    "TotalTokens": 150584,
+    "ReasoningTokens": 2121,
+    "CacheReadTokens": 92672,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 82283,
+    "ToolCalls": 30,
+    "NanoAIUnits": 35121280000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 92672,
+      "cache_write": 0,
+      "input": 52756,
+      "output": 5156
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
