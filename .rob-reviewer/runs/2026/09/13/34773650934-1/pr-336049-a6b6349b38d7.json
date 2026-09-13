@@ -1,0 +1,179 @@
+{
+  "PullRequest": {
+    "Number": 336049,
+    "Title": "Agent Host: Forward Git identity to Dev Containers",
+    "Body": "## Summary\n\nForward the host Git author identity to Dev Container Agent Host sessions so baseline checkpoints and requested commits can succeed without manual repository configuration.\n\nFixes #335761\n\n\u003cdetails\u003e\n\u003csummary\u003eSession Context\u003c/summary\u003e\n\nKey decisions from the development session:\n\n- **Use the existing post-`devcontainer up` configuration hook**: The recent `safe.directory` fix established this as the shared-process boundary where container Git setup must occur before Agent Host startup and its baseline checkpoint.\n- **Forward only author identity**: Only host-global `user.name` and `user.email` are copied. Copying the full host Git configuration could leak or break credential helpers, signing configuration, filters, and host-specific paths.\n- **Preserve container configuration**: Effective identity already available in the container is retained; only missing values are written to the container user global configuration.\n- **Keep startup best-effort**: Identity forwarding follows the `safe.directory` behavior by logging failures without preventing the Dev Container Agent Host from starting.\n\n\u003c/details\u003e\n\n## Changes\n\n- Read host-global Git author name and email after starting the Dev Container.\n- Populate only missing identity fields for the container user.\n- Add regression coverage for forwarding, preserving container identity, and absent host identity.\n\n## Validation\n\n- `npm run transpile-client`\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/devContainerAgentHostService.test.ts` (27 passing)\n- Editor TypeScript diagnostics reported no errors.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336049",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "chrmarti",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "8e35945bae3f2b0b3d0276963281180f1ce10cb0",
+    "HeadRef": "chrmarti/dev-container-git-identity",
+    "HeadSHA": "a6b6349b38d7c5d4ad74e48094c386618b978e1a",
+    "CreatedAt": "2026-09-13T16:51:22Z",
+    "UpdatedAt": "2026-09-13T17:34:35Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-DE6FDBF88125",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts",
+      "Side": "RIGHT",
+      "Line": 309,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The production call path from connector create/reconnect through `connect` is explicit, every identity `exec` is proven to spawn a fresh Dev Container CLI process, and the new test establishes exact command cardinality. Actual milliseconds vary by host/container, but the serialized critical-path mechanism and common two-field trigger are direct.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Subprocess launches and container exec round trips",
+      "PerformanceScaling": "Cost is incurred on every initial connection and every transport reconnect, growing from two local subprocesses when host identity is absent to two local plus 3-5 serialized Dev Container CLI subprocesses when one or two identity fields are present/missing; there is no identity-result cache or coalescing.",
+      "PerformanceOutcome": "Increased Dev Container Agent Host connection and reconnection latency on the critical path",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The connection path proceeded from safe.directory setup directly to the parallel platform probes; it performed none of these host Git subprocesses or identity-related Dev Container CLI invocations.",
+      "ChangedBehavior": "Every Dev Container connection now synchronously reads two host Git keys and, when host identity exists, performs a separate container `exec` for Git availability, each configured key lookup, and each missing-key write before platform detection and relay establishment.",
+      "CausalDiffEvidence": "RIGHT line 309 adds a per-field awaited container probe inside the new identity loop; RIGHT line 313 adds another separately awaited container write, while RIGHT line 176 awaits the whole setup on every connection's critical path.",
+      "Title": "Batch Git identity setup into one container invocation",
+      "Impact": "With the normal host configuration containing both user.name and user.email, connecting or reconnecting now blocks on two serialized local Git processes plus three Dev Container CLI child processes when the container identity is already set, or five CLI child processes when it is missing. Repeated Node/CLI/container-exec startup can add noticeable connection latency before the Agent Host relay is usable.",
+      "Evidence": "The added loop awaits `exec(\"git config --get ...\")` once per present host identity field and separately awaits a write for each missing field. `_configureGitIdentity` also awaits a standalone `command -v git`; `_getHostGitIdentity` serially awaits two `_runLocalCommand('git', ...)` calls. The traced `_createExec` implementation maps every `exec` call to `_runDevContainer(getDevContainerExecArgs(...))`, and `_runDevContainer` starts a fresh Dev Container CLI child process. The test's common two-field case confirms four identity commands after the availability check.",
+      "Recommendation": "Read both host keys in one local Git invocation and execute one container shell command that checks Git, inspects both effective keys, and conditionally writes missing values while preserving the current no-overwrite semantics. This bounds the added setup to one local and one container subprocess instead of serial per-key fan-out."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Initial Dev Container Agent Host connection, or relay reconnection, when the host has Git name/email configured",
+        "CriticalPath": "Renderer-to-shared-process `connect` IPC waits for `devcontainer up`, safe.directory setup, the newly added identity setup, platform detection, CLI availability, endpoint discovery/spawn, and relay creation. The new identity setup must fully finish before platform probes or relay establishment can begin.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/remoteAgentHost/electron-browser/devContainerAgentHostConnector.contribution.ts:createConnection/establish",
+            "Operation": "Invoke the shared-process Dev Container service connection",
+            "Cardinality": "One IPC request per initial connection and each reconnect",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC request existed, but the shared-process handler did not perform Git identity forwarding.",
+            "CriticalPathEffect": "The caller awaits it before receiving a usable Agent Host transport"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:connect",
+            "Operation": "Run `devcontainer up` and the existing safe.directory/container setup",
+            "Cardinality": "One `up` process plus existing conditional safe.directory-related process/exec operations per connection",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical setup occurred before platform detection.",
+            "CriticalPathEffect": "Already on the connection critical path before this diff"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_getHostGitIdentity",
+            "Operation": "Read host-global `user.name` and `user.email` via separate local Git processes",
+            "Cardinality": "Exactly two serial local processes per connection/reconnect",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No host Git identity processes ran during connection.",
+            "CriticalPathEffect": "Both complete before any identity container check and before platform detection"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_configureGitIdentity",
+            "Operation": "Check Git availability, inspect each effective identity key, and conditionally write each missing global key through `devcontainer exec`",
+            "Cardinality": "Three serial Dev Container CLI processes for two present host fields already configured in the container; five when both need writes",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No identity-related Dev Container CLI invocations occurred.",
+            "CriticalPathEffect": "All child processes and container round trips complete before platform detection and relay establishment"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:connect",
+            "Operation": "Detect platform, install/reuse the remote CLI, discover/start endpoints, and create the relay",
+            "Cardinality": "Three parallel platform execs followed by existing install/discovery operations per connection",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Platform detection began immediately after safe.directory setup.",
+            "CriticalPathEffect": "These existing operations remain critical, but now cannot start until identity setup completes"
+          }
+        ],
+        "ScalingInput": "One workspace connection or reconnect, with one or two host identity fields. The common two-field case produces two local Git calls and 3 container calls if identity is already configured, or 5 container calls if both fields need writing.",
+        "EffectiveConcurrency": "The two host reads are serialized. Git availability, per-key container reads, and per-key writes are also serialized by successive awaits. Existing platform probes run in parallel only after all new identity work finishes; there is no shared batching or coalescing for reconnects.",
+        "CacheBehavior": "Shell environment resolution is cached per service instance, but host identity values, container identity probes, and completed configuration are not cached. Warm reconnects therefore repeat all new probes, even when no writes are needed.",
+        "MechanismConfidence": "High: each added `exec` maps to `_runDevContainer`, which spawns a fresh Node-based Dev Container CLI process, and the connector explicitly calls this path for initial and reconnect attempts.",
+        "MagnitudeUncertainty": "Exact process and container round-trip duration varies by Docker backend and whether this is an initial connection or reconnect, but host name/email is a normal configuration and the 3-5 serial container invocations are deterministic for that case.",
+        "Verdict": "Reportable medium startup regression: the diff adds avoidable serial subprocess fan-out to every common connection and reconnect critical path."
+      },
+      {
+        "Scenario": "Dev Container Agent Host connection when the host has no global Git identity",
+        "CriticalPath": "After existing `devcontainer up` and safe.directory work, connection waits for both new local Git queries; identity setup then returns without container commands and platform detection proceeds.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_getHostGitIdentity",
+            "Operation": "Query absent host-global Git name and email",
+            "Cardinality": "Two serial local Git child processes per connection/reconnect",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No host Git subprocesses were launched.",
+            "CriticalPathEffect": "Both misses block platform detection and all later Agent Host setup"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:connect",
+            "Operation": "Existing Dev Container startup, platform, CLI, endpoint, and relay operations",
+            "Cardinality": "Existing bounded setup operations per connection",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "They followed safe.directory setup without these host Git probes.",
+            "CriticalPathEffect": "Still critical, but delayed by the two new local misses"
+          }
+        ],
+        "ScalingInput": "One connection or reconnect; absence of both host-global keys still causes two local process launches.",
+        "EffectiveConcurrency": "The two local Git queries execute sequentially; no container identity process is launched.",
+        "CacheBehavior": "Only shell environment resolution is cached. Negative host identity results are not cached, so every reconnect repeats both misses.",
+        "MechanismConfidence": "High: both reads are unconditional and serial before the early return, with no negative cache.",
+        "MagnitudeUncertainty": "Local Git startup is usually cheaper than container CLI startup, so this branch alone may have modest impact; frequency depends on users without global identity and reconnect count.",
+        "Verdict": "This branch corroborates the same reported batching issue but does not warrant a separate finding because its mechanism and fix are encompassed by the identity-setup fan-out finding."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and traced initial connection, reconnect, present/missing identity, cache behavior, and all changed subprocess boundaries. Submitted one high-confidence critical-path subprocess fan-out finding; no regression-fix learning signal was present."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-13T18:11:14.415144833Z",
+    "CompletedAt": "2026-09-13T18:12:55.576474388Z",
+    "WallClockMilliseconds": 101161,
+    "ModelCalls": 9,
+    "InputTokens": 229071,
+    "OutputTokens": 5536,
+    "TotalTokens": 234607,
+    "ReasoningTokens": 2276,
+    "CacheReadTokens": 184832,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 86934,
+    "ToolCalls": 30,
+    "NanoAIUnits": 36160880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 184832,
+      "cache_write": 0,
+      "input": 44239,
+      "output": 5536
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
