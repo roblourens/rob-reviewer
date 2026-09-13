@@ -31,3 +31,8 @@ When a fix removes repeated work, reconstruct the pre-fix multiplicity explicitl
 ## Serialization and allocation revealed by shipped fixes
 
 Check whether changed telemetry, logging, protocol, or storage paths sanitize, clone, encode, or buffer unbounded data before a downstream cap. Bound work before allocation and transformation whenever only a prefix can be consumed.
+
+<!-- learned-family:concurrency-burst -->
+## Concurrency bursts revealed by shipped fixes
+
+Distinguish per-key serialization from global concurrency. When one event schedules work for many independent keys, compute the aggregate resource burst and look for a shared limiter that bounds expensive creation, disposal, or remote operations.
