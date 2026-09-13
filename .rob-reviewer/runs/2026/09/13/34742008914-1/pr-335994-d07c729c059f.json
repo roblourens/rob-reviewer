@@ -1,0 +1,197 @@
+{
+  "PullRequest": {
+    "Number": 335994,
+    "Title": "Overlap macOS signing and notarization in official builds",
+    "Body": "Changes macOS artifact processing from a global sign-then-notarize barrier to independent sign-then-notarize chains. This lets notarization begin for an artifact as soon as that artifact's signing completes while retaining concurrent processing across artifacts.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/335994",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3879d0e80faeaeb351bbb44dd0f74f1bac12fc0a",
+    "HeadRef": "agents/optimize-macos-signing",
+    "HeadSHA": "d07c729c059f74b99a8130513484ad37d27b5e00",
+    "CreatedAt": "2026-09-12T23:09:22Z",
+    "UpdatedAt": "2026-09-13T01:18:57Z",
+    "MergedAt": null,
+    "Labels": [
+      "vscode-build",
+      "macos",
+      "engineering"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "build/azure-pipelines/darwin/codesign.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 14,
+      "BasePath": "build/azure-pipelines/darwin/codesign.ts",
+      "BaseLine": 51,
+      "IntroducingPath": "build/azure-pipelines/darwin/codesign.ts",
+      "IntroducingCommit": "ed8f9653dadc3029f14bf71917bee5d335c20732",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceCategory": "subprocess",
+      "Mechanism": "A global phase barrier serialized the start of every ESRP notarization behind completion of the slowest signing subprocess, leaving already-signed artifacts idle and making step latency max(all signing durations) plus max(all notarization durations) rather than the maximum per-artifact sign/notarize chain.",
+      "Symptom": "Official macOS build completion was delayed whenever artifact signing durations differed, because notarization for early-finished artifacts could not overlap the remaining signing work.",
+      "FixedBehavior": "Each artifact now forms an independent sign-then-notarize chain, so a completed artifact enters the external notarization operation immediately instead of idling behind the slowest unrelated signing job. The total boundary-call count remains four operations for universal builds or eight for architecture-specific builds, and effective concurrency remains bounded by the two or four artifact chains.",
+      "Evidence": "In the base revision, all 2 (universal) or 4 (architecture-specific) sign-darwin subprocesses were started, then every signing result was awaited through line 47 before the first notarize-darwin subprocess could be spawned at line 51. Each subprocess invokes the synchronous dotnet ESRP CLI path in build/azure-pipelines/common/sign.ts, and the encompassing Azure Pipelines Codesign \u0026 Notarize step cannot complete until all operations finish. The changed helper awaits only the matching artifact's signing operation before starting its notarization, and Promise.all retains parallel processing across independent artifacts.",
+      "Confidence": 0.96
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Official non-universal macOS build (x64 or arm64) signs and notarizes client ZIP, DMG, server ZIP, and web-server ZIP",
+        "CriticalPath": "The Codesign \u0026 Notarize pipeline step must complete all four chains before artifact extraction/publishing can proceed. Each chain now awaits its own signing subprocess and then its own notarization subprocess; Promise.all waits for the slowest complete chain. Previously every notarization waited for all four sign operations.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/darwin/codesign.ts:11-14 via build/azure-pipelines/common/codesign.ts:28-29 and build/azure-pipelines/common/sign.ts:166-216",
+            "Operation": "Spawn sign.ts once for signing and once for notarization for each of four artifact groups; each sign.ts invocation also runs dotnet --version and then the dotnet ESRP CLI.",
+            "Cardinality": "Eight top-level Node subprocesses and eight nested ESRP CLI subprocesses per build, grouped by four artifact globs; at most four artifact operations are live concurrently.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same four signing and four notarization subprocesses ran, with four-way signing followed by a global barrier and then four-way notarization.",
+            "CriticalPathEffect": "All eight logical operations remain on the pipeline-step critical path, but notarization for an artifact can now overlap remaining signing work."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/sign.ts:101-116,166-216",
+            "Operation": "The ESRP CLI performs remote MacAppDeveloperSign or MacAppNotarize work against api.esrp.microsoft.com.",
+            "Cardinality": "Eight logical remote operations per successful build, one sign and one notarization for each of four artifact groups; existing ESRP retry settings are unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same eight remote operations occurred, but all notarization requests started only after all signing requests completed.",
+            "CriticalPathEffect": "Remote completion gates each chain and therefore the pipeline step; the diff overlaps independent operation types without adding requests."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/azure-pipelines/common/sign.ts:132-143,180-216",
+            "Operation": "Each sign.ts invocation writes four temporary credential/config files and the ESRP CLI reads and updates the selected artifact glob.",
+            "Cardinality": "Four temp files per invocation (32 across eight invocations), plus one artifact-group operation per invocation; counts and artifact grouping are unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical per-invocation local file setup and artifact access occurred under the prior two-phase schedule.",
+            "CriticalPathEffect": "These operations execute within the subprocesses on the step's critical path; only their scheduling overlap changes."
+          }
+        ],
+        "ScalingInput": "Fixed effective cardinality of four independent artifact groups and eight logical external operations per architecture-specific build; ESRP-internal file counts may vary with archive contents but are unchanged by the diff.",
+        "EffectiveConcurrency": "Four chains start together, each with at most one live ESRP operation, so effective concurrency remains bounded at four. The diff changes phase overlap, not the maximum worker count or total operation count.",
+        "CacheBehavior": "There is no application cache or negative cache on this build path; every official build invokes all required signing/notarization operations. Warm versus cold cache behavior is unchanged, and artifact grouping by glob remains one operation per artifact group.",
+        "MechanismConfidence": "High: the changed await placement directly removes the cross-artifact barrier while preserving one live operation per chain.",
+        "MagnitudeUncertainty": "Exact ESRP durations and the amount of overlap depend on service and artifact timing, but operation count and maximum concurrency are statically established.",
+        "Verdict": "No regression. The diff reduces critical-path idle time without increasing total calls or peak concurrency; it is recorded as a performance regression fix."
+      },
+      {
+        "Scenario": "Official universal macOS build signs and notarizes the client ZIP and DMG",
+        "CriticalPath": "The direct Codesign \u0026 Notarize pipeline step blocks extraction and verification. The two artifact chains must finish, with notarization following signing within each chain; previously both sign operations had to finish before either notarization started.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/darwin/codesign.ts:11-14,33-34",
+            "Operation": "Run sign.ts and the nested dotnet ESRP CLI for signing and notarization of the client and DMG.",
+            "Cardinality": "Four logical top-level operations across two artifact groups, with at most two live concurrently.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same four operations ran as two parallel signs followed by two parallel notarizations.",
+            "CriticalPathEffect": "All operations gate the pipeline step; the new per-artifact dependency allows overlap across phases."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/sign.ts:101-116,166-216",
+            "Operation": "Submit two signing and two notarization operations to ESRP.",
+            "Cardinality": "Four logical remote operations, unchanged and not cacheable in this script.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same remote operations were separated by a global signing barrier.",
+            "CriticalPathEffect": "External completion remains required before extraction; only launch timing changes."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/azure-pipelines/common/sign.ts:132-143,180-216",
+            "Operation": "Create invocation-local temp parameter files and process the client/DMG globs.",
+            "Cardinality": "Four temp files per invocation (16 total) and four artifact-group accesses, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical local file work ran under the previous phased schedule.",
+            "CriticalPathEffect": "Local setup and artifact mutation remain inside the external-operation critical path."
+          }
+        ],
+        "ScalingInput": "Fixed two artifact groups and four logical external operations for a universal build.",
+        "EffectiveConcurrency": "Two independent chains, at most two live ESRP operations. Promise.all provides the same concurrency bound as the old two-phase implementation.",
+        "CacheBehavior": "No cache is consulted; both artifacts are processed on every run. Cold and warm behavior are equivalent at this layer.",
+        "MechanismConfidence": "High: branch conditions and process launch sites statically establish the two-chain schedule.",
+        "MagnitudeUncertainty": "Exact saved wall time depends on imbalance between client and DMG signing/notarization durations.",
+        "Verdict": "No regression. Boundary cardinality and concurrency are unchanged, while the global barrier is removed."
+      },
+      {
+        "Scenario": "Signing or notarization failure during an official macOS build",
+        "CriticalPath": "Promise.all rejects when the first active chain reports failure and main exits the process. Other child processes are terminated with the parent; unlike the old global barrier, a fast successful sign may have begun its own notarization before a different sign fails.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/darwin/codesign.ts:11-14,43-49",
+            "Operation": "Sibling chains may have started notarization before another signing subprocess reports failure.",
+            "Cardinality": "At most one live subprocess per artifact chain; on a failed run, up to one notarization per already-signed sibling can start earlier than under the prior barrier.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No notarization started until every signing await succeeded, so a signing failure prevented the notarization phase.",
+            "CriticalPathEffect": "The first rejection ends the pipeline step rather than awaiting all siblings, so this work does not extend the failed step's foreground critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/sign.ts:110-116,166-216",
+            "Operation": "An ESRP notarization request for an already-signed sibling may be submitted before another signing request fails.",
+            "Cardinality": "Bounded by the other one or three artifact chains and only occurs in failed builds; no increase on successful builds.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A sign-phase failure prevented all notarization requests.",
+            "CriticalPathEffect": "The process exits on the first rejection; any remote residual work is not awaited and has no evidenced user-visible latency impact."
+          }
+        ],
+        "ScalingInput": "Bounded fixed set of two or four artifact chains, not an unbounded collection or recurring event.",
+        "EffectiveConcurrency": "Still bounded by two or four active chains. Fail-fast rejection can shorten failure reporting; successful sibling chains may transiently overlap later-stage work.",
+        "CacheBehavior": "No retry cache or shared result cache is visible; ESRP retry behavior is unchanged. Failure does not populate reusable state in this script.",
+        "MechanismConfidence": "High for possible early sibling notarization launch; low for any material residual resource cost after fail-fast process exit.",
+        "MagnitudeUncertainty": "Whether an ESRP request continues remotely after parent termination is not established, and failed official builds are not the primary successful-build scenario.",
+        "Verdict": "No reportable regression. The extra failure-only work is tightly bounded, does not increase peak concurrency, and lacks evidence of material latency or resource impact; fail-fast behavior may instead reduce failed-build duration."
+      }
+    ],
+    "Summary": "Reviewed the complete one-file diff and traced macOS signing through the pipeline, Node child-process wrapper, local filesystem setup, dotnet ESRP CLI, and remote ESRP operations. No actionable performance regression was introduced. The change preserves operation count and peak concurrency while replacing a global sign/notarize barrier with independent artifact chains; the removed barrier was recorded as a regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-13T06:13:50.879708756Z",
+    "CompletedAt": "2026-09-13T06:15:25.192785738Z",
+    "WallClockMilliseconds": 94313,
+    "ModelCalls": 9,
+    "InputTokens": 172609,
+    "OutputTokens": 6442,
+    "TotalTokens": 179051,
+    "ReasoningTokens": 2787,
+    "CacheReadTokens": 140288,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 84962,
+    "ToolCalls": 32,
+    "NanoAIUnits": 31423920000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 140288,
+      "cache_write": 0,
+      "input": 32321,
+      "output": 6442
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
