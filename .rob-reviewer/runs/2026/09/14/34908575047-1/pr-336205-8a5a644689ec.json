@@ -1,0 +1,150 @@
+{
+  "PullRequest": {
+    "Number": 336205,
+    "Title": "Fix MCP connection failures being reported as user cancellation",
+    "Body": "Fixes #336192\r\n\r\n## Summary\r\n\r\nTreat a connection-caused cancellation as an ordinary MCP tool error, without changing genuine caller cancellation.\r\n\r\n`McpServerRequestHandler` intentionally cancels pending RPC promises when the connection fails or stops. Previously, `McpTool` let that `CancellationError` escape unchanged, which Copilot interpreted as the user canceling the invocation and used to end the agent turn.\r\n\r\n## Change\r\n\r\nAfter the existing retry handling in `McpTool._callWithProgress()`:\r\n\r\n* Convert only `CancellationError` with an uncanceled caller token and a connection currently in `Error` or `Stopped`.\r\n* Use the existing `McpConnectionFailedError` type, including the connection error message or an interaction-required message.\r\n* Leave caller cancellation, intentional server cancellation on a running connection, ordinary tool errors, and the existing single retry unchanged.\r\n\r\nNo new automatic retries, authentication bypasses, transport changes, or Copilot-specific changes are introduced.\r\n\r\n## Coverage\r\n\r\nThirteen regression/control cases exercise the real MCP service, connection, tool, request handler, and JSON-RPC stack using the existing in-memory transport fixtures:\r\n\r\n* `call` and `callWithProgress` for connection error, stopped connection, and interaction-required stop.\r\n* Caller cancellation racing with each of those states.\r\n* Server cancellation while the connection is running.\r\n* Ordinary JSON-RPC tool errors.\r\n* The existing retry succeeding, and an exhausted retry becoming an ordinary connection error.\r\n\r\nThe post-success tool-list refresh is stubbed; it is separate from the cancellation path under test.\r\n\r\n## Validation\r\n\r\n* Negative control on the original implementation: **7 expected failures, 10 passing**, with no unhandled rejections or disposable leaks.\r\n* Patched targeted service suite: **17 passing**.\r\n* Surrounding MCP common suites: **302 passing, 14 pending**.\r\n* `npm run typecheck-client`: passed.\r\n* Scoped ESLint on the two changed files: passed.\r\n\r\nThis fixes failure classification at the MCP boundary, not the underlying reason a particular server lost connectivity or authentication.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336205",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "abmahdy",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "c48e5e4a36448a6788d234ac510cf0985a08e10b",
+    "HeadRef": "fix/mcp-connection-error-not-user-cancel",
+    "HeadSHA": "8a5a644689ec26dd60ca6f1ceb8bbaafd36c265f",
+    "CreatedAt": "2026-09-14T22:21:44Z",
+    "UpdatedAt": "2026-09-14T22:25:48Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Successful MCP tool invocation from chat or an agent host",
+        "CriticalPath": "The tool service invokes McpTool.callWithProgress, McpServer.callOn ensures the server is started, one JSON-RPC tools/call request completes, and the existing tool-refresh wait completes before returning. The changed catch block is not reached on success.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess/network",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpServer.ts:McpServer.callOn",
+            "Operation": "Start or connect the MCP server transport when it is not already running.",
+            "Cardinality": "At most one cold start for the server lifecycle; warm invocations reuse the running connection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical cold/warm startup behavior before the diff.",
+            "CriticalPathEffect": "Cold startup must finish before the tool request; warm calls bypass startup work."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpServer.ts:McpTool._callWithProgress",
+            "Operation": "Send the MCP JSON-RPC tools/call request over the configured stdio or HTTP transport.",
+            "Cardinality": "One request per successful invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single request and response were required before the diff.",
+            "CriticalPathEffect": "The response is on the invocation critical path."
+          }
+        ],
+        "ScalingInput": "One transport request per tool invocation; concurrent calls are determined by the existing chat/tool orchestration, and this diff adds no fan-out or concurrency.",
+        "EffectiveConcurrency": "Existing calls may run concurrently across tool invocations; server startup remains sequenced/idempotent and the diff adds no queue, limiter, or parallel work.",
+        "CacheBehavior": "On a cold server, callOn may start the MCP transport and initialize the handler; on a warm running server, start is idempotent. The diff does not alter tool caching, startup, or refresh behavior.",
+        "MechanismConfidence": "High: the production diff executes only inside the existing catch block after callTool fails.",
+        "MagnitudeUncertainty": "Transport and server latency vary by MCP implementation, but no changed work is present on the successful path.",
+        "Verdict": "No performance regression: successful invocation cost, cache behavior, boundary count, and concurrency are unchanged."
+      },
+      {
+        "Scenario": "MCP transport enters Error or Stopped while a tool request is pending",
+        "CriticalPath": "The pending tools/call request is cancelled by McpServerRequestHandler when the connection becomes terminal. Existing retry logic may issue one retry only when Error.shouldRetry is true; after that, the new code performs constant-time cancellation/token/state checks and allocates one localized McpConnectionFailedError.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpServer.ts:McpTool._callWithProgress and src/vs/workbench/contrib/mcp/common/mcpServerRequestHandler.ts",
+            "Operation": "Send tools/call and receive connection termination/cancellation.",
+            "Cardinality": "One transport request per failed invocation, or two only when the existing Error.shouldRetry path is enabled.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Before the diff, the same request and optional one retry occurred, then CancellationError propagated.",
+            "CriticalPathEffect": "Connection failure settles the pending request; the added classification runs afterward and does not block on another boundary."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts client-tool error handling",
+            "Operation": "A higher-level agent may continue its normal model loop after receiving an ordinary tool error instead of treating it as user cancellation.",
+            "Cardinality": "Potential subsequent model work is determined by existing agent orchestration and model decisions; this diff adds no automatic retry or loop.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The misclassified CancellationError could terminate the agent turn instead of reporting the failed tool call.",
+            "CriticalPathEffect": "Continuation is the intended behavior of reclassifying connection failure and is not performed inside the changed code."
+          }
+        ],
+        "ScalingInput": "Cost scales once per failed tool invocation. Effective transport cardinality remains one request normally or two requests under the pre-existing single retry.",
+        "EffectiveConcurrency": "No new automatic concurrency is introduced. Each failed invocation independently classifies its own error after the transport settles; aggregate concurrency remains controlled by existing callers.",
+        "CacheBehavior": "No cache participates in failure classification. Cold and warm server states retain their existing start/reuse behavior, and no failure keys or objects are retained.",
+        "MechanismConfidence": "High for the bounded local classification and unchanged MCP request count; downstream model continuation is possible but caller-controlled.",
+        "MagnitudeUncertainty": "Whether an agent makes another model request after receiving the error depends on the caller/model, but there is no code evidence of unbounded retries or changed concurrency.",
+        "Verdict": "No reportable regression: the added work is one state read, checks, localization, and one error allocation per failed call. Normal agent continuation is the intentional functional correction, with no new automatic retries or fan-out."
+      },
+      {
+        "Scenario": "Caller cancellation or server-originated cancellation while the connection remains running",
+        "CriticalPath": "The existing MCP request rejects with CancellationError. The new checks inspect the caller token and current connection state, then rethrow the original cancellation when the caller cancelled or the connection is still running.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpServerRequestHandler.ts and src/vs/workbench/contrib/mcp/common/mcpServer.ts:McpTool._callWithProgress",
+            "Operation": "The already-issued MCP tools/call is cancelled or receives a server cancellation notification.",
+            "Cardinality": "One cancellation for the affected request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same request cancellation propagated as CancellationError.",
+            "CriticalPathEffect": "Cancellation settles the request immediately; the changed branch performs only local checks before rethrowing."
+          }
+        ],
+        "ScalingInput": "Constant work per cancelled invocation; no collection or history growth.",
+        "EffectiveConcurrency": "Cancellation remains per invocation, and existing request/disposable cleanup runs in finally. No new asynchronous work is scheduled.",
+        "CacheBehavior": "No cache reads, writes, keys, or negative entries are involved.",
+        "MechanismConfidence": "High: token/state guards and finally disposal are explicit in the traced code.",
+        "MagnitudeUncertainty": "None material; all changed operations are bounded scalar checks.",
+        "Verdict": "No performance regression: cancellation timing, boundary cardinality, and cleanup lifecycle remain unchanged."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and traced MCP tool invocation through transport cancellation, retry, caller handling, startup, and disposal. The production change adds only bounded error classification after a failed request; it adds no MCP boundary call, retry, retained state, serialization, or concurrency burst. The expanded tests affect test-only execution and do not establish a product performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-14T23:33:52.560124121Z",
+    "CompletedAt": "2026-09-14T23:35:05.705500139Z",
+    "WallClockMilliseconds": 73145,
+    "ModelCalls": 8,
+    "InputTokens": 242857,
+    "OutputTokens": 3863,
+    "TotalTokens": 246720,
+    "ReasoningTokens": 1089,
+    "CacheReadTokens": 191779,
+    "CacheWriteTokens": 51054,
+    "APIDurationMilliseconds": 63737,
+    "ToolCalls": 29,
+    "NanoAIUnits": 40933760000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 191779,
+      "cache_write": 51054,
+      "input": 24,
+      "output": 3863
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
