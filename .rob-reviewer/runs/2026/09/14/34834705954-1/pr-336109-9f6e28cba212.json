@@ -1,0 +1,156 @@
+{
+  "PullRequest": {
+    "Number": 336109,
+    "Title": "Precompute NLS translation cache identity during packaging",
+    "Body": "## Summary\r\n\r\nIndependent NLS cache fix, related to #336093. The existing esbuild pipeline can produce different NLS tables for the same commit, so the old commit-only translation cache can be reused with incompatible message indexes.\r\n\r\n- Compute the commit/table identity during desktop and server packaging and stamp it into product configuration.\r\n- Pass that identity through native bootstrap and remote language-pack resolution.\r\n- Keep cache-hit checks before reading the NLS tables: no runtime fingerprinting and no additional metadata-file read on a warm cache hit.\r\n- Preserve the legacy cache path for products without the new identity, plus existing cleanup and corruption handling.\r\n\r\n## Validation\r\n\r\n- 15 runtime/localization/cache checks and 17 build/localization tests passed.\r\n- The warm-cache test fails against the runtime-hashing implementation from #336093 and passes here, even after both NLS tables are removed.\r\n- Client/build typechecks, staged hygiene and explicit ESLint passed.\r\n- Built real minified Windows server and server-web packages with the same commit and verified their product identities against the actual tables.\r\n- Fresh-process probes using native bootstrap and remote language-pack resolution switched targets with one German pack and shared user-data directory. Indices 1946/4019 localized correctly; the warm server-web process also succeeded with its keys table removed.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336109",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "2886f6d669831dfaed883670cdabf7cf31c8df67",
+    "HeadRef": "agents/nls-build-time-cache-identity",
+    "HeadSHA": "9f6e28cba21201bb29507bd265defac7efe0c70b",
+    "CreatedAt": "2026-09-14T06:34:54Z",
+    "UpdatedAt": "2026-09-14T08:49:43Z",
+    "MergedAt": null,
+    "Labels": [
+      "vscode-build",
+      "engineering",
+      "nls"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Desktop packaging stamps the NLS cache identity into product configuration",
+        "CriticalPath": "The product.json packaging stream synchronously reads and hashes both generated NLS tables before that package can finish. This is on the packaging critical path, not an end-user startup path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "build/lib/nlsMetadata.ts:computeNLSMetadataHash",
+            "Operation": "Synchronously read nls.keys.json and nls.messages.json into buffers",
+            "Cardinality": "Exactly two reads per package invocation",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Packaging copied the NLS files but did not synchronously reread them to derive a product identity.",
+            "CriticalPathEffect": "Blocks that package's product.json stream until both bounded generated files are read and hashed"
+          }
+        ],
+        "ScalingInput": "Two generated metadata files per invoked package task; cost scales linearly with their combined byte size and with independently invoked platform/architecture packaging tasks.",
+        "EffectiveConcurrency": "Each helper call performs two synchronous reads serially inside one package task. Platform/architecture jobs are otherwise independently scheduled by the existing build pipeline; the diff adds no concurrency burst.",
+        "CacheBehavior": "No memoization is added, so each package invocation hashes its source output once. Minified and non-minified or distinct server/server-web outputs correctly receive identities derived from their own tables.",
+        "MechanismConfidence": "High: the synchronous reads and their once-per-package call sites are explicit in the changed hunks.",
+        "MagnitudeUncertainty": "Exact generated table sizes and packaging timing are not measured, but cardinality is fixed at two reads per package and packaging already processes the full application payload.",
+        "Verdict": "No reportable regression. The new work is bounded build-time I/O performed once per package, not repeated per packaged file or runtime launch, and is small relative to the existing packaging workload."
+      },
+      {
+        "Scenario": "Localized desktop startup resolves a cached or cold language pack",
+        "CriticalPath": "resolveNLSConfiguration runs before localized application code can load. A warm cache checks existing language-pack metadata and the hashed messages path; a cold cache reads and converts the same NLS and translation tables as before.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/base/node/nls.ts:resolveNLSConfiguration",
+            "Operation": "Read languagepacks.json and test the selected translation/cache paths",
+            "Cardinality": "One language-pack configuration read and bounded existence checks per startup resolution",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same configuration read and checks used a commit-named messages directory.",
+            "CriticalPathEffect": "Existing startup-critical metadata access; unchanged by the diff except for the cache directory name"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/base/node/nls.ts:resolveNLSConfiguration",
+            "Operation": "On a cache miss, read keys, default messages, and language-pack data, then write generated messages and translation configuration",
+            "Cardinality": "Three parallel reads and two parallel writes once per cold identity",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cold conversion ran once per commit-based cache miss.",
+            "CriticalPathEffect": "Blocks localized startup only on a cold cache, as before"
+          }
+        ],
+        "ScalingInput": "One selected locale and language pack per desktop process; cold conversion scales with the number of NLS keys/messages, while warm startup remains constant-cardinality metadata checks.",
+        "EffectiveConcurrency": "One promise is created for the user-selected locale during startup. The three cold-cache reads are joined with Promise.all as before; writes are likewise paired. No new fan-out is introduced.",
+        "CacheBehavior": "The precomputed identity selects a cache directory without reading or hashing NLS tables at runtime. Warm hits reuse it and asynchronously touch its directory. Cold builds create one cache per unique commit/table identity. Existing cleanup removes inactive language packs and aged identity directories after startup.",
+        "MechanismConfidence": "High: changed code only substitutes the precomputed hash for commit in the cache path, and tests explicitly establish warm hits without table reads.",
+        "MagnitudeUncertainty": "A first launch after adopting the new naming may not reuse a legacy directory, but normal product updates already change commits and force the same cold conversion; table sizes and storage bytes vary by build.",
+        "Verdict": "No reportable regression. Warm runtime I/O and cold conversion work are unchanged; cache directory cardinality remains approximately one per build/table, with existing age-based cleanup."
+      },
+      {
+        "Scenario": "Default-English desktop, CLI, and server startup",
+        "CriticalPath": "The resolver returns the default NLS configuration before reading language-pack metadata because English, empty user-data paths, or development conditions satisfy the early guard.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One resolver call per process startup; no collection-dependent work is added.",
+        "EffectiveConcurrency": "No new asynchronous boundary or parallel work is reached for these default-locale entry points.",
+        "CacheBehavior": "No translated-message cache is consulted. The added product field is passed through but unused after the early return.",
+        "MechanismConfidence": "High: the unchanged early guard precedes all filesystem accesses and hash-path construction.",
+        "MagnitudeUncertainty": "None material for the changed behavior.",
+        "Verdict": "No performance change beyond passing one optional string property."
+      },
+      {
+        "Scenario": "Remote server resolves language packs for connected clients",
+        "CriticalPath": "The first request for each language/user-data pair resolves its language pack before returning configuration; subsequent requests reuse the process-local promise.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/server/node/remoteLanguagePacks.ts:getNLSConfiguration -\u003e src/vs/base/node/nls.ts:resolveNLSConfiguration",
+            "Operation": "Check default metadata, read language-pack configuration, and on a disk miss generate translated messages",
+            "Cardinality": "At most once per distinct in-process language/userDataPath key; cold filesystem conversion once per unique disk identity",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same boundary path used a commit-only disk cache and the same in-process coalescing.",
+            "CriticalPathEffect": "First matching request waits for resolution; warm in-process requests reuse the promise"
+          }
+        ],
+        "ScalingInput": "Effective cardinality is one resolution per distinct language and userDataPath pair in a server process, after Map coalescing. Disk cache cardinality is one directory per distinct packaged table identity actually used with a language pack.",
+        "EffectiveConcurrency": "Same-key calls coalesce through the existing promise cache. Different language/user-data keys can resolve concurrently as before; the diff adds no limiter change or new per-client fan-out.",
+        "CacheBehavior": "The in-memory key remains language plus userDataPath. The disk cache now distinguishes server and server-web tables at the same commit, preserving warm reuse for identical identities and avoiding runtime hashing. Aged directories remain governed by the existing language-pack cache cleaner.",
+        "MechanismConfidence": "High: the changed call only supplies the product identity and the unchanged Map controls request multiplicity.",
+        "MagnitudeUncertainty": "Operators sharing one user-data directory across different server target packages can retain an additional table-specific cache, but realistic target count is small and aged entries are cleaned.",
+        "Verdict": "No reportable regression. The change separates genuinely incompatible target tables while preserving process coalescing, warm-cache behavior, and cleanup."
+      }
+    ],
+    "Summary": "Reviewed all 13 changed files and traced packaging, desktop/CLI/server startup, remote language-pack resolution, cold/warm cache behavior, and cache cleanup. No high-confidence actionable performance regression was introduced, and the PR does not establish a concrete performance-regression fix requiring blame attribution."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-14T10:58:28.902949711Z",
+    "CompletedAt": "2026-09-14T10:59:56.808985702Z",
+    "WallClockMilliseconds": 87906,
+    "ModelCalls": 7,
+    "InputTokens": 178892,
+    "OutputTokens": 5021,
+    "TotalTokens": 183913,
+    "ReasoningTokens": 1891,
+    "CacheReadTokens": 135475,
+    "CacheWriteTokens": 43396,
+    "APIDurationMilliseconds": 77299,
+    "ToolCalls": 46,
+    "NanoAIUnits": 37167400000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 135475,
+      "cache_write": 43396,
+      "input": 21,
+      "output": 5021
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
