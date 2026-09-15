@@ -1,0 +1,107 @@
+{
+  "PullRequest": {
+    "Number": 336236,
+    "Title": "fix(copilot-chat): dispose PromptRenderer's hydrated InstantiationService when super.render throws",
+    "Body": "### Summary\r\n\r\n`PromptRenderer.render` creates a per-render child `InstantiationService` via `createChild`, then disposes it on the happy-path return. When `super.render(progress, token)` throws — cancellation, or a `_throwIfDisposed` from a parent-cascade-dispose reaching `createElement` mid tree-walk — the trailing `dispose()` is skipped and the hydrated child leaks.\r\n\r\nFix: wrap the body in `try { ... } finally { this._instantiationService.dispose(); }`. `dispose()` is idempotent, so cascade-then-explicit is a no-op.\r\n\r\n### Why this is minimal and non-silencing\r\n\r\n- Only `finally` — no `catch`. Any error (including the `InstantiationService has been disposed` from #336235) still propagates unchanged.\r\n- No change to the vendored `InstantiationService` (`extensions/copilot/src/util/vs/platform/instantiation/common/instantiationService.ts`) — that file is a marked copy from vscode core.\r\n- Does not address the underlying async-re-entry crash surfaced in #336235; that lives at the caller / prompt-tsx walk site. This PR only fixes the leak on the failure path.\r\n\r\n### Scope\r\n\r\nOne method (`PromptRenderer.render`) in one file (`extensions/copilot/src/extension/prompts/node/base/promptRenderer.ts`). No public API change.\r\n\r\n### Related\r\n\r\n- #336235 — the crash report and diagnostic pointer.\r\n- #330277 / #330344 — sibling fix in settings editor, same error class, same \"guard at the re-entry boundary\" principle.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336236",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "ChakshuGupta13",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "903d0d0aad3aa5a6a230be51a867edcffa3a00d5",
+    "HeadRef": "fix/prompt-renderer-dispose-in-finally",
+    "HeadSHA": "869efd226067a9cea94dbe942418e0f847c1917d",
+    "CreatedAt": "2026-09-15T07:52:52Z",
+    "UpdatedAt": "2026-09-15T09:44:23Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "extensions/copilot/src/extension/prompts/node/base/promptRenderer.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 137,
+      "BasePath": "extensions/copilot/src/extension/prompts/node/base/promptRenderer.ts",
+      "BaseLine": 133,
+      "IntroducingPath": "extensions/copilot/src/extension/prompts/node/base/promptRenderer.ts",
+      "IntroducingCommit": "333d9a4053e71ed5249450e112b6a9decd3997b4",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "memory",
+      "Mechanism": "A per-render child InstantiationService was retained by the parent after cancellation or any render exception because cleanup only ran after the awaited render succeeded. Retained children grew linearly with failed render attempts until the root service was disposed, increasing extension-host memory and GC pressure.",
+      "Symptom": "Repeated cancelled or failed prompt renders caused monotonically retained child instantiation-service objects and their service collections for the extension-host lifetime.",
+      "FixedBehavior": "The added `try/finally` executes child-service disposal after both successful and rejected renders, removing the child from its parent's `_children` Set and releasing its service collection and endpoint references instead of allowing failed renders to accumulate for the parent lifetime.",
+      "Evidence": "`PromptRenderer.create` allocates one child `InstantiationService` per prompt render at lines 66-67. In the base revision, `render()` awaited `super.render()` before reaching the sole trailing dispose at line 133, so any rejection skipped cleanup. `InstantiationService.createChild` inserts the child into the parent's `_children` Set, and only the child's overridden `dispose()` removes it; therefore every failed/cancelled render remained strongly reachable from the long-lived parent. The added failure test exercises this exact rejection path and asserts disposal.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "unbounded-retention"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Successful chat or utility prompt rendering through `PromptRenderer.render` / `renderPromptElement`",
+        "CriticalPath": "`super.render` and existing trace/message/reference post-processing must complete before the caller receives the rendered prompt. Child disposal was already synchronous on this success path; moving it to `finally` preserves its position before promise settlement and adds no extra disposal.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Prompt tree/message/reference size controls unchanged rendering and post-processing work; request concurrency controls the number of independent renderer instances.",
+        "EffectiveConcurrency": "Concurrent requests still render independently with one child service per request and no new queue, limiter, serialization, or fan-out. Disposal remains one call per completed render and is idempotent.",
+        "CacheBehavior": "Each render creates a fresh hydrated child `InstantiationService`; inherited application services remain parent-owned and warm. The diff does not change tokenizer, prompt-result, or reference deduplication cache behavior.",
+        "MechanismConfidence": "High: the changed control flow and success-path operation count are explicit; the same single local disposal still occurs after one render.",
+        "MagnitudeUncertainty": "Prompt-tree size and the cost of individual unchanged prompt elements vary by caller, but the diff does not increase their work or frequency.",
+        "Verdict": "No performance regression. The success path performs the same render, logging, normalization, deduplication, and one disposal as before."
+      },
+      {
+        "Scenario": "Cancelled or otherwise failed prompt rendering while `super.render` walks the prompt tree",
+        "CriticalPath": "The unchanged prompt walk runs until cancellation or exception. The new `finally` performs local child-service cleanup before the rejection propagates; this bounded cleanup is on the failure path and prevents lifetime retention.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "The old retained object count scaled linearly with the number of cancelled or exceptional renders over the extension-host lifetime; the diff bounds it to currently active renders.",
+        "EffectiveConcurrency": "Multiple failing renders may execute concurrently, but each performs exactly one idempotent disposal. There is no new subprocess/IPC/filesystem/network burst or shared serialization point.",
+        "CacheBehavior": "A fresh child service is allocated per attempt and is not reused. Before the diff, failed attempts remained in the parent's `_children` Set until parent shutdown; after the diff, each failed attempt removes its own child immediately. No negative cache or coalescing is involved.",
+        "MechanismConfidence": "Very high: `createChild` inserts into the parent's strong `_children` Set, only child disposal removes it, and the base revision skipped the trailing disposal on any rejection. The added test confirms disposal on failure.",
+        "MagnitudeUncertainty": "Cancellation/failure prevalence and retained bytes per child vary in production, but retained-child count previously grew exactly with failed attempts and persisted for the parent lifetime.",
+        "Verdict": "This PR fixes an unbounded cleanup-lifecycle retention mechanism. The newly executed failure-path disposal is bounded per failed request and is not a reportable regression."
+      }
+    ],
+    "Summary": "Reviewed both changed files and the complete diffs, traced renderer creation/callers and `InstantiationService` parent-child ownership, and checked success and failure critical paths, concurrency, caches, and expensive boundaries. No diff-introduced performance finding was found. Recorded the concrete failed-render memory-retention regression fix with its blamed introducing commit."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-15T12:10:54.350010756Z",
+    "CompletedAt": "2026-09-15T12:12:30.80641049Z",
+    "WallClockMilliseconds": 96456,
+    "ModelCalls": 9,
+    "InputTokens": 180216,
+    "OutputTokens": 4191,
+    "TotalTokens": 184407,
+    "ReasoningTokens": 2162,
+    "CacheReadTokens": 151208,
+    "CacheWriteTokens": 28981,
+    "APIDurationMilliseconds": 79084,
+    "ToolCalls": 23,
+    "NanoAIUnits": 28931620000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 151208,
+      "cache_write": 28981,
+      "input": 27,
+      "output": 4191
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

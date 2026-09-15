@@ -1,0 +1,161 @@
+{
+  "PullRequest": {
+    "Number": 336253,
+    "Title": "fix: check update mutex before claiming instance ownership",
+    "Body": "Fixes https://github.com/microsoft/vscode/issues/335295",
+    "URL": "https://github.com/microsoft/vscode/pull/336253",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "deepak1556",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "903d0d0aad3aa5a6a230be51a867edcffa3a00d5",
+    "HeadRef": "robo/fix_locked_user_resources_windows",
+    "HeadSHA": "2b5a0ba4f3f3e8ddf176fab694b619bdec1923f4",
+    "CreatedAt": "2026-09-15T10:25:57Z",
+    "UpdatedAt": "2026-09-15T11:36:51Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold first launch on a Windows versioned Inno installation when no update is active",
+        "CriticalPath": "Service initialization completes, then claimInstance binds the main named-pipe IPC server and checkInnoSetupMutex dynamically loads the mutex module and performs one native mutex query before CodeApplication startup can proceed. This mutex check was already on the same startup critical path before the PR.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/code/electron-main/main.ts:352 claimInstance",
+            "Operation": "Bind the process-wide main named-pipe server",
+            "Cardinality": "One bind for the first instance",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The first instance performed the same single nodeIPCServe bind before the mutex check.",
+            "CriticalPathEffect": "The bind must complete before startup proceeds."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/code/electron-main/main.ts:558 checkInnoSetupMutex",
+            "Operation": "Load @vscode/windows-mutex and query the updater mutex",
+            "Cardinality": "One cached module import and one native mutex query when no update is active",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same import and mutex query ran immediately after claimInstance returned.",
+            "CriticalPathEffect": "The query must return before CodeApplication startup proceeds."
+          }
+        ],
+        "ScalingInput": "One operation per cold first-instance launch; no collection-sized input or loop is entered when the mutex is inactive.",
+        "EffectiveConcurrency": "A single process owns the main IPC handle; no new parallel work is introduced.",
+        "CacheBehavior": "The dynamic import uses the runtime module cache. Cold launch pays module loading once; subsequent calls in the process are warm. No application cache affects the native mutex query.",
+        "MechanismConfidence": "High: the old and new control flow both bind once and execute the same inactive-mutex check before application startup.",
+        "MagnitudeUncertainty": "Native mutex-query duration is not measured, but its count and critical-path placement are unchanged.",
+        "Verdict": "No regression: the normal first-launch boundary count and critical path are unchanged."
+      },
+      {
+        "Scenario": "Launching a secondary instance while an existing VS Code instance owns the IPC handle",
+        "CriticalPath": "nodeIPCServe fails with EADDRINUSE, claimInstance connects to the existing main process, forwards launch/status work, and terminates. The updater mutex check is not reached because claimInstance does not return a server on this path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/code/electron-main/main.ts:352-486 claimInstance",
+            "Operation": "Attempt named-pipe bind, connect to the existing instance, and invoke launch or diagnostics RPC",
+            "Cardinality": "One failed bind, one client connection, and the existing scenario-specific RPC calls per secondary launch",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same claimInstance flow completed or terminated before the old caller-side mutex check could run.",
+            "CriticalPathEffect": "The IPC forwarding is the secondary launch critical path."
+          }
+        ],
+        "ScalingInput": "One IPC forwarding sequence per secondary process; status mode additionally requests the same diagnostics as before.",
+        "EffectiveConcurrency": "The existing primary process remains the sole server; secondary launches are independent clients, unchanged by the diff.",
+        "CacheBehavior": "No changed cache or coalescing behavior; the mutex module is not loaded on this path before or after the PR.",
+        "MechanismConfidence": "High: EADDRINUSE transfers control directly into the unchanged catch branch, so the moved mutex check is bypassed.",
+        "MagnitudeUncertainty": "Existing-instance RPC duration depends on requested work, but no changed operation reaches this path.",
+        "Verdict": "No regression: secondary-instance IPC cardinality and latency are unchanged."
+      },
+      {
+        "Scenario": "Launch races a Windows background update holding the -updating mutex",
+        "CriticalPath": "The process first binds the main IPC handle, observes the updater mutex, immediately closes its server, polls the native mutex every 250 ms for at most 120 attempts, and either exits after 30 seconds or, after release, performs one recursive claim that rebinds the IPC server before application startup. Waiting on the updater remains intentional and was already on the critical path; releasing ownership permits the updater to progress.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/code/electron-main/main.ts:352-364 claimInstance",
+            "Operation": "Bind, close, and after updater release rebind the main named-pipe server",
+            "Cardinality": "At most one additional close/rebind cycle for the ordinary single-update overlap; further cycles require distinct external mutex reacquisitions between attempts",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The process bound once and retained the main server throughout the updater wait, which is the ownership conflict this change removes.",
+            "CriticalPathEffect": "The final rebind follows the required updater wait and must complete before startup."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/code/electron-main/main.ts:558-580 checkInnoSetupMutex",
+            "Operation": "Poll the Windows updater mutex",
+            "Cardinality": "One initial query plus up to 120 queries at 250 ms intervals; after release, the recursive pass performs one additional inactive query",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same initial query and bounded 120-retry polling loop ran after the first server bind; only one extra inactive query occurs after a successful release.",
+            "CriticalPathEffect": "Polling intentionally blocks launch for up to 30 seconds while installation is active."
+          }
+        ],
+        "ScalingInput": "Cost is bounded by one updater overlap and 120 polls in the normal scenario, not by workspace size or user data. Concurrent manually repeated launches could each wait independently, but each process was already retained waiting on or connecting to the pre-startup owner and the diff does not establish a realistic aggregate performance regression.",
+        "EffectiveConcurrency": "Each process serializes its own bind, mutex wait, and optional rebind. Named-pipe ownership serializes successful binds; there is no unbounded internal task fan-out or newly launched subprocess.",
+        "CacheBehavior": "The first dynamic import may be cold; the recursive pass is module-cache warm. There is no stale or growing cache and mutex polling is intentionally uncached.",
+        "MechanismConfidence": "High: changed lines explicitly dispose on active mutex and recurse only after the bounded check returns false; inspection of Server.dispose confirms it closes the underlying net server.",
+        "MagnitudeUncertainty": "Exact Windows named-pipe bind/close latency is unmeasured, but the added work is one bounded local IPC lifecycle operation only on the rare update-overlap path.",
+        "Verdict": "No reportable regression: the PR adds a bounded local close/rebind and one warm mutex query to resolve an updater ownership conflict, without introducing collection scaling, retained growth, or meaningful boundary fan-out."
+      },
+      {
+        "Scenario": "Build and distribution of the Windows inno_updater artifact",
+        "CriticalPath": "Packaging consumes the checked-in executable and Cargo package metadata; the manifest and lockfile only increment the local package version, while the executable is a binary diff with no reviewable code patch.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One artifact per Windows build/package operation; no changed dependency graph or source-level operation is visible.",
+        "EffectiveConcurrency": "No concurrency behavior is changed by the reviewable manifest hunks.",
+        "CacheBehavior": "The version-only metadata change does not alter dependency caching or keys beyond the package's own version identity.",
+        "MechanismConfidence": "High for the reviewable metadata: Cargo.lock and Cargo.toml change only 0.23.0 to 0.24.0.",
+        "MagnitudeUncertainty": "Behavioral internals of the binary artifact cannot be inferred from binary bytes, so no speculative performance claim is made.",
+        "Verdict": "No source-evidenced performance regression in the reviewable package metadata."
+      }
+    ],
+    "Summary": "Completed the performance pass over the full four-file inventory and every reviewable diff page. Traced first launch, secondary launch, updater overlap, recursive ownership retry, IPC disposal, mutex polling, and packaging boundaries. The only added runtime work is a bounded IPC close/rebind plus a warm mutex query on the rare updater-overlap path; no actionable performance regression or sufficiently evidenced performance-regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-15T12:12:34.212519237Z",
+    "CompletedAt": "2026-09-15T12:13:51.996633324Z",
+    "WallClockMilliseconds": 77784,
+    "ModelCalls": 8,
+    "InputTokens": 162197,
+    "OutputTokens": 5468,
+    "TotalTokens": 167665,
+    "ReasoningTokens": 2125,
+    "CacheReadTokens": 128925,
+    "CacheWriteTokens": 33248,
+    "APIDurationMilliseconds": 67735,
+    "ToolCalls": 41,
+    "NanoAIUnits": 32726600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 128925,
+      "cache_write": 33248,
+      "input": 24,
+      "output": 5468
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
