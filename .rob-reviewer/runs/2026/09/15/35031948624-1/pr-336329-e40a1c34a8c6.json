@@ -1,0 +1,211 @@
+{
+  "PullRequest": {
+    "Number": 336329,
+    "Title": "agentHost: Recover customization sync after reconnect",
+    "Body": "## Summary\n\n- retry read-only client filesystem operations when their active Agent Host connection changes, preventing remote customization copies from waiting forever on a stale transport\n- preserve filesystem provider error codes and keep mutating operations non-retrying\n- derive synchronized customization bundle identities from file contents while retaining metadata as a fast path, avoiding full copies for touch-only changes\n- invalidate cached bundle state before rewriting so failed or reverted rewrites self-heal\n\n## Motivation\n\nAn exported Agent Host log showed a synchronized customization bundle copy remaining pending across a remote client reconnect. The next `sendMessage` waited for that customization sync and permanently occupied the per-chat queue before the prompt reached the Copilot SDK.\n\n## Validation\n\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/common/agentHostFileSystemProvider.test.ts` (61 passing)\n- `./scripts/test.sh --run src/vs/workbench/contrib/chat/test/browser/agentSessions/syncedCustomizationBundler.test.ts` (45 passing)\n- `npm run typecheck-client`\n- `git diff --check`\n\n(Written by Copilot)",
+    "URL": "https://github.com/microsoft/vscode/pull/336329",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "642d3e2735e47bcb58658dbb6290c45abddf758f",
+    "HeadRef": "roblou/agents/session-hang-investigation-c810a8b0",
+    "HeadSHA": "e40a1c34a8c646ca64d8341934da289b37231054",
+    "CreatedAt": "2026-09-15T20:47:13Z",
+    "UpdatedAt": "2026-09-15T22:33:12Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-4DC0D717E266",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/common/agentHostFileSystemProvider.ts",
+      "Side": "RIGHT",
+      "Line": 622,
+      "Severity": "medium",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The retry and lack of cancellation are directly visible in the changed loop, the updated integration test proves simultaneous original and replacement requests, and the server map's only cleanup paths are response/transport close/server disposal. Exact reconnect frequency and tree size vary, which limits severity rather than confidence in the mechanism.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "reverse-RPC request entries, promises, and duplicate client filesystem operations",
+      "PerformanceScaling": "The retained and duplicate work grows as the number of in-flight read/stat/list operations multiplied by overlapping active-connection changes; each change can leave one request on every still-open older transport while launching another on the newest transport.",
+      "PerformanceOutcome": "retained memory and excessive IPC/filesystem I/O",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "A logical filesystem read issued one reverse-RPC request and waited for that request to settle or for its transport to close; it could hang across reconnect, but it did not create replacement requests while the original remained live.",
+      "ChangedBehavior": "The added Promise.race abandons the operation promise when the connection-change event wins, loops, and invokes the operation again on the replacement connection without canceling or unregistering the old request.",
+      "CausalDiffEvidence": "Added RIGHT line 622 starts operation(connection) inside a race with the connection-change promise; when the latter wins, the new while loop repeats the operation. The changed protocol test explicitly observes a replacement resourceList request before replying to the original request.",
+      "Title": "Cancel superseded reverse reads before retrying",
+      "Impact": "During an overlapping reconnect while the agent host is copying a customization/plugin tree or otherwise reading client files, every in-flight read can be duplicated on the new transport, while unanswered requests on the old transport remain retained. Repeated reconnects can accumulate pending reverse-RPC state and unnecessary client filesystem/IPC work even after the logical read has completed on a replacement connection.",
+      "Evidence": "In the product server, _sendReverseRequest stores every request in ProtocolServerHandler._pendingReverseRequests and removes it only when that same transport responds, closes, or the server disposes. Overlapping reconnects intentionally keep older connections registered, and _attachConnection retains all live transports. Therefore a stalled-but-open old transport keeps the abandoned map entry/closures indefinitely, while a responsive old client can still perform the duplicate filesystem read. AgentPluginManager syncs customizations with fileService.copy, which can have many directory-list/read requests in flight, so reconnecting during a plugin copy amplifies the duplicate work.",
+      "Recommendation": "Make read operations cancelable/abandonable across the connection interface. When the connection-change branch wins, synchronously remove and reject the corresponding pending reverse request (and send protocol cancellation if supported) before retrying on the new connection, while preserving the non-retry behavior for mutations."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/syncedCustomizationBundler.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 366,
+      "BasePath": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/syncedCustomizationBundler.ts",
+      "BaseLine": 339,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/syncedCustomizationBundler.ts",
+      "IntroducingCommit": "300ad62e2cf7322acd14de7a00ca0924370d9c9a",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "io",
+      "Mechanism": "The old bundle nonce was derived from mtime and size, so a touch-only update changed the nonce and forced the bundler to delete/rewrite the complete in-memory bundle; the changed nonce then defeated AgentPluginManager's cache and caused a full reverse-RPC fileService.copy to host storage.",
+      "Symptom": "Touching an unchanged customization or skill resource triggered O(total bundle files and bytes) local reads/writes plus a complete remote customization copy, delaying customization publication/session readiness.",
+      "FixedBehavior": "The PR reads and hashes content after a metadata miss, then reuses the prior bundle and nonce when line 366 finds identical content, preventing both the destructive local rewrite and the downstream remote copy for touch-only changes.",
+      "Evidence": "resolveCustomizationRefs awaits bundler.bundle, AgentCustomizationScope gates its initial resolved state on that result, and AgentPluginManager skips fileService.copy only when the nonce matches. The added touch-only test verifies that the previous result is reused and the in-memory tree is not rewritten. Base line 339 carried the metadata-derived nonce mechanism, and blame identifies its introducing commit.",
+      "Confidence": 0.95
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "concurrency-burst",
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Resolve and publish local customizations for a new or updated agent scope",
+        "CriticalPath": "AgentCustomizationScope awaits resolveCustomizationRefs and SyncedCustomizationBundler.bundle before setting isResolved; session claim waits whenResolved before publishing the active client. On the host, a nonce miss must finish plugin fileService.copy before the customization is usable. Later debounced updates are off the initial claim path but can still precede the next host synchronization.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/syncedCustomizationBundler.ts:_bundle/collectDirectoryFiles",
+            "Operation": "Resolve/stat recursive skill entries and read every bundled source file",
+            "Cardinality": "One or more resolve/stat operations per discovered directory entry and one read per effective bundled file, capped at 10 concurrent operations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same source reads occurred on cold bundles and metadata changes; unchanged metadata skipped them.",
+            "CriticalPathEffect": "Must finish before the bundle nonce and initial scope resolution can complete."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/syncedCustomizationBundler.ts:355",
+            "Operation": "Compute SHA-1 for every source buffer and combine content hash parts",
+            "Cardinality": "One digest per effective bundled file and one pass over total bundled bytes after a metadata miss.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The nonce used metadata only, with no content digest; however every metadata miss then proceeded to full local rewrite and downstream copy.",
+            "CriticalPathEffect": "Must finish before deciding whether to reuse or rewrite the bundle."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/syncedCustomizationBundler.ts:_bundle",
+            "Operation": "Delete and rewrite the in-memory synthetic plugin tree",
+            "Cardinality": "One recursive delete, one manifest write, one write per bundled file, and an optional MCP write on cold/content-changed bundles.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Previously also ran for touch-only metadata changes; the PR now avoids it when content is unchanged.",
+            "CriticalPathEffect": "Must finish before publication on a cache miss."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentPluginManager.ts:_syncPlugin",
+            "Operation": "Reverse-RPC resourceList/resourceRead traversal while copying the client plugin into host storage",
+            "Cardinality": "On a host nonce miss, traversal/list/read calls scale with the complete plugin tree; a nonce hit avoids the copy.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Metadata-derived nonce changes caused a miss and full copy even for touch-only changes; content nonce reuse now avoids that boundary.",
+            "CriticalPathEffect": "A miss blocks host customization synchronization; a hit skips the copy."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentPluginManager.ts:_syncPlugin",
+            "Operation": "Materialize the copied plugin revision and persist/evict cache entries on the agent host",
+            "Cardinality": "One full destination tree write plus cache persistence and bounded revision cleanup per nonce miss.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Touch-only metadata changes previously reached this path; the PR removes those misses.",
+            "CriticalPathEffect": "Blocks completion of a fresh customization sync."
+          }
+        ],
+        "ScalingInput": "The effective collection is every enabled loose customization plus every recursively discovered file under each skill directory after excluding .git, node_modules, symlinks, and failed stats; total bytes control read, hash, write, and copy cost.",
+        "EffectiveConcurrency": "Bundles are serialized per authority. Source stat/read operations are limited to 10; the added SHA-1 computations are scheduled with Promise.all across all collected files. Host customizations are synchronized in parallel across distinct refs and serialized per ref URI.",
+        "CacheBehavior": "Warm unchanged metadata hits _lastMetadataNonce and performs no content reads. A metadata miss reads and hashes all entries; equal content updates the metadata fast path and reuses the previous content nonce. The host's nonce cache then skips fileService.copy. Cold bundles and real content changes read/hash/rewrite locally and miss the host nonce cache.",
+        "MechanismConfidence": "High: cache branches, operation limits, scope gating, host nonce check, and copy call are directly traced.",
+        "MagnitudeUncertainty": "Skill tree file counts and byte sizes vary widely. The unbounded digest scheduling adds work, but it replaces much more expensive touch-only rewrite/copy work and did not independently establish a reportable regression; cold/content-changing bundles already process all bytes.",
+        "Verdict": "No finding for the content-hash change. It adds digest work on metadata misses but fixes a verified repeated full-copy regression for unchanged content; that fix was recorded with introducing attribution."
+      },
+      {
+        "Scenario": "Read client-side files from the agent host while the client reconnects",
+        "CriticalPath": "stat, realpath, readFile, and readdir await _readFromConnection. A replacement connection now lets the logical read continue, and plugin synchronization may depend on many such reads. Superseded operations on older transports are off the logical critical path after the replacement succeeds but continue consuming retained state and possibly client I/O.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/common/agentHostFileSystemProvider.ts:_readFromConnection and src/vs/platform/agentHost/node/protocolServerHandler.ts:_sendReverseRequest",
+            "Operation": "Send resourceRead/resourceList/resourceResolve as reverse JSON-RPC over the client transport",
+            "Cardinality": "Previously one request per logical operation; now one additional request per active-connection change until an attempt settles, with old and replacement requests overlapping.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A logical read stayed attached to its original request and could hang, but did not fan out across replacement transports.",
+            "CriticalPathEffect": "The newest request is on the logical read's critical path; abandoned older requests are off-path but remain live."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:resourceList/resourceRead and reverse-request handling",
+            "Operation": "Client handles each reverse request by listing, resolving, or reading its local resource",
+            "Cardinality": "Up to one client filesystem operation per original and retry request; duplicates scale with in-flight reads and overlapping reconnects.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the original transport requested the operation.",
+            "CriticalPathEffect": "Only the winning replacement result advances the logical read; work performed for older requests is wasted."
+          }
+        ],
+        "ScalingInput": "The number of in-flight read/list/resolve operations, multiplied by active-connection replacements before old transports respond or close; customization tree copying can supply many simultaneous logical reads.",
+        "EffectiveConcurrency": "Each connection change races every active operation and can launch another request on the newest transport while prior requests remain concurrent on all still-open older transports. There is no cross-request cancellation or retry limiter at this layer.",
+        "CacheBehavior": "No cache or coalescing exists for these provider reads. Each retry is a fresh reverse request, and old pending entries remain until their own response, transport close, or server disposal.",
+        "MechanismConfidence": "Very high: the changed Promise.race/loop, integration test, connection retention, and pending reverse-request map establish the mechanism.",
+        "MagnitudeUncertainty": "The exact number of simultaneous plugin-copy reads and frequency/duration of overlapping transports vary, but the updated integration test proves both requests coexist and product cleanup only occurs on response, close, or disposal.",
+        "Verdict": "Reported a medium cleanup-lifecycle/IPC finding because retries do not cancel or unregister superseded requests, allowing duplicate client I/O and retained pending state."
+      },
+      {
+        "Scenario": "Dispose the filesystem provider or expire a disconnected authority",
+        "CriticalPath": "This runs during provider shutdown or after the five-second no-connection grace period, not during normal read progress except that waiting reads are awakened and fail.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of registered authorities and listeners/watchers.",
+        "EffectiveConcurrency": "Cleanup iterates authorities synchronously, fires one connection-change notification per authority, then disposes each per-entry emitter; no subprocess, IPC, filesystem, database, or network call is made by the changed cleanup itself.",
+        "CacheBehavior": "Authority entries are cleared immediately on provider disposal and after grace expiry; no cold/warm cache distinction applies.",
+        "MechanismConfidence": "High from the changed disposal and expiry code.",
+        "MagnitudeUncertainty": "Authority/watch counts are expected to be small; no scaling expensive boundary was found.",
+        "Verdict": "No reportable performance regression; the added lifecycle notifications are bounded by live authorities and release entry emitters."
+      }
+    ],
+    "Summary": "Completed the performance pass over all five changed files and all diff pages. Reported one reconnect cleanup regression, recorded the touch-only customization-copy regression fix with blame attribution, and found no additional high-confidence performance issue."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-15T22:43:20.336556917Z",
+    "CompletedAt": "2026-09-15T22:46:25.424684234Z",
+    "WallClockMilliseconds": 185088,
+    "ModelCalls": 14,
+    "InputTokens": 856764,
+    "OutputTokens": 11277,
+    "TotalTokens": 868041,
+    "ReasoningTokens": 5155,
+    "CacheReadTokens": 763656,
+    "CacheWriteTokens": 93066,
+    "APIDurationMilliseconds": 166515,
+    "ToolCalls": 74,
+    "NanoAIUnits": 99650040000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 763656,
+      "cache_write": 93066,
+      "input": 42,
+      "output": 11277
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
