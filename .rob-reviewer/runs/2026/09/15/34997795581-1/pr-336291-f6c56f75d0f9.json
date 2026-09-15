@@ -1,0 +1,187 @@
+{
+  "PullRequest": {
+    "Number": 336291,
+    "Title": "performance: reduce Quick Open (Cmd+P) latency by ~20% in a controlled benchmark",
+    "Body": "## Summary\n\nReduce overhead in fuzzy-scoring cache-key construction, with about\n20% lower warm input-to-rendering-boundary latency in a controlled\nlocal Quick Open benchmark.\n\nThe existing path constructs temporary nested objects and arrays,\nsorts their property names, and recursively hashes them before each\ncache lookup—even on cache hits.\n\nThis change computes the same numeric hash directly and precomputes\nthe hashing transforms for constant property names.\n\n## Behavior\n\n- Preserves existing numeric cache keys and collision behavior.\n- Leaves fuzzy scoring, match highlights, and result ordering unchanged.\n- Reads mutable query values on every call; no per-query memoization.\n- Adds no growing scratch buffers or retained query objects.\n\nThe specialized implementation deliberately follows the existing generic\nhash recipe. Regression tests compare its keys against that original\nrecipe to catch divergence.\n\n## Performance\n\nMeasured on an Apple M5 Max:\n\n| Measurement | Baseline | Candidate | Reduction |\n| --- | ---: | ---: | ---: |\n| Warm Quick Open rendering-boundary median | 53.2 ms | 42.1 ms | 20.9% |\n| Warm Quick Open rendering-boundary mean | 49.2 ms | 39.8 ms | 19.1% |\n| Warm Quick Open rendering-boundary p95 | 70.4 ms | 49.8 ms | 29.3% |\n\nThe scorer-component benchmark separately showed an 18.2–19.6%\nreduction in execution time.\n\n### Measurement scope\n\nThe real Electron Quick Open comparison used:\n- The same frozen workspace containing 11,082 source-file paths.\n- Counterbalanced baseline/candidate launch order.\n- 256 measured input samples per variant, excluding warmups.\n- Single-word and multi-word queries.\n- Identical isolated profiles, with declarative built-ins only;\n  executable built-ins and third-party extensions were omitted.\n\nTiming starts at the input event and ends after final results are applied\nand two animation-frame callbacks. This is not a physical-display timestamp.\n\nThese are controlled, warmed-up local measurements—not a claim that all\nVS Code operations or extension configurations become 20% faster.\n\n## Validation\n\n- 74 targeted fuzzy-scoring/hash test checks passed.\n- Full client TypeScript checking passed.\n- Changed-file ESLint and whitespace checks passed.\n- 752,320 complete score comparisons, 40 ordering comparisons, and\n  40 cache-key-set comparisons produced no mismatches.\n- All 768 UI samples, including warmups, passed ordered-result,\n  resource-path, highlight, and visible-row checks.\n\nOnly four source/test files are changed. Benchmark instrumentation and\nexperimental variants are not included in the production patch.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336291",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "federicobrancasi",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "f44f55cde0c1ff6c834bad0bb46397bc48711da8",
+    "HeadRef": "fb/fuzzy-scorer-cache-hash",
+    "HeadSHA": "f6c56f75d0f9ff0774c14303046f43acfde240f3",
+    "CreatedAt": "2026-09-15T16:41:49Z",
+    "UpdatedAt": "2026-09-15T16:59:02Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/base/common/fuzzyScorer.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 392,
+      "BasePath": "src/vs/base/common/fuzzyScorer.ts",
+      "BaseLine": 386,
+      "IntroducingPath": "src/vs/base/common/fuzzyScorer.ts",
+      "IntroducingCommit": "629d9f6dd7ab37d8dc41f1388a68d1f51bf92987",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "Every fuzzy-score cache lookup reconstructed and recursively hashed a nested object and mapped query-piece array. Sorting invokes the lookup twice per comparison, so this allocation and generic traversal repeated O(N log N) times on warm Quick Open sorts despite score-cache hits.",
+      "Symptom": "Higher warm Quick Open input-to-render latency plus avoidable allocation/GC pressure for large workspaces; the controlled benchmark cited in the PR observed about a 19-21% latency reduction after removing the mechanism.",
+      "FixedBehavior": "The added direct accumulator sequence at fuzzyScorer.ts:392 reproduces the same object/array hash recipe in sorted-key order while iterating existing query pieces, eliminating temporary nested objects, mapped arrays, property enumeration/sorting, and recursive dispatch from every cache-key computation.",
+      "Evidence": "Base line 386 begins the old `hash({ ... })` cache-key construction, introduced by blame commit 629d9f6dd7ab37d8dc41f1388a68d1f51bf92987. `scoreItemFuzzy` computed this key before every cache lookup, and `compareItemsByFuzzyScore` calls it twice per comparator invocation; Quick Open applies the comparator across large candidate sets, so even cache hits repeatedly allocated a nested object, mapped query pieces into a new array/object set, sorted property keys in `objectHash`, and recursively dispatched `doHash`. The PR's controlled 11,082-path benchmark reports roughly 20% lower warm input-to-render-boundary latency, consistent with this directly traced CPU/allocation mechanism.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Quick Open (Cmd+P) file and workspace-symbol results while typing",
+        "CriticalPath": "Input prepares a query, awaits file and workspace-symbol retrieval in parallel, then synchronously ranks/filters returned picks before rendering. The changed cache-key hashing is on the synchronous ranking critical path; it introduces no await or boundary and removes allocation/sorting work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/filesystem",
+            "Location": "src/vs/workbench/contrib/search/browser/anythingQuickAccess.ts:707 and src/vs/workbench/services/search/node/rawSearchService.ts:90",
+            "Operation": "Workspace file search through searchService.fileSearch and the file-search engine",
+            "Cardinality": "Normally one primary search per input after throttling/cache behavior; a second search can occur for a multi-piece query when the first search hits its result limit. Cold searches enumerate workspace files; warm prefix searches can reuse the existing search cache.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same search calls, cache, and result limits existed; the old scorer then built and generically hashed nested temporary objects before each score-cache lookup.",
+            "CriticalPathEffect": "The awaited search must complete before final file ranking/rendering; raw result sorting follows enumeration. The changed hash only reduces downstream CPU work."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/search/browser/anythingQuickAccess.ts:748",
+            "Operation": "Stat an explicitly typed absolute path",
+            "Cardinality": "At most one stat for an input recognized as an absolute path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical absolute-path stat behavior.",
+            "CriticalPathEffect": "Awaited before deciding whether to bypass normal file search; unrelated to changed hashing."
+          },
+          {
+            "Kind": "IPC/other",
+            "Location": "src/vs/workbench/contrib/search/browser/anythingQuickAccess.ts:457",
+            "Operation": "Query workspace symbol providers",
+            "Cardinality": "One logical workspace-symbol request per applicable input, with provider fan-out owned by the existing symbol service.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical symbol-provider request and merge path.",
+            "CriticalPathEffect": "Runs in parallel with file picks and must settle before combined ranking."
+          }
+        ],
+        "ScalingInput": "Workspace files and returned symbols; the controlled PR scenario has 11,082 file paths. Browser ranking is capped by result limits, while the raw search-side scoring can inspect the larger workspace result set. Comparator calls reuse score entries but still compute a cache key for each compared side.",
+        "EffectiveConcurrency": "File picks and workspace-symbol picks run through Promise.all; file and relative-path lookup also run through Promise.all. Ranking itself is synchronous/serial. Existing throttling delays uncached typing searches; the diff changes none of this scheduling.",
+        "CacheBehavior": "A file-query cache is created per picker run and can reuse narrowed search results; the fuzzy scorer cache is also reused for the picker run and reset for a normal new run. Warm fuzzy-score hits still execute getCacheHash, which is why replacing generic nested-object hashing reduces the hot-path cost. No key cardinality or lifetime changes.",
+        "MechanismConfidence": "High: scoreItemFuzzy computes the key before every cache lookup, compareItemsByFuzzyScore calls it twice, and the diff directly removes temporary structures, key sorting, and recursive dispatch while preserving accumulator order.",
+        "MagnitudeUncertainty": "Exact latency depends on workspace size, provider mix, result limits, and hardware, but the critical-path CPU mechanism is direct and the supplied controlled benchmark reports roughly a 20% warm latency reduction.",
+        "Verdict": "No regression. This is the primary performance-fix scenario: bounded module-initialization work for six constant strings replaces much larger repeated allocation and hashing work."
+      },
+      {
+        "Scenario": "Open Editors quick access filtering and sorting",
+        "CriticalPath": "Each input synchronously filters all open-editor picks with scoreItemFuzzy and sorts matches with compareItemsByFuzzyScore before updating picks. The changed hash is directly on this in-memory critical path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of open editor entries; filtering performs one lookup per editor and sorting performs repeated two-sided lookups proportional to sort comparisons.",
+        "EffectiveConcurrency": "Entire filter/sort path is synchronous and serial on the UI thread; no limiter or queue is involved.",
+        "CacheBehavior": "The scorer cache is reused within the picker and reset for normal new runs, with special reuse during quick navigation. Score-cache hits still need key computation; the diff does not alter cache retention or key cardinality.",
+        "MechanismConfidence": "High: caller and comparator paths are direct and contain no transitive I/O.",
+        "MagnitudeUncertainty": "Most users have far fewer editors than workspace files, so absolute benefit varies, but there is no plausible degradation mechanism.",
+        "Verdict": "No regression; the diff reduces per-entry and per-comparison CPU/allocation work and adds only fixed, tiny module initialization."
+      },
+      {
+        "Scenario": "Raw workspace file-search result sorting",
+        "CriticalPath": "A cold FileSearchEngine enumeration completes, then sortResults ranks raw matches with topAsync before serialized matches are returned. On warm cached searches, enumeration can be skipped but ranking still executes. Hashing is part of comparator CPU work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/search/node/rawSearchService.ts:104",
+            "Operation": "Enumerate workspace files with FileSearchEngine",
+            "Cardinality": "One engine search on a cold cache miss for the logical query; warm compatible queries can use one cached result row with no new enumeration.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same engine invocation, cache lookup, sorting batches, and result serialization; only the key implementation was generic and allocation-heavy.",
+            "CriticalPathEffect": "Cold enumeration precedes sorting; warm cache reuse removes this boundary but leaves ranking/key lookup CPU on the critical path."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/services/search/node/rawSearchService.ts:110",
+            "Operation": "Convert sorted raw matches to serialized file-match records",
+            "Cardinality": "One small serialized record per returned raw match, after limits/sorting.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical per-result conversion.",
+            "CriticalPathEffect": "Occurs after ranking and before progress delivery; unchanged by the hash optimization."
+          }
+        ],
+        "ScalingInput": "All raw file matches, potentially tens of thousands; topAsync processes in 10,000-item batches and score lookups occur across comparator invocations.",
+        "EffectiveConcurrency": "The file engine can use its configured worker/thread count. Result ranking uses topAsync batching for cancellation/cooperative progress rather than parallel comparator execution. The diff changes neither.",
+        "CacheBehavior": "Per cacheKey, raw result rows and a scorer cache are retained and reused. Prefix searches can reuse cached raw results; fuzzy-score values are reused by numeric key. Specialized hashing preserves the same key values and lifecycle.",
+        "MechanismConfidence": "High: rawSearchService directly supplies the same scorer cache to compareItemsByFuzzyScore and topAsync.",
+        "MagnitudeUncertainty": "Exact match count and engine duration vary by workspace and exclusions; the ranking multiplicity is explicit and can be large.",
+        "Verdict": "No regression. Cold and warm paths retain their existing I/O behavior while repeated comparator CPU/allocation is reduced."
+      },
+      {
+        "Scenario": "Agent-host workspace file completion for @/# tokens",
+        "CriticalPath": "The provider first awaits workspace file enumeration, then synchronously deduplicates candidates, fuzzy-filters them, sorts matches, and returns up to the fixed result limit. The changed scorer is after the subprocess boundary and on the ranking critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostWorkspaceFiles.ts:103",
+            "Operation": "Spawn ripgrep --files for each cold unique enumeration root",
+            "Cardinality": "One subprocess per cold unique enumeration root, capped at four concurrent; same-root in-flight requests coalesce and warm requests within 30 seconds reuse up to 50,000 files. Truncated parent roots may cause fallback logical-root enumerations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical ripgrep enumeration, limiter, truncation fallback, coalescing, and TTL cache; subsequent fuzzy ranking used the old generic hash.",
+            "CriticalPathEffect": "All required enumerations complete before candidate scoring starts. The changed hash cannot increase subprocess count or duration."
+          }
+        ],
+        "ScalingInput": "Up to 50,000 cached files per enumeration root, deduplicated across roots before scoring. Filtering scores each candidate once; sorting reuses cached scores but computes keys for comparator sides.",
+        "EffectiveConcurrency": "Current roots are requested with Promise.all, but a shared Limiter caps ripgrep enumerations globally at four. Ranking is synchronous/serial. The diff changes no concurrency or backpressure.",
+        "CacheBehavior": "Workspace file lists are cached per root for 30 seconds, concurrent same-root requests coalesce on one promise, and failures evict the entry. The scorer cache is local to one completion request. No cache lifecycle changes are introduced.",
+        "MechanismConfidence": "High: enumeration is awaited before prepareQuery/scoring, and the diff touches only the in-process hash implementation.",
+        "MagnitudeUncertainty": "Root count, overlap, and file counts vary, but subprocess cardinality and the 50,000-file/root cap are explicit.",
+        "Verdict": "No regression; existing subprocess fan-out remains bounded and unchanged, while high-cardinality ranking becomes cheaper."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over all four changed files and relevant callers. No diff-introduced performance finding was found. The change is a high-confidence repeated-work/serialization-allocation fix: it replaces per-lookup nested object/array construction, property sorting, and recursive generic hashing with equivalent direct accumulation. Recorded the validated regression fix against introducing commit 629d9f6dd7ab37d8dc41f1388a68d1f51bf92987."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-15T17:03:12.29718323Z",
+    "CompletedAt": "2026-09-15T17:05:46.830692438Z",
+    "WallClockMilliseconds": 154533,
+    "ModelCalls": 11,
+    "InputTokens": 318219,
+    "OutputTokens": 6823,
+    "TotalTokens": 325042,
+    "ReasoningTokens": 2545,
+    "CacheReadTokens": 274640,
+    "CacheWriteTokens": 43546,
+    "APIDurationMilliseconds": 138319,
+    "ToolCalls": 37,
+    "NanoAIUnits": 46417800000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 274640,
+      "cache_write": 43546,
+      "input": 33,
+      "output": 6823
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
