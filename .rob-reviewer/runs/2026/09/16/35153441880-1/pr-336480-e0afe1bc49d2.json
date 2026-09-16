@@ -1,0 +1,239 @@
+{
+  "PullRequest": {
+    "Number": 336480,
+    "Title": "agentHost: recognise a crash-orphaned provisional session",
+    "Body": "Fixes a session that can never be opened after a crash, reported by @roblourens after his OS crashed:\n\n\u003e `Provider copilotcli could not describe copilotcli:/229963e7-9163-452a-a2a6-34913a560315 yet`\n\n## What actually happened\n\nA new chat reserves a backend session before the user sends anything. That reservation is **durably registered**, and — this is the part worth being precise about — its provider data, including the SDK backing id, is persisted too. The identity survived the crash intact.\n\nWhat it recorded was a pointer to **an SDK session that was never created**: `_reserveChatBacking` only mints a UUID, and the real SDK session first exists at `_materialize`. So the host durably recorded a promise that was never fulfilled.\n\nThat matters because the widely-repeated explanation — \"creation state is in-memory only until materialization\" — is wrong, and it points at the wrong fix. No recovery path can exist for these rows, which is why `yet` was categorically wrong rather than merely imprecise, and why suppressing them is correct rather than a workaround.\n\nThe row stayed visible because the guard that hides idle provisional sessions, `isIdleProvisionalSession`, is in-memory: after a restart there is no tracked state, so it returns `false` and stops hiding the registration (#321269).\n\n## The fix\n\nRecord the provisional fact **durably**, as a host-owned `sessionProvisional:` metadata key, and clear it at materialization. Listing then drops a session only when **both** hold:\n\n1. it is still marked provisional, and\n2. its provider cannot describe it.\n\nBoth clauses are required, and the second is what protects real user content: clearing the marker is best-effort, so a materialized session whose clear never landed keeps a stale marker — and stays visible, because its provider vouches for it. An unregistered or erroring provider is likewise never treated as evidence of absence.\n\n### Rejected: deferring durable registration until materialization\n\nThe obvious fix — don't register until the session materializes — was tested and **discarded**. Probed by execution, a materialized session whose registry row is missing does not recover after a restart, even when the provider relists it under the correct URI:\n\n```\nmaterialize → drop registry row → restart\nsameId:      recoveredAfterRestart: FALSE\ndivergedId:  recoveredAfterRestart: FALSE\n```\n\nThe registry is the sole durable index. Deferring its write trades a cosmetic empty row for **permanent silent loss of a session with real user content**, in exactly the crash window this bug occupies.\n\n## Scope: prevention only\n\nExisting orphaned rows are not cleaned up; they stay until deleted. **Deleting one works today** — `_doDisposeSession` needs no provider metadata, and the SDK call is skipped when there is no live backing — so anyone hitting this has a working recovery path now and need not wait for this change. Nothing already on disk can carry the marker, so a retroactive sweep would need a different, evidence-based discriminator; that deserves its own design rather than being smuggled in here.\n\n## Second commit: the error message\n\n`yet` told the user to wait for something that could never happen. Now: *\"Provider X is not ready to open Y; it may still be starting, so try again shortly\"*.\n\nWording only. The `catalogReadable \u0026\u0026 !knownToRegistry` classification is deliberately untouched — turning borderline cases into sticky `AHP_SESSION_NOT_FOUND` is the regression #331721 exists to prevent.\n\n## Implementation note\n\nThe suppression check cannot `await` inside `_computeSessions`. Doing so shifts when `_retryInitialProviderMigrationsInBackground` fires and produces a second provider-absent exclusion pass, breaking `provider-absent stale exclusion withholds migration completion`. That is why the marker is mirrored in memory and read synchronously, with the call site skipping the await entirely when nothing is provisional. It looks like gratuitous complexity otherwise, and simplifying it reintroduces the regression.\n\n## Independent verification\n\nThe fix was verified by a second implementation built against the same behaviour, not a re-reading of this code. Both orphan shapes were run with the session catalog on and off:\n\n| shape | catalog | marker | visible | restore |\n|---|---|---|---|---|\n| vouches-while-live | on | true | **false** | `Session was never created on the backend` |\n| vouches-while-live | off | true | **false** | same |\n| never-vouches | on | true | **false** | same |\n| never-vouches | off | true | **false** | same |\n\n**Suppression holds with the catalog disabled**, which is true by construction: the check runs outside any catalog-mode branch. The fix is therefore at the registration layer and is unaffected by the rollback switch — it is not a narrowing of what the catalog will show.\n\nThe *vouches-while-live* shape is the valuable half: a catalog row written from real provider metadata that later outlives the provider's memory. That is the reported shape, and it was the route least covered by the tests in this PR.\n\nThe inverse-orphan case — a materialized session with real content — was probed under four interleavings (clean, stale marker, stale marker with a throwing provider, stale marker with no provider). All keep the session visible. No interleaving was found that hides real content.\n\n### If you write your own probe: vouch via `getChatMetadata`\n\nSuppression consults `getChatMetadata`. A double that vouches only through `getSessionMetadata`/`listSessions` is not vouching on the path under test, and will appear to show real content being wrongly hidden. That false positive occurred during verification before being traced to the mock.\n\nNothing here required instrumenting inside `_computeSessions`: the behaviour is observable from `listSessions()` plus `listProvisionalSessions()`.\n\n## A rejected robustness change, recorded so it is not re-added\n\nThe marker mirror loads asynchronously while listing reads it synchronously, so a listing during that window fails open. Two mitigations were considered; **only one was shipped**.\n\n`whenDeferredWorkSettled()` now joins the marker load, so a settled listing cannot miss suppression. This was the load-bearing half — the observed \"still visible when settled\" behaviour was a settle-semantics gap, not a caching one.\n\nRe-verified against a 250 ms delayed marker read: `visibleWhenSettled` flipped `true → false`, while `visibleOnFirstListingWithSlowRead` stayed `true` (fail-open, by design) and `visibleAfterLoadCompletes` was already `false` beforehand. The change moved exactly the one cell it was meant to move.\n\nAn epoch bump on load completion was **implemented and then dropped as a no-op**:\n\n1. A settled entry is evicted from `_inFlightListSessions` on `clear()`, so the next listing recomputes regardless.\n2. Suppression runs after the provider phase, so a computation still in flight when the markers land consults the mirror anyway.\n3. A changed epoch only forces recomputation when `_sameSessionRegistrations` also reports a change. Markers are not registrations, so that branch never fires for this case.\n\nNo test could be written that fails without it. Shipping it would have added a dead line plus an unfalsifiable test, both of which would read as covering the race. The loader carries a comment explaining this so it is not re-added.\n\n## Validation\n\nThe new test reproduces the reported symptom exactly when the fix is neutralised:\n\n```\nlisted: ['copilot:/crashed-provisional']   restoreCode: -32603   saysYet: true\n```\n\nWith the fix: `listed: []`, `restoreCode: -32001`, `saysYet: false`. Falsifiability was verified twice — on the initial shape and again after the design changed.\n\nThree regression guards alongside it: a merely-unavailable provider stays listed; a provisional session the provider *can* describe stays listed (the failed-promotion case); deletion clears the marker.\n\n5,389 passing across the agentHost node suites, typecheck and lint clean.\n\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336480",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "de1a430a2f394735221e3a5198a074b85fd64c87",
+    "HeadRef": "sandy081/agents/suppress-crash-orphaned-provisional",
+    "HeadSHA": "e0afe1bc49d2ec920a49d0ce0b0ab1c2cfa4dab1",
+    "CreatedAt": "2026-09-16T20:38:10Z",
+    "UpdatedAt": "2026-09-16T20:59:18Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-E3EF0547E5F2",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentService.ts",
+      "Side": "RIGHT",
+      "Line": 1662,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The new call site, unbounded concurrency, repeated list reachability, and concrete Copilot/Claude boundary operations are directly traced. Exact latency depends on marker count and SDK/storage speed, but the boundary fan-out and bypass of the existing limiter/prewarm are certain.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "Per-session filesystem/database opens and provider SDK IPC calls",
+      "PerformanceScaling": "Each visible session whose durable provisional marker survives contributes one concurrent validation. The marker is retained after an orphan is hidden, so the same P validations recur on every backend list computation, and P can accumulate across crash-orphaned sessions or failed marker clears.",
+      "PerformanceOutcome": "An initial or invalidated session-list request can issue an unbounded burst of provider requests and filesystem reads and remains blocked until the slowest request completes, increasing list/startup latency and provider load.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "With an eligible central catalog row, `_computeSessions` returned catalog metadata without provider metadata or session-database reads; existing tests explicitly assert zero `getChatMetadata` calls and zero session DB opens for that path. Provider fallback reads, when needed, were limited to four and could use `prewarmSessionMetadata`.",
+      "ChangedBehavior": "Whenever any provisional marker exists, the new post-catalog pass identifies each marked visible session and calls `_registeredSessionMetadata` under an unbounded `Promise.all`. This occurs after `prewarmDisposables` have been disposed, so Copilot falls back to targeted `getSessionMetadata` IPC instead of its bulk-warmed cache.",
+      "CausalDiffEvidence": "The added `await Promise.all(sessions.map(...))` at line 1662 schedules every marked session's `_registeredSessionMetadata` validation concurrently; this validation pass did not exist before the change.",
+      "Title": "Bound and coalesce provisional-session validation",
+      "Impact": "After one or more crash-orphaned provisional chats (or stale markers from failed clears), opening or refreshing the sessions list waits for a burst of one provider validation per marked row. On Copilot this can mean multiple session DB probes plus one SDK IPC per row on the list critical path.",
+      "Evidence": "`_registeredSessionMetadata` first calls `_readDefaultChatProviderData`, which can try both the default-chat and session databases, then calls the provider. `CopilotAgent.getChatMetadata` additionally opens stored session metadata and, once its prewarm cache is gone, calls `client.getSessionMetadata`; Claude calls `sdk.getSessionInfo`. The surrounding fallback phase uses `Limiter(4)` and keeps provider prewarm alive specifically to avoid N metadata round trips, but the added pass runs afterward without either protection. Provisional markers are removed only on successful materialization or disposal, not after a successfully hidden orphan, so these calls repeat.",
+      "Recommendation": "Validate only the marked intersection, route those reads through a bounded limiter, and keep/group provider prewarming across this pass (or maintain an invalidated cache of definitive orphan classifications) so catalog-backed listing does not issue unbounded targeted provider reads while preserving stale-marker revalidation semantics."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "repeated-work",
+      "cache-lifecycle",
+      "io"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Initial or refreshed session listing with no provisional markers",
+        "CriticalPath": "Registry and central-catalog reads complete before the list is returned. The new marker load starts at service construction but listing does not await it; once the in-memory set is known empty, the new suppression branch is skipped.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostDatabase.ts:listProvisionalSessions",
+            "Operation": "One bulk SQLite metadata query loads provisional marker keys.",
+            "Cardinality": "Once per AgentService lifetime, independent of session list refresh count.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No provisional-marker metadata query existed.",
+            "CriticalPathEffect": "Started asynchronously at construction and not on the ordinary list critical path; test-only deferred settling joins it."
+          }
+        ],
+        "ScalingInput": "Total registered and visible sessions; provisional cardinality is zero.",
+        "EffectiveConcurrency": "Existing catalog reads and fallback work retain their limiter of four; overlapping list callers are coalesced by `_inFlightListSessions`.",
+        "CacheBehavior": "Durable markers are loaded once into an in-memory set. A listing racing the load fails open; settled computations are evicted rather than retained. The workbench list store caches completed results until invalidation.",
+        "MechanismConfidence": "High: call timing and one-shot memoization are explicit.",
+        "MagnitudeUncertainty": "The metadata-table size and query duration are not measured, but this is a single asynchronous read and not enough for a finding.",
+        "Verdict": "No reportable regression when no marker exists; the added list branch takes the synchronous fast path."
+      },
+      {
+        "Scenario": "Session listing after restart with crash-orphaned or stale provisional markers",
+        "CriticalPath": "After registry/catalog resolution, the list awaits `_withoutUnmaterializedProvisionalSessions`; every marked visible row must complete provider validation before results return.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_registeredSessionMetadata and _readDefaultChatProviderData",
+            "Operation": "Read default-chat provider data via up to two session database probes, followed by provider-specific stored metadata reads.",
+            "Cardinality": "Up to multiple session-database probes for each of P marked visible sessions on every computation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Eligible central catalog rows required zero per-session database opens.",
+            "CriticalPathEffect": "Awaited by the suppression phase and therefore blocks the returned list."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_withoutUnmaterializedProvisionalSessions",
+            "Operation": "Fetch targeted provider metadata; Copilot falls back to `client.getSessionMetadata` after prewarm disposal, Claude calls SDK `getSessionInfo`, and activated Codex may read through its app-server.",
+            "Cardinality": "One provider validation per marked visible session, P concurrent and repeated per computation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Catalog-eligible rows did not call providers; fallback rows were limited to four and could share a provider bulk prewarm.",
+            "CriticalPathEffect": "The list waits for all validations; slowest completion determines added latency while aggregate P creates provider load."
+          }
+        ],
+        "ScalingInput": "P marked visible sessions after intersecting catalog results with registrations. P can persist and accumulate because successfully hidden orphans keep both registration and marker until explicit disposal.",
+        "EffectiveConcurrency": "All P validations are launched by one unbounded `Promise.all`. This bypasses the existing fallback `Limiter(4)`; Copilot's bulk prewarm disposable has already been released before this phase.",
+        "CacheBehavior": "The marker set is cached, but provider validation results are not. Hidden or provider-vouched markers are checked again on each backend recomputation. The front-end coalesces/cache-valid refreshes, while host restarts, invalidations, modes, and direct callers produce new computations.",
+        "MechanismConfidence": "Very high: changed Promise.all, provider implementations, prewarm disposal ordering, and existing zero-read tests directly establish the behavior.",
+        "MagnitudeUncertainty": "Typical P after a single crash may be one, while repeated aborted sessions or failed marker clears increase it; exact provider RPC latency varies. This lowers severity but not confidence in the fan-out mechanism.",
+        "Verdict": "Reportable medium-severity concurrency burst and repeated boundary work; finding submitted."
+      },
+      {
+        "Scenario": "Creating an idle provisional chat",
+        "CriticalPath": "Provider reservation and registry registration complete, then the new provisional metadata write is awaited before createSession returns.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostDatabase.ts:setSessionProvisional",
+            "Operation": "SQLite metadata INSERT/UPSERT for the provisional marker.",
+            "Cardinality": "One additional write per provisional create, with at most one immediate retry.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Creation performed the registry registration but no separate provisional-marker write.",
+            "CriticalPathEffect": "Awaited on createSession's critical path after the existing registration write."
+          }
+        ],
+        "ScalingInput": "One metadata write per newly reserved provisional session; retry can repeat once on failure.",
+        "EffectiveConcurrency": "The marker write is serialized through the database transaction sequencer and occurs after registration rather than in the same transaction.",
+        "CacheBehavior": "The in-memory marker is updated only after the durable write succeeds; no write coalescing is used.",
+        "MechanismConfidence": "High for the extra serialized write; low for material user-visible magnitude.",
+        "MagnitudeUncertainty": "A local SQLite autocommit adds real I/O, but there is no evidence that one extra write at user-driven new-chat frequency causes material latency.",
+        "Verdict": "Not reported because the frequency is user-driven and the evidence does not establish a meaningful regression beyond one necessary durable write."
+      },
+      {
+        "Scenario": "First send materializes a provisional session",
+        "CriticalPath": "Materialization updates live state immediately; marker clearing is launched without awaiting and is off the send completion path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_onDidMaterializeChat",
+            "Operation": "SQLite DELETE of the provisional marker.",
+            "Cardinality": "One per materialization, or two attempts after a transient failure.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No marker clear was required.",
+            "CriticalPathEffect": "Fire-and-forget; it does not block first-send progress."
+          }
+        ],
+        "ScalingInput": "One marker DELETE per materialized provisional session, retried once on failure.",
+        "EffectiveConcurrency": "The asynchronous clear is serialized with other registry mutations by the database sequencer.",
+        "CacheBehavior": "Successful clearing removes both durable and in-memory marker state. A failed clear leaves a stale marker, causing later listings to revalidate it.",
+        "MechanismConfidence": "High: scheduling and retry behavior are explicit.",
+        "MagnitudeUncertainty": "Queue contention is possible but each session contributes one small off-path operation.",
+        "Verdict": "No independent finding; cost is bounded and off the critical path, though failed clears feed the reported list-time issue."
+      },
+      {
+        "Scenario": "Deleting a registered or crash-orphaned session",
+        "CriticalPath": "Existing unregister/tombstone transaction now also deletes the provisional metadata key before commit; disposal then removes the in-memory key.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostDatabase.ts:unregisterSession/tombstoneAndUnregisterSession",
+            "Operation": "Delete provisional marker in the existing unregister or tombstone transaction.",
+            "Cardinality": "One statement per deletion.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Deletion removed registration and related metadata but had no provisional key.",
+            "CriticalPathEffect": "Adds one statement to an already awaited deletion transaction."
+          }
+        ],
+        "ScalingInput": "One additional indexed metadata DELETE per deleted session.",
+        "EffectiveConcurrency": "Runs inside the existing serialized unregister transaction; no new parallel fan-out.",
+        "CacheBehavior": "Both durable marker and in-memory mirror are removed, preventing retained marker work after explicit deletion.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Statement latency is unmeasured but bounded and indexed.",
+        "Verdict": "No reportable regression; cleanup is correctly coupled to ownership and adds bounded work."
+      },
+      {
+        "Scenario": "Restoring a provider-missing provisional session",
+        "CriticalPath": "The existing provider metadata lookup runs first. On a miss, restore now awaits the one-shot marker load before classifying the session as never created.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:restore missing-metadata branch",
+            "Operation": "Join the one-time bulk provisional-marker SQLite read.",
+            "Cardinality": "At most one shared read per service lifetime, regardless of restore calls.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A provider metadata miss was classified immediately after registry/catalog checks.",
+            "CriticalPathEffect": "Can delay an early restore only until the startup read completes; later restores use memory."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:restoreSession",
+            "Operation": "Provider metadata lookup attempted by the pre-existing restore flow.",
+            "Cardinality": "One targeted provider lookup per restore attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same provider lookup occurred before the PR.",
+            "CriticalPathEffect": "Already on restore's critical path before this diff."
+          }
+        ],
+        "ScalingInput": "One restore request; marker load scans all matching metadata keys only if still in flight.",
+        "EffectiveConcurrency": "All callers share `_provisionalSessionKeysLoaded`; no duplicate database reads.",
+        "CacheBehavior": "The marker-load promise and resulting set are retained for the service lifetime.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Only very early restores can observe the marker-read wait; no evidence shows a significant delay.",
+        "Verdict": "No reportable performance regression; new work is one-shot and coalesced."
+      }
+    ],
+    "Summary": "Reviewed all five changed files and every diff hunk. One medium-confidence-severity performance regression was submitted: the new provisional suppression phase bypasses the catalog fast path's zero-read behavior and the existing limiter/prewarm strategy, issuing repeated unbounded per-marker provider/storage validations. The added startup marker read, create/materialize writes, disposal cleanup, and restore classification were also traced and did not independently meet the reporting threshold. The PR fixes a correctness issue, not an evidenced shipped performance regression, so no regression-fix record was filed."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T21:47:08.951443199Z",
+    "CompletedAt": "2026-09-16T21:49:56.193740744Z",
+    "WallClockMilliseconds": 167242,
+    "ModelCalls": 13,
+    "InputTokens": 732379,
+    "OutputTokens": 11819,
+    "TotalTokens": 744198,
+    "ReasoningTokens": 5505,
+    "CacheReadTokens": 634880,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 154579,
+    "ToolCalls": 78,
+    "NanoAIUnits": 88032800000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 634880,
+      "cache_write": 0,
+      "input": 97499,
+      "output": 11819
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

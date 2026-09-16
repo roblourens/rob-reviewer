@@ -1,0 +1,168 @@
+{
+  "PullRequest": {
+    "Number": 336354,
+    "Title": "agentHost: fix scoped debug log export",
+    "Body": "## Summary\n\n- group client-owned AHP wire logs by a stable logical-host ID while preserving the actual protocol connection ID in each JSONL entry\n- include reconnect-created, rotated, and older output-channel log segments without mixing overlapping connections\n- stream browser-owned files without a silent inline byte budget and fail explicitly when desktop archive inputs cannot be saved\n- surface unexpected enumeration and read failures while retaining expected missing-log behavior\n\n## Validation\n\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/common/ahpJsonlLogger.test.ts --run src/vs/platform/agentHost/test/common/relayTransport.test.ts --run src/vs/platform/agentHost/test/browser/agentHostIpcChannelTransport.test.ts --run src/vs/workbench/contrib/chat/test/browser/exportAgentHostDebugLogs.test.ts` (47 passing)\n- `npm run typecheck-client`\n- ESLint on all changed TypeScript files\n- `git diff --check`\n\n(Written by Copilot)",
+    "URL": "https://github.com/microsoft/vscode/pull/336354",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0face04e644810d64fe7f4a115adfba5d96b3ac7",
+    "HeadRef": "agents/fix-ahp-debug-log-export-bug",
+    "HeadSHA": "74abec19592735cc1d462db4a7de1f7f40b389fc",
+    "CreatedAt": "2026-09-16T00:44:40Z",
+    "UpdatedAt": "2026-09-16T20:39:54Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "boundary-fanout",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Agent Host protocol logging during initial connection and relay/WebSocket reconnects",
+        "CriticalPath": "Connection establishment must complete before protocol traffic proceeds. The changed logical-host hashing happens synchronously only when each logger is constructed; existing JSON serialization and file appends remain off the connection handshake after construction and are queued by the logger.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/remoteAgentHostServiceImpl.ts:WebSocketConnectionFactory.createConnection and relay transport factories",
+            "Operation": "Establish WebSocket, tunnel, SSH, WSL, dev-container, or cloud-sandbox transport",
+            "Cardinality": "One establishment per initial connection or reconnect attempt; unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same transport establishment occurred; relay loggers used the seed ID rather than the newly established connection ID.",
+            "CriticalPathEffect": "The establishment is on the connection critical path, but the diff only passes the established connection ID into logger construction."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/common/ahpJsonlLogger.ts:AhpJsonlLogger._drainPending",
+            "Operation": "Create the AHP log directory and append coalesced JSONL batches",
+            "Cardinality": "One memoized directory creation per logger and sequential writes capped at 1 MiB per batch; unchanged. Rotation remains capped at five segments per logger.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same queued directory creation, file-size stat, batched append, and rotation occurred.",
+            "CriticalPathEffect": "Queued logging I/O is not awaited by protocol send/receive and therefore is off the message critical path."
+          }
+        ],
+        "ScalingInput": "Number of established/re-established transport connections and logged protocol bytes. The diff adds one SHA-1 computation per logger construction, not per message.",
+        "EffectiveConcurrency": "One logger is created per established transport. Relay reconnect attempts are serialized by ReconnectingTransport; each logger retains the existing promise-queue serialization and 1 MiB write coalescing.",
+        "CacheBehavior": "Directory creation remains memoized per logger; no shared cache is added or defeated. Rotation and batch state are unchanged.",
+        "MechanismConfidence": "High: logger construction and queued write ownership are directly visible in the changed factories and AhpJsonlLogger.",
+        "MagnitudeUncertainty": "Reconnect frequency varies, but the added CPU work is constant per established connection and tiny relative to network establishment.",
+        "Verdict": "No reportable regression. The changed connection identity does not increase boundary cardinality or move file I/O onto the handshake/message critical path."
+      },
+      {
+        "Scenario": "Opening the Agent Debug AHP wire-log view, including while wire logging is disabled",
+        "CriticalPath": "The view waits for source enumeration before rendering a selected historical log. The diff makes one AHP-directory metadata resolve occur even when logging is currently disabled so historical files remain visible.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatDebug/agentHostLogSources.ts:listWireLogFiles",
+            "Operation": "Resolve the current log session's ahp directory with child metadata",
+            "Cardinality": "One directory resolve per wire-log view show; filenames are filtered in memory. Before the diff this was zero when the logging setting was disabled and one when enabled.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "When logging was disabled, enumeration skipped the directory entirely and could not expose historical logs; enabled enumeration already resolved the same directory.",
+            "CriticalPathEffect": "The metadata resolve delays initial source rendering, but occurs only when this diagnostic view is explicitly opened."
+          }
+        ],
+        "ScalingInput": "Number of files in the current log session's ahp directory. Log sessions are externally retained in a bounded history, while reconnect-created files can increase current-directory cardinality.",
+        "EffectiveConcurrency": "A single enumeration runs per view show; source filtering and sorting are synchronous after one directory resolve. Live refresh rereads the selected file but does not re-enumerate sources.",
+        "CacheBehavior": "No application cache; warm behavior depends on filesystem/provider metadata caching. No repeated enumeration occurs during live file watching.",
+        "MechanismConfidence": "High: the removed configuration guard and sole caller's show/load flow are explicit.",
+        "MagnitudeUncertainty": "Current-session reconnect counts can vary, but this is a user-opened diagnostics surface and performs metadata-only work once per show.",
+        "Verdict": "No finding. The added single metadata enumeration is necessary to expose historical logs and is not a realistic latency regression on this non-hot diagnostic path."
+      },
+      {
+        "Scenario": "Export Agent Host debug logs to a native ZIP or browser-selected folder",
+        "CriticalPath": "Collection and destination selection start concurrently. Collection awaits the existing host collectDebugLogs RPC and local metadata enumeration; after destination selection, save streams/copies each selected client file and the host artifact before completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/actions/exportAgentHostDebugLogsAction.ts:collectAgentHostDebugLogs/createHostArtifactStream",
+            "Operation": "Request host-owned debug-log artifact and read remote artifact chunks",
+            "Cardinality": "One collectDebugLogs request, then artifact bytes in at most 1 MiB sequential chunks; unchanged by the client-file collection changes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same host collection and bounded chunk protocol were used.",
+            "CriticalPathEffect": "Host artifact production and later transfer are on export completion's critical path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/actions/exportAgentHostDebugLogsAction.ts:collectAgentHostDebugLogs/findOutputChannelLogFiles",
+            "Operation": "Enumerate renderer/shared rotated logs, output-channel folders, AHP logs, and sidecars",
+            "Cardinality": "Two process-log directory resolves, one AHP-directory resolve, up to two sidecar stats, and one resolve per output_* folder. The diff changes output-channel matching from the newest match per requested filename to all matching historical folders.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The prior search stopped after finding one newest file for each requested channel; rotated process/AHP enumeration already scanned their directories.",
+            "CriticalPathEffect": "Metadata enumeration is on collection's critical path, though collection runs concurrently with destination selection."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/actions/exportAgentHostDebugLogsAction.ts:exportFilesToLocalFolder and src/vs/workbench/contrib/chat/electron-browser/actions/exportAgentHostDebugLogsService.ts:save",
+            "Operation": "Stream each URI-backed client log to a browser destination or into the native ZIP",
+            "Cardinality": "One sequential stream per selected client log; bytes scale with all selected historical logs. Native ZIP entry count is capped at 1000. Browser export has no aggregate byte cap but uses backpressured streams.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "File/vscodeUserData resources were already streamed. Other schemes were eagerly read and converted to retained inline strings under a shared 30 MiB cap, silently omitting additional bytes.",
+            "CriticalPathEffect": "All selected bytes must be read and written before export completes."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "N/A",
+            "Operation": "None",
+            "Cardinality": "No subprocess is started by the changed export path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "No subprocess boundary.",
+            "CriticalPathEffect": "No subprocess boundary."
+          }
+        ],
+        "ScalingInput": "Total bytes and file count across process rotations, matching output-channel histories, AHP reconnect/rotation logs, sidecars, and host artifact entries. Effective cardinality is one stream per selected file rather than per log record.",
+        "EffectiveConcurrency": "Destination selection and collection run in parallel. Collection directory scans and per-file metadata operations are sequential. Browser folder export streams files sequentially; native export makes one createZipFile IPC whose implementation streams local files, while remote host artifacts are downloaded in sequential 1 MiB chunks.",
+        "CacheBehavior": "No export-result cache or coalescing; each explicit export re-enumerates and rereads current files. Warm behavior is limited to OS/provider caches. Negative sidecar and missing AHP-directory results are not retained between separate exports.",
+        "MechanismConfidence": "High: all collection loops, provider boundaries, native ZIP implementation, and browser streaming consumer were traced.",
+        "MagnitudeUncertainty": "Long-lived windows and reconnect-heavy hosts can produce larger complete exports, but the operation is explicit, sequential, streaming, and intended to include those histories; exact disk/network duration depends on log volume.",
+        "Verdict": "No finding. Historical inclusion increases intentional export I/O, but avoids the prior eager 30 MiB buffer/string retention and remains sequential/backpressured. The expanded output-folder scan is user-triggered metadata work and not a high-confidence actionable regression."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 18 changed files. No diff-introduced performance finding met the reporting threshold. The main change converts non-local client-log collection from capped eager buffering to URI-backed streaming; a regression-fix record was attempted after blame identified 4f34cd7973989fc40b9aacd64be02263d3f1673c, but the regression-fix reporting tool failed twice."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T21:44:25.524456132Z",
+    "CompletedAt": "2026-09-16T21:47:06.424283446Z",
+    "WallClockMilliseconds": 160899,
+    "ModelCalls": 15,
+    "InputTokens": 804669,
+    "OutputTokens": 9012,
+    "TotalTokens": 813681,
+    "ReasoningTokens": 3254,
+    "CacheReadTokens": 727705,
+    "CacheWriteTokens": 76919,
+    "APIDurationMilliseconds": 146369,
+    "ToolCalls": 80,
+    "NanoAIUnits": 85609700000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 727705,
+      "cache_write": 76919,
+      "input": 45,
+      "output": 9012
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

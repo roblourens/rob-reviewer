@@ -1,0 +1,160 @@
+{
+  "PullRequest": {
+    "Number": 336482,
+    "Title": "Configure HydraFusion through SDK session feature flags",
+    "Body": "## Summary\r\n\r\nMove the existing `chat.copilot.hydraFusion.enabled` opt-in from Copilot child-process environment variables into the SDK session configuration.\r\n\r\n- Pass `HYDRAFUSION` and `HYDRAFUSION_ROLLOUT` through `featureFlags` alongside the existing `enableExperimentalMode` opt-in in the shared create/resume config builder.\r\n- Stop setting the HydraFusion environment variables and remove inherited standalone/aggregate HydraFusion overrides while preserving unrelated environment configuration.\r\n- Update the environment and session-config tests. Preserve the existing model-picker and runtime-restart behavior.",
+    "URL": "https://github.com/microsoft/vscode/pull/336482",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "9a9133d13699bc66d2f5aa7f544811fa8288dc59",
+    "HeadRef": "dev/bhavyau/hydrafusion-sdk-flags",
+    "HeadSHA": "0e5780966bf8ca83372f5dbcb5b5b1149e81d73b",
+    "CreatedAt": "2026-09-16T20:50:45Z",
+    "UpdatedAt": "2026-09-16T21:36:02Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold Copilot CLI startup and configuration-driven runtime restart",
+        "CriticalPath": "Environment sanitization runs synchronously before CLI path resolution and the existing CopilotClient.start subprocess boundary; all of it is on the startup/restart critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:243 resolveCopilotCliPath",
+            "Operation": "Probe platform-specific Copilot CLI entry-point candidates with fileExists during resolveCopilotCliPath.",
+            "Cardinality": "One successful probe normally; up to the bounded platform candidate list plus one legacy path probe on misses.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same bounded CLI path probes ran on every cold start/restart before the diff.",
+            "CriticalPathEffect": "Must resolve before the subprocess can start."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:2400 _ensureClientOnce",
+            "Operation": "Start the Copilot CLI over a stdio RuntimeConnection via CopilotClient.start.",
+            "Cardinality": "One subprocess start per cold runtime start or coalesced restart.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same subprocess start occurred with HydraFusion represented by two environment variables instead of per-session SDK flags.",
+            "CriticalPathEffect": "Startup waits for the client to start."
+          }
+        ],
+        "ScalingInput": "Number of inherited environment entries E plus comma-separated feature flags F. The diff adds one Object.keys scan and, only when the aggregate flag variable exists, one split/filter/join over F; realistic cardinality is tens to hundreds of environment entries and a short flag list.",
+        "EffectiveConcurrency": "Concurrent callers are coalesced by _clientStarting, and stopping is serialized by _clientStopping, so one effective CLI startup occurs at a time.",
+        "CacheBehavior": "A live _client is the warm cache and bypasses environment construction. Cold starts and explicit restarts rebuild the environment once; no negative-cache behavior is involved.",
+        "MechanismConfidence": "High: the changed loop and aggregate-flag filtering are directly on the startup path, while _clientStarting and client.start establish frequency and boundary cardinality.",
+        "MagnitudeUncertainty": "Exact process-environment size varies by host, but the new CPU/allocation work is bounded by an already-copied small environment and does not add an expensive boundary.",
+        "Verdict": "No finding. The extra O(E+F) string/object work is negligible relative to the unchanged filesystem probes and subprocess startup, runs once per effective start, and is not an actionable regression."
+      },
+      {
+        "Scenario": "Create or resume an SDK session with HydraFusion enabled",
+        "CriticalPath": "_buildSessionConfig resolves existing BYOK/customization state, then the returned config is passed to the existing createSession or resumeSession SDK call. The two feature booleans are serialized on that existing call and add no extra await or boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:893 _buildSessionConfig -\u003e toSdkSessionCustomAgents",
+            "Operation": "Read explicitly projected custom-agent resources while constructing session config.",
+            "Cardinality": "Scales with non-file-directory custom agents plus the selected agent; ephemeral sessions skip it.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same custom-agent projection and reads occurred before featureFlags were added.",
+            "CriticalPathEffect": "The reads must finish before create/resume, but their collection and count are unchanged."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:827 _resolveByokSessionConfig",
+            "Operation": "Lazily start the shared BYOK loopback proxy when BYOK models are enabled.",
+            "Cardinality": "At most one proxy start per launcher lifetime between runtime stops, shared by concurrent launches.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same memoized proxy startup behavior existed before the diff.",
+            "CriticalPathEffect": "Only BYOK-enabled launches with surfaced models wait for it; unrelated HydraFusion flag construction does not alter this path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:691 _resumeSession and :713 _createSession",
+            "Operation": "Invoke Copilot SDK createSession or resumeSession against the CLI runtime, including existing retry/fallback rules for resume.",
+            "Cardinality": "One RPC for a normal launch; existing resume failures can cause one custom-agent retry and, only for empty history, an existing create fallback.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same SDK calls and retry cardinality occurred; HydraFusion was supplied process-wide through environment variables, while the diff adds two booleans to the existing per-session payload.",
+            "CriticalPathEffect": "The session cannot open until the SDK call completes."
+          }
+        ],
+        "ScalingInput": "One two-entry featureFlags object per opted-in session launch. Existing plugin/custom-agent work scales with the projected plugin resources, but the diff does not change that collection or its effective cardinality.",
+        "EffectiveConcurrency": "Independent session launches retain their prior concurrency. Concurrent BYOK-enabled launches share the memoized _byokProxyHandle promise; the diff creates no new fan-out or burst.",
+        "CacheBehavior": "HydraFusion configuration is read once for each launch with no cache needed. The BYOK proxy is lazily memoized across launches and cleared on runtime stop; feature-flag transport has no cold/warm behavioral difference beyond the existing SDK session call.",
+        "MechanismConfidence": "High: the changed object is constructed once in _buildSessionConfig and reaches the already-existing create/resume call without loops, extra RPCs, or new awaits.",
+        "MagnitudeUncertainty": "The SDK's internal handling of HydraFusion is external to this repository, but the prior environment flags requested the same feature; there is no evidence the transport change increases runtime work.",
+        "Verdict": "No finding. Per-session serialization grows by two booleans, while boundary count, plugin scale, retries, and concurrency are unchanged."
+      },
+      {
+        "Scenario": "Toggle the HydraFusion setting while the Copilot runtime is active",
+        "CriticalPath": "The root-config listener compares CopilotAgentStartupConfig and requests the existing deferred runtime restart; model refresh and subsequent sessions then use the new setting. The restart is deferred past active turns.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:1146 _restartClientIfStartupConfigChanged",
+            "Operation": "Stop and restart the Copilot CLI after an effective HydraFusion configuration change.",
+            "Cardinality": "One deferred lifecycle restart for an effective setting transition, with concurrent starts coalesced.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "HydraFusion was already part of CopilotAgentStartupConfig and already triggered the same process restart because its environment variables were startup-baked.",
+            "CriticalPathEffect": "Not on an in-flight turn because restart waits for a quiet point; subsequent runtime use waits for startup."
+          }
+        ],
+        "ScalingInput": "One startup-config comparison per root configuration event; a HydraFusion value change results in one restart request, independent of session or model collection size.",
+        "EffectiveConcurrency": "Restart requests use the existing deferred/serialized client lifecycle, wait for active chats to become idle, and client starts remain coalesced.",
+        "CacheBehavior": "_lastStartupConfig suppresses restarts when effective startup values are unchanged. A live client is replaced only when the comparison changes; the diff intentionally leaves HydraFusion in that comparison.",
+        "MechanismConfidence": "High: HydraFusion remains in CopilotAgentStartupConfig, and the root listener/restart path are unchanged.",
+        "MagnitudeUncertainty": "Restart duration is host-dependent, but its trigger and cardinality are explicitly preserved rather than introduced or amplified by the changed hunks.",
+        "Verdict": "No finding. Although restarting is expensive, that behavior is pre-existing and unchanged, so it does not meet PR-causality requirements."
+      }
+    ],
+    "Summary": "Completed the performance pass over all five changed files and every diff page. The PR replaces process-wide HydraFusion environment transport with two fields on existing SDK session payloads and strips inherited overrides during the already-existing startup environment copy. It introduces no new expensive boundary, fan-out, concurrency burst, cache retention, or realistically significant critical-path work, and it is not itself a proven regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T21:53:15.43381274Z",
+    "CompletedAt": "2026-09-16T21:55:24.573495863Z",
+    "WallClockMilliseconds": 129139,
+    "ModelCalls": 12,
+    "InputTokens": 349884,
+    "OutputTokens": 5964,
+    "TotalTokens": 355848,
+    "ReasoningTokens": 1811,
+    "CacheReadTokens": 304990,
+    "CacheWriteTokens": 44858,
+    "APIDurationMilliseconds": 118882,
+    "ToolCalls": 51,
+    "NanoAIUnits": 46571000000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 304990,
+      "cache_write": 44858,
+      "input": 36,
+      "output": 5964
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
