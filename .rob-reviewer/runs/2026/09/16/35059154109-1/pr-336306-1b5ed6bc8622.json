@@ -1,0 +1,179 @@
+{
+  "PullRequest": {
+    "Number": 336306,
+    "Title": "agentHost: stabilize trusted Codex workspace hooks",
+    "Body": "## Summary\n\n- recheck Codex workspace hook trust after provisional thread startup, when a cold app-server has populated its hook catalog\n- carry newly discovered trust directly into a lossless pre-turn replacement thread\n- repeat a cold resume when hooks become visible only after the initial resume\n- distinguish hook discovery failures from an empty catalog so failures do not trigger unnecessary restarts\n- wait for the integration test Workspace Trust update before creating its session\n\n## Motivation\n\nA cold Codex process can return an empty `hooks/list` result before its first thread starts. The thread then starts without `hooks.state`, so a trusted workspace `SessionStart` hook does not run for the first turn. This is a product race that surfaced as a flaky timeout in Azure build 473928.\n\nThe separate quarantine PR is #336297. This change fixes the underlying product behavior and keeps the trusted integration case active.\n\n## Validation\n\n- `npm run typecheck-client`\n- hygiene on all three changed files\n- 17 focused workspace-hook-trust unit tests\n- full Codex customizations integration suite: 6 passing\n- trusted/untrusted integration pair repeated in five cold processes: 5/5 passing\n\n## Review\n\nReviewed with Claude Opus. The review findings around inherited hooks, replacement connections, cold resume, discovery failure signaling, polling overhead, and send-path coverage were addressed before opening this draft.\n\n(Written by Copilot)",
+    "URL": "https://github.com/microsoft/vscode/pull/336306",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6182a6ebe7cfcf1ce05126fcd475f66a5650cebc",
+    "HeadRef": "roblou/agents/fix-flaky-test-issue-7a80290c",
+    "HeadSHA": "1b5ed6bc8622a80f275d297a6c36b4b18d70f449",
+    "CreatedAt": "2026-09-15T17:45:37Z",
+    "UpdatedAt": "2026-09-16T03:58:14Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "missing-coalescing",
+      "concurrency-burst",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Fresh or prewarmed Codex chat sends its first user turn in a trusted workspace",
+        "CriticalPath": "Before turn/start can be issued, the send awaits materialization, then the added post-start hooks/list recheck. If grants changed, it also awaits thread/unsubscribe and replacement thread/start. Baseline checkpointing and later customization publication remain off the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:5855 _sendMessage/_tryBuildSessionHookTrustState",
+            "Operation": "Query the cwd-scoped effective hook catalog via hooks/list after provisional thread startup",
+            "Cardinality": "One added request for the first turn of each trusted-workspace chat; zero for untrusted/no-cwd sessions",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Materialization queried hooks/list before thread/start, but first send did not recheck it after startup.",
+            "CriticalPathEffect": "Serialized before turn/start and therefore adds one app-server round trip to first-turn latency"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:5885 _sendMessage/_restartThreadWithCurrentTools",
+            "Operation": "Unsubscribe the provisional thread and start a replacement carrying newly discovered hook grants",
+            "Cardinality": "At most one replacement on this path when the post-start grant signature differs; no replacement on a warm unchanged catalog",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Hook discovery could not trigger a pre-turn replacement; restarts occurred only for changed tools, MCP, or customizations.",
+            "CriticalPathEffect": "Serialized before turn/start only in the cold late-discovery case"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:7639 _tryBuildSessionHookTrustState",
+            "Operation": "App-server hook discovery underlying the cwd-scoped hooks/list catalog request",
+            "Cardinality": "One cwd catalog per request; no host-side per-hook filesystem calls",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The catalog was queried during materialization, not re-queried after provisional startup on first send.",
+            "CriticalPathEffect": "Transitively contributes to the awaited hooks/list duration"
+          }
+        ],
+        "ScalingInput": "One recheck per chat before its first successful turn; the request is cwd-scoped to one primary working directory, not per hook or per workspace root. Hook result processing scales linearly with the returned catalog.",
+        "EffectiveConcurrency": "Materialization is coalesced by session.materializePromise. The added hook recheck is sequential on the first-send path; normal host turn handling drains queued user messages after the active turn, so this does not create aggregate per-item fan-out. Different chats can progress independently as before.",
+        "CacheBehavior": "An untrusted or missing cwd short-circuits without IPC. Trusted workspaces query the app-server catalog even when a prewarm populated it; warm catalogs avoid replacement when the signature matches. There is no host cache because Workspace Trust and hook hashes must be current; pending trust is consumed and cleared after replacement.",
+        "MechanismConfidence": "High confidence in the extra serialized IPC and conditional replacement: changed code and unit request-order assertions establish both cardinality and critical-path placement.",
+        "MagnitudeUncertainty": "The external app-server implementation and measured warm/cold hooks/list latency are not in this repository, so exact milliseconds are unknown. The added round trip is one-time per chat and specifically required to observe a catalog that becomes available only after startup.",
+        "Verdict": "No reportable regression. The PR deliberately adds one bounded post-start recheck to repair cold catalog discovery, avoids replacement when the signature is unchanged, short-circuits untrusted workspaces, and clears pending state. This is an intentional one-time correctness tradeoff rather than scaling or repeated per-turn work."
+      },
+      {
+        "Scenario": "A restored Codex session resumes on a cold or warm app-server",
+        "CriticalPath": "Resume preparation performs the existing initial hooks/list before thread/resume. When that result contains no eligible grants, the changed path awaits one post-resume hooks/list; only newly discovered grants cause thread/unsubscribe and a second thread/resume. MCP inventory refresh after successful resume remains fire-and-forget.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:6666 _resumeSession/resumeWithHookTrust",
+            "Operation": "Initial thread/resume using the pre-resume hook trust snapshot",
+            "Cardinality": "One per restored session, unchanged except that it may be followed by a bounded retry",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One thread/resume was issued after one pre-resume hooks/list.",
+            "CriticalPathEffect": "Required resume boundary on the send/restore critical path"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:6670 _resumeSession",
+            "Operation": "Re-query hooks/list after an empty-grant initial resume",
+            "Cardinality": "At most one added request per resume attempt whose initial eligible grant set is empty",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No post-resume catalog query occurred.",
+            "CriticalPathEffect": "Serialized after initial resume and before the session is considered resumed"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:6674 _resumeSession",
+            "Operation": "Unsubscribe and resume the thread again with late-discovered grants",
+            "Cardinality": "At most one added unsubscribe and one added resume when the second query finds eligible grants",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The initial resume completed without a late-grant replacement.",
+            "CriticalPathEffect": "Adds two serialized round trips only in the cold late-discovery case"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:7639 _tryBuildSessionHookTrustState",
+            "Operation": "App-server hook catalog discovery behind the post-resume hooks/list request",
+            "Cardinality": "One cwd catalog query in the empty-grant fallback",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the pre-resume hook catalog was queried.",
+            "CriticalPathEffect": "Transitively contributes to resume latency"
+          }
+        ],
+        "ScalingInput": "One restored thread at a time per session; the added fallback is one cwd-scoped catalog request when initial eligible grant count is zero, plus one replacement resume only if late eligible project hooks appear.",
+        "EffectiveConcurrency": "session.resumePromise coalesces concurrent resume demand for the same session, and all hooks/list/resume/unsubscribe calls are serialized. Different restored sessions remain independent; no new shared burst is created by a single collection loop.",
+        "CacheBehavior": "Warm catalog with eligible project hooks skips the second query. Empty/ineligible catalogs take one negative recheck because the first cold resume may populate project hooks; a second empty result is not retried in a loop. Failures return undefined and do not trigger replacement.",
+        "MechanismConfidence": "High confidence: changed control flow and tests explicitly establish hooks/list, resume, hooks/list, unsubscribe, resume ordering, with no loop after the second resume.",
+        "MagnitudeUncertainty": "Exact catalog scan and resume costs are external and unmeasured here. The tests prove the maximum changed sequence but not production prevalence of cold empty catalogs.",
+        "Verdict": "No reportable regression. The extra work is bounded to the cold/negative-catalog recovery path, same-session resumes are coalesced, warm positive catalogs skip it, and no unbounded retry or fan-out is introduced."
+      },
+      {
+        "Scenario": "Direct backing creation or fork applies workspace hook trust",
+        "CriticalPath": "The operation builds one trust snapshot and awaits one hooks/list before thread/start or thread/fork. Trust context validation is synchronous and may rebuild only if Workspace Trust or cwd changes during the operation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:4884,5263 direct start/fork trust application",
+            "Operation": "Fetch hooks/list and then start or fork one Codex thread",
+            "Cardinality": "One hooks/list plus one thread/start or thread/fork per operation",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "These operations already queried hooks/list and then started/forked a thread; the diff wraps grants with a context signature without increasing normal boundary count.",
+            "CriticalPathEffect": "Awaited before creation/fork completes"
+          }
+        ],
+        "ScalingInput": "One cwd-scoped catalog per direct creation or fork; grant signature work scales linearly with the returned eligible hooks.",
+        "EffectiveConcurrency": "Each chat creation is serialized by _chatLifecycleSequencer for that chat. There is no new per-hook IPC and no changed global limiter behavior.",
+        "CacheBehavior": "No host cache is added; an untrusted cwd returns an empty snapshot without hooks/list. A context change invalidates the snapshot and can cause one fresh query before applying it, preserving authorization freshness.",
+        "MechanismConfidence": "High confidence that normal boundary cardinality is unchanged; changed call sites only pass cwd and validate the captured trust context.",
+        "MagnitudeUncertainty": "A trust/cwd mutation during the small discovery-to-apply window can add a rebuild, but prevalence is low and bounded by user configuration changes.",
+        "Verdict": "No performance regression: normal IPC count, cardinality, and serialization are unchanged, while added signatures are small bounded CPU/allocation work."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and every diff page. Traced first-send, prewarm, cold resume, direct creation, and fork boundaries; considered repeated work, boundary fan-out, coalescing, cache lifecycle, retention, serialization, and concurrency. The PR adds bounded critical-path IPC for late hook discovery but gates retries/replacements, coalesces resume/materialization, and introduces no high-confidence actionable scaling regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T05:29:51.203992001Z",
+    "CompletedAt": "2026-09-16T05:31:26.610895076Z",
+    "WallClockMilliseconds": 95406,
+    "ModelCalls": 7,
+    "InputTokens": 256033,
+    "OutputTokens": 6240,
+    "TotalTokens": 262273,
+    "ReasoningTokens": 2777,
+    "CacheReadTokens": 186277,
+    "CacheWriteTokens": 69735,
+    "APIDurationMilliseconds": 86750,
+    "ToolCalls": 31,
+    "NanoAIUnits": 54806980000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 186277,
+      "cache_write": 69735,
+      "input": 21,
+      "output": 6240
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

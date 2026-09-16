@@ -1,0 +1,244 @@
+{
+  "PullRequest": {
+    "Number": 336317,
+    "Title": "chat: surface out-of-band subagent approvals",
+    "Body": "## Summary\n\nMake pending subagent approvals discoverable independently of where their original launch response is rendered, while preserving the existing confirmation UI.\n\n- Discover pending tool invocations from the chat view model instead of relying on a mounted transcript row to populate the input confirmation carousel.\n- Surface approvals from earlier responses in the Sessions list, preserving current-request precedence and the original tool callback. Single-choice file approvals are supported; multi-choice file operations remain in the full chat UI.\n- Keep the original subagent pill's pending/active approval highlight and the usual confirmation card with Allow/Skip. Do not add an \"action needs your approval\" heading, duplicate launch pill, or generic out-of-band shimmer. Ordinary current-request confirmation presentation is preserved.\n- Route Accept/Skip commands to the selected carousel item, preserve each item's rendering context, and clean up stale entries when models change.\n- Restore edited terminal commands, including extracted directory prefixes, when recreating an approval after switching chats. Observe request-edit entry/exit directly so a pending approval appears immediately when editing ends.\n\n## Investigation findings\n\nThe apparent hangs included several distinct cases:\n\n1. **Offscreen approval — addressed here.** A retained subagent continued publishing into its original parent response. The pending invocation and confirmation callback existed in the frontend model, but that historical response was outside the virtualized viewport. Revealing it exposed the existing Allow button. Carousel discovery depended on rendering that row, and the Sessions-list approval model only inspected the latest response. The session-level `inputNeeded` watcher handles owned client-tool execution, not independent rendering of SDK-native shell/file approvals.\n2. **Reported failure after Allow — not established by the original export.** That capture ended with two independent approvals pending and did not contain the reported final Allow action. This patch tests correct callback/selection behavior but does not claim to resolve every provider-side post-approval stall.\n3. **Large subagent fan-out — not addressed here.** A later capture contained 40 attempted launches: 32 succeeded and eight were rejected by that runtime's 32-concurrent-agent limit. All 32 eventually published child-start events. Earlier `Resource not found` subscriptions preceded delayed child startup; the remaining 18 requested reviews were not hidden running agents.\n4. **Foreground completion while a background shell remains alive — not addressed here.** A separate capture showed successful `task_complete`, completed tool calls, and delivered final Markdown, but no protocol `chat/turnComplete` while an attached preview server remained running. That completion-boundary issue is tracked separately in #336083.\n\nRelated rendering work: #335899. This PR does not change SDK/CLI versions, runtime concurrency limits, child-start timing, or foreground completion semantics.\n\n## Validation\n\n- `npm run gulp compile-client` — passed, zero errors.\n- Full hygiene for all 14 changed files — passed; pre-commit hygiene also passed.\n- Focused Electron suites for `AgentSessionApprovalModel`, `ChatListRenderer`, `ChatSubagentContentPart`, and Sessions-list chat rows — **263 passing, 1 existing pending**.\n- Regressions cover completed historical responses, independent Sessions-list Allow buttons, retained-pill highlighting, no extra heading/shimmer, model removal/rebinding, command edits across chat switches, and cancelling request editing without further progress.\n- Real browser interaction with the actual chat list, input, terminal editors, and confirmation controls in Dark/Light themes. The original launch stayed unmounted while both approvals appeared; revealing it showed both pills highlighted. Allow cleared only the selected approval/highlight, then the remaining mock approval completed independently. No real shell commands or LLM calls were executed by the mock approvals. Preview processes were stopped after testing.\n\n## Manual validation\n\nOpen the existing Component Explorer Server task and select `chat/agent-lifecycle/chatAgentLifecycle/OffscreenSubagentApprovals` (Dark or Light):\n\n1. The conversation starts on a later request with the original launch offscreen.\n2. Select **Request Offscreen Approvals**. Both approvals should be available above the input with the existing card style, without an extra count heading or shimmer.\n3. Select **Show Original Agent**. Both retained pills should indicate pending approval; the active approval retains its existing emphasis.\n4. Select **Allow**, or use **Accept Selected** / **Skip Selected**. Only that invocation should resolve; the other remains pending.\n5. Approve the remaining mock check. Its continuation is recorded and the carousel clears.\n\nThe fixture's shortcut shim dispatches the real Accept/Skip commands; it is not an end-to-end test of the production keybinding resolver. Sessions-list Allow routing is exercised separately with real row controls in the focused tests.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336317",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "justschen",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6a932e0f957fb194b0ffa81b8bb51080aa274147",
+    "HeadRef": "agents/fix-subagent-rendering-issues",
+    "HeadSHA": "fb8d71608489e1d27a4dfdabe64237d50c0a820e",
+    "CreatedAt": "2026-09-15T19:22:03Z",
+    "UpdatedAt": "2026-09-16T04:41:46Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-D37902637A22",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/agentSessions/agentSessionApprovalModel.ts",
+      "Side": "RIGHT",
+      "Line": 119,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed subscription order and response event cadence are directly traced. The model is instantiated by Sessions lists, Automations, and blocked-session indicators; only the exact history length at which stutter is noticeable is uncertain.",
+      "PerformanceCategory": "rendering",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Main-thread CPU work and a reversed request-array allocation",
+      "PerformanceScaling": "With H requests in a live session and D streamed response updates, the autorun performs O(H × D) request iteration while no approval is pending; the response pending observable also scans the active response parts on those updates.",
+      "PerformanceOutcome": "Increasing UI-thread CPU and GC pressure in Sessions/Automations views as chat history grows",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The previous model observed the session-level `requestNeedsInput` signal and inspected only the latest response after that signal became truthy, so ordinary token streaming did not trigger a historical request scan.",
+      "ChangedBehavior": "The new autorun reverses and walks all requests, creates/subscribes a broad `response.onDidChange` signal for each visited response, and reads that signal before checking `isPendingConfirmation`. Consequently, normal content updates in the active response rerun the full historical search even when every pending state remains false.",
+      "CausalDiffEvidence": "The PR replaces the previous last-response/requestNeedsInput path with a reverse full-history loop and adds `changed.read(reader)` before the pending-state guard, directly moving the historical scan onto every streamed response change.",
+      "Title": "Avoid rescanning every request for each response delta",
+      "Impact": "When a live chat streams while a Sessions, Automations, or blocked-session surface owns this approval model, long histories cause progressively more synchronous work per token and can make those UI surfaces stutter.",
+      "Evidence": "`ChatResponseModel` forwards every non-quiet response content change through `onDidChange`. The added `changed.read(reader)` subscribes the full-history autorun to that broad event. In the common no-approval case, the loop reaches and subscribes every historical response and allocates `toReversed()` each run. `isPendingConfirmation` is already derived from response/tool state and only needs to notify this consumer when its value changes.",
+      "Recommendation": "Track the request collection on structural model changes, but observe each response's `isPendingConfirmation` value rather than its broad `onDidChange`; only scan that response's parts when pending transitions to a non-empty state, preserving newest-request precedence."
+    },
+    {
+      "ID": "PERF-A160EC026C5A",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/widget/chatListRenderer.ts",
+      "Side": "RIGHT",
+      "Line": 1020,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The event chain, synchronous collection work, and O(history × deltas) scaling are explicit in the repository. Exact frame loss depends on history length and stream cadence, so that affects severity rather than mechanism confidence.",
+      "PerformanceCategory": "rendering",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Main-thread CPU work and temporary arrays/Sets/observable transactions",
+      "PerformanceScaling": "For H transcript responses and D non-quiet response deltas, this adds O(H × D) collection filtering and keyed reconciliation; H includes offscreen history that virtualization previously kept off the render path.",
+      "PerformanceOutcome": "Increased main-thread CPU/GC pressure and dropped-frame risk while long chats stream",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this change, confirmation routing was installed from rendered tool/subagent parts, so a response delta did not enumerate and keyed-diff every response in the transcript.",
+      "ChangedBehavior": "The new observable maps every broad view-model change to `getItems().filter(isResponseVM)`, and its keyed autorun traverses that newly allocated response array even when no approval exists.",
+      "CausalDiffEvidence": "The added `observableFromEvent(this, viewModel.onDidChange, () =\u003e viewModel.getItems().filter(isResponseVM))` puts whole-transcript enumeration behind the per-response streaming event; no equivalent model-wide observer existed before the PR.",
+      "Title": "Stop diffing the full transcript on every streamed update",
+      "Impact": "In a long conversation, each streamed markdown/reasoning/tool delta synchronously walks all historical responses on the UI thread, so opening or continuing a heavily populated chat can become progressively less responsive while the answer streams.",
+      "Evidence": "`ChatViewModel.onAddResponse` forwards every `ChatResponseViewModel.onDidChange` to `viewModel.onDidChange`; `ChatResponseModel` fires that event from `Response.onDidChangeValue` for each non-quiet progress update. The added line responds by calling `getItems()` (which filters all `_items`) and filtering again for responses. `autorunPerKeyedItem` then traverses the entire returned array and builds a `Set` on each invalidation. This work happens regardless of whether `isPendingConfirmation` is true.",
+      "Recommendation": "Drive the keyed response collection only from structural add/remove/initialize events, or maintain an incrementally updated response index; subscribe directly to each indexed response for pending-state transitions without rebuilding the full collection on generic response changes."
+    },
+    {
+      "ID": "PERF-31B25B4CD25C",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts",
+      "Side": "RIGHT",
+      "Line": 2496,
+      "Severity": "low",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The resume/send call path and replay boundaries are explicit; uncertainty is limited to how often history is requested immediately anyway and typical log size.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "SDK RPC bytes, database reads, event-loop CPU, and reconstructed turn objects",
+      "PerformanceScaling": "Cold-resume cost grows with the persisted event count and edit-tool history; replay makes multiple full event passes and one batched historical edit read.",
+      "PerformanceOutcome": "Extra I/O and CPU contend with the newly submitted turn, increasing cold resumed-session latency and allocation pressure",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Persisted events were fetched and mapped only when getMessages or getSubagentMessages requested transcript data; a resume used solely to send a turn did not reconstruct full history.",
+      "ChangedBehavior": "Every resumed session now starts the full memoized mapped-events pipeline from initializeSession merely to seed subagent names.",
+      "CausalDiffEvidence": "The added `_getMappedEvents()` call moves full transcript RPC/database reconstruction from explicit history reads onto every cold resumed-session initialization.",
+      "Title": "Do not reconstruct the full transcript during send-only resume",
+      "Impact": "Sending to a long session evicted from memory starts a full event-log transfer, historical edit metadata read, and turn reconstruction alongside first-response processing.",
+      "Evidence": "The send path reaches _ensureResolvedChatSession and awaits initializeSession. The added call starts _computeMappedEvents, which invokes session.getEvents and mapSessionEvents; replay then calls db.getFileEdits for all historical edit calls and constructs all parent/subagent turns. Memoization only prevents a later duplicate read.",
+      "Recommendation": "Cache raw events or a lightweight agent-name index during resume, but defer mapSessionEvents and its historical edit load until getMessages or getSubagentMessages actually requests history."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "eager-work",
+      "boundary-fanout",
+      "synchronous-ui-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Stream a response in a long writable chat while discovering confirmations from offscreen historical responses",
+        "CriticalPath": "Each non-quiet response progress update synchronously fires ChatResponseModel -\u003e ChatResponseViewModel -\u003e ChatViewModel.onDidChange on the UI thread; the new response collection mapping and keyed reconciliation complete before observers settle. No boundary call is involved.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of transcript responses H, including virtualized/offscreen history, multiplied by streamed deltas D; response-part count also affects the pending-state derivation for the changing response.",
+        "EffectiveConcurrency": "Single UI-thread serialization; there is no debounce or frame coalescing around the new whole-transcript collection observer.",
+        "CacheBehavior": "Per-response keyed cells are retained, but `getItems()` and both filtering/key-set passes are redone with newly allocated arrays/Sets for every broad view-model event. The cache does not avoid O(H) reconciliation.",
+        "MechanismConfidence": "High: the event forwarding, full collection creation, and keyed traversal are explicit.",
+        "MagnitudeUncertainty": "Exact frame impact depends on transcript length, delta cadence, and concurrent renderer work; the synchronous O(H × D) mechanism is certain.",
+        "Verdict": "Reportable repeated synchronous UI work introduced by the diff; finding submitted."
+      },
+      {
+        "Scenario": "Show approval rows in Sessions, Automations, or blocked-session UI while a live chat streams",
+        "CriticalPath": "The approval model's autorun runs synchronously on response changes, reverses and scans request history, and reads pending state before the UI can settle. No subprocess, IPC, filesystem, database, or network operation is reached.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Requests H per tracked live chat multiplied by streamed response changes D; when no approval is pending, every eligible historical response is visited/subscribed.",
+        "EffectiveConcurrency": "Serialized on the renderer/UI thread. Multiple approval-model owners can independently observe the same live chat models; there is no shared scan/coalescer.",
+        "CacheBehavior": "The request array is refreshed only on model structural events, but `toReversed()` allocates each autorun and broad response-change subscriptions invalidate the full search on ordinary content deltas. Pending-state equality could have coalesced unchanged false states, but the explicit broad signal bypasses that benefit.",
+        "MechanismConfidence": "High: ChatResponseModel emits for non-quiet content changes and the added signal is read before the pending guard.",
+        "MagnitudeUncertainty": "Visible stutter threshold depends on history size and how many approval-model surfaces are alive; the per-delta historical scan is directly established.",
+        "Verdict": "Reportable repeated synchronous work introduced by the diff; finding submitted."
+      },
+      {
+        "Scenario": "Cold-resume an evicted Copilot session to send or resume a new turn",
+        "CriticalPath": "Session initialization is awaited before send/resume proceeds. The new mapped-event warmup is fire-and-forget after initialization's existing awaited setup, so it is nominally off the promise critical path, but its SDK transfer, database read, and replay CPU run concurrently with first-turn processing on the same host/session.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_computeMappedEvents",
+            "Operation": "Fetch the complete persisted SDK event log with `session.getEvents()`",
+            "Cardinality": "One full-log fetch per cold resume/restore wave, shared by subsequent parent and subagent history reads until invalidated",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only getMessages/getSubagentMessages started this fetch.",
+            "CriticalPathEffect": "Introduced onto every resumed-session initialization as background contention; previously absent unless history was explicitly requested"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/mapSessionEvents.ts:mapSessionEvents",
+            "Operation": "Batch-load stored file-edit metadata for all replayed edit tool calls",
+            "Cardinality": "Zero when no historical edit calls; otherwise one batched query covering all edit call IDs",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Reached only during explicit transcript/subagent history reconstruction.",
+            "CriticalPathEffect": "The existing replay query is newly reached during send-only resume and runs alongside first-turn work"
+          }
+        ],
+        "ScalingInput": "Persisted event count E and historical edit-tool-call count; event replay performs multiple O(E) passes and reconstructs all parent/subagent turns.",
+        "EffectiveConcurrency": "One memoized reconstruction per session/restore wave. There is no cross-session limiter; simultaneous cold resumes can each start one reconstruction. Within one session, later getMessages/getSubagentMessages share the memo.",
+        "CacheBehavior": "Cold resume always starts the work. Warm reads share `_mappedEventsMemo`; invalidation after event-log changes permits a later rebuild. There is no negative cache after failure.",
+        "MechanismConfidence": "High for eager reachability and scaling; medium-high for exact first-token delay because the promise is not awaited but shares transport/event-loop resources.",
+        "MagnitudeUncertainty": "Many UI opens may request history immediately and therefore share the same work; impact is greatest for send-only resumes with long histories and depends on SDK/database latency.",
+        "Verdict": "Reportable low-severity eager work; finding submitted."
+      },
+      {
+        "Scenario": "Complete or continue multiple subagent model rounds",
+        "CriticalPath": "Subagent turn-end/background-task events schedule asynchronous authoritative task-list reconciliation; inactive completion waits for the configured delay and a confirming reconciliation before emitting completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_reconcileSubagentTaskStatuses",
+            "Operation": "List authoritative SDK background tasks",
+            "Cardinality": "At most one active plus one queued call for a burst; spaced child turn ends can each cause a call, and inactive confirmation can cause a later call",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Background-task-change events already reconciled via tasks.list; child turn-end previously scheduled local completion without adding this reconciliation call.",
+            "CriticalPathEffect": "Asynchronous for ongoing turns, but completion presentation waits on the status/delay path"
+          }
+        ],
+        "ScalingInput": "Subagent model rounds and active task count, with a realistic runtime cap of tens of subagents.",
+        "EffectiveConcurrency": "A per-session Throttler permits one active tasks.list RPC and retains only the latest queued factory, so bursty sibling events coalesce to at most one active plus one queued read. Per-agent completion timers can converge on the same throttler.",
+        "CacheBehavior": "No task-list cache; status is intentionally re-read for authority. Running status disposes completion timers; completed agents remove activity/scheduler entries.",
+        "MechanismConfidence": "High for the added RPC trigger and global coalescing semantics.",
+        "MagnitudeUncertainty": "SDK event ordering determines how often turn-end and background-task-change reads coalesce; no evidence establishes a costly enough uncoalesced rate for a separate finding.",
+        "Verdict": "No finding: the authoritative read is asynchronous and globally coalesced per session, and the diff includes bounded lifecycle cleanup."
+      },
+      {
+        "Scenario": "Replay history with canonical subagent names and render an empty final-answer round boundary",
+        "CriticalPath": "Explicit history reads fetch/map events, then UI adaptation emits a hidden empty-thinking marker; rendering finalizes active thinking parts synchronously. The new name lookup itself is in-memory.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_computeMappedEvents",
+            "Operation": "Fetch persisted session events for an explicit history read",
+            "Cardinality": "One full fetch shared across parent and subagent reads until invalidation",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same explicit history read fetched the full event log.",
+            "CriticalPathEffect": "Required before explicit history can render; this boundary pre-existed the naming change"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/mapSessionEvents.ts:mapSessionEvents",
+            "Operation": "Batch-load replay edit metadata",
+            "Cardinality": "At most one batched query when edit tool calls exist",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same batched query during replay.",
+            "CriticalPathEffect": "Required by existing transcript reconstruction and not added by the naming prepass"
+          }
+        ],
+        "ScalingInput": "Persisted event count for name precollection; rendered content-part count within the affected response for an empty round marker.",
+        "EffectiveConcurrency": "History replay is one memoized computation per session wave; UI marker handling is serialized on the UI thread and occurs once per empty final-answer boundary.",
+        "CacheBehavior": "Agent display names are retained per live session and map lookup is O(1). Explicit replay performs one added linear prepass. Empty markers are represented once in response state.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Event logs and content-part counts vary, but the added in-memory passes are linear and infrequent relative to the existing full replay/render.",
+        "Verdict": "No additional finding: explicit replay adds only a bounded linear name prepass, and the empty-round scan occurs per round boundary rather than per token/frame."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 33 changed files. Submitted two repeated-work findings for full-history scans on streaming UI updates and one eager-work finding for cold-resume transcript reconstruction. Checked task RPC coalescing, history replay boundaries, cache lifetimes, empty-round rendering, and subagent cleanup; no regression-fix learning record was warranted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T05:31:29.216918285Z",
+    "CompletedAt": "2026-09-16T05:35:21.109226399Z",
+    "WallClockMilliseconds": 231892,
+    "ModelCalls": 16,
+    "InputTokens": 1498940,
+    "OutputTokens": 16832,
+    "TotalTokens": 1515772,
+    "ReasoningTokens": 7322,
+    "CacheReadTokens": 1368181,
+    "CacheWriteTokens": 130711,
+    "APIDurationMilliseconds": 220061,
+    "ToolCalls": 122,
+    "NanoAIUnits": 153765940000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1368181,
+      "cache_write": 130711,
+      "input": 48,
+      "output": 16832
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
