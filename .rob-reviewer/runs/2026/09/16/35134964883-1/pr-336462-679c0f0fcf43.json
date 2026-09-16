@@ -1,0 +1,140 @@
+{
+  "PullRequest": {
+    "Number": 336462,
+    "Title": "performance: reduce URI-to-string conversion overhead",
+    "Body": "## Summary\n\nReduce overhead when converting URIs into strings, with approximately\n52% lower execution time on VS Code's existing URI corpus in a controlled\nlocal benchmark using Electron's V8 runtime.\n\nA URI (Uniform Resource Identifier) identifies a file or other resource.\nURI formatting converts its components—such as the scheme, host, path,\nquery, and fragment—into a string, escaping reserved characters where\nrequired. For example, a literal `#` inside a file path becomes `%23`\nrather than being interpreted as the start of a fragment.\n\nThe existing minimal encoder scans every character in JavaScript, even\nwhen no escaping is needed. After encountering a delimiter, it appends\nunchanged characters individually.\n\nThis change uses native string searches to locate the first `?` or `#`,\nreturns delimiter-free components unchanged, and copies subsequent safe\nruns as substrings.\n\n## Behavior\n\n- Preserves existing minimal-encoding output, including delimiter order\n  and repeated delimiters.\n- Preserves Unicode and surrogate code units in unchanged runs.\n- Leaves normal encoding, raw-fragment handling, and URI caching unchanged.\n- Adds no caches, retained state, dependencies, or public API changes.\n\nRegression tests cover delimiter boundaries, unchanged prefixes and tails,\ncomponent encoding, and both normal/minimal serialization call orders.\nThe new tests also pass against the unchanged upstream implementation.\n\n## Performance\n\nMeasured on an Apple M3 Pro, macOS arm64, using the existing URI corpus:\n\n| Runtime | Baseline median | Candidate median | Time reduction |\n| --- | ---: | ---: | ---: |\n| Electron 43.6.0 | 346 ns/operation | 166 ns/operation | 52.2% |\n| Node.js 24.18.0 | 394 ns/operation | 230 ns/operation | 41.8% |\n\n### Measurement scope\n\nThe comparison used:\n- The same 105,025 corpus entries, including the trailing empty entry.\n- Actual baseline/candidate URI modules built with identical tooling.\n- Fresh URI construction, minimal formatting, and output-content\n  consumption inside each measured operation.\n- Warmups followed by alternating baseline/candidate samples.\n- Separate repeat runs, including reversed first-arm order in Electron.\n- An unchanged full-encoding control and matching output checksums.\n- Correctness checking in a separate process to avoid preconditioning\n  the benchmark's JIT.\n\nElectron was run in Node mode. These are component-level measurements,\nnot workbench startup or renderer-latency measurements. Results are\ncorpus-specific; some very short delimiter-heavy inputs can be slower.\n\n## Validation\n\n- 131 targeted URI and consumer tests passed on both baseline and candidate,\n  with the same four pending tests.\n- Full client TypeScript checking passed.\n- Changed-file ESLint and whitespace checks passed.\n- 387,209 exact public-API comparisons completed without mismatches.\n- Validation was performed on macOS; Windows/Linux CI remains necessary.\n\nOnly two source/test files are changed: 19 production lines added and\n9 removed, plus 52 regression-test lines. Benchmark instrumentation and\nraw reports are not included in the production patch.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336462",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "federicobrancasi",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "13346ee139387d46ed3bcc8cfffe29d28670646d",
+    "HeadRef": "fb/uri-minimal-encoding",
+    "HeadSHA": "679c0f0fcf437b58f0bb3f240b62397d15887c7a",
+    "CreatedAt": "2026-09-16T18:26:49Z",
+    "UpdatedAt": "2026-09-16T18:30:17Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Serializing file and resource URIs with URI.toString(true) for identifiers, labels, logs, and collection processing",
+        "CriticalPath": "Minimal serialization must finish synchronously before the caller can use the URI string. For skipEncoding calls, every non-empty authority/user-info, path, and query component is encoded; fragments bypass this helper.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/base/common/uri.ts:605 encodeURIComponentMinimal / src/vs/base/common/uri.ts:475 Uri.toString",
+            "Operation": "Convert URI components into a minimally encoded string.",
+            "Cardinality": "Up to several component encodings per toString(true) call; one path encoding for common file URIs, multiplied by the number of serialized resources.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same serialization occurred, scanning every character in JavaScript and appending unchanged suffix characters individually after the first '?' or '#'.",
+            "CriticalPathEffect": "Synchronous CPU work directly gates availability of the URI string."
+          }
+        ],
+        "ScalingInput": "Cost scales with the total characters across URI components and the number of uncached toString(true) calls. The existing URI perf corpus uses about 105,025 fresh file URIs, while ordinary calls usually serialize one URI at a time.",
+        "EffectiveConcurrency": "Synchronous and serialized within each JavaScript call; collection callers generally loop or map without an internal limiter, but this diff adds no asynchronous work or concurrency burst.",
+        "CacheBehavior": "URI.toString(true) is intentionally not cached, so cold and repeated calls both execute minimal encoding. URI.toString(false) retains its existing per-instance formatted-string cache and uses a different encoder, so warm normal serialization is unaffected.",
+        "MechanismConfidence": "High: the changed helper and uncached toString(true) call path are explicit, and the before/after character scanning and allocation behavior is directly visible in the diff.",
+        "MagnitudeUncertainty": "Exact end-to-end impact varies by URI length, delimiter placement, and caller frequency. Very short delimiter-heavy components may not benefit, but no realistic user-visible regression is established.",
+        "Verdict": "No reportable regression. Delimiter-free components now return after native searches, and components requiring escaping copy safe runs rather than appending unchanged characters one by one; this removes repeated JavaScript work without adding retained state or scaling fan-out."
+      },
+      {
+        "Scenario": "Loading extension, worker, webview, and other browser resources whose URLs are produced with toString(true)",
+        "CriticalPath": "URI serialization completes synchronously before dynamic import, fetch, loadURL, or DOM resource assignment can start; the subsequent network/module load dominates and is unchanged by this patch.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/base/common/uri.ts:605 encodeURIComponentMinimal",
+            "Operation": "Minimally encode the resource URI before handing it to a loader.",
+            "Cardinality": "One URI serialization per resource URL construction, with one encoding call for each populated authority/path/query component.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The resource URL was serialized on the same critical path using a full JavaScript character scan.",
+            "CriticalPathEffect": "Must finish before the load is initiated, but the patch reduces common-case serialization work."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/extensionResourceLoader/browser/extensionResourceLoaderService.ts:48 fetch and analogous unchanged resource loaders",
+            "Operation": "Fetch or load the serialized resource URL.",
+            "Cardinality": "One downstream load per requested resource; unchanged by URI encoding and subject to existing browser/network caching.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The identical fetch/load boundary occurred after the old minimal formatter, with the same URL and call count.",
+            "CriticalPathEffect": "The load gates resource availability; URI formatting precedes it but does not add a new boundary."
+          }
+        ],
+        "ScalingInput": "One serialization and one downstream load per requested resource in the inspected call sites; batching/grouping behavior belongs to those unchanged consumers, and the diff does not increase request cardinality.",
+        "EffectiveConcurrency": "Downstream loads may run concurrently according to existing caller/browser scheduling. URI encoding itself is synchronous per request, and the diff neither creates nor expands concurrency.",
+        "CacheBehavior": "Minimal URI strings are recomputed on repeated calls because skipEncoding output is not cached. Browser/network caches remain owned by unchanged consumers and are not affected; cold and warm boundary-call counts are identical before and after.",
+        "MechanismConfidence": "High: representative toString(true)-to-loader call sites and the formatter selection are explicit; all network and module boundaries are unchanged.",
+        "MagnitudeUncertainty": "The fraction of startup or UI loading latency attributable to URI formatting is workload-dependent, but the changed mechanism does not add work or boundary calls for realistic URLs.",
+        "Verdict": "No reportable regression. The diff changes only CPU/string-allocation strategy before existing resource loads and neither introduces network I/O nor amplifies its cardinality."
+      },
+      {
+        "Scenario": "Serializing custom URIs whose authority, path, or query contains '?' and '#' delimiters",
+        "CriticalPath": "The helper locates the first delimiter, scans from it to the end, escapes each delimiter, and copies intervening safe runs before returning synchronously.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/base/common/uri.ts:606-630 encodeURIComponentMinimal",
+            "Operation": "Search for '?' and '#', escape delimiter code units, and assemble safe substrings.",
+            "Cardinality": "Two native searches per non-empty component, followed only when a delimiter exists by one suffix scan and allocations proportional to delimiter-separated runs.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One JavaScript scan covered the whole component and, after the first delimiter, appended every unchanged character separately. The new searches can add a small constant-pass cost for some delimiter-heavy shapes but avoid per-character suffix concatenation.",
+            "CriticalPathEffect": "Entirely synchronous CPU/allocation work; no filesystem, IPC, database, subprocess, or network operation is reached by the helper itself."
+          }
+        ],
+        "ScalingInput": "Cost scales linearly with component length plus the number of delimiter-separated runs. Typical URIs have few embedded delimiters; adversarial alternating delimiter/safe-character strings increase substring count but remain linear.",
+        "EffectiveConcurrency": "Single synchronous formatter invocation; repeated callers independently execute it because skipEncoding output is not cached.",
+        "CacheBehavior": "No positive or negative cache is introduced. Repeated minimal serialization performs the same linear work each time, as before; normal serialization caching is unaffected.",
+        "MechanismConfidence": "High for the linear algorithm and allocation behavior; low that the small shape-specific slowdown reaches a meaningful product scenario.",
+        "MagnitudeUncertainty": "The PR notes some very short delimiter-heavy inputs can benchmark slower, but repository call patterns and URI syntax do not establish realistic multiplicity or a user-visible latency/throughput impact. Pathologically huge components are not a realistic basis for a finding.",
+        "Verdict": "No reportable regression. Worst-case asymptotic complexity remains linear, output allocation remains bounded by input/output size, and the plausible counter-cases are microbenchmark-only without a realistic performance trigger."
+      }
+    ],
+    "Summary": "Completed the performance pass over the full two-file diff. Traced uncached minimal URI serialization, normal serialization caching, delimiter-heavy allocation behavior, collection scaling, and representative downstream resource-loading boundaries. The patch removes common repeated per-character work and adds no actionable performance regression; no finding or regression-fix learning record was warranted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T18:40:16.834481997Z",
+    "CompletedAt": "2026-09-16T18:41:38.706329593Z",
+    "WallClockMilliseconds": 81871,
+    "ModelCalls": 6,
+    "InputTokens": 111244,
+    "OutputTokens": 3307,
+    "TotalTokens": 114551,
+    "ReasoningTokens": 1136,
+    "CacheReadTokens": 80704,
+    "CacheWriteTokens": 30522,
+    "APIDurationMilliseconds": 71815,
+    "ToolCalls": 17,
+    "NanoAIUnits": 25110360000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 80704,
+      "cache_write": 30522,
+      "input": 18,
+      "output": 3307
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
