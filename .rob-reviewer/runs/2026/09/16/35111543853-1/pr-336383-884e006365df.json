@@ -1,0 +1,261 @@
+{
+  "PullRequest": {
+    "Number": 336383,
+    "Title": "Fix built-in extensions manifest cache never being hit",
+    "Body": "## Problem\r\n\r\nBuilt-in extension scanning is on the `code/willLoadExtensions` critical path, and **the window re-scans all ~96 built-in extensions on every startup** even though a manifest cache already exists.\r\n\r\n`CachedExtensionsScanner` keys its cache on `ExtensionScannerInput`, which includes `language` — but the cache *file name* did not. Two callers scan built-ins with different languages against the same file:\r\n\r\n| caller | language | outcome |\r\n|---|---|---|\r\n| window — `cachedExtensionScanner.ts` | `platform.language` (e.g. `'en'`) | **missed every startup** |\r\n| shared process — `extensionManagementService.cleanUp()` via IPC `getInstalled` | `undefined` | wrote last, 9–15×/startup |\r\n\r\nEach overwrote the other's entry, so `ExtensionScannerInput.equals` always failed on the `language` comparison and neither side ever got a hit.\r\n\r\nA second cost sits on top: on every cache *hit*, `validateCache()` runs a **full re-scan** 3s later to diff the result. For built-ins of an installed product that work is pure waste — they are replaced wholesale by an update, and `productCommit` is already part of the cache key.\r\n\r\nThis is long-standing (1.105 has it too); it simply got more expensive as built-ins grew 93 → 97 and the `extensions/` folder grew 47 MB → 269 MB.\r\n\r\n## Change\r\n\r\n- `getManifestCacheFileName(type, language)` in `platform/extensions/common/extensions.ts` — the cache file name now carries the scan language (`extensions.builtin.en.cache`). The language is lowercased and reduced to `[a-z0-9-]` because it can originate from a remote client. Also fixes remote servers serving clients with different locales, which had the same collision.\r\n- `CachedExtensionsScanner.shouldValidateCache()` — skips the throttled re-scan for system extensions in built products. User extensions and dev mode are unchanged.\r\n- `ExtensionsManifestCache` now deletes **all** per-language user cache files on install/uninstall, so invalidation keeps working.\r\n\r\n## Measurements\r\n\r\n1.139.0-insider win32-x64, `--disable-extensions`, fresh user-data dir, warm starts, window-side `Started scanning system extensions` → `Scanned system extensions`:\r\n\r\n| | median scan | cache hits |\r\n|---|---|---|\r\n| before | 372 ms (398/405/347/332) | 0/5 |\r\n| after | 41 ms (36/63/41/41) | **5/5** |\r\n\r\n**~330 ms off every startup**, on the window that regressed 273 ms → 435.5 ms between 1.105 and 1.139.\r\n\r\nThe \"after\" numbers were produced by patching the shipped shared-process bundle to use a distinct cache file name, which reproduces exactly what this change does; the build was restored afterwards.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336383",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ed9aec4e5647e3a76b83a417fba52e9e16d76494",
+    "HeadRef": "agents/reduce-extension-scanning-costs",
+    "HeadSHA": "884e006365dfc8ac4e3c496ddc945dc2622dab17",
+    "CreatedAt": "2026-09-16T08:26:26Z",
+    "UpdatedAt": "2026-09-16T13:45:18Z",
+    "MergedAt": null,
+    "Labels": [
+      "extension-host",
+      "perf",
+      "perf-startup"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-1BB33C635A05",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/extensionManagement/node/extensionsManifestCache.ts",
+      "Side": "RIGHT",
+      "Line": 47,
+      "Severity": "low",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The event batching, lack of coalescing, and filesystem operations are directly traced in code. The exact duration depends on extension count, locale-cache count, and filesystem speed, so severity is low, but the redundant operation count and concurrency are deterministic for batched results.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "filesystem directory resolutions and cache-file delete operations",
+      "PerformanceScaling": "For an install event containing N successful extensions for one profile, this loop invokes invalidation N times. The new invalidation performs at least N directory resolves and can race up to N×L deletes for the same L language cache files, although one resolve/delete set is sufficient.",
+      "PerformanceOutcome": "redundant filesystem I/O bursts and reduced post-install throughput",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "Each result attempted one direct delete of the single known user-cache path; it did not enumerate the cache directory or fan out across language files.",
+      "ChangedBehavior": "Each successful result independently calls deleteUserCacheFiles, which resolves the profile cache directory and deletes every matching per-language file with Promise.all.",
+      "CausalDiffEvidence": "RIGHT line 47 replaces the per-result single-file deletion with deleteUserCacheFiles; changed lines 58-63 make every invocation enumerate cacheHome and fan out deletes across matching language files.",
+      "Title": "Coalesce cache invalidation for batched installs",
+      "Impact": "Updating all extensions, importing a profile, installing workspace recommendations, or Settings Sync can produce one event with many successful results for the same profile. The listener launches all invalidations without awaiting or coalescing them, so these redundant directory reads and racing deletes run concurrently with follow-up extension work and can degrade post-install responsiveness.",
+      "Evidence": "AbstractExtensionManagementService fires one onDidInstallExtensions event containing the full results array after a batched install (abstractExtensionManagementService.ts:562), and updateAll/profile import/Settings Sync pass collections to installGalleryExtensions. This handler loops every local result and calls invalidate; invalidate awaits the newly added fileService.resolve and Promise.all deletes. There is no profile deduplication or shared in-flight invalidation.",
+      "Recommendation": "Deduplicate successful results by profile and invalidate each profile once per event; additionally share an in-flight invalidation per profile if metadata/uninstall bursts can overlap, while preserving deletion of every language cache."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 1038,
+      "BasePath": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts",
+      "BaseLine": 1035,
+      "IntroducingPath": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts",
+      "IntroducingCommit": "8188c823c7c0fa66a8550ac7f58ee7fb2e53dbc0",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceCategory": "startup",
+      "Mechanism": "The cache key comparison includes input.language, but the old cache path included only extension type. The startup window scans system extensions with platform.language while extension-management startup paths scan them with undefined, so callers overwrite the same file with incompatible keys and force repeated full filesystem scans.",
+      "Symptom": "Built-in extension scanning repeatedly misses its cache on the extension-loading startup path, requiring directory enumeration and manifest/NLS reads across the built-in extension set.",
+      "FixedBehavior": "getCacheFile now derives a language-specific filename, allowing each caller's cache entry to survive and be reused on warm starts.",
+      "Evidence": "ExtensionScannerInput.equals compares language at extensionsScannerService.ts:570; CachedExtensionScanner reads and rewrites the selected file on mismatch; CachedExtensionScanner in the window calls scanSystemExtensions with platform.language, while extensionManagementService startup scanning calls it with no language. The changed filename function separates these entries, and the added tests prove same-language hits and distinct-language files.",
+      "Confidence": 0.99
+    },
+    {
+      "FixedPath": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 972,
+      "BasePath": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts",
+      "BaseLine": 970,
+      "IntroducingPath": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts",
+      "IntroducingCommit": "2df55d8428d1d6464a78d2778006791133987150",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "io",
+      "Mechanism": "Every cache hit scheduled validateCache, which calls super.scanExtensions and therefore re-enumerates the built-in extension directory and rereads/parses manifests and localization files after a three-second delay.",
+      "Symptom": "A warm startup that successfully used the built-in cache still performed a redundant full built-in extension scan shortly afterward, creating avoidable filesystem I/O and CPU contention during startup settling.",
+      "FixedBehavior": "Installed-product system-extension cache hits no longer schedule validation; user-extension and development-mode caches retain validation.",
+      "Evidence": "The deleted unconditional trigger reached validateCache, whose expected value is built from await super.scanExtensions(this.input); ExtensionsScanner.scanExtensionsFromLocation resolves the directory and scans every child concurrently. The new type/devMode guard and focused timer test verify that built-product system hits do not execute that scan.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "unbounded-retention"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Desktop warm startup scans built-in and current-profile user extensions before extension loading",
+        "CriticalPath": "CachedExtensionScanner.startScanningExtensions awaits system and user scans in parallel before resolving scannedExtensions; cache reads and any miss-induced extension scan are on the extension-loading critical path. The delayed validation scan is off the direct critical path but competes during startup settling.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts CachedExtensionsScanner.scanExtensions/readExtensionCache",
+            "Operation": "Read and parse the system and user manifest cache files",
+            "Cardinality": "One cache read per system scan and one per cached user scan; filenames are now keyed by exact language.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same reads occurred, but different-language callers selected the same file and frequently found an incompatible entry.",
+            "CriticalPathEffect": "These reads must complete before installed extensions are available."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts ExtensionsScanner.scanExtensionsFromLocation/scanExtension",
+            "Operation": "Resolve extension directories and read/parse manifests and NLS files on a cache miss",
+            "Cardinality": "One directory resolve plus per-extension manifest/localization reads, scaling with the built-in or user extension set.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same full scan existed but happened repeatedly because the shared filename caused language-key collisions; the diff reduces its frequency.",
+            "CriticalPathEffect": "On a miss this blocks completion of startup extension scanning."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts CachedExtensionsScanner.validateCache",
+            "Operation": "Delayed full cache-validation rescan",
+            "Cardinality": "Previously one throttled collection-wide scan after cache hits; now zero for built-product system extensions, unchanged for user and development scans.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every cache hit scheduled the rescan; the diff removes it for immutable installed-product built-ins.",
+            "CriticalPathEffect": "Off the direct scan critical path due to the three-second delayer, but consumes I/O and CPU during startup settling."
+          }
+        ],
+        "ScalingInput": "Approximately one system scan over the installed built-in extension set and one user scan over the current profile; on a miss, work scales with extension count and localization files. Cache identity cardinality is one entry per exact scan language and extension type.",
+        "EffectiveConcurrency": "System and user scans run in Promise.allSettled. Within a miss, extension children are scanned with Promise.all. There is no cross-caller cache-request coalescing, but distinct language files stop callers from overwriting each other.",
+        "CacheBehavior": "Before the diff, system scans using platform.language and undefined shared one filename, so incompatible ExtensionScannerInput.language values caused alternating misses; even a hit scheduled a full validation scan after three seconds. After the diff, cold behavior is one full scan/write per language, warm behavior is a cache-file read/parse with no built-product system validation; user cache hits still validate.",
+        "MechanismConfidence": "High: cache equality, caller language values, full-scan call paths, and scheduling are directly visible and covered by focused tests.",
+        "MagnitudeUncertainty": "Exact scan duration varies by platform, filesystem, extension count, and localization, but the critical-path miss and collection-wide validation mechanisms are established.",
+        "Verdict": "The diff materially improves warm startup by preserving per-language cache hits and eliminating redundant installed-product built-in validation scans; no regression in this scenario."
+      },
+      {
+        "Scenario": "Remote window connects and asks the server to scan extensions for its UI locale",
+        "CriticalPath": "One existing IPC call to RemoteExtensionsScannerChannel must complete; server-side built-in, user, workspace, and development scans run in parallel, and built-in/user cache reads or cold scans block the IPC response.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/remote/common/remoteExtensionsScanner.ts RemoteExtensionsScannerService.scanExtensions",
+            "Operation": "Client invokes remoteExtensionsScanner.scanExtensions and receives serialized extension descriptions",
+            "Cardinality": "One IPC request per remote extension scan/window connection, serving the full returned extension description collection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC call existed; the diff changes only server cache-file identity and hit behavior.",
+            "CriticalPathEffect": "The response is required before remote extensions can be initialized."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/server/node/remoteExtensionsScanner.ts _scanBuiltinExtensions/_scanInstalledExtensions -\u003e extensionsScannerService",
+            "Operation": "Read locale-specific cache files or scan built-in/user extension trees on a locale cold miss",
+            "Cardinality": "Two cached scans per request; cold full-scan multiplicity is per distinct locale rather than repeatedly alternating through one shared file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Different client locales shared and overwrote one file, causing additional cold scans; the diff creates separate files and lowers repeat I/O.",
+            "CriticalPathEffect": "Required to form the IPC response."
+          }
+        ],
+        "ScalingInput": "One scan per remote window connection, with built-in/user extension collection sizes and distinct exact locales used by clients sharing the server controlling cache cardinality.",
+        "EffectiveConcurrency": "Four scan categories run in Promise.all. Separate client requests may overlap; cache files are separated per language but writes for the same language are not explicitly coalesced.",
+        "CacheBehavior": "The first request for a locale performs cold scans and writes system/user locale files; later same-locale requests can hit. Different locales no longer overwrite each other. User locale files are removed on extension changes; system locale files persist and are replaced when that locale is next scanned with a changed product key.",
+        "MechanismConfidence": "High for the IPC and filesystem paths; moderate only for long-term locale cardinality magnitude.",
+        "MagnitudeUncertainty": "The number of locales sharing one server and cache-file sizes vary. Distinct-locale retention is expected to remain modest for normal locale sets and did not justify a finding.",
+        "Verdict": "Per-language files remove realistic remote-client cache collisions. Potential locale-file retention is bounded enough in normal use that no actionable performance regression was reported."
+      },
+      {
+        "Scenario": "Batch extension update, profile import, workspace recommendation install, or Settings Sync invalidates user manifest caches",
+        "CriticalPath": "The install operation fires onDidInstallExtensions before returning results. The cache listener synchronously launches invalidations but does not await them, so most directory reads/deletes are off the install promise's direct critical path and overlap subsequent extension/UI work. Explicit invalidate callers such as metadata updates likewise launch work without awaiting it.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/extensionManagement/node/extensionsManifestCache.ts deleteUserCacheFiles lines 55-63",
+            "Operation": "Resolve the profile cache directory and enumerate children",
+            "Cardinality": "N directory resolve/readdir operations for N successful results even when all target one profile; one is sufficient.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No directory enumeration; invalidation directly addressed the single known user-cache path.",
+            "CriticalPathEffect": "Launched from the event before install returns, then continues asynchronously and can contend with immediate follow-up work."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/extensionManagement/node/extensionsManifestCache.ts deleteUserCacheFiles lines 61-63",
+            "Operation": "Delete every matching per-language user manifest cache file",
+            "Cardinality": "Up to N×L attempted deletes when concurrent resolves observe the same L files, rather than L deletes once per affected profile.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "N direct attempts against one fixed file; there was no per-language fan-out.",
+            "CriticalPathEffect": "Mostly off the direct install promise but creates an unbounded-with-batch-size I/O burst during post-install work."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/extensionManagement/common/abstractExtensionManagementService.ts installGalleryExtensions",
+            "Operation": "Download/install gallery extensions in update/import/sync workflows",
+            "Cardinality": "Existing per-extension gallery/download work for the requested batch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged by this diff.",
+            "CriticalPathEffect": "The install operation awaits this work before firing results; cache invalidation begins afterward."
+          }
+        ],
+        "ScalingInput": "N successful extension results, grouped into one event but not deduplicated by profile, and L existing language-specific user cache files in that profile. Effective changed cost is at least N cache-directory resolutions and potentially N×L raced delete attempts.",
+        "EffectiveConcurrency": "The result loop launches invalidate once per result with no await, limiter, profile grouping, or in-flight coalescing. Each invalidation then uses Promise.all for all matching files.",
+        "CacheBehavior": "Before the diff, each result attempted a direct delete of one known cache file. After the diff, invalidation enumerates cacheHome to discover all language files and deletes them; subsequent scans are cold and recreate only requested locale entries.",
+        "MechanismConfidence": "High: the full results array is fired once, the listener loops every result, and each changed invocation performs explicit filesystem enumeration and fan-out without coalescing.",
+        "MagnitudeUncertainty": "Filesystem speed, batch size, and number of cached locales control duration; profile imports and update-all establish realistic multi-result batches even though the exact post-install delay is unmeasured.",
+        "Verdict": "Reportable low-severity boundary fan-out: deduplicate affected profiles and share in-flight invalidations so each profile is enumerated and cleared once."
+      },
+      {
+        "Scenario": "Development-mode system extension scanning and user cache validation",
+        "CriticalPath": "Initial cache reads/misses remain on the requested scan path. Validation after a hit remains delayed and off the immediate critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/extensionManagement/common/extensionsScannerService.ts CachedExtensionsScanner.validateCache",
+            "Operation": "Full delayed validation scan of mutable user or development extensions",
+            "Cardinality": "At most one pending validation per cached scanner throttle window, scanning the relevant collection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same validation scan occurred; the new guard deliberately preserves it for mutable scenarios.",
+            "CriticalPathEffect": "Off the immediate cache-hit path due to throttling."
+          }
+        ],
+        "ScalingInput": "Scales with development or user extension count and scan frequency; one throttler per cached scanner coalesces validation triggers within its delay.",
+        "EffectiveConcurrency": "System and user scanners have separate throttlers; within a validation scan, extension children are scanned concurrently. The diff preserves validation for user scans and devMode system scans.",
+        "CacheBehavior": "Language-specific naming applies, while mutable user/development caches continue delayed validation. Warm mutable-cache behavior therefore remains intentionally unchanged apart from avoiding cross-language filename collisions.",
+        "MechanismConfidence": "High from the explicit type/devMode condition and existing throttler.",
+        "MagnitudeUncertainty": "Development collection sizes and scan frequency vary, but behavior is preserved rather than introduced.",
+        "Verdict": "No regression; the optimization is correctly limited to immutable built-product system extensions."
+      }
+    ],
+    "Summary": "Reviewed all five changed files and all diff pages under the performance focus. Traced desktop and remote startup cache paths, mutable-cache validation, cache-file lifecycle, and install/update invalidation boundaries. Submitted one low-severity batched filesystem fan-out finding and recorded two concrete regression fixes: language-collision cache misses and redundant built-in cache validation scans."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T15:03:03.274802835Z",
+    "CompletedAt": "2026-09-16T15:06:18.030701614Z",
+    "WallClockMilliseconds": 194755,
+    "ModelCalls": 15,
+    "InputTokens": 736921,
+    "OutputTokens": 10451,
+    "TotalTokens": 747372,
+    "ReasoningTokens": 3611,
+    "CacheReadTokens": 660192,
+    "CacheWriteTokens": 76684,
+    "APIDurationMilliseconds": 146786,
+    "ToolCalls": 85,
+    "NanoAIUnits": 85669680000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 660192,
+      "cache_write": 76684,
+      "input": 45,
+      "output": 10451
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
