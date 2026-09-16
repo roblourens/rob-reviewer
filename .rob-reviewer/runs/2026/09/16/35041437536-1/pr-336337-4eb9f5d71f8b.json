@@ -1,0 +1,162 @@
+{
+  "PullRequest": {
+    "Number": 336337,
+    "Title": "chat: Keep Mermaid diagrams mounted while a response streams",
+    "Body": "Mermaid diagrams render into a webview `\u003ciframe\u003e` inside a chat output code block. While a response was still streaming, every markdown update re-rendered the whole markdown part and reset its container, which detached and reinserted that iframe. Detaching an iframe destroys its browsing context, so the diagram reloaded on every token and flickered heavily.\n\nMeasured on a streaming response containing a diagram:\n\n| | Webview reloads during 14s of streaming |\n|---|---|\n| Before | **84** |\n| After | **0** |\n\n\u003e [!NOTE]\n\u003e A side-by-side before/after screen recording is attached in a comment below.\n\nIn the \"before\" state the diagram never even finishes drawing — it reloads faster than Mermaid can render, so it sits on *\"Rendering code block…\"*. The recording harness initially failed outright with `Frame was detached`, which is the bug itself.\n\n## Approach\n\nReconcile the rendered markdown in place instead of clearing it, so a reused code block and its matching ancestors stay connected to the document.\n\n- **`markdownRenderer`** — add a reconciling replacement that keeps reused sync code blocks and their ancestor chain in the DOM, falling back to the previous reset when nothing can be preserved.\n- **`chatMarkdownContentPart`** — re-render in place and reuse the part across streamed updates so the diagram survives. Read the layout width through a delegate so a resize is picked up by later renders.\n- **`chatListRenderer`** — notify reused parts when their row is remounted after virtualization, keep code block registrations in sync as the part re-renders, and stop the progressive renderer from rewinding past a closing fence that was already rendered.\n\n## Testing\n\n- New coverage in `markdownRenderer.test.ts`, `chatMarkdownContentPart.test.ts` and `chatListRenderer.test.ts` for iframe document preservation (top-level, blockquote and list nesting), remount after virtualization, resize during streaming, and rendering a diagram once its fence closes.\n- Full chat browser suite (5577) and base markdown suite (173) pass, plus `typecheck-client` and ESLint.\n- Verified end to end in a real Code OSS window in both streaming modes, and confirmed the new remount tests fail when the fix is disabled.\n\n## Notes for reviewers\n\n- This reuse path previously sat behind the `chat.experimental.incrementalRendering.enabled` flag. That gate is removed so the fix applies by default, but the non-experimental path only engages for an append-only update to a part that already contains a rendered output code block. **This is the part most worth a close look.**\n- Known pre-existing limitations, not addressed here: collapsing a completed response re-parents (and so reloads) a diagram in the collapsed range, and reordering two diagrams reloads them.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336337",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "justschen",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "bf98feb428cc9253f711230ab966f0c3a66fbf27",
+    "HeadRef": "agents/mermaid-rendering-flicker-fix",
+    "HeadSHA": "4eb9f5d71f8b55b6b91dfea938b35f34bb39aba0",
+    "CreatedAt": "2026-09-15T21:43:50Z",
+    "UpdatedAt": "2026-09-16T00:30:23Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/base/browser/markdownRenderer.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 261,
+      "BasePath": "src/vs/workbench/contrib/chat/browser/widget/chatContentParts/chatMarkdownContentPart.ts",
+      "BaseLine": 182,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/browser/widget/chatContentParts/chatMarkdownContentPart.ts",
+      "IntroducingCommit": "00a718eb5c95e2aebfd6ddd60f11e2f84afb1b09",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "rendering",
+      "Mechanism": "Each incremental streaming render replaced the markdown target's entire child tree, detaching an unchanged iframe-backed output code block and forcing its browsing context and renderer to initialize again for successive token batches.",
+      "Symptom": "Iframe-backed Mermaid diagrams repeatedly reload and flicker while a response streams, consuming repeated webview rendering work and often preventing the diagram from finishing before the next update.",
+      "FixedBehavior": "The target update now reconciles ordinary markdown nodes while retaining reused synchronous code-block elements and their matching ancestors in the live DOM. Streaming updates still reparse/render markdown, but they no longer detach and reload an unchanged contributed code-block webview.",
+      "Evidence": "The base morpher callback at line 182 invoked the full markdown render on each rAF-buffered streaming update. That render targeted the existing chat markdown node, whose base renderer unconditionally reset all target children; meanwhile ChatOutputRendererService mounts contributed code-block output in a webview element under that target. Even though ChatMarkdownContentPart reused the ChatOutputCodeBlockPart object, resetting the ancestor detached the iframe/webview browsing context on every streamed update. The new reconciliation at markdownRenderer.ts:261 preserves the reused output element and its ancestor chain, and the added browser tests prove that repeated append-only updates retain the same iframe contentDocument and create only one rendered output.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "synchronous-ui-work",
+      "cleanup-lifecycle",
+      "cache-lifecycle",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A visible chat response streams additional markdown after a completed Mermaid/output-renderer code block, with incremental rendering enabled or disabled.",
+        "CriticalPath": "Each visible update must parse and sanitize the currently revealed markdown and reconcile its DOM before the new text appears. The contributed renderer/webview is on the critical path only when the code fence first becomes complete; later append-only renders now retain it rather than reloading it.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatOutputItemRenderer.ts:ChatOutputRendererService.renderCodeBlock/doRenderOutputPart",
+            "Operation": "Activate the contributed chat output renderer, create and mount a webview, and render the completed code block.",
+            "Cardinality": "One activation/render per newly completed output code block on a cold path; extension registration is shared and an unchanged output block is reused across all later token batches. Multiple distinct completed diagrams each require their own webview.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The explicit renderer-service call was already once per completed block, but every later markdown target reset detached the mounted iframe/webview and forced its browsing context to reload internally. The diff preserves the live ancestor chain, eliminating that repeated boundary work.",
+            "CriticalPathEffect": "The first completed diagram waits for renderer lookup/activation and webview rendering. Subsequent text can render without waiting for another boundary call because the existing output part is retained."
+          }
+        ],
+        "ScalingInput": "Cost of markdown parsing/reconciliation scales with revealed response length and update cadence; code-block reconciliation and registration scale with the effective number of code blocks in that markdown part. Incremental mode coalesces incoming updates to at most one scheduled render per animation frame; non-incremental progressive mode is paced by the existing 50 ms timer.",
+        "EffectiveConcurrency": "Incremental updates use one rAF slot with a single pending markdown value, so bursts coalesce. Non-incremental rendering remains serialized by the existing progressive timer. Distinct output webviews may initialize independently only as distinct fences become complete.",
+        "CacheBehavior": "The existing ChatOutputCodeBlockPart is keyed by response element, block index, and renderer identifier and is reused only when text/completion state match. The output state cache preserves height/webview state across reconstruction; the new live-DOM reconciliation is the warm path and falls back to full replacement when no reusable connected block exists.",
+        "MechanismConfidence": "High: the rAF/progressive call paths, synchronous markdown target update, webview mount, keyed output reuse, and iframe document-preservation tests directly establish the mechanism.",
+        "MagnitudeUncertainty": "Exact response lengths, token rates, and renderer costs vary, but the changed mechanism reduces expensive iframe reloads. Added map/DOM bookkeeping is linear in typically small code-block counts and is dominated by the pre-existing full markdown render.",
+        "Verdict": "No reportable regression. The PR removes repeated webview reload work while preserving existing scheduling and renderer-call cardinality."
+      },
+      {
+        "Scenario": "A streamed response contains ordinary Monaco-backed code blocks, possibly alongside a Mermaid block, and later text or a resize causes another render.",
+        "CriticalPath": "The standard markdown render reparses content, reacquires keyed editor-pool entries, updates code-block models/options, performs postponed editor layout, and reconciles DOM before the response update is visible. Width is read lazily at each render so a resize is reflected.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "CPU and DOM work scale with current markdown length, update count, and code-block count. The PR's preservation scan adds ancestor/child reconciliation proportional to the rendered DOM and reusable block count rather than adding another parse or editor render.",
+        "EffectiveConcurrency": "All render/model updates are synchronous on the UI thread; editor layout explicitly uses postponed rendering, while incremental calls are rAF-coalesced and non-incremental calls remain timer-serialized.",
+        "CacheBehavior": "Keyed EditorPool reuse remains warm for stable response/block indices and keeps at most two idle editors. Reused output refs are leaked from the prior render store only for matching output blocks; stale unmatched refs are disposed after the render.",
+        "MechanismConfidence": "High for call frequency and scaling from the render loop, pool implementation, and CodeBlockPart render/layout code.",
+        "MagnitudeUncertainty": "Large responses with many code blocks remain inherently costly to fully re-render, but that work predates the diff. No evidence shows the added reconciliation materially amplifies it beyond linear bookkeeping, and preserving connected blocks avoids destructive replacement.",
+        "Verdict": "No reportable regression. No new filesystem, network, subprocess, database, or IPC boundary is added, and the extra DOM work is bounded while expensive editor rendering remains coalesced/postponed."
+      },
+      {
+        "Scenario": "A virtualized chat response row containing one or more rendered output code blocks is disconnected and later remounted without receiving another token.",
+        "CriticalPath": "When the row reconnects, code-block navigation registrations are rebuilt and each retained output webview is told to reinitialize after dismount so visible content can recover. This work occurs as part of rendering the remounted row.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatContentParts/chatMarkdownContentPart.ts:ChatMarkdownContentPart.onDidRemount -\u003e ChatOutputCodeBlockPart.onDidRemount",
+            "Operation": "Call RenderedOutputPart.reinitialize, which invokes the webview's reinitializeAfterDismount lifecycle.",
+            "Cardinality": "Once per retained output code block for each actual row remount. The renderedPartsMounted guard prevents repeated calls on ordinary renderElement updates while the row remains mounted.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A content-diff remount already notified retained parts, but an unchanged progressive remount could skip the notification entirely. The diff extends the existing lifecycle call to that missing remount path rather than increasing calls while continuously mounted.",
+            "CriticalPathEffect": "Reinitialization is required for each remounted output to become usable after iframe/webview dismount; registration rebuilding itself is synchronous and linear in the row's code blocks."
+          }
+        ],
+        "ScalingInput": "Work scales with output code blocks retained in the single remounted response row and with genuine virtualization cycles, not token count while mounted.",
+        "EffectiveConcurrency": "The renderer walks parts synchronously and invokes each reinitialize once; underlying webview recovery may proceed independently. There is no added queue or repeated timer, and the mounted-state guard bounds each cycle.",
+        "CacheBehavior": "The row retains parts and cached output state while virtualized. WeakMap registration callbacks do not keep disposed parts alive, and state is reused on reinitialization. Code-block maps are removed on disposeElement and rebuilt only when the owning template is current.",
+        "MechanismConfidence": "High: connection-observer state, remount guards, ownership checks, weak-map lifecycle, and tests directly cover unchanged and updated remounts.",
+        "MagnitudeUncertainty": "Responses containing many diagrams could reinitialize several webviews together, but realistic rows usually contain few output blocks and every remounted block lost its browsing context. No evidence supports a harmful burst beyond the required restoration work.",
+        "Verdict": "No reportable regression. The newly reached reinitialization is bounded to genuine remounts and restores an already-required resource rather than adding token-frequency or unbounded work."
+      },
+      {
+        "Scenario": "An incomplete Mermaid fence closes during progressive rendering and the response later completes.",
+        "CriticalPath": "Word-count/progressive selection must retain a previously revealed closing fence; once complete, constructing the output part starts the renderer/webview boundary. Final response diffing then reuses the same markdown/output part when content remains append-only.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatContentParts/chatMarkdownContentPart.ts:ChatOutputCodeBlockPart constructor",
+            "Operation": "Encode the completed block and call the output renderer service to initialize its webview.",
+            "Cardinality": "Exactly once when each distinct output fence transitions to a complete rendered block; unchanged completion/finalization passes reuse it.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The renderer call already occurred when a fence was complete, but progressive word truncation could rewind the revealed fence and later reconstruction/reloads repeated browser work. The changed high-water logic and in-place reuse prevent that churn.",
+            "CriticalPathEffect": "The diagram itself waits on the renderer, while final non-output response content is not serialized behind repeated renderer calls."
+          }
+        ],
+        "ScalingInput": "One boundary operation per distinct completed output block; progressive markdown selection scales with response part count and revealed text length.",
+        "EffectiveConcurrency": "Progressive rendering is timer-serialized or rAF-coalesced depending on configuration. A block is not initialized while incomplete, avoiding speculative webview creation.",
+        "CacheBehavior": "Incomplete blocks have no rendered webview to cache. Once complete, the keyed output ref and state cache become the warm path through response completion.",
+        "MechanismConfidence": "High from the completeness guard, progressive high-water change, output constructor, and tests asserting output counts across fence closure.",
+        "MagnitudeUncertainty": "Renderer startup duration depends on installed contribution and diagram complexity, but the changed code does not multiply that operation.",
+        "Verdict": "No reportable regression. The diff avoids reconstruction and does not introduce eager output rendering."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 10 changed files and their render, pool, virtualization, scheduling, and webview call paths. No diff-introduced actionable performance issue was found. Recorded the PR's concrete repeated-render regression fix against the blamed incremental-rendering introducer."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T00:51:14.038783901Z",
+    "CompletedAt": "2026-09-16T00:54:39.595674515Z",
+    "WallClockMilliseconds": 205556,
+    "ModelCalls": 11,
+    "InputTokens": 694128,
+    "OutputTokens": 9677,
+    "TotalTokens": 703805,
+    "ReasoningTokens": 4542,
+    "CacheReadTokens": 594873,
+    "CacheWriteTokens": 99222,
+    "APIDurationMilliseconds": 177766,
+    "ToolCalls": 63,
+    "NanoAIUnits": 92773120000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 594873,
+      "cache_write": 99222,
+      "input": 33,
+      "output": 9677
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

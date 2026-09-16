@@ -1,0 +1,188 @@
+{
+  "PullRequest": {
+    "Number": 310801,
+    "Title": "Add incremental chat rendering experiment",
+    "Body": "## Add incremental rendering experiment\r\n\r\nAdds an experimental incremental rendering mode for chat responses that uses event-driven, rAF-batched DOM updates instead of the default 50ms timer-based word-counting progressive render. Optionally animates new block-level elements as they appear.\r\n\r\n### How it works\r\n\r\n- A new `IncrementalDOMMorpher` orchestrates two independent concerns: **buffering** (when to render) and **animation** (how rendered content appears). It schedules rAF-batched re-renders through the **standard markdown pipeline** — so code blocks, tables, KaTeX, and all markdown features render correctly.\r\n- **Buffering strategies**: `off` (render immediately as tokens arrive), `word` (drip-feed words at the model's token production speed), or `paragraph` (buffer at `\\n\\n` block boundaries outside code fences).\r\n- **Animation strategies**: Newly inserted top-level DOM children can receive a staggered CSS entrance animation as a post-processing decoration. Animations are re-applied with negative `animation-delay` across re-renders to avoid snap-back. Supports `prefers-reduced-motion`.\r\n- If the model rewrites earlier content (non-append), the morpher bails and falls back to a full re-render.\r\n- On response completion, the morpher's rate is switched to a fast drain so any buffered content flushes immediately.\r\n\r\n### Settings\r\n\r\n| Setting | Type | Default | Description |\r\n|---|---|---|---|\r\n| `chat.experimental.incrementalRendering.enabled` | `boolean` | `false` | Enable incremental rendering (rAF-driven, no 50ms timer) |\r\n| `chat.experimental.incrementalRendering.animationStyle` | `enum` | `fade` | Animation style: `none`, `fade`, `rise`, `blur`, `scale`, `slide`, `reveal` |\r\n| `chat.experimental.incrementalRendering.buffering` | `enum` | `word` | Buffering mode: `off`, `word`, `paragraph` |\r\n\r\n### Files changed\r\n\r\n- **`chatIncrementalRendering/chatIncrementalRendering.ts`** — `IncrementalDOMMorpher` class: orchestrates buffering + animation, rAF-batched rendering, append-only detection, configuration reactivity\r\n- **`chatIncrementalRendering/animations/`** — `IIncrementalRenderingAnimation` interface, `BlockAnimation` class, animation registry\r\n- **`chatIncrementalRendering/buffers/`** — `IIncrementalRenderingBuffer` interface, `OffBuffer`, `WordBuffer` (rate-matched drip-feed), `ParagraphBuffer` (with `lastBlockBoundary()` helper supporting both backtick and tilde fences)\r\n- **`chatIncrementalRendering/media/chatIncrementalRendering.css`** — keyframe animations for all 7 styles + `prefers-reduced-motion` support\r\n- **chatMarkdownContentPart.ts** — integrates morpher; adds `tryIncrementalUpdate()` for in-place DOM morphing, `updateStreamRate()` for word-rate forwarding\r\n- **chatListRenderer.ts** — new `doIncrementalRender()` path; bypasses word-counting when enabled; propagates completion signal to morpher\r\n- **constants.ts** / **chat.contribution.ts** — config registration for 3 settings\r\n- **chatIncrementalRendering.test.ts** — 46 unit tests covering `lastBlockBoundary` (including tilde fences), `IncrementalDOMMorpher` (tryMorph, seed, animation styles, disposal), `BlockAnimation`, and `WordBuffer`",
+    "URL": "https://github.com/microsoft/vscode/pull/310801",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "pwang347",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "5027dde8582d533d91b03f1a44b7eea7676e6aa7",
+    "HeadRef": "pawang/incrementalRender",
+    "HeadSHA": "7c5eecf5dd9dfbc4978b23ca50537b640c951f45",
+    "CreatedAt": "2026-04-16T17:17:02Z",
+    "UpdatedAt": "2026-06-01T23:48:41Z",
+    "MergedAt": "2026-04-17T19:25:10Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-74973BA9A402",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/widget/chatContentParts/chatIncrementalRendering/chatIncrementalRendering.ts",
+      "Side": "RIGHT",
+      "Line": 259,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The scheduler, default word-buffer rates, full-string getNWords implementation, callback wiring, and destructive doRenderMarkdown path are all directly traced. Exact milliseconds depend on response complexity and hardware, which limits severity because the feature is experimental and disabled by default, but the 20 Hz to near-60 Hz multiplicity is deterministic when enabled.",
+      "PerformanceCategory": "rendering",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "CPU work, DOM nodes, code-block/editor objects, and temporary regex/markdown-render allocations",
+      "PerformanceScaling": "While the default word buffer has a backlog, cost repeats on animation frames and each pass processes the entire growing rendered prefix; total work therefore grows with both response length and the number of reveal frames, and code blocks/tables multiply reconstruction work.",
+      "PerformanceOutcome": "Sustained main-thread CPU/GC pressure and dropped frames while long or code-rich chat responses stream or drain after completion.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Progressive rendering was driven by a 50 ms interval, bounding full markdown-part replacement to at most 20 passes per second and revealing multiple words per pass at higher stream rates.",
+      "ChangedBehavior": "The added needsNextFrame branch continuously schedules requestAnimationFrame; WordBuffer scans the complete accumulated string on every frame and, whenever at least one word becomes due, the callback runs doRenderMarkdown, which clears the node, disposes all prior render refs, reparses/sanitizes the full prefix, walks decorations, wraps tables/KaTeX, and recreates code blocks.",
+      "CausalDiffEvidence": "Added line 259 turns buffered content into a continuous rAF loop; together with the newly added callback at line 253, this newly permits whole-prefix markdown/DOM reconstruction once per display frame rather than the prior 50 ms cadence.",
+      "Title": "Cap full markdown reconstruction below the display frame rate",
+      "Impact": "With the experiment enabled (default buffering is word), a model rate at or above roughly one word per frame drives the full markdown pipeline near 60 Hz instead of 20 Hz; even the 40 words/s floor commits roughly every other frame. Long responses and fenced code blocks can visibly jank during streaming, and completion forces at least an 80 words/s drain that keeps the loop at frame rate while backlog remains.",
+      "Evidence": "The changed rAF loop reschedules itself at line 259 whenever WordBuffer reports backlog. WordBuffer.filterFlush calls getNWords(fullMarkdown, revealedWordCount), whose implementation materializes all regex matches for the full string, and successful frames invoke the callback at line 253. ChatMarkdownContentPart wires that callback to doRenderMarkdown; that function clears the DOM, disposes all refs, calls renderer.render over the full prefix, recreates code/diff blocks, walks the DOM for references and KaTeX, and wraps tables. The deleted/default path uses WindowIntervalTimer at 50 ms.",
+      "Recommendation": "Keep rAF for visual coalescing, but bound expensive markdown commits to a cadence no faster than the prior 50 ms path (or batch enough newly due words per commit), and schedule the next due commit rather than scanning and rerendering on every frame. Preserve the final flush by draining multiple words per bounded pass."
+    },
+    {
+      "ID": "PERF-C9D649B01F87",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/widget/chatContentParts/chatMarkdownContentPart.ts",
+      "Side": "RIGHT",
+      "Line": 176,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The DOM-write → event → getBoundingClientRect call path is explicit, synchronous, and newly added. Browser layout may occasionally already be valid, but after clearNode plus full DOM recreation a geometry read generally requires style/layout; exact duration varies with content and hardware.",
+      "PerformanceCategory": "layout",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceResource": "Synchronous browser style/layout computation for the chat row and list height update",
+      "PerformanceScaling": "The geometry read occurs after every successful buffered-word commit, up to the display refresh rate, and its cost grows with the rendered response DOM, code blocks, tables, math, and surrounding chat-list layout.",
+      "PerformanceOutcome": "Blocked animation frames and dropped frames during streaming as DOM reconstruction is immediately followed by forced synchronous layout.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The 50 ms progressive path replaced markdown parts without an onDidChangeHeight emission from the synchronous constructor render; the row's existing ResizeObserver could report size changes asynchronously.",
+      "ChangedBehavior": "Every morpher callback now calls doRenderMarkdown to clear and rebuild the DOM and then immediately fires onDidChangeHeight. The registered listener calls fireItemHeightChange, whose fallback executes rowContainer.getBoundingClientRect().height before returning to the rAF callback.",
+      "CausalDiffEvidence": "Added line 176 introduces a synchronous height notification after each rAF-driven DOM rebuild; its unchanged listener immediately performs the geometry read, placing forced layout directly on the new per-frame render path.",
+      "Title": "Avoid forcing layout after every incremental markdown flush",
+      "Impact": "For the default word mode, long streaming responses can perform a forced row/list layout roughly 30–60 times per second immediately after large DOM writes, consuming the same frame budget intended for smooth animation and causing visible chat scrolling/render jank.",
+      "Evidence": "Added line 176 fires synchronously after doRenderMarkdown. ChatListRenderer.renderMarkdown registers this event to fireItemHeightChange, and fireItemHeightChange computes template.rowContainer.getBoundingClientRect().height when no measured height is supplied. The callback is reached from IncrementalDOMMorpher's rAF flush for each committed word batch; the same row already has ResizeObserver-based height handling.",
+      "Recommendation": "Do not synchronously emit this unmeasured height notification after each flush. Rely on the row ResizeObserver's measured block size, or coalesce a measured height update after browser layout and only propagate it when the size actually changed."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "synchronous-ui-work",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Stream an active chat response with the experiment enabled using the default word buffer (also representative of high-frequency `off` buffering).",
+        "CriticalPath": "A model update reaches renderElement/doIncrementalRender, append changes are accepted by the morpher, and while buffered words remain its requestAnimationFrame callback runs WordBuffer.filterFlush, full markdown rendering/DOM replacement, animation decoration, and the synchronous height notification before the frame can present.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatContentParts/chatIncrementalRendering/chatIncrementalRendering.ts:_flushRender and chatMarkdownContentPart.ts:doRenderMarkdown",
+            "Operation": "Run the complete markdown parse/sanitize/render pipeline, clear and recreate response DOM, dispose/recreate code-block render refs, walk reference links, and wrap KaTeX/tables.",
+            "Cardinality": "One attempt per animation frame while backlog exists; a successful commit is roughly every other frame at the 40 words/s floor and every frame at rates around 60 words/s or higher. Each commit processes the full growing prefix and recreates each visible code block.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same broad markdown-part reconstruction existed but was bounded by a 50 ms interval, at most 20 times per second, with multiple words revealed per pass at high rates.",
+            "CriticalPathEffect": "Synchronous on the rAF presentation path; all work must finish before the incremental content and animation can be painted."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatContentParts/chatMarkdownContentPart.ts:176 -\u003e chatListRenderer.ts:fireItemHeightChange",
+            "Operation": "Synchronously read rowContainer.getBoundingClientRect().height immediately after rebuilding the markdown DOM, then potentially update the virtualized list item height.",
+            "Cardinality": "Once per successful incremental markdown commit, roughly 30–60 times per second under a sustained default-buffer backlog.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The synchronous ChatMarkdownContentPart constructor render did not emit this event after each progressive replacement; the row ResizeObserver handled changed dimensions asynchronously.",
+            "CriticalPathEffect": "The geometry read is synchronous in the rAF callback after DOM writes and can force style/layout before paint."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatListRenderer.ts:logIncrementalRenderingTelemetry",
+            "Operation": "Enqueue the selected animation and buffering settings through publicLog2.",
+            "Cardinality": "At most once per ChatListItemRenderer instance because _incrementalRenderingTelemetryLogged coalesces subsequent render updates.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No incremental-rendering settings telemetry event was emitted.",
+            "CriticalPathEffect": "Called during the first incremental render but is fire-and-forget and does not gate response rendering; no reportable fan-out was found."
+          }
+        ],
+        "ScalingInput": "The effective cardinality is one active markdown morpher in the common latest-response case, with work controlled by accumulated markdown characters, revealed words, number/complexity of code blocks/tables/math nodes, and backlog frames. Token updates coalesce to one pending rAF, but the default 40–2000 words/s rate yields roughly 30–60 successful whole-prefix commits per second while backlogged.",
+        "EffectiveConcurrency": "Each morpher permits only one pending rAF, so incoming token events coalesce per markdown part. There is no cross-morpher limiter; separate active widgets/parts can run independent frame loops, although the normal scenario has one currently growing markdown part.",
+        "CacheBehavior": "There is no cache for parsed/sanitized markdown or rendered DOM across flushes: doRenderMarkdown clears the node and render store every time. The editor pool may reuse editor instances and KaTeX may be warm after first load, but code-block refs, renderer output, decoration walks, and DOM wrappers are rebuilt. Telemetry is coalesced by one renderer-instance boolean.",
+        "MechanismConfidence": "High: the continuous rAF scheduling, full-string regex scan, destructive full-prefix render callback, synchronous height event, and getBoundingClientRect listener are all directly traced.",
+        "MagnitudeUncertainty": "Exact parse, editor-pool, DOM, and layout duration depends on response complexity, hardware, refresh rate, and whether multiple chat widgets stream concurrently. The experimental feature is disabled by default, reducing prevalence.",
+        "Verdict": "Two reportable regressions: whole-prefix markdown/DOM work is permitted near display refresh rate instead of the previous 20 Hz cap, and every successful pass adds a synchronous post-write geometry read."
+      },
+      {
+        "Scenario": "Complete or cancel a response while the word buffer still has unrevealed content.",
+        "CriticalPath": "The renderer marks the active morpher complete, raises its reveal floor to 80 words/s, and the morpher continues its rAF loop until the backlog drains. Each successful drain pass still runs the full markdown pipeline and forced height measurement before the remaining text appears.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatContentParts/chatIncrementalRendering/chatIncrementalRendering.ts:_flushRender",
+            "Operation": "Repeated full-prefix markdown/DOM/code-block reconstruction while draining buffered words.",
+            "Cardinality": "Up to one per display frame for backlogWords divided by words revealed per frame; at 80 words/s and 60 Hz this is commonly one or more words per frame, hence near-60 rebuilds/s.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Completion still accelerated progressive rendering, but the WindowIntervalTimer limited reconstruction to one pass every 50 ms and could reveal several words in that pass.",
+            "CriticalPathEffect": "On the critical path to showing the completed response's buffered tail; CPU and layout can delay visual completion and drop frames."
+          }
+        ],
+        "ScalingInput": "Unrevealed word backlog at completion and complexity of the full accumulated response. At the 80 words/s completion floor, at least one new word becomes due each 16 ms frame on a 60 Hz display, so effective commit cardinality is up to one full-prefix rebuild per frame until caught up.",
+        "EffectiveConcurrency": "One serialized rAF chain per backlogged morpher; completion does not collapse the backlog into one render. Multiple independently completing chat widgets could drain concurrently without a shared limiter.",
+        "CacheBehavior": "The final response prefix is not parsed or rendered once and reused; every drain step rebuilds a larger prefix. Warm KaTeX/editor pools reduce cold initialization but do not cache markdown parsing, DOM, decoration walks, or layout.",
+        "MechanismConfidence": "High: setRate floors completed streams at 80 words/s, needsNextFrame retains the rAF loop, and each committed prefix reaches the same full renderer and height read.",
+        "MagnitudeUncertainty": "Backlog size depends on model burstiness and whether the UI fell behind before completion; the mechanism is most visible after a large/bursty response.",
+        "Verdict": "Covered by the two submitted findings; completion amplifies their cadence rather than introducing a separate issue."
+      },
+      {
+        "Scenario": "Use paragraph buffering, switch animation/buffering configuration, or render completed responses from chat history.",
+        "CriticalPath": "Paragraph mode scans accumulated markdown on model updates and only schedules rendering when a paragraph boundary or 4000-character escape hatch advances. Configuration changes replace strategy objects through registered listeners. Completed history responses do not construct an IncrementalDOMMorpher because creation is gated to actively streaming incomplete responses.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Paragraph scanning scales with full markdown length and model update count; configuration listener count scales with currently retained streaming-created markdown parts; animation decoration scales with newly rendered top-level children.",
+        "EffectiveConcurrency": "Paragraph updates are event-driven and rAF-coalesced; config callbacks run synchronously per retained morpher. No subprocess, IPC, filesystem, database, or additional network operation was found on these paths.",
+        "CacheBehavior": "lastBlockBoundary does not cache scan state, but the prior progressive implementation also rescanned full markdown for word counting on its timer, and repository evidence does not establish a sufficiently higher realistic model-event cardinality for a separate high-confidence regression. Morpher listeners and pending rAF handles are disposed with the content part.",
+        "MechanismConfidence": "High for the traced gating, disposal, and scan behavior; insufficient evidence that paragraph scanning or listener fanout materially exceeds prior cost in a realistic scenario.",
+        "MagnitudeUncertainty": "Model update frequency relative to the prior 50 ms timer and the number of retained rendered markdown parts are not established strongly enough to claim a separate paragraph-scan or configuration-fanout regression. CSS filter/mask animation cost depends heavily on compositor behavior and chosen opt-in style.",
+        "Verdict": "No additional finding: paragraph rendering is boundary-coalesced, completed history bypasses the morpher, cleanup cancels pending rAF work, and animation costs are bounded/intentional."
+      }
+    ],
+    "Summary": "Reviewed all 16 changed files and the complete diff under the performance focus. Submitted two medium-severity findings for repeated full-document reconstruction at rAF cadence and the newly forced synchronous layout after each reconstruction. Checked buffering/animation configuration, completion drain, disposal, telemetry, completed-history gating, caches, concurrency, and transitive expensive boundaries; no regression-fix learning record applies."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T00:54:41.358415563Z",
+    "CompletedAt": "2026-09-16T00:57:28.297790821Z",
+    "WallClockMilliseconds": 166939,
+    "ModelCalls": 7,
+    "InputTokens": 272081,
+    "OutputTokens": 9899,
+    "TotalTokens": 281980,
+    "ReasoningTokens": 4939,
+    "CacheReadTokens": 210673,
+    "CacheWriteTokens": 61387,
+    "APIDurationMilliseconds": 157780,
+    "ToolCalls": 39,
+    "NanoAIUnits": 58926820000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 210673,
+      "cache_write": 61387,
+      "input": 21,
+      "output": 9899
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
