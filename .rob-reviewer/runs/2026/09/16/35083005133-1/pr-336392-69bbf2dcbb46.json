@@ -1,0 +1,244 @@
+{
+  "PullRequest": {
+    "Number": 336392,
+    "Title": "build: separate artifact processing from producer validation",
+    "Body": "## Summary\n\nSeparate retryable artifact processing from the final producer-stage result check.\n\n- `Process artifacts` uses `publish.ts --process-artifacts` and retains its existing task/per-operation retries.\n- Processing still waits for every enabled producer to finish, discovers later artifacts, and drains publication workers. Downloads/extraction stay serial; publication remains concurrent; successful outputs retain the existing checkpoint behavior.\n- A following `Validate producer stages` task re-reads the timeline and fails once for missing, incomplete, or unsuccessful producers. It has no task-level retry or continue-on-error bypass. Scheduled release remains gated on the whole job succeeding.\n- Running `publish.ts` without arguments still performs both operations. A drained coordinator exits naturally to avoid the Windows Node async-handle assertion exposed by the new CLI tests; publishing workers and interrupted processing retain forced shutdown.\n\nThe regression covered explicitly is: **Windows fails -\u003e Mac artifacts arrive later -\u003e Mac artifacts finish publishing -\u003e producer validation fails -\u003e no final build release.**\n\nRefs microsoft/vscode-engineering#3710. This removes useless terminal-stage retries; it does not implement artifact reuse or change signing, SBOM, canonical artifact identity, or security gates. Independent of #336389; the two branches merge cleanly.\n\n## Validation\n\n- `node --test build/lib/test/artifactProcessing.test.ts` — 17 passed, covering late-Mac publication, draining, serial preparation/concurrent publication, checkpoint reuse, failed publication, and actual CLI exit behavior for all three modes.\n- Targeted TypeScript check using `build/tsconfig.json` for changed build entry points and imports — passed.\n- Existing hygiene checks on all five changed paths — passed.\n- Azure DevOps definition 111 **preview-only** expansion — passed. Verified retryable processing followed by non-retrying validation. A scheduled-path preview (in-memory scheduled-flag override only) also verified release remains behind `succeeded()` and the processed-artifact checkpoint retains `always()`.\n- Three-way merge check with #336389 — clean.\n\nNo build was queued, no production artifacts were published, and no infrastructure/storage changes were made during validation.\n## Combined verification\n\nValidated together with #336389 in a temporary local merge: all **37 focused tests**, targeted build type checking, standalone ESLint (including both new test files), and eligible hygiene checks passed. The temporary merge was discarded without changing either independent PR branch tip. The late-Mac regression passes with both improvements applied.",
+    "URL": "https://github.com/microsoft/vscode/pull/336392",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ed9aec4e5647e3a76b83a417fba52e9e16d76494",
+    "HeadRef": "agents/separate-publish-stage-validation",
+    "HeadSHA": "69bbf2dcbb468a1961763f6fafeb8f68ab8f77f5",
+    "CreatedAt": "2026-09-16T10:04:10Z",
+    "UpdatedAt": "2026-09-16T10:09:32Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "build/azure-pipelines/product-publish.yml",
+      "FixedSide": "RIGHT",
+      "FixedLine": 123,
+      "BasePath": "build/azure-pipelines/product-publish.yml",
+      "BaseLine": 132,
+      "IntroducingPath": "build/azure-pipelines/product-publish.yml",
+      "IntroducingCommit": "4b8bd3cb6fb916c3abd4801003599ea653a6fe80",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "network",
+      "Mechanism": "Terminal producer failures were checked inside a task configured for three retries, causing repeated process startup, checkpoint scanning, and timeline/artifact API reads that could not repair the terminal failure.",
+      "Symptom": "Failed producer builds spend additional CI time and AZDO requests rerunning the publication task after all recoverable artifact work has already drained.",
+      "FixedBehavior": "The retryable task now exits after artifact processing, while producer-stage validation runs in a separate task without `retryCountOnTaskFailure`; terminal producer failures therefore no longer trigger three redundant task reruns and repeated AZDO reads.",
+      "Evidence": "Before this PR, the retryable `Process artifacts` task ran `publish.ts` in combined mode. After artifact draining, the unchanged old main validated producer results and threw on a terminal failed/canceled/skipped producer, so Azure Pipelines' `retryCountOnTaskFailure: 3` reran the task even though that terminal stage result could not change. Each retry created a Node process and re-read the timeline and artifact list through AZDO network APIs (checkpoint state avoided republishing completed artifacts). The changed command at line 123 selects processing-only mode, and the following non-retryable task performs terminal validation once.",
+      "Confidence": 0.96
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Successful Publish job with all enabled producer stages and product artifacts",
+        "CriticalPath": "The Process artifacts task polls until every enabled producer stage is complete, serially downloads/extracts each newly discovered artifact, and drains all publication workers. The new Validate producer stages task then starts Node and completes a fresh timeline read before scheduled release or dependent sanity stages can proceed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/publish.ts:getState / getPipelineTimeline / getPipelineArtifacts",
+            "Operation": "Read the build timeline and complete artifact list from Azure DevOps",
+            "Cardinality": "Two grouped GETs per 10-second processing poll, independent of artifact count",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The combined publish command made the same paired reads at the same polling frequency.",
+            "CriticalPathEffect": "Each poll must complete before discovery or completion checks advance"
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/publish.ts:prepareArtifact",
+            "Operation": "Download an artifact archive",
+            "Cardinality": "One download per newly discovered artifact not present in the checkpoint",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same serial download loop ran inline in `publish.ts`.",
+            "CriticalPathEffect": "Downloads/extraction are serial and all must be started before processing can drain"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/azure-pipelines/common/publish.ts:prepareArtifact, processArtifact, State.add",
+            "Operation": "Write archive, extract entries, hash the product file, and append checkpoint state",
+            "Cardinality": "Archive/extraction/hashing work once per cold artifact; checkpoint append once per successful artifact",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "These operations and their placement are preserved by the extraction into `processArtifacts`.",
+            "CriticalPathEffect": "Preparation is serial; hashing occurs inside concurrent publication workers"
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "build/azure-pipelines/common/publish.ts:publishArtifact / processArtifact",
+            "Operation": "Start a worker thread for Blob lease/CDN/ESRP publication and Cosmos asset creation",
+            "Cardinality": "One worker and publication sequence per cold artifact",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old loop started the same worker per prepared artifact with the same aggregate concurrency.",
+            "CriticalPathEffect": "Workers overlap, but processing waits for all of them to settle"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/product-publish.yml:Validate producer stages",
+            "Operation": "Start the standalone producer-validation Node command",
+            "Cardinality": "Exactly one process after a successful processing task",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Producer validation ran at the end of the existing processing process.",
+            "CriticalPathEffect": "Must exit successfully before release/dependent work"
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/publish.ts:--validate-producer-stages",
+            "Operation": "Fetch a fresh Azure DevOps timeline for standalone producer validation",
+            "Cardinality": "One successful GET, with existing transient retry semantics",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Combined mode validated the final timeline already obtained by the processing loop, without this extra GET.",
+            "CriticalPathEffect": "Adds one request to the successful-job critical path before release"
+          }
+        ],
+        "ScalingInput": "Up to the configured Quality plus Windows/Linux/Alpine/macOS/Web stages; polling performs one grouped timeline read and one grouped artifact-list read every 10 seconds, while preparation and publication scale with distinct `vscode_*` artifacts remaining after checkpoint deduplication.",
+        "EffectiveConcurrency": "Timeline and artifact-list reads are paired with Promise.all each poll. Downloads and extraction remain globally serial. One worker is started per prepared artifact and all publication workers may overlap without a new shared limiter; this is unchanged from the base implementation. Validation is serialized after processing.",
+        "CacheBehavior": "`State` loads prior `artifacts_processed_*` checkpoints and skips download/publication for warm artifacts; successful publications append immediately. Timeline and artifact-list reads are uncached. The new validation intentionally makes one fresh timeline read.",
+        "MechanismConfidence": "High: the diff and call path directly establish both the unchanged per-artifact boundaries and the one newly added validation process/timeline request.",
+        "MagnitudeUncertainty": "Exact artifact count, publication duration, and timeline API latency vary by build configuration. The introduced successful-path overhead is bounded to one Node invocation and one grouped timeline read, so it does not establish a meaningful regression against the long-running artifact path.",
+        "Verdict": "No reportable performance regression. The only added successful-path work is a bounded one-process/one-request validation step; expensive artifact-scaled work, checkpointing, and concurrency are unchanged."
+      },
+      {
+        "Scenario": "A producer reaches a terminal failure while another producer later emits artifacts",
+        "CriticalPath": "Processing continues polling and publishing late artifacts until all enabled stages complete and all discovered publications drain. The following standalone validation reads the final timeline once and fails the job, preventing release.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/publish.ts:processArtifacts integration",
+            "Operation": "Poll timeline/artifact list and process any late artifact through download, Blob/CDN/ESRP, and Cosmos calls",
+            "Cardinality": "Two grouped reads per poll plus one existing publication sequence per late uncheckpointed artifact",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The base loop used the same completion predicate and artifact processing boundaries.",
+            "CriticalPathEffect": "Processing waits for remaining producers and publications before surfacing terminal producer failure"
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/product-publish.yml:Validate producer stages",
+            "Operation": "Read the final producer timeline in the non-retryable validation task",
+            "Cardinality": "One successful GET before the task reports the terminal failure",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Validation occurred inside the task configured with three retries, so a terminal producer failure reran Node and AZDO state reads despite being irreparable.",
+            "CriticalPathEffect": "Determines job failure after useful artifact work has drained"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/product-publish.yml:Process artifacts / Validate producer stages",
+            "Operation": "Run publication processing and then standalone validation",
+            "Cardinality": "One processing process plus one validation process; terminal validation itself is not retried",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One combined command failed inside `retryCountOnTaskFailure: 3`, causing repeated process startup and state reads.",
+            "CriticalPathEffect": "Removes up to three task-level reruns after terminal failure"
+          }
+        ],
+        "ScalingInput": "The wait scales with remaining producer duration; polling remains two grouped AZDO reads every 10 seconds, and late artifact work scales with distinct uncheckpointed artifacts rather than producer jobs.",
+        "EffectiveConcurrency": "Late artifacts are prepared serially and published in overlapping workers. Terminal validation is serialized after the drain and has no task-level retry.",
+        "CacheBehavior": "Previously completed artifacts are skipped from the persisted checkpoint. Late successful outputs are checkpointed before validation fails, so a later stage/job attempt is warm. Terminal producer results are deliberately fetched fresh rather than cached.",
+        "MechanismConfidence": "High: command-mode branching, task retry placement, checkpoint behavior, and network call flow are directly visible. The performance regression fix was recorded against the blamed base line.",
+        "MagnitudeUncertainty": "Azure Pipelines retry delay and exact API latency are environment-dependent, but the removed repeated execution is explicit and bounded by the configured three retries.",
+        "Verdict": "Performance improves on terminal producer failures by moving irreparable validation outside the retryable processing task; no new regression is introduced."
+      },
+      {
+        "Scenario": "Transient artifact download or publication failure followed by a Process artifacts task retry",
+        "CriticalPath": "An internal retry first handles recognized transient boundary failures. If processing still fails, Azure Pipelines may rerun the processing task up to three times; standalone validation does not run until processing succeeds.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/publish.ts and build/azure-pipelines/common/retry.ts",
+            "Operation": "Retry AZDO reads/downloads and artifact publication service calls",
+            "Cardinality": "Up to ten internal attempts for recognized transient failures and up to three serial task retries; only uncheckpointed artifact work repeats",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same internal retries, task-level retry setting, and successful-artifact checkpoint reuse applied to the combined command.",
+            "CriticalPathEffect": "Failures block completion and validation, as before"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/azure-pipelines/common/publish.ts:State",
+            "Operation": "Load the latest checkpoint and recreate the current attempt's checkpoint file",
+            "Cardinality": "Once per processing task attempt, plus one append per successful artifact",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical `State` construction and append behavior existed before extraction.",
+            "CriticalPathEffect": "Avoids repeating expensive publication work on warm retries"
+          }
+        ],
+        "ScalingInput": "Retry work scales with failed boundary attempts and uncheckpointed artifacts. Successfully checkpointed artifacts are excluded on subsequent task attempts; the failed artifact remains eligible for retry.",
+        "EffectiveConcurrency": "Downloads stay serial. Publication workers overlap and are all drained before an aggregate publication error is thrown. A task-level retry starts only after the failed attempt exits, so task attempts do not overlap.",
+        "CacheBehavior": "The persisted checkpoint is the warm cache across task/stage attempts. Successes are retained; failed artifacts are not added and are intentionally redownloaded/republished. No negative cache is used.",
+        "MechanismConfidence": "High: retry nesting, checkpoint lifecycle, and task sequencing are explicit in the changed and surrounding code.",
+        "MagnitudeUncertainty": "Failure frequency and whether retries reach their maximum depend on external services, but diff causality is clear: recoverable processing retries are retained rather than increased.",
+        "Verdict": "No regression. The split preserves retry behavior for recoverable processing failures and does not amplify artifact cardinality or concurrency."
+      },
+      {
+        "Scenario": "Direct CLI use without a mode argument",
+        "CriticalPath": "The command performs processing and drains publications, then validates the last timeline returned by processing in the same Node process.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/publish.ts:main default mode",
+            "Operation": "Poll AZDO, download artifacts, publish through remote services, and update Cosmos",
+            "Cardinality": "Two grouped reads per poll and one publication sequence per cold artifact",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This is the compatibility path and preserves the old combined behavior.",
+            "CriticalPathEffect": "All processing drains before in-process validation"
+          }
+        ],
+        "ScalingInput": "The same producer count, polling duration, and distinct cold artifact count as the pre-diff combined command.",
+        "EffectiveConcurrency": "Paired polling reads, serial preparation, and concurrent publication workers match pipeline processing mode; validation is synchronous after drain.",
+        "CacheBehavior": "Uses the same `State` checkpoint and does not issue the standalone mode's extra timeline read.",
+        "MechanismConfidence": "High: the mode branch calls the extracted coordinator and then validates its returned timeline without another fetch.",
+        "MagnitudeUncertainty": "No material uncertainty: default-mode boundary count and scheduling are structurally preserved.",
+        "Verdict": "No reportable performance change; the refactor preserves default CLI boundary cardinality and scheduling."
+      }
+    ],
+    "Summary": "Completed the performance pass over all five changed files and all diff pages. Traced successful publication, terminal producer failure, transient retry, and default CLI scenarios through AZDO, filesystem, worker, Blob/CDN/ESRP, and Cosmos boundaries. No actionable diff-introduced performance regression was found. Recorded the concrete removal of redundant task retries on terminal producer failure as an internal regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T10:13:16.38494497Z",
+    "CompletedAt": "2026-09-16T10:15:26.183640198Z",
+    "WallClockMilliseconds": 129798,
+    "ModelCalls": 8,
+    "InputTokens": 227489,
+    "OutputTokens": 7530,
+    "TotalTokens": 235019,
+    "ReasoningTokens": 3553,
+    "CacheReadTokens": 157696,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 114980,
+    "ToolCalls": 30,
+    "NanoAIUnits": 49285040000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 157696,
+      "cache_write": 0,
+      "input": 69793,
+      "output": 7530
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

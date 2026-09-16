@@ -1,0 +1,198 @@
+{
+  "PullRequest": {
+    "Number": 336352,
+    "Title": "Remove external DNS dependency from browser tools test",
+    "Body": "Fixes microsoft/vscode-engineering#3817\r\n\r\n## Summary\r\n\r\n- Replace the live Google URL in `chat - browser tools \u003e Open a page from the web` with an ephemeral loopback HTTP fixture.\r\n- Exercise the real `open_browser_page` tool and assert both its Page ID and the rendered fixture heading, rather than only tab creation.\r\n- Register an owned tunnel in remote workspaces so existing remote proxying or forwarded-localhost rewriting can reach the fixture.\r\n- Close browser tabs, dispose the tunnel, and close the HTTP server and lingering connections, including on failure.\r\n\r\nNo test skips, mocks, file/data navigation, or additional permission/network-policy overrides.\r\n\r\n## Evidence\r\n\r\nThe original [472458 Electron log](https://dev.azure.com/monacotools/a6d41577-0fa3-498e-af22-257312ff0545/_apis/build/builds/472458/logs/1585?api-version=7.1) and [470936 log](https://dev.azure.com/monacotools/a6d41577-0fa3-498e-af22-257312ff0545/_apis/build/builds/470936/logs/1584?api-version=7.1) show navigation to Google rejecting with `ERR_NAME_NOT_RESOLVED (-105)`. This test does not need external DNS or internet access to cover HTTP navigation.\r\n\r\nAlthough ADO reports zero changes between green 472452 and failing 472458, their source commits differ by unrelated #335290; the browser-test contents are identical. This fixes the latent test dependency, not an established product DNS defect. #335368 addressed a separate storage-test cleanup timeout.\r\n\r\n## Validation\r\n\r\n- API-test extension compilation and scoped single-file hygiene passed.\r\n- `git diff --check` passed.\r\n- Ran the exact test on Windows using an existing older Code OSS runtime with external DNS deliberately failing (`--host-resolver-rules=\"MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost\"`): the original test reproduced `ERR_NAME_NOT_RESOLVED (-105)`; the fixed test passed, including the rendered-content assertion.\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336352",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d598ad9cac92e08dc13524f4aad4aad7566035cf",
+    "HeadRef": "agents/fix-browser-tools-dns-issue-3817",
+    "HeadSHA": "d0d159fe765e8e545577f1f4a9f7ef7b7cb3035b",
+    "CreatedAt": "2026-09-16T00:35:48Z",
+    "UpdatedAt": "2026-09-16T04:43:54Z",
+    "MergedAt": "2026-09-16T04:43:52Z",
+    "Labels": [
+      "vscode-build",
+      "engineering"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Desktop API test opens the HTTP fixture through open_browser_page",
+        "CriticalPath": "The test awaits one ephemeral loopback server bind, then one language-model tool invocation; browser page creation, one loopback HTTP response, and the Playwright accessibility summary must complete before assertions. Cleanup runs afterward and is not on product startup or interactive UI paths.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/vscode-api-tests/src/singlefolder-tests/browser.tools.test.ts:265-276",
+            "Operation": "Bind an ephemeral 127.0.0.1 HTTP listener and serve the fixture document.",
+            "Cardinality": "One listener and normally one document request for this single test invocation; the response has no subresources.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No local listener; the test navigated once to an external HTTPS URL.",
+            "CriticalPathEffect": "Listener readiness precedes navigation; the loopback response is required for the tool summary."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/vscode-api-tests/src/singlefolder-tests/browser.tools.test.ts:288; src/vs/workbench/contrib/browserView/electron-browser/tools/openBrowserTool.ts:_openNewPage",
+            "Operation": "Invoke open_browser_page across the extension API, create one browser view, and obtain one Playwright page summary.",
+            "Cardinality": "One tool invocation, one forced-new page, and one summary read.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same tool path was invoked once; absent a pre-existing Google-host page it also created one page and summary, but used external DNS/HTTPS.",
+            "CriticalPathEffect": "All are awaited before assertions."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/vscode-api-tests/src/singlefolder-tests/browser.tools.test.ts:294",
+            "Operation": "Close browser tabs through BrowserTab.close calls.",
+            "Cardinality": "One call per currently tracked browser tab, executed concurrently; suite teardown already closes editors between tests, so the realistic effective cardinality here is the single page created by this test.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No per-tab close in this test body; suite teardown subsequently issued one close-all-editors command.",
+            "CriticalPathEffect": "Cleanup delays completion of this test but occurs after assertions."
+          }
+        ],
+        "ScalingInput": "A single test case and single fixture page; no changed loop over user data. Cleanup technically scales with tracked tabs, but suite isolation keeps the effective count near one.",
+        "EffectiveConcurrency": "Startup and navigation are serialized. Tab cleanup uses Promise.all, realistically over one tab; there is no aggregate unbounded concurrency.",
+        "CacheBehavior": "The fixture explicitly disables HTTP caching and is requested once. forceNew prevents page reuse, but clean per-test editor teardown means the old Google navigation was also normally cold; no repeated miss path is introduced.",
+        "MechanismConfidence": "High confidence from the changed test and traced open_browser_page implementation.",
+        "MagnitudeUncertainty": "Exact browser startup and summary latency varies by test host, but the changed network path removes external DNS/TLS and has fixed cardinality.",
+        "Verdict": "No reportable regression: fixed-size local fixture work replaces a slower and less reliable external network dependency, with bounded cleanup."
+      },
+      {
+        "Scenario": "Remote-workspace API test forwards the fixture port and opens it through the integrated browser",
+        "CriticalPath": "After the remote loopback listener starts, one workspace.openTunnel call is awaited. The browser tool then either uses remote proxying directly or rewrites localhost to the registered local tunnel, followed by one page summary. Tunnel and server disposal are awaited only during cleanup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/vscode-api-tests/src/singlefolder-tests/browser.tools.test.ts:284; src/vs/workbench/api/common/extHostTunnelService.ts:openTunnel",
+            "Operation": "Request one port forward from the extension host through MainThreadTunnelService.",
+            "Cardinality": "Exactly one open request for the ephemeral port and one close request in finally.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No tunnel was opened; the browser navigated once to external Google.",
+            "CriticalPathEffect": "Tunnel establishment is awaited before page navigation; disposal is post-assertion cleanup."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/remote/common/tunnelModel.ts:forward; src/vs/workbench/contrib/browserView/electron-browser/tools/browserToolHelpers.ts:rewriteRemoteLocalhostUrl",
+            "Operation": "Establish the remote-to-local tunnel and carry the fixture HTTP request when localhost rewriting is required.",
+            "Cardinality": "One ref-counted tunnel for one unique ephemeral port and one fixture document request.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One external DNS/HTTPS navigation instead of a loopback request and tunnel.",
+            "CriticalPathEffect": "Required on remote configurations without browser remote proxying; with proxying enabled the registered tunnel is not used by navigation but remains a single bounded test-only setup."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/remote/common/tunnelModel.ts:doForward",
+            "Operation": "Persist the forwarded-port model after tunnel creation.",
+            "Cardinality": "One storeForwarded operation for the one newly forwarded port; no per-resource fan-out.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This test did not mutate forwarded-port state.",
+            "CriticalPathEffect": "Awaited as part of tunnel establishment before navigation."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/vscode-api-tests/src/singlefolder-tests/browser.tools.test.ts:288; src/vs/workbench/contrib/browserView/electron-browser/tools/openBrowserTool.ts:_openNewPage",
+            "Operation": "Create the browser page and retrieve its Playwright accessibility summary.",
+            "Cardinality": "One page and one summary.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same browser-tool boundary occurred once for the external URL.",
+            "CriticalPathEffect": "Awaited before content assertions."
+          }
+        ],
+        "ScalingInput": "One remote test execution, one ephemeral port, one page, and one document request; no collection-dependent fan-out.",
+        "EffectiveConcurrency": "Listener startup, tunnel opening, and navigation are sequential. The tunnel service coalesces same-address creation; cleanup disposes one tunnel and one page without a burst.",
+        "CacheBehavior": "Tunnel lookup is cold because the port is ephemeral; tunnel service coalescing/ref-counting applies by host and port. HTTP caching is disabled but only one navigation occurs. There is no negative-cache retry loop.",
+        "MechanismConfidence": "High confidence that the boundaries and ordering are real based on the changed lines and traced tunnel/browser implementations.",
+        "MagnitudeUncertainty": "Remote tunnel setup cost depends on provider and remote authority. It is a fixed one-time test cost and replaces an external internet request, so there is no evidence of net critical-path degradation.",
+        "Verdict": "No actionable performance bug: the added remote boundary is fixed-cardinality, necessary for non-proxied remote localhost reachability, ref-counted, and deterministically disposed."
+      },
+      {
+        "Scenario": "Failure-path cleanup of fixture, tunnel, browser tabs, and active HTTP connections",
+        "CriticalPath": "Nested finally blocks close tracked browser tabs, dispose the optional tunnel, then close the server and active connections. This runs after success or failure and can delay test completion, but prevents resources from surviving into later tests.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/vscode-api-tests/src/singlefolder-tests/browser.tools.test.ts:294",
+            "Operation": "Close each tracked browser tab concurrently.",
+            "Cardinality": "Effective count is one page created by this test under suite teardown isolation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Cleanup relied on suite teardown's close-all-editors command.",
+            "CriticalPathEffect": "Awaited during test cleanup."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/vscode-api-tests/src/singlefolder-tests/browser.tools.test.ts:297; src/vs/workbench/api/common/extHostTunnelService.ts:openTunnel",
+            "Operation": "Dispose the optional extension-owned tunnel, which closes the ref-counted forwarded port.",
+            "Cardinality": "Zero locally or one remotely.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no tunnel resource to dispose.",
+            "CriticalPathEffect": "Awaited during cleanup before server shutdown."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/vscode-api-tests/src/singlefolder-tests/browser.tools.test.ts:299-302",
+            "Operation": "Stop accepting requests and force-close lingering HTTP connections.",
+            "Cardinality": "One server; active connections are bounded by the single fixture page and have no subresources.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no owned server or connection lifecycle.",
+            "CriticalPathEffect": "Awaited at the end of cleanup."
+          }
+        ],
+        "ScalingInput": "One fixture server, at most one tunnel, and realistically one current browser tab.",
+        "EffectiveConcurrency": "Tab closes are parallel, followed serially by tunnel disposal and server shutdown. Effective parallelism is one under normal suite isolation.",
+        "CacheBehavior": "No cache participates in cleanup; all handles are lexical and released in finally.",
+        "MechanismConfidence": "High confidence that all changed resources retain handles through failure and are awaited during disposal.",
+        "MagnitudeUncertainty": "A pathological pre-populated tab set could increase close IPC count, but existing per-test editor teardown prevents that from being a realistic trigger in this suite.",
+        "Verdict": "No cleanup-lifecycle regression; the diff bounds resource lifetime and avoids retained listeners, sockets, tunnels, and browser pages."
+      }
+    ],
+    "Summary": "Completed the performance pass over the sole changed test and traced local/remote navigation, tunnel setup, browser IPC, persistence, cache behavior, concurrency, and cleanup. No high-confidence actionable performance regression was introduced."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-16T10:11:37.858954653Z",
+    "CompletedAt": "2026-09-16T10:13:13.234591435Z",
+    "WallClockMilliseconds": 95375,
+    "ModelCalls": 10,
+    "InputTokens": 245635,
+    "OutputTokens": 4898,
+    "TotalTokens": 250533,
+    "ReasoningTokens": 1259,
+    "CacheReadTokens": 204482,
+    "CacheWriteTokens": 41123,
+    "APIDurationMilliseconds": 84245,
+    "ToolCalls": 41,
+    "NanoAIUnits": 38548780000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 204482,
+      "cache_write": 41123,
+      "input": 30,
+      "output": 4898
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
