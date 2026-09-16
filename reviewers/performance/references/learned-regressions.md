@@ -36,3 +36,8 @@ Check whether changed telemetry, logging, protocol, or storage paths sanitize, c
 ## Concurrency bursts revealed by shipped fixes
 
 Distinguish per-key serialization from global concurrency. When one event schedules work for many independent keys, compute the aggregate resource burst and look for a shared limiter that bounds expensive creation, disposal, or remote operations.
+
+<!-- learned-family:cache-lifecycle -->
+## Cache lifecycle revealed by shipped fixes
+
+Evaluate positive and negative cache states separately. Check whether misses, empty successes, failures, and not-yet-discovered resources are distinguishable, bounded, invalidated, and coalesced rather than retried per item or pinned indefinitely.
