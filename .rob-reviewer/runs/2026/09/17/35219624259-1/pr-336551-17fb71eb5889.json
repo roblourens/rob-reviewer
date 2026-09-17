@@ -1,0 +1,117 @@
+{
+  "PullRequest": {
+    "Number": 336551,
+    "Title": "Make deepFreeze worklist traversal linear (O(n²) → O(n))",
+    "Body": "### What\n\n`deepFreeze` walks an object graph with a worklist, draining it via `Array.shift()`.\n\n```diff\n \tconst stack: any[] = [obj];\n-\twhile (stack.length \u003e 0) {\n-\t\tconst obj = stack.shift();\n+\tfor (let index = 0; index \u003c stack.length; index++) {\n+\t\tconst obj = stack[index];\n+\t\tstack[index] = undefined;\n \t\tObject.freeze(obj);\n```\n\n### Why\n\n`shift()` re-indexes the whole array on every call, so once the queue is large the bookkeeping dominates and freezing a wide graph degrades to **O(n²)**. An index cursor makes it **O(n)**. `stack[index] = undefined` releases the processed reference so those objects can still be collected.\n\n`pop()` would be linear too, but `deepFreeze` reads properties with `for...in`, which invokes enumerable getters — so traversal order is externally observable, and `pop()` would silently reverse sibling order. The cursor preserves it exactly.\n\n### Performance\n\nNode 24, wide graph of n sibling objects. Speedup spans two independent benchmark runs on different harnesses; `before` is the slower run.\n\n| n | before | after | speedup |\n|---|---|---|---|\n| 10,000 | 1.4 ms | 0.6 – 1.1 ms | 1.3× – 1.6× |\n| 30,000 | 74 ms | 3.3 – 5.4 ms | 14× – 19× |\n| 50,000 | 202 ms | 5.6 – 10 ms | 20× – 31× |\n| 100,000 | 1.4 s | 10 – 11.2 ms | **64× – 137×** |\n\nBoth runs used a same-vs-same control arm to establish the measurement floor. Graphs below ~1,000 objects are within noise — this is not a small-input optimization, and I'm making no claim about startup or user-visible latency.\n\nTradeoff: the worklist array is no longer shrunk as it drains, so peak transient memory is ~1 MiB per 100,000 enqueues, released when the call returns.\n\nVerified with 30,000 randomized differential cases (cycles, shared references, typed arrays, symbols, throwing getters, graph mutation mid-traversal) checking return identity, frozen set, getter invocation order and exception signature: 0 mismatches.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336551",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "federicobrancasi",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "64cbf0ba8676e1e5c2331743e3b53051e60b6767",
+    "HeadRef": "fb/deepfreeze-linear-worklist",
+    "HeadSHA": "17fb71eb5889eaff850593bd6c12e562acdad9ef",
+    "CreatedAt": "2026-09-17T10:55:05Z",
+    "UpdatedAt": "2026-09-17T12:00:06Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/base/common/objects.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 27,
+      "BasePath": "src/vs/base/common/objects.ts",
+      "BaseLine": 27,
+      "IntroducingPath": "src/vs/base/common/objects.ts",
+      "IntroducingCommit": "10541d91a74351643b5a0982ebc11cc7288993aa",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "Array.shift() repeatedly compacts a wide FIFO worklist, causing cumulative quadratic CPU work while synchronously freezing broad object graphs.",
+      "Symptom": "Large, broad configuration values or document-change payloads can spend disproportionate synchronous time draining deepFreeze's queue, delaying getter completion or extension event delivery.",
+      "FixedBehavior": "The indexed for-loop advances through the dynamically growing worklist without removing its prefix, reducing queue bookkeeping from O(N^2) slot movement to O(N) indexed reads; RIGHT line 29 clears each consumed reference so processed graph objects are not retained solely by the worklist.",
+      "Evidence": "In the base revision, deepFreeze uses a FIFO array worklist and drains it with stack.shift(). Object-property enumeration can enqueue a wide frontier, so each subsequent shift moves the remaining array elements; draining N queued objects performs a quadratic number of slot moves. The changed RIGHT line 27 replaces that drain with a monotonically increasing cursor while preserving FIFO traversal. This synchronous helper is reached by configuration value/inspection getters (configurationModels.ts:24,101-117,611) and twice before extension document-change listeners are fired (extHostDocuments.ts:196-219), so the queue bookkeeping directly delays those consumers for large wide object graphs.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Reading or inspecting a configuration value that returns a structured object",
+        "CriticalPath": "ConfigurationModel.inspect/value getters synchronously call freeze/deepFreeze before returning the value, so traversal is on the caller's critical path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "The reachable unfrozen configuration object graph, including broad arrays/maps represented as objects; effective worklist cardinality is the number of enqueues after already-frozen and typed-array properties are skipped.",
+        "EffectiveConcurrency": "One synchronous traversal per cold returned root; no internal parallelism, limiter, queue, or async overlap.",
+        "CacheBehavior": "Cold unfrozen roots traverse and freeze the reachable graph. Warm reads of the same root are bypassed by Object.isFrozen(data), so they do not rebuild the worklist. There is no negative-cache state.",
+        "MechanismConfidence": "High: the old shift-based FIFO performs repeated prefix compaction, while the changed cursor performs one indexed read per enqueue. The added undefined assignment releases consumed object references, though the backing array remains transiently sized to total enqueues until return.",
+        "MagnitudeUncertainty": "Repository call flow proves synchronous reachability and graph-size scaling, but typical production configuration graph widths and exact durations are not established from repository code.",
+        "Verdict": "No introduced regression. The diff removes quadratic queue-compaction CPU work. Its transient worklist backing storage can grow with total enqueues rather than current frontier size, but it is call-bounded, clears processed references, and no realistic narrow configuration graph large enough for a reportable memory regression is established."
+      },
+      {
+        "Scenario": "Delivering a text document model-change event to extension-host listeners",
+        "CriticalPath": "An incoming $acceptModelChanged RPC updates the document, constructs two public change-event graphs, deep-freezes each synchronously, and only then fires the corresponding extension events. Both freezes are on event-delivery's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadDocuments.ts:114 -\u003e src/vs/workbench/api/common/extHostDocuments.ts:$acceptModelChanged",
+            "Operation": "Send one serialized text-model change event from the main thread to the extension host.",
+            "Cardinality": "One RPC per model content-change event; after receipt, two local deepFreeze traversals serve the two extension-host event emitters.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one RPC per model event and same two deepFreeze calls existed before the diff; only each worklist's draining algorithm changed.",
+            "CriticalPathEffect": "The RPC delivers the event to the changed helper's caller; once received, deepFreeze must complete before extension listeners are notified."
+          }
+        ],
+        "ScalingInput": "The number of serialized content changes in one model event and each change's reachable range/metadata objects. Two event graphs are built and frozen sequentially per accepted model change; the second uses a separately mapped changes array.",
+        "EffectiveConcurrency": "One incoming model-change handler runs its two deepFreeze calls sequentially. The changed loop itself is synchronous and introduces no burst or additional concurrency.",
+        "CacheBehavior": "Each emitted event root and mapped contentChanges array is newly allocated, so both roots are cold. Objects such as the document that were frozen by the first traversal are skipped when encountered by the second. There is no cross-event worklist cache or coalescing.",
+        "MechanismConfidence": "High: queue order and traversal cardinality are preserved, while repeated Array.shift compaction is replaced by linear cursor advancement. No extra IPC, serialization, or traversal was added.",
+        "MagnitudeUncertainty": "The synchronous event path and per-change graph cardinality are established, but normal and worst-case counts of edits batched into one event are not quantified in the repository evidence.",
+        "Verdict": "No introduced regression. The change reduces CPU latency for wide change payloads and does not alter boundary cardinality or concurrency. The larger transient backing array on narrow graphs is bounded to the synchronous call and lacks a realistic reportable trigger here."
+      }
+    ],
+    "Summary": "Completed the performance pass over the sole changed hunk and its configuration and extension-event callers. No actionable performance regression was introduced. Recorded the PR as a high-confidence fix for the prior quadratic Array.shift worklist drain, attributed to the base commit that introduced iterative freezing."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-17T12:20:58.372722685Z",
+    "CompletedAt": "2026-09-17T12:23:21.138005412Z",
+    "WallClockMilliseconds": 142765,
+    "ModelCalls": 11,
+    "InputTokens": 166517,
+    "OutputTokens": 4576,
+    "TotalTokens": 171093,
+    "ReasoningTokens": 2210,
+    "CacheReadTokens": 142888,
+    "CacheWriteTokens": 23596,
+    "APIDurationMilliseconds": 101242,
+    "ToolCalls": 32,
+    "NanoAIUnits": 26678720000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 142888,
+      "cache_write": 23596,
+      "input": 33,
+      "output": 4576
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

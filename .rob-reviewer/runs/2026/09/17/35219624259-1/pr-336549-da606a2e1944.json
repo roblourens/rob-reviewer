@@ -1,0 +1,150 @@
+{
+  "PullRequest": {
+    "Number": 336549,
+    "Title": "fix: allow workbench origin for remote resources",
+    "Body": "Fixes https://github.com/microsoft/vscode/issues/336527\r\n\r\nElectron 43 migrated `vscode-remote-resource` from the deprecated `registerHttpProtocol()` API to `protocol.handle()` backed by `net.fetch()`. The new handler preserves the request method, headers, and body. This is intentional, it keeps HTTP behavior intact and allows Electron to relay untouched `net.fetch()` responses without copying the response body through JavaScript.\r\n\r\nUnlike the old protocol API, `net.fetch()` applies normal CORS validation. The renderer correctly sends:\r\n\r\n```text\r\nOrigin: vscode-file://vscode-app\r\nSec-Fetch-Mode: cors\r\n```\r\n\r\nThe remote server did not authorize that origin in its response, so Chromium rejected the resource.\r\n\r\n## NetLog evidence\r\n\r\nThe net log capture shows that the remote file was found and returned successfully:\r\n\r\n```text\r\nHTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nCache-Control: public, max-age=31536000\r\nVary: Origin\r\n```\r\n\r\nThe response was missing:\r\n\r\n```text\r\nAccess-Control-Allow-Origin: vscode-file://vscode-app\r\n```\r\n\r\nChromium then ended the request with `CORS_REQUEST` followed by `CANCELLED`, which surfaced as `net::ERR_FAILED`.\r\n\r\n## Why WSL and Dev Containers failed\r\n\r\nWSL and Dev Containers use a direct host-and-port connection:\r\n\r\n```text\r\nvscode-remote-resource\r\n→ protocol.handle()\r\n→ net.fetch()\r\n→ forwarded loopback HTTP endpoint\r\n```\r\n\r\nSSH uses `vscode-managed-remote-resource`, which reads through main process IPC and the remote file service. It does not use the affected HTTP fetch path.\r\n\r\n## Why this is different from previous regressions\r\n\r\nEarlier fixes covered `vscode-managed-remote-resource`:\r\n\r\n- #319834 registered the managed scheme as CORS capable.\r\n- #335241 fixed managed workbench request identification and response handling.\r\n\r\nThose fixes remain valid and explain why SSH continues to work. The direct `vscode-remote-resource` path did not have equivalent end-to-end coverage. The remote resource endpoint now authorizes the exact native workbench origin\r\n\r\n```text\r\nAccess-Control-Allow-Origin: vscode-file://vscode-app\r\nVary: Origin\r\n```\r\n\r\nExisting configured web endpoint origins remain supported. The fix does not use a wildcard and does not authorize `vscode-webview://` origins. Webviews use the HTTPS virtual resource pipeline and should not get direct access to token protected remote files.\r\n\r\n## Test coverage\r\n\r\nThe new tests cover both sides of the failure:\r\n\r\n1. A server test verifies that native workbench and configured web origins are allowed, while webview and arbitrary origins are rejected.\r\n2. An Electron integration test loads a real SVG from `vscode-file://vscode-app` through `vscode-remote-resource` and verifies that the server receives the expected CORS headers.",
+    "URL": "https://github.com/microsoft/vscode/pull/336549",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "deepak1556",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "123cec29ea4e1e9ed9a406b69717dd92271c99fc",
+    "HeadRef": "robo/fix_remote_resource_loading",
+    "HeadSHA": "da606a2e1944f1bf3303a2e8f87f238e0a331670",
+    "CreatedAt": "2026-09-17T10:43:05Z",
+    "UpdatedAt": "2026-09-17T10:52:31Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "eager-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Native desktop workbench renders remote images, fonts, or other resources from a direct WSL/Dev Container authority.",
+        "CriticalPath": "Chromium resolves a vscode-remote-resource URL, the Electron protocol handler awaits net.fetch to the forwarded HTTP endpoint, the remote server validates the token and origin, and serveFile stats and potentially opens/streams the file before the renderer can use it. The diff changes CORS authorization but does not add a new critical-path boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/protocol/electron-main/remoteResourceProtocol.ts:createRemoteResourceRequestHandler",
+            "Operation": "Electron net.fetch relays the custom-scheme request to the remote authority over HTTP.",
+            "Cardinality": "One HTTP request per browser cache miss or revalidation for each effective resource URL; browser caching/coalescing remains authoritative.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same net.fetch call, method, headers, body, and bypassCustomProtocolHandlers option were inline in CodeApplication; this PR only extracts them into a helper.",
+            "CriticalPathEffect": "The fetch response must arrive before the resource can render."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/server/node/webClientServer.ts:serveFile",
+            "Operation": "The remote server stats the requested file and, unless an ETag revalidation returns 304, opens and streams it.",
+            "Cardinality": "One stat per server request and one open/stream per non-304 successful request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same serveFile path and CacheControl.ETAG behavior ran before the diff.",
+            "CriticalPathEffect": "Stat and file streaming are required before the HTTP response completes."
+          }
+        ],
+        "ScalingInput": "The number of distinct remote resource URLs requested by the rendered workbench content after browser caching and request coalescing.",
+        "EffectiveConcurrency": "Chromium/Electron controls concurrent resource fetches; the PR adds no Promise.all fan-out, queue, limiter, or retry and preserves one net.fetch per protocol request.",
+        "CacheBehavior": "Built-in and installed extension resources retain public max-age caching; other files retain ETag revalidation. The added Access-Control-Allow-Origin and existing Vary: Origin do not alter cache policy, keys, or coalescing in this code.",
+        "MechanismConfidence": "High: the old inline handler and new helper are operation-for-operation equivalent, while the server change performs only bounded header selection before the unchanged serveFile call.",
+        "MagnitudeUncertainty": "Resource counts and remote filesystem/network latency vary by workbench content and remote environment, but the diff does not increase their cardinality or scheduling.",
+        "Verdict": "No reportable performance regression. Native-origin requests now short-circuit before the existing web-origin regular expression, and the required network and filesystem work is unchanged."
+      },
+      {
+        "Scenario": "VS Code for the Web or a configured web endpoint loads a remote resource through the remote extension host agent.",
+        "CriticalPath": "The existing HTTP request reaches the remote agent, token/path checks run, the configured-origin regular expression is evaluated, and serveFile stats and potentially streams the file. The response-header extraction does not move a new operation onto this path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/server/node/remoteExtensionHostAgentServer.ts:handle and src/vs/server/node/webClientServer.ts:serveFile",
+            "Operation": "The server stats and conditionally streams the requested remote file.",
+            "Cardinality": "One stat per effective HTTP request, with one stream only for a successful non-304 response.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Before the diff, the same endpoint called the same serveFile function with the same ETag and extension-resource max-age policies.",
+            "CriticalPathEffect": "The requested media cannot load until the file response is available."
+          }
+        ],
+        "ScalingInput": "Distinct remote resources requested by web content after HTTP cache reuse and ETag revalidation.",
+        "EffectiveConcurrency": "HTTP/browser request concurrency is unchanged; origin matching remains one synchronous regular-expression test per request with an origin, and there is no added fan-out.",
+        "CacheBehavior": "Positive browser caching and ETag behavior are unchanged. Vary: Origin and allowed configured-origin handling already existed before this PR; there is no application cache or negative-cache change.",
+        "MechanismConfidence": "High: before/after comparison shows the existing origin matcher and filesystem path are preserved, with the helper adding only a native-origin equality short-circuit.",
+        "MagnitudeUncertainty": "Actual resource counts vary by page and extensions, but no changed mechanism scales beyond constant header work per existing request.",
+        "Verdict": "No reportable performance regression; boundary count, cache behavior, and concurrency are unchanged."
+      },
+      {
+        "Scenario": "Electron unit-test runner startup and the new remote-resource CORS integration test.",
+        "CriticalPath": "On app readiness, the runner now awaits two local module imports and binds one loopback HTTP server before creating/loading the main test window. The single new test invokes IPC, creates one hidden BrowserWindow, loads one local fixture, and performs one loopback fetch before assertion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "test/unit/electron/index.js:app ready handler",
+            "Operation": "Dynamically imports two built JavaScript modules and loads the local HTML fixture for the integration test.",
+            "Cardinality": "Two imports once per Electron test-runner process; one fixture navigation when the single test runs.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The runner did not import these modules or load this fixture.",
+            "CriticalPathEffect": "The imports complete before the test window starts; fixture loading is on only the new test's critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "test/unit/electron/index.js:remoteResourceServer and vscode:test-remote-resource IPC handler",
+            "Operation": "Binds one loopback HTTP listener and serves one SVG request from the hidden integration-test window.",
+            "Cardinality": "One listener per runner process and one loopback request for the single added test.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No dedicated remote-resource loopback listener or request existed in this runner.",
+            "CriticalPathEffect": "Listener setup is awaited once before tests; the one response is awaited by the new test."
+          }
+        ],
+        "ScalingInput": "One Electron runner process and one newly added test invocation, independent of production resource count or suite test count.",
+        "EffectiveConcurrency": "A single listener is shared for the process, and the integration test issues one request. The server is closed after reporter draining in non-development runs; no burst or unbounded listener creation occurs.",
+        "CacheBehavior": "The fixture request has no meaningful warm-cache path, but it executes once; production caches are not involved.",
+        "MechanismConfidence": "High: the awaited startup work and cleanup are explicit in the changed harness code.",
+        "MagnitudeUncertainty": "Exact module-import and loopback-bind duration varies by platform, but the work is constant and bounded rather than scaling with the suite.",
+        "Verdict": "The harness gains small constant startup work, but there is no realistic scaling mechanism or material performance regression warranting a finding."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files and every diff page. Traced production remote-resource network/filesystem behavior, cache policy, origin-check cost, browser concurrency, and the Electron integration-test lifecycle. The PR preserves production boundary cardinality and scheduling; no actionable performance finding or qualifying regression-fix record was identified."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-17T12:19:18.067549231Z",
+    "CompletedAt": "2026-09-17T12:20:55.449562093Z",
+    "WallClockMilliseconds": 97382,
+    "ModelCalls": 7,
+    "InputTokens": 139865,
+    "OutputTokens": 4155,
+    "TotalTokens": 144020,
+    "ReasoningTokens": 1508,
+    "CacheReadTokens": 108600,
+    "CacheWriteTokens": 31244,
+    "APIDurationMilliseconds": 86242,
+    "ToolCalls": 29,
+    "NanoAIUnits": 28284400000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 108600,
+      "cache_write": 31244,
+      "input": 21,
+      "output": 4155
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

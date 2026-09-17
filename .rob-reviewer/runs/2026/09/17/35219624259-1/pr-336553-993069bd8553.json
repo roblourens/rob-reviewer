@@ -1,0 +1,195 @@
+{
+  "PullRequest": {
+    "Number": 336553,
+    "Title": "sessions: fix inline rename edge cases",
+    "Body": "## Summary\n\nFollow-up to #336464.\n\n- reveal virtualized session and chat rows before starting inline rename and resolve refreshed chat wrappers by URI identity\n- keep double-click session opening while preserving focus in the inline editor\n- show visible blank-title validation and keep compact metadata from shrinking the editor\n- preserve rename drafts across renderer recycling and clean up validation resize observers\n\n## Testing\n\n- `npm run typecheck-client`\n- targeted ESLint and Stylelint\n- 28 Electron rename/context-menu tests\n- 27 browser rename/context-menu tests\n- 3 session open trust-gate tests",
+    "URL": "https://github.com/microsoft/vscode/pull/336553",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "64cbf0ba8676e1e5c2331743e3b53051e60b6767",
+    "HeadRef": "sandy081/agents/inline-session-rename-feature",
+    "HeadSHA": "993069bd8553ba5fcf845b05d0b8628a63eb85e7",
+    "CreatedAt": "2026-09-17T11:02:02Z",
+    "UpdatedAt": "2026-09-17T11:45:59Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-8A4AF96A46E1",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/sessions/browser/views/sessionsList.ts",
+      "Side": "RIGHT",
+      "Line": 4270,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed reinvocation, two-call test expectation, forwarding path, service cancellation/restart behavior, and uncancellable provider hook are all explicit. Exact duration depends on provider/cache state, so severity is medium rather than high.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "provider resolution work and agent-host IPC/subscriptions (and potentially on-demand connection work)",
+      "PerformanceScaling": "Every successful double-click rename while the initial open promise is pending turns one user gesture into two overlapping open pipelines; repeated rename gestures repeat this 2x boundary work.",
+      "PerformanceOutcome": "increased session-open latency from cancelling and restarting progress, plus duplicate backend/IPC work",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "A double-click still caused the list's normal open event once, then began inline rename; the renderer did not issue another onSessionOpen/onChatOpen call.",
+      "ChangedBehavior": "After inline rename starts, preservePendingOpenFocus mutates the request and calls invokeOpenRequest again whenever the first open has started, forwarding a second onSessionOpen/onChatOpen while the first promise is still pending.",
+      "CausalDiffEvidence": "The added RIGHT line 4270 directly calls this.invokeOpenRequest(request) from the double-click focus-preservation callback; the new test explicitly expects preserveFocusValues [false, true], proving two opens for one double-click.",
+      "Title": "Preserve focus without restarting the session open",
+      "Impact": "Double-clicking a renameable session/chat while it opens can discard up to the elapsed open progress and issue duplicate provider/backend work. This is especially visible for cold or legacy agent-host sessions, where resource resolution is explicitly documented as taking seconds and performs an IPC subscription.",
+      "Evidence": "SessionsView forwards each invocation to sessionsService.openSession/openChat. Each service call runs _startOpenSession(), so the second cancels the first and starts resolution again. openSession awaits sessionsManagementService.resolveSessionResource, which sequentially invokes provider hooks without a cancellation token; LocalAgentHostSessionsProvider's hook creates an agent-host subscription and may wait up to LEGACY_MIGRATION_TIMEOUT_MS (30s). Thus cancellation cannot stop the first boundary operation, while the second starts another one and the visible open can complete only through the restarted pipeline.",
+      "Recommendation": "Do not invoke the open callback a second time. Preserve or restore the inline editor's focus when the original open settles, or defer the one open until the click/double-click intent is known, while retaining a single provider-resolution pipeline."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "synchronous-ui-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Single-click opening a session or chat from the sessions list",
+        "CriticalPath": "The gesture awaits canOpenSession, marks the item read, then must complete provider resource resolution, optional provider preparation, activation, and session loading. The diff routes this through beginOpenRequest but still starts one pipeline for an ordinary click.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/services/sessions/browser/sessionsService.ts:canOpenSession",
+            "Operation": "Query workspace trust for each working directory and possibly prompt for trust",
+            "Cardinality": "One parallel lookup per workspace folder, followed by serial prompts only for untrusted folders",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same canOpenSession gate ran once before mark-read and open.",
+            "CriticalPathEffect": "Must complete before opening proceeds"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/services/sessions/browser/sessionsManagementService.ts:resolveSessionResource",
+            "Operation": "Resolve a session resource through provider hooks; legacy local-agent-host migration can create a backend subscription",
+            "Cardinality": "At most one call per resolver provider, sequentially, for one ordinary open",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One resolution pipeline was already part of SessionsService.openSession/openChat.",
+            "CriticalPathEffect": "Must complete before activation; the legacy probe may wait up to 30 seconds on a cold host"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/providers/remoteAgentHost/browser/remoteAgentHostSessionsProvider.ts:prepareSessionForOpen",
+            "Operation": "Prepare a remote session by connecting an on-demand remote agent host",
+            "Cardinality": "Zero on warm connected providers; one connection attempt for a cold ordinary open",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same preparation occurred once for an explicit open.",
+            "CriticalPathEffect": "Must complete before the session is shown"
+          }
+        ],
+        "ScalingInput": "Workspace-folder count for trust checks and registered provider count for sequential resource resolution; effective open cardinality remains one per ordinary click.",
+        "EffectiveConcurrency": "Folder trust lookups run in parallel as before; provider resolvers run sequentially; SessionsService uses one global latest-open cancellation token. No new parallelism occurs for a single click.",
+        "CacheBehavior": "Already-active/trusted sessions take the warm path. Cached provider catalogs make most resolution local; cold legacy agent-host resources may perform adoption IPC, and a disconnected remote provider may connect on demand. The diff adds no new cache or invalidation behavior on the single-click path.",
+        "MechanismConfidence": "High: the call path and one-open cardinality for an ordinary click are explicit.",
+        "MagnitudeUncertainty": "Provider latency varies from in-memory resolution to seconds on cold legacy or remote hosts.",
+        "Verdict": "No reportable regression for ordinary clicks; the helper preserves the prior effective boundary cardinality."
+      },
+      {
+        "Scenario": "Double-clicking a renameable session or chat title while its open is pending",
+        "CriticalPath": "The first click starts the normal open. The double-click handler begins inline rename and the added preservePendingOpenFocus branch invokes the open callback again. SessionsService cancels the first token and the user-visible open must proceed through a newly started resolver pipeline.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/localAgentHostSessionsProvider.ts:resolveSessionResource",
+            "Operation": "Probe/adopt a legacy session through an agent-host subscription during provider resource resolution",
+            "Cardinality": "Two resolution pipelines after the diff versus one before for one pending double-click open; each probe can remain live until completion or the 30-second timeout",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The list forwarded only the original open; beginning inline rename did not issue a second open.",
+            "CriticalPathEffect": "The first pipeline's progress is discarded and the second resolution must finish before activation"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/providers/remoteAgentHost/browser/remoteAgentHostSessionsProvider.ts:prepareSessionForOpen",
+            "Operation": "Establish an on-demand remote agent-host connection during session preparation",
+            "Cardinality": "Usually one, but potentially two overlapping attempts when both pipelines reach preparation before connection state is published",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only one preparation pipeline was started by the gesture.",
+            "CriticalPathEffect": "The restarted pipeline must finish preparation; any uncancelled first attempt consumes backend/network work without advancing the winning open"
+          }
+        ],
+        "ScalingInput": "One double-click gesture deterministically produces two open callback invocations while the first promise is pending, as asserted by the added test; repeated rename gestures repeat the 2x work.",
+        "EffectiveConcurrency": "The second SessionsService call cancels the first logical token, but cancellation is not passed into provider resolveSessionResource or prepareSessionForOpen. Those boundary operations can overlap even though only the second pipeline may activate the session.",
+        "CacheBehavior": "Warm in-memory resolvers make the waste smaller but still duplicate telemetry/provider iteration. A cold legacy resource starts two uncancellable agent-host subscription probes; cold remote preparation can also overlap depending on first-pipeline progress. There is no coalescing by session URI.",
+        "MechanismConfidence": "Very high: line 4270 reinvokes the request, the test expects [false, true], and service cancellation does not propagate to provider hooks.",
+        "MagnitudeUncertainty": "The exact duplicated duration depends on double-click timing, provider type, and whether provider state is warm.",
+        "Verdict": "Reportable medium repeated-work regression because one gesture restarts a potentially seconds-long open and duplicates uncancellable backend work."
+      },
+      {
+        "Scenario": "Starting inline rename for an offscreen or refreshed virtualized row, then committing it",
+        "CriticalPath": "beginRenameSession/beginRenameChat synchronously traverses the materialized tree by URI, reveals an offscreen match, renders and focuses one input. On commit, the existing management-service path forwards one rename to the owning provider.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/services/sessions/browser/sessionsManagementService.ts:renameSession/renameChat",
+            "Operation": "Persist the new session or chat title through the owning provider",
+            "Cardinality": "One provider call per successful commit",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Commit already forwarded exactly one rename call.",
+            "CriticalPathEffect": "Runs after the editor closes and is not on the path to displaying the input"
+          }
+        ],
+        "ScalingInput": "One depth-first visit over up to all currently materialized session/group/chat tree nodes per explicit rename request; effective provider rename cardinality is one on commit.",
+        "EffectiveConcurrency": "Traversal and reveal are synchronous on the UI thread; one rename editor is active. The asynchronous provider rename is a single uncoalesced call, unchanged from before.",
+        "CacheBehavior": "Tree identity lookup has no cache and repeats per explicit rename action. Virtualization bounds DOM rendering to visible rows, while reveal recycles templates. Provider-side rename cache behavior is unchanged.",
+        "MechanismConfidence": "High: the recursive lookup/reveal path and one-call commit path are explicit.",
+        "MagnitudeUncertainty": "Lists can vary in size, but rename is a discrete user action rather than a render/scroll loop, and the traversal performs only URI comparisons over the tree.",
+        "Verdict": "No reportable performance regression. The new O(tree size) lookup enables refreshed/offscreen identity matching, but runs once per user action and avoids increasing boundary calls or retained DOM."
+      },
+      {
+        "Scenario": "Blank-title validation, list resizing, renderer recycling, and focus/hover styling during inline rename",
+        "CriticalPath": "A blank Enter shows one InputBox context view. While visible, its ResizeObserver reads input width and relayouts the validation overlay on actual size changes. Hiding, recycling, or disposing the input clears the observer store. CSS suppresses compact metadata during rename and changes visibility on hover/focus.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "At most one active inline editor/validation observer; callback frequency follows actual input resizes, not rows or frames. Styling applies to the hovered or focused row within the list.",
+        "EffectiveConcurrency": "Browser resize delivery and synchronous context-view layout occur on the UI thread; there are no subprocess, IPC, filesystem, database, or network calls on this path.",
+        "CacheBehavior": "No cache is involved. The validation DOM and observer are created lazily only after invalid commit, and disposal disconnects/unobserves the target when hidden or recycled.",
+        "MechanismConfidence": "High: observer creation, width read/layout callback, and cleanup ownership are explicit in InputBox and renderer disposable stores.",
+        "MagnitudeUncertainty": "Layout cost depends on resize frequency, but the observer is single-instance, event-driven, and scoped to the short validation lifetime.",
+        "Verdict": "No reportable regression. Work is lazy and bounded, and the changed DisposableStore preserves cleanup through hide/recycle paths."
+      }
+    ],
+    "Summary": "Completed the performance pass over all seven changed files and all diff pages. Reported one medium repeated-open regression on double-click rename; no additional hot-path, retention, observer-cleanup, virtualization, or boundary-fanout issue met the evidence threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-17T12:23:24.608276069Z",
+    "CompletedAt": "2026-09-17T12:27:01.867397781Z",
+    "WallClockMilliseconds": 217259,
+    "ModelCalls": 14,
+    "InputTokens": 648036,
+    "OutputTokens": 8690,
+    "TotalTokens": 656726,
+    "ReasoningTokens": 2991,
+    "CacheReadTokens": 578388,
+    "CacheWriteTokens": 69606,
+    "APIDurationMilliseconds": 204324,
+    "ToolCalls": 69,
+    "NanoAIUnits": 75335320000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 578388,
+      "cache_write": 69606,
+      "input": 42,
+      "output": 8690
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
