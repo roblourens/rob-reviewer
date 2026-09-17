@@ -1,0 +1,193 @@
+{
+  "PullRequest": {
+    "Number": 336615,
+    "Title": "Migrate shared prompts to skills",
+    "Body": "Converts the remaining shared prompt files into skills so they participate in skill discovery while remaining explicitly invoked.\n\n- Moves 14 prompt definitions under `.github/skills/\u003cname\u003e/SKILL.md`\n- Replaces prompt-specific agent and tool metadata with skill metadata\n- Sets `disable-model-invocation: true` and preserves argument hints where applicable\n\nValidation: pre-commit hygiene and `git diff --check` passed.",
+    "URL": "https://github.com/microsoft/vscode/pull/336615",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "ulugbekna",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "880d57b832037cfd869a3ac1265326077b4531e1",
+    "HeadRef": "ulugbekna/migrate-prompts-to-skills",
+    "HeadSHA": "e49b58b21bdc7aaaf27dbce4b8394b766654a527",
+    "CreatedAt": "2026-09-17T20:32:49Z",
+    "UpdatedAt": "2026-09-17T22:16:58Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-0C81DC9DD975",
+      "Focus": "performance-review",
+      "Path": ".github/skills/build-champ/SKILL.md",
+      "Side": "RIGHT",
+      "Line": 4,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The changed paths, exact added cardinality (14), serial awaits, full-file reads, cache lifecycle, and awaited chat-send call path are directly established in repository code. Only the absolute duration varies with filesystem latency and file sizes, which is reflected in medium severity rather than lower mechanism confidence.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "14 added filesystem resolves, 14 added full-file reads, parsed bytes, and remote filesystem/IPC round trips",
+      "PerformanceScaling": "Cold-path cost grows linearly with the number of migrated skill directories and total skill-body bytes; for this diff it is N=14, with two serial filesystem phases. Remote latency contributes approximately 28 round-trip delays before provider invocation.",
+      "PerformanceOutcome": "Increased cold-request latency and a blocked provider-invocation critical path",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "These workflows lived under `.github/prompts/*.prompt.md`. Automatic instruction collection on chat send calls `findAgentSkills`, so it did not enumerate or read these prompt files; prompt slash-command discovery was a separate cached path.",
+      "ChangedBehavior": "This line makes `build-champ` one of 14 newly migrated manual-only skills. On the first request after startup or skill-cache invalidation, automatic instruction collection discovers every skill and only filters `disable-model-invocation` after reading and parsing each complete `SKILL.md`. The same mechanism applies to the other 13 skill files added by this diff.",
+      "CausalDiffEvidence": "The diff moves 14 prompt definitions into separate `.github/skills/\u003cname\u003e/SKILL.md` paths and adds `disable-model-invocation: true` (for example this added line). `PromptFilesLocator.findAgentSkillsInFolder` sequentially awaits `fileService.resolve(\u003cchild\u003e/SKILL.md)` for every skill directory; `computeSkillDiscoveryInfo` then sequentially awaits `parseNew`, whose file-backed path calls `fileService.readFile`. `ComputeAutomaticInstructions.collect` awaits `findAgentSkills` during `ChatService.sendRequest`, and the provider request starts only after that collection completes. Before these path changes, none of the 14 prompt files participated in `findAgentSkills`.",
+      "Title": "Keep manual skill discovery off the cold chat critical path",
+      "Impact": "The first chat request after opening the workspace, or after a skill change, can be delayed by 28 added serialized filesystem operations. This is especially visible over SSH, Codespaces, or other high-latency remote filesystems, where it delays time to first model progress even though all 14 skills are explicitly excluded from automatic invocation.",
+      "Evidence": "For the realistic first agent request in this repository, the added directories contribute 14 serial filesystem existence checks followed by 14 serial full-file reads/parses. `disable-model-invocation` prevents bodies from entering model context but is evaluated only after those reads. In a remote workspace each await can cross the remote filesystem/IPC boundary, so the fan-out adds roughly 28 serialized round trips plus bytes for all 14 bodies to time-to-provider-invocation. `cachedSkills` removes this work on warm requests, but file changes invalidate it; slash-command discovery has a separate cache and does not eliminate these reads.",
+      "Recommendation": "Preserve manual invocation without serial cold-path fan-out: either keep these workflows as prompt files, or update skill discovery in the same change to run per-directory checks and metadata reads through the existing bounded discovery limiter (and reuse one cached parse across skill and slash discovery) before migrating all 14."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cache-lifecycle",
+      "serialization-allocation",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First agent chat request after opening the VS Code workspace or after a skill-file change",
+        "CriticalPath": "`ChatService.sendRequest` creates the UI request, then awaits `collectInstructions()` in a `Promise.all`; `ComputeAutomaticInstructions.collect` awaits `_getCustomizationsIndex`, which awaits `findAgentSkills`. Provider/model invocation cannot begin until this finishes, so skill discovery is on time-to-first-model-progress.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/utils/promptFilesLocator.ts:findAgentSkillsInFolder",
+            "Operation": "Resolve each child directory's `SKILL.md` to test whether it is a skill.",
+            "Cardinality": "The diff adds 14 skill directories, producing 14 additional sequential resolves per cold skill discovery, after existing source-folder scans.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The 14 files were flat prompt files and were not enumerated by `findAgentSkills` during automatic instruction collection.",
+            "CriticalPathEffect": "All 14 resolves complete serially before skill metadata parsing and before instruction collection can finish."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts:computeSkillDiscoveryInfo/parseNew",
+            "Operation": "Read and parse each complete `SKILL.md` to obtain name, description, and `disable-model-invocation`.",
+            "Cardinality": "14 additional full-file reads, sequential in the `for ... await parseNew` loop; effective cardinality remains 14 because names are unique and filtering occurs after parsing.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Automatic instruction collection performed zero reads of these 14 prompt files.",
+            "CriticalPathEffect": "The manual-only flag is unavailable until after each full read, so these reads block provider invocation even though no migrated skill is model-invocable."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts:sendRequest",
+            "Operation": "Invoke the selected model/provider after request context collection.",
+            "Cardinality": "One provider request per user send; unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The provider request could start without discovering or reading these 14 manual prompt files.",
+            "CriticalPathEffect": "The network request is not added, but its start is delayed by the newly added filesystem fan-out."
+          }
+        ],
+        "ScalingInput": "The number of migrated skill directories and total bytes in their bodies; this PR's effective added cardinality is 14 skills, 14 sequential existence checks, and 14 sequential reads.",
+        "EffectiveConcurrency": "Hook collection, instruction collection, and migration-hint work run in parallel, but within instruction collection the 14 skill existence checks are serial and the 14 metadata/body reads are serial. No shared limiter is used by this skill parse loop.",
+        "CacheBehavior": "`cachedSkills` coalesces and caches a successful warm discovery. The cost occurs on the first request and after watched skill-path changes invalidate the cache. The slash-command cache is separate and does not provide parsed-file reuse.",
+        "MechanismConfidence": "High: changed cardinality, serial filesystem operations, filter ordering, cache invalidation, and the awaited send path are all explicit in code.",
+        "MagnitudeUncertainty": "Local filesystem latency may make the fixed 28-operation delta modest; SSH, Codespaces, and other remote filesystem round trips can make it hundreds of milliseconds or more. Exact body-byte total and deployment RTT are not measured.",
+        "Verdict": "Reportable medium-severity boundary fan-out: the migration newly puts 28 serial filesystem operations for manual-only workflows on the cold request path."
+      },
+      {
+        "Scenario": "Opening slash-command completion or manually invoking one of the migrated workflows",
+        "CriticalPath": "Slash command discovery must complete before the command list/lookup is authoritative. Resolving a command then parses the selected file before execution.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/utils/promptFilesLocator.ts:findAgentSkillsInFolder",
+            "Operation": "Discover each new skill by resolving `\u003cskill\u003e/SKILL.md`.",
+            "Cardinality": "14 added sequential resolves for these migrated entries.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Prompt discovery resolved the flat prompt source location rather than probing one `SKILL.md` per migrated subdirectory.",
+            "CriticalPathEffect": "They delay cold slash-command discovery before its bounded parse phase."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts:computeSlashCommandDiscoveryInfo",
+            "Operation": "Read and parse prompt/skill files for slash metadata through the shared discovery limiter.",
+            "Cardinality": "14 migrated files are still read once for cold slash discovery; reads are bounded by the service-wide limiter. If skill discovery already ran, there is no shared parsed-file cache, so these bodies can be read again.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The 14 prompt bodies participated only in slash discovery, not also in automatic skill discovery.",
+            "CriticalPathEffect": "Cold command completion waits for discovery. The read cardinality existed for prompts, but duplicate reads across the separate skill and slash caches are newly reachable after migration."
+          }
+        ],
+        "ScalingInput": "Fourteen migrated commands, plus total file bytes.",
+        "EffectiveConcurrency": "Directory probes are serial; slash metadata reads use the shared bounded limiter. Manual execution itself resolves one selected command.",
+        "CacheBehavior": "`cachedSlashCommands` makes warm completion cheap and coalesces a pass, but it is separate from `cachedSkills`; edits invalidate relevant caches.",
+        "MechanismConfidence": "High for discovery and cache separation; user-visible duration varies.",
+        "MagnitudeUncertainty": "The incremental slash-only delay depends on filesystem latency and whether discovery was prewarmed; the cross-cache duplicate read is certain when both cold paths execute.",
+        "Verdict": "Covered by the reported root cause; no duplicate finding submitted."
+      },
+      {
+        "Scenario": "Automatic model context construction with the migrated skills present",
+        "CriticalPath": "Skill discovery is awaited, but after metadata parsing each migrated entry is filtered because `disable-model-invocation: true`; only then is the model context serialized and sent.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/computeAutomaticInstructions.ts:_getCustomizationsIndex",
+            "Operation": "Filter discovered skills and build the customization index string.",
+            "Cardinality": "Fourteen added metadata objects are inspected, but zero migrated skill descriptions or bodies are appended to model context.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These prompt definitions were not candidates for the automatic skill index.",
+            "CriticalPathEffect": "Small linear in-memory filtering occurs after filesystem discovery; there is no meaningful token or payload growth from these disabled skills."
+          },
+          {
+            "Kind": "network",
+            "Location": "model/provider request downstream of ChatService.sendRequest",
+            "Operation": "Send assembled request context to the model provider.",
+            "Cardinality": "One request with no added skill-body or skill-list payload from these 14 disabled entries.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "No automatic payload from these prompt files.",
+            "CriticalPathEffect": "Payload size is unchanged by these entries; only pre-request discovery latency regresses."
+          }
+        ],
+        "ScalingInput": "Fourteen disabled skills; effective serialized cardinality is zero after filtering.",
+        "EffectiveConcurrency": "Filtering and index assembly are synchronous after cached discovery; no additional network concurrency is introduced.",
+        "CacheBehavior": "Discovery metadata is warm-cached, while request index assembly repeats each send. Disabled entries remain excluded on cold and warm requests.",
+        "MechanismConfidence": "High: the explicit flag and filter are direct.",
+        "MagnitudeUncertainty": "CPU cost of filtering 14 objects is negligible.",
+        "Verdict": "No serialization-allocation finding: `disable-model-invocation` correctly prevents context/token amplification."
+      }
+    ],
+    "Summary": "Reviewed all 15 changed files and all diff pages. The migration adds one concrete cold-path performance regression: 14 manual workflows now incur serial skill filesystem discovery and full-file parsing before first model invocation. Submitted one finding; automatic context payload growth, unbounded retention, eager body loading into the model, and concurrency bursts were rejected based on filtering and cache behavior."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-17T22:55:00.535265203Z",
+    "CompletedAt": "2026-09-17T22:56:42.557989722Z",
+    "WallClockMilliseconds": 102022,
+    "ModelCalls": 15,
+    "InputTokens": 676368,
+    "OutputTokens": 9438,
+    "TotalTokens": 685806,
+    "ReasoningTokens": 3306,
+    "CacheReadTokens": 602390,
+    "CacheWriteTokens": 73933,
+    "APIDurationMilliseconds": 91299,
+    "ToolCalls": 83,
+    "NanoAIUnits": 79956100000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 602390,
+      "cache_write": 73933,
+      "input": 45,
+      "output": 9438
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
