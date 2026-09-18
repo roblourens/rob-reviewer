@@ -1,0 +1,264 @@
+{
+  "PullRequest": {
+    "Number": 336628,
+    "Title": "agentHost: Use the SDK 1.0.14 owned runtime",
+    "Body": "## Summary\n\n- removes the explicit `@github/copilot` runtime dependency from root and remote manifests\n- uses the runtime owned by `@github/copilot-sdk@1.0.14` (`copilotCliVersion: 1.0.85`)\n- packages and launches `@github/copilot-sdk-\u003cplatform\u003e/prebuilds/\u003cplatform\u003e/copilot-runtime` with its adjacent `runtime.node`\n- keeps both native files outside ASAR so Microsoft product signing signs both\n- updates universal macOS cross-copy/merge handling and Linux package dependency snapshots\n- couples SDK canary overrides to the runtime version declared by the SDK and rejects shell metacharacters in canary version inputs\n- preserves the two supported runtime-owned built-in skills and project/plugin skills through explicit session skill directories\n- explicitly forwards directory-backed plugin hooks through the SDK callback surface\n- rejects stale model selections against an available provider catalog before dispatching a model request\n\nThis does not use the standalone Node SEA and does not extract runtime code into the user-global Copilot cache.\n\nThe SDK-owned runtime still does not invoke plugin hook callbacks on Windows. Those seven Windows variants remain precisely gated and documented in `KNOWN_ISSUES.md`; Unix callback behavior is active and verified exactly once.\n\n## Local validation\n\nPassed:\n- `npm run hygiene`\n- `npm run typecheck-client`\n- `npm run typecheck --prefix build`\n- targeted ESLint\n- complete deterministic Agent Host E2E matrix: Conformance, Claude, Codex, and Copilot\n- Copilot prompt snapshots and skill-budget behavior: 23/23\n- SDK runtime packaging tests: 23/23\n- complete CopilotAgent unit suite: 388 passing, 1 expected pending; targeted launcher/runtime tests: 12/12\n- structural audit of all 19 prompt baselines: identical tool and supported built-in capability sets\n- unsafe Windows canary version input is rejected before npm execution\n\n## Remote validation\n\n- GitHub Code OSS run 35311420025 passed on the reviewed head.\n- ADO Product build 474933 passed on the reviewed head across Windows x64, Linux x64/ARM64, and macOS x64/ARM64/universal; publishing and release were disabled.\n- Earlier build 474817 validated the SDK-only packaging/signing layout and signed both `copilot-runtime` and adjacent `runtime.node` on macOS.\n\n(Written by Copilot)\n\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336628",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "80a2663db974a32280e865c805d32eef9a7f86aa",
+    "HeadRef": "roblou/agents/copilot-latest-expanded-runtime",
+    "HeadSHA": "7207128e5bb0238623f48247dbe43b990ec90e4f",
+    "CreatedAt": "2026-09-17T21:48:41Z",
+    "UpdatedAt": "2026-09-18T07:07:49Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-06729DC60296",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts",
+      "Side": "RIGHT",
+      "Line": 5104,
+      "Severity": "low",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed call path and network boundary are explicit in repository code, and the scheduler establishes realistic periodic and activity-driven overlap. Exact service latency and how often users switch during that overlap are uncertain, so severity is low rather than suppressing the finding.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "A Copilot runtime `models.list` RPC and its backing network request",
+      "PerformanceScaling": "Every model-change request that overlaps the 30-minute activity-gated refresh, an authentication/token refresh, or a client-restart refresh inherits the full remaining latency of that shared network request; concurrent model changes all remain blocked behind the same request.",
+      "PerformanceOutcome": "Increased model-switch latency and a blocked user action when catalog enumeration is slow or stalled",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this change, `_changeModelOnce` resolved the chat and queued the SDK `setModel` operation immediately; background catalog refreshes did not gate the model-selection action.",
+      "ChangedBehavior": "`_validateModelSelection` now awaits any scheduled or in-flight catalog refresh before even entering the per-chat queue, despite an already populated `_models` snapshot being available for validation.",
+      "CausalDiffEvidence": "Added RIGHT line 5104 directly inserts `await (this._scheduledModelRefresh?.deferred.p ?? this._modelRefreshInFlight);` on every `changeModel` call; no equivalent wait existed before the PR.",
+      "Title": "Do not await background catalog refreshes before switching models",
+      "Impact": "Selecting a model while a periodic, token-driven, or restart-driven refresh is in flight now waits for `client.rpc.models.list`; the scheduler explicitly documents this as a real network request. On a slow connection or service hiccup, the model picker action can pause for that request even though the current catalog already contains the selected model.",
+      "Evidence": "The added await reads `_scheduledModelRefresh?.deferred.p ?? _modelRefreshInFlight`. Those promises run `_refreshModels`, which calls `_listModels`, which awaits `client.rpc.models.list({ gitHubToken })`. `AgentModelRefreshScheduler` starts this real network request after active turns and every 30 minutes. The existing Codex model-resolution path demonstrates the bounded pattern: it starts/waits for refresh only when its model collection is empty.",
+      "Recommendation": "Validate synchronously against the already populated `_models` snapshot, and only await/start catalog loading when the snapshot is empty or has been explicitly invalidated. Keep refresh coalescing and stale-generation handling unchanged."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "repeated-work",
+      "serialization-allocation",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Switching the model for an existing Copilot chat",
+        "CriticalPath": "The changed path now awaits `_scheduledModelRefresh` or `_modelRefreshInFlight`, then enters the per-chat sequencer, performs the SDK set-model operation, and persists metadata. The catalog await is newly on the user-action critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts `_validateModelSelection` -\u003e `_refreshModels` -\u003e `_listModels`",
+            "Operation": "Enumerate the provider catalog through `client.rpc.models.list({ gitHubToken })`",
+            "Cardinality": "At most one globally coalesced catalog request is in flight, but every overlapping model-change caller waits for it; refreshes are activity-gated and can occur on first/stale turn, every 30 minutes of active use, token changes, and client restarts.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Catalog refreshes ran in the background and model changes proceeded directly to the existing per-chat SDK/persistence path.",
+            "CriticalPathEffect": "The full remaining request latency blocks the model-selection action before its chat queue starts."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts `_changeModelOnce` / `entry.setModel`",
+            "Operation": "Set the selected model on the live runtime session",
+            "Cardinality": "One SDK operation per model change, serialized by chat key.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One serialized SDK set-model operation per selection.",
+            "CriticalPathEffect": "Existing required model-switch operation; unchanged by the diff."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts `_changeModelOnce` / `_storeSessionMetadata`",
+            "Operation": "Persist selected model metadata",
+            "Cardinality": "At most one metadata write per applicable model change.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same metadata persistence path.",
+            "CriticalPathEffect": "Existing required persistence after the SDK operation; unchanged by the diff."
+          }
+        ],
+        "ScalingInput": "The cost scales with the number of selections overlapping a refresh and, for each, with remaining network latency rather than model count. Effective boundary cardinality remains one coalesced request.",
+        "EffectiveConcurrency": "Model catalog refresh is globally coalesced to one request; model changes wait together on it and then remain serialized per chat through `_queueChat`. There is no added request fan-out, but the shared request now gates all overlapping selections.",
+        "CacheBehavior": "`_models` retains the last-known successful catalog, including across transient failures, but the added await does not use that warm snapshot to avoid waiting. Empty catalogs fail open after refresh handling.",
+        "MechanismConfidence": "High: the added await, scheduler triggers, coalescing, and real network RPC are directly traced in repository code.",
+        "MagnitudeUncertainty": "Overlap frequency and service latency vary; the critical-path dependency is explicit, but typical delay is unmeasured.",
+        "Verdict": "Reportable low-severity latency regression: an already warm catalog no longer prevents an unrelated background network refresh from blocking model selection."
+      },
+      {
+        "Scenario": "Cold Copilot client startup and session create/resume",
+        "CriticalPath": "Client acquisition resolves packaged runtime paths, obtains telemetry configuration, spawns one SDK-owned runtime subprocess, then creates or resumes sessions. Session config includes two built-in skill directories and plugin metadata.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts `resolveCopilotRuntimePaths`",
+            "Operation": "Probe runtime executable, native module, SDK wrapper, built-in skill root, and two SKILL.md files",
+            "Cardinality": "Six successful local access checks for the selected package; Linux may probe the alternate libc candidate first, but short-circuits after its first missing runtime file.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One access check per candidate for the standalone CLI entry point.",
+            "CriticalPathEffect": "One-time local filesystem probing before runtime spawn; bounded and small relative to subprocess startup."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts `_ensureClientOnce` / `RuntimeConnection.forStdio`",
+            "Operation": "Spawn the Copilot runtime over stdio",
+            "Cardinality": "One coalesced runtime process per client lifecycle, with a bounded startup-config retry path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Spawned one standalone Copilot CLI runtime process over stdio.",
+            "CriticalPathEffect": "Required startup boundary; runtime package/path changes but subprocess cardinality remains one."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts `_buildSessionConfig`",
+            "Operation": "Runtime discovers the two explicit built-in skill directories during session launch",
+            "Cardinality": "Two deduplicated built-in directories per create/resume, plus existing user/plugin skill directories after grouping.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The standalone runtime owned and exposed these same two supported built-in skills without host-supplied directory paths.",
+            "CriticalPathEffect": "Session initialization may read these small skill manifests before use, but the prior standalone runtime already exposed the same supported built-in skills and snapshots preserve their prompt surface."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts `launch` / `_buildSessionConfig`",
+            "Operation": "Create or resume an SDK session with tools, skills, hooks, and plugin directories",
+            "Cardinality": "One create/resume request per session launch; plugin and skill inputs are deduplicated where applicable.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One create/resume request with existing plugin directories and customization metadata.",
+            "CriticalPathEffect": "Existing required session startup request; richer metadata does not add request fan-out."
+          }
+        ],
+        "ScalingInput": "Runtime probes are constant-sized. Session metadata scales with configured plugins, while this diff adds exactly two built-in skill directories after set deduplication.",
+        "EffectiveConcurrency": "Client startup is globally coalesced through `_clientStarting`/`_ensureClientHealing`; session launches use the existing launcher behavior. No new aggregate process burst is introduced.",
+        "CacheBehavior": "Warm client acquisition returns the existing client and skips all probes/spawn. Filesystem probes benefit from OS cache but are not memoized across actual client restarts. Skill content is owned by the runtime/session lifecycle.",
+        "MechanismConfidence": "High for the startup path and cardinalities; lower for runtime-internal skill parsing duration, which is not needed for the verdict.",
+        "MagnitudeUncertainty": "Exact local filesystem and runtime skill-discovery costs are unmeasured, but multiplicity is constant and bounded.",
+        "Verdict": "No reportable regression: additional local probes and two skill paths are bounded, while process and session boundary cardinality remain unchanged."
+      },
+      {
+        "Scenario": "Executing directory-backed plugin hooks during prompts and tool calls",
+        "CriticalPath": "The session now explicitly registers hooks from all plugins. When the runtime invokes a hook callback, matching commands execute sequentially before the prompt/tool phase can continue.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts `_buildSessionConfig` -\u003e `toSdkHooks`; src/vs/platform/agentHost/node/copilot/copilotPluginConverters.ts `runHookCommands`",
+            "Operation": "Execute configured plugin hook shell commands",
+            "Cardinality": "One sequential subprocess per configured command for the invoked hook type, stopping early only where a valid JSON result is accepted; the E2E assertion verifies each directory-backed hook event is invoked exactly once.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Hooks belonging to file-backed plugins were excluded from the explicit SDK callback map; plugin directory discovery did not register those commands on that callback surface.",
+            "CriticalPathEffect": "Pre-tool and prompt hooks block their corresponding operation by design; post/session hooks follow their declared semantics."
+          }
+        ],
+        "ScalingInput": "Cost scales with the user-configured number and duration of hook commands and with prompt/tool-event frequency, not with unrelated plugin contents.",
+        "EffectiveConcurrency": "Commands within one hook type are intentionally serialized; callback invocation is exactly once rather than duplicated between directory discovery and explicit projection.",
+        "CacheBehavior": "There is no command-result cache; each declared hook invocation intentionally reruns its commands. Session hook configuration is built once per launch.",
+        "MechanismConfidence": "High for subprocess execution and serialization; these are the intended semantics of enabling previously inactive directory-backed hooks.",
+        "MagnitudeUncertainty": "User hook counts and durations vary widely, but the diff's exact-once callback cardinality is tested.",
+        "Verdict": "No performance finding: the boundary cost is intrinsic to the newly supported hook behavior, ordering is required, and the diff avoids duplicate invocation."
+      },
+      {
+        "Scenario": "Product build, cross-platform packaging, and canary override",
+        "CriticalPath": "Build jobs resolve the SDK runtime version, ensure one target platform package, filter/package native files, and for universal macOS builds cross-copy the opposite architecture package.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/common/apply-sdk-canary-override.ts",
+            "Operation": "Run `npm view` for SDK canary/runtime metadata and npm lockfile refresh operations",
+            "Cardinality": "One runtime-version lookup when an SDK override is supplied, plus existing lockfile refresh work per root/remote target when dependency versions change; removed code previously issued additional dependency/range lookups.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "SDK/CLI inference and compatibility checks could issue multiple npm-view subprocess/network calls.",
+            "CriticalPathEffect": "Build-only network/subprocess work; the diff reduces metadata lookup fan-out rather than increasing it."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/lib/copilot.ts `ensureCopilotPlatformPackage`; build/darwin/create-universal-app.ts",
+            "Operation": "Validate required SDK runtime files and package/cross-copy the selected platform package",
+            "Cardinality": "Five existence checks per ensured target package and one platform-directory cross-copy per architecture/base in universal builds.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Ensured, filtered, and cross-copied the standalone Copilot platform package instead.",
+            "CriticalPathEffect": "Build/package critical path only; replaces equivalent standalone runtime package handling with bounded SDK package handling."
+          }
+        ],
+        "ScalingInput": "Costs scale with the fixed set of build targets and two node_modules bases in universal packaging, not workspace/user data.",
+        "EffectiveConcurrency": "Per-target packaging remains governed by existing build job parallelism; no new unbounded concurrent npm, copy, or subprocess loop is introduced.",
+        "CacheBehavior": "Normal node_modules/build caches remain; canary manifest changes intentionally invalidate the package cache. No runtime user cache is affected.",
+        "MechanismConfidence": "High for boundary counts and build-only reachability.",
+        "MagnitudeUncertainty": "SDK and standalone package byte sizes may differ, but the diff provides no evidence of a material build regression and operation counts remain bounded.",
+        "Verdict": "No reportable performance regression: package ownership changes while build operation multiplicity stays bounded, and canary registry calls decrease."
+      },
+      {
+        "Scenario": "Sending Copilot model requests with skill metadata",
+        "CriticalPath": "Session prompt construction serializes instructions and tool schemas, then the runtime sends them with each model request.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts `skillDirectories` / `enableSkills`; changed prompt snapshots",
+            "Operation": "Serialize built-in skill names/descriptions into the model request prompt/tool schema",
+            "Cardinality": "Two supported built-in skills per session/request, deduplicated by directory; request count is unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The standalone runtime already exposed the same two built-in skills; snapshots show their metadata moved from instructions into the skill tool description rather than adding a second copy.",
+            "CriticalPathEffect": "Payload bytes remain on the existing model-request network path."
+          },
+          {
+            "Kind": "network",
+            "Location": "Copilot runtime model request represented by the prompt E2E snapshots",
+            "Operation": "Send the model request to the provider",
+            "Cardinality": "One existing model request per turn/model call; no additional call is introduced.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same model-request cardinality with the prior runtime.",
+            "CriticalPathEffect": "Existing dominant turn boundary; no request fan-out from this diff."
+          }
+        ],
+        "ScalingInput": "Payload cost is constant for the two retained built-ins and otherwise scales with existing project/plugin skills and tools.",
+        "EffectiveConcurrency": "Unchanged runtime request scheduling; no new per-skill network call or subprocess is created.",
+        "CacheBehavior": "Session configuration is rebuilt on create/resume; no changed request cache is evident. The runtime owns prompt assembly.",
+        "MechanismConfidence": "High that skill count is two and request cardinality is unchanged; insufficient evidence that unrelated runtime prompt revisions create a host-caused regression.",
+        "MagnitudeUncertainty": "Exact token delta from broader runtime prompt revisions varies by model, but the changed snapshots do not establish duplicate skill metadata or an added request.",
+        "Verdict": "No reportable regression: richer metadata is not duplicated and does not change expensive-boundary cardinality."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 47 changed files and paginated patches. One low-severity latency regression was reported: model changes now wait on a coalesced but real background catalog network request. Runtime startup probes, session skills, plugin hooks, packaging, prompt serialization, cleanup, cache behavior, and concurrency were traced; no other changed mechanism met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-18T09:56:50.373135413Z",
+    "CompletedAt": "2026-09-18T09:58:59.345909347Z",
+    "WallClockMilliseconds": 128972,
+    "ModelCalls": 12,
+    "InputTokens": 960898,
+    "OutputTokens": 11879,
+    "TotalTokens": 972777,
+    "ReasoningTokens": 3840,
+    "CacheReadTokens": 839365,
+    "CacheWriteTokens": 121497,
+    "APIDurationMilliseconds": 112273,
+    "ToolCalls": 101,
+    "NanoAIUnits": 118095500000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 839365,
+      "cache_write": 121497,
+      "input": 36,
+      "output": 11879
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
