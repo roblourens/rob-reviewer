@@ -1,0 +1,229 @@
+{
+  "PullRequest": {
+    "Number": 336792,
+    "Title": "sessions: Track editor chat cohorts in Agents telemetry",
+    "Body": "## Summary\nTrack editor-window chat usage so Agents window telemetry can distinguish user cohorts based on prior editor activity.\n\n- Persist session starts by bounded provider category, total accepted messages, same-window and all-editor-window overlap counts, and last-message time in machine-local shared application storage.\n- Include cohort fields in `agents/firstTimeWindowOpen` and `agents/requestSent`, reporting seconds since the last editor message rather than an absolute timestamp.\n- Count queued and steering submissions once, excluding retries, queue drains, system/hidden messages, and Agents window activity.\n\n## Implementation notes\n- Counters use ordinary shared-storage reads/writes with separate keys per counter/provider. They are intentionally best effort: overlapping window writes can undercount. No new atomic storage API is introduced.\n- Cross-window overlap uses a 200ms live probe; unresponsive windows may be missed. The all-window count includes overlap known to the submitting window.\n- Telemetry contains bounded provider categories, counts, and elapsed seconds, not session resources or message content.\n\n## Validation\n- `npm run gulp compile-client` — passed\n- Staged-file hygiene — passed\n- Focused chat submission, cohort tracking, telemetry, and window-handoff suites — 136 passing\n- Client type check, ESLint, and layer checks — passed",
+    "URL": "https://github.com/microsoft/vscode/pull/336792",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6629039adedf1b0009b43d0c4f2f8d8cd52e2bc2",
+    "HeadRef": "benibenj/agents/user-cohort-telemetry-tracking",
+    "HeadSHA": "f7155c607a775fefae2d0eed5d763fa76244d336",
+    "CreatedAt": "2026-09-18T16:11:58Z",
+    "UpdatedAt": "2026-09-18T17:15:37Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-F201D406EAB4",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/editorChatUsage.contribution.ts",
+      "Side": "RIGHT",
+      "Line": 114,
+      "Severity": "low",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The 200 ms timeout, pending-set lifecycle, and blocking shutdown join are explicit and deterministic. Only how often users close within that interval is uncertain, which is reflected in low severity.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "Shutdown join time waiting on 200 ms timer-backed probe promises",
+      "PerformanceScaling": "Any submission during the 200 ms before close/reload adds a pending operation; because probes run concurrently, delay is bounded by the latest probe's remaining timeout but can approach the full 200 ms after the most recent submission.",
+      "PerformanceOutcome": "Blocked window close or reload for up to 200 ms",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this contribution, closing or reloading an editor window had no editor-usage probe promise to join and therefore no telemetry-imposed 200 ms wait.",
+      "ChangedBehavior": "Every accepted request creates a probe that resolves only after a peer response or the 200 ms timeout. The added shutdown listener joins `Promise.all(pending)`, and desktop lifecycle explicitly awaits default joiners before the window closes.",
+      "CausalDiffEvidence": "Added line 114 newly joins all pending cross-window telemetry operations during shutdown; those operations are introduced at lines 92-105 and use a 200 ms timeout.",
+      "Title": "Do not hold shutdown open for the telemetry probe timeout",
+      "Impact": "In the common single-window/no-responding-peer case, closing or reloading shortly after sending a chat message visibly waits for the remainder of the 200 ms telemetry timeout, even though this accounting is documented as best effort.",
+      "Evidence": "The promise is added to `pending` after scheduling `disposableTimeout(..., 200)` and has no earlier completion when no peer replies. `NativeLifecycleService.handleWillShutdown` awaits `Promises.settled(joiners)`, and the lifecycle contract states joined promises block application closing. Line 114 places all such timer-backed operations into that blocking phase.",
+      "Recommendation": "On shutdown, synchronously dispose/finalize outstanding probes and record the local counters without waiting for remote replies, or split baseline recording from the optional cross-window increment so the best-effort remote check never joins the shutdown critical path."
+    },
+    {
+      "ID": "PERF-33D8B5F28DE5",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/editorChatUsage.contribution.ts",
+      "Side": "RIGHT",
+      "Line": 52,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The changed synchronous listener, broadcast fan-out, lazy model getter side effect, full-list getter, and extension-host refresh RPC are all directly traced in repository code. The exact session/window counts vary, affecting magnitude but not the mechanism or reachability.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Extension-host IPC refreshes, synchronous cached-session parsing, and per-window session-array allocations",
+      "PerformanceScaling": "For one accepted message, work grows across all W open editor windows; a previously idle peer can refresh each of its P registered providers, and every probe scans/materializes its C chat models plus S persisted agent sessions, yielding O(W*P) provider refreshes and O(W*(C+S)) local work.",
+      "PerformanceOutcome": "Excessive cross-window IPC/CPU and increased latency returning from an editor chat send",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this change, accepting an editor chat message did not broadcast a probe, access `IAgentSessionsService.model`, parse the agent-session cache, or refresh session providers in unrelated windows; the delayed service/model stayed lazy until a feature that displayed or used agent sessions requested it.",
+      "ChangedBehavior": "The new `hasOtherSession` closure reads `agentSessionsService.model.sessions`. It is called synchronously for the submitting request and by every window receiving the new broadcast probe. The first read creates `AgentSessionsModel`, parses all cached sessions, and calls `resolve(undefined)`; that path refreshes every registered controller, with extension controllers crossing `$refreshChatSessionItems` IPC. Subsequent probes still materialize and deduplicate the entire historical session array.",
+      "CausalDiffEvidence": "Added line 52 newly dereferences `agentSessionsService.model.sessions` from the telemetry predicate; added line 80 invokes that predicate for every incoming cross-window probe, and added line 91 invokes it synchronously for every accepted local submission.",
+      "Title": "Keep telemetry probes from activating every window's session providers",
+      "Impact": "Sending one editor chat message with several VS Code windows open can activate and refresh all chat-session providers in every idle peer window, while the submitting window synchronously pays full-history setup/scanning before `sendRequest` returns. Users with multiple windows or large agent-session histories can see first-send latency and a burst of extension-host/provider work unrelated to the requested chat.",
+      "Evidence": "`Emitter.fire` delivers the new acceptance listener synchronously. This closure dereferences the lazy `agentSessionsService.model`; its getter constructs `AgentSessionsModel`, whose constructor parses `agentSessions.model.cache` and whose service getter invokes `model.resolve(undefined)`. `resolve` schedules every registered provider, `refreshChatSessionItems` calls each controller's `refresh`, and extension-backed controllers implement that as `_proxy.$refreshChatSessionItems`. The `sessions` getter also converts the complete map to an array and runs full-list deduplication before `some`. The broadcast receive path calls the same closure in every peer.",
+      "Recommendation": "Answer telemetry from a lightweight set/count of currently in-progress resource IDs that is maintained by existing status/model events, and let probe handling inspect only already-initialized state. In particular, do not dereference the lazy agent-sessions model or call its full `sessions` getter from this best-effort telemetry path; if no lightweight state exists yet, expose a non-activating peek rather than resolving providers."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "eager-work",
+      "cleanup-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Send or queue a user chat request from an editor window while other editor windows are open",
+        "CriticalPath": "`ChatService.sendRequestInternal` starts the request/queues it, then synchronously fires `onDidAcceptRequest`; before `sendRequest` returns, the new listener scans local chat/session state and posts the cross-window probe. Peer responses, provider refreshes, the 200 ms wait, and storage accounting are off the request-response critical path, although lazy model construction/cache parsing in the synchronous listener is on it.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/editorChatUsage.contribution.ts:92-105",
+            "Operation": "Broadcast one probe and receive up to one response from each live editor peer through `BroadcastChannel` (or synchronous localStorage fallback).",
+            "Cardinality": "One outbound probe per accepted submission, delivered to W-1 editor windows; each busy peer may send one response. There is no coalescing across submissions.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No cross-window probe or response was sent for chat submissions.",
+            "CriticalPathEffect": "Posting occurs before the acceptance listener returns; peer handling and responses are asynchronous and off the submitting request's immediate critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/editorChatUsage.contribution.ts:52 via AgentSessionsService.model -\u003e AgentSessionsModel.resolve -\u003e ChatSessionsService.refreshChatSessionItems",
+            "Operation": "Activate and refresh chat-session item controllers; extension-backed controllers call `$refreshChatSessionItems` in the extension host.",
+            "Cardinality": "On first model access in each previously idle window, up to P registered providers are refreshed concurrently; one submission can trigger this independently in W windows, for O(W*P) refreshes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The delayed agent-sessions model and its providers remained inactive until agent-session UI/functionality explicitly requested them; a chat submission in another window did not activate them.",
+            "CriticalPathEffect": "Synchronous model/cache construction is on the submitter listener path. Provider refreshes are delayed per provider and asynchronous, so they create background IPC/load rather than blocking the response directly."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/workbench/contrib/chat/common/editorChatUsage.ts:43-56",
+            "Operation": "Persist bounded usage counters to application-shared storage, whose renderer cache flushes through storage IPC/database updates.",
+            "Cardinality": "Two to five counter keys plus last-message date per accepted submission, coalesced by the storage layer's 100 ms flush into generally one update batch.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Editor submissions did not write these shared usage counters.",
+            "CriticalPathEffect": "Runs after the probe response/200 ms timeout and is off the send critical path; shutdown may flush pending storage through the existing storage close joiner."
+          }
+        ],
+        "ScalingInput": "Number W of open editor windows, P registered session providers per window, C live chat models, and S persisted agent sessions. Effective work is O(W*(C+S)) state inspection per probe and can add O(W*P) first-touch provider refreshes; storage writes remain bounded per submission.",
+        "EffectiveConcurrency": "Broadcast delivery fans out to all peer windows concurrently. Within each newly initialized model, provider resolves use `Promise.all` and per-provider delayers, but there is no cross-window limiter, so aggregate provider refresh concurrency grows with W*P. Storage coalesces same-window key updates over 100 ms.",
+        "CacheBehavior": "The agent-session model initialization and workspace cache parse happen once per window, but every later probe still materializes/deduplicates the full session collection. Probe results are not cached or coalesced. Shared-storage reads are from the initialized in-memory cache; writes are delayed/coalesced by storage.",
+        "MechanismConfidence": "High: synchronous event delivery, lazy model side effects, full-array getters, broadcast fan-out, provider Promise.all, and extension-host RPC are directly traced.",
+        "MagnitudeUncertainty": "Typical users may have only one window and modest history, but multi-window users with several providers or long session histories receive the full fan-out. Exact extension/provider refresh duration is implementation-dependent.",
+        "Verdict": "Reportable boundary-fanout regression: best-effort telemetry now activates/scans unrelated windows and provider inventories."
+      },
+      {
+        "Scenario": "Close, quit, or reload an editor window shortly after sending a chat request",
+        "CriticalPath": "Desktop lifecycle fires `onWillShutdown` and awaits all default joiners before closing. The new joiner waits for all outstanding probes, each of which otherwise settles only on a peer response or its 200 ms timer.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/editorChatUsage.ts:43-56 and existing storage shutdown",
+            "Operation": "Potential application-shared storage update/flush after the probe settles.",
+            "Cardinality": "At most one coalesced counter batch for submissions that settle while storage remains writable; the storage flush is existing infrastructure, while these keys are new.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No editor-usage counter update was pending at shutdown.",
+            "CriticalPathEffect": "The deterministic regression is waiting for the timer-backed telemetry promise; any resulting storage flush can also join the existing shutdown path."
+          }
+        ],
+        "ScalingInput": "Submissions made in the final 200 ms before shutdown. Multiple probes settle concurrently, so delay is bounded by the most recent probe's remaining timeout and can approach 200 ms.",
+        "EffectiveConcurrency": "All pending operations are awaited with `Promise.all`; concurrency prevents additive N*200 ms waits but does not remove the latest timer deadline.",
+        "CacheBehavior": "No cache or negative response shortens the common no-peer case; absence of a peer is learned only by the fixed timeout.",
+        "MechanismConfidence": "High: timeout creation and native lifecycle join semantics are explicit.",
+        "MagnitudeUncertainty": "Closing/reloading within 200 ms of submission is intermittent, but when triggered the blocking interval is deterministic.",
+        "Verdict": "Reportable low-severity shutdown latency regression; best-effort telemetry should not block close/reload."
+      },
+      {
+        "Scenario": "Emit Agents-window request and first-open telemetry",
+        "CriticalPath": "On each Agents request, `getTelemetry` synchronously reads bounded counters before the existing asynchronous workspace-file-count path emits telemetry. First-open telemetry reads the same counters at timer/shutdown emission.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/common/editorChatUsage.ts:66-82",
+            "Operation": "Read up to 17 bounded shared-storage values and JSON-serialize at most 12 provider counters.",
+            "Cardinality": "Once per Agents request and once for the first-open event; provider cardinality is statically bounded to 12.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These bounded counter reads and the small provider-map serialization were absent from these telemetry events.",
+            "CriticalPathEffect": "Reads hit the storage service's initialized in-memory cache; no new filesystem/IPC read is performed. Serialization is constant-bounded and precedes existing telemetry emission."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/sessions/browser/sessionsTelemetry.contribution.ts:219 and src/vs/sessions/contrib/sessions/browser/sessionsWindowOpenTelemetry.ts:227",
+            "Operation": "Emit existing `agents/requestSent` or `agents/firstTimeWindowOpen` telemetry with five additional bounded fields.",
+            "Cardinality": "No additional event; one richer payload per existing event.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same events were emitted without the five editor-usage fields.",
+            "CriticalPathEffect": "The PR does not add an extra telemetry call. Request telemetry remains behind the existing workspace-file-count promise; first-open uses the existing emission path."
+          }
+        ],
+        "ScalingInput": "Agents request count; each event adds constant bounded reads and payload size independent of chat history.",
+        "EffectiveConcurrency": "No changed concurrency; the request event retains its existing async workspace-count sequencing.",
+        "CacheBehavior": "Storage values are warm in-memory after storage-service initialization. There is no unbounded telemetry cache or payload growth because providers are enumerated from a fixed list.",
+        "MechanismConfidence": "High for the bounded in-memory behavior.",
+        "MagnitudeUncertainty": "Negligible bounded CPU/serialization cost; no evidence of user-visible regression.",
+        "Verdict": "No finding: richer telemetry adds constant-bounded cache reads and no new event/boundary call."
+      },
+      {
+        "Scenario": "Restore an ordinary editor window without using chat",
+        "CriticalPath": "At `WorkbenchPhase.BlockRestore`, the new contribution checks the window kind, captures delayed service proxies, creates one `BroadcastChannel`, and registers listeners. It does not access `agentSessionsService.model` until a submission or incoming probe.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/workbench/contrib/chat/browser/chat.shared.contribution.ts:3296 and src/vs/workbench/contrib/chat/browser/editorChatUsage.contribution.ts:54-59",
+            "Operation": "Create one browser `BroadcastChannel` and event listener per editor window.",
+            "Cardinality": "Exactly one channel per editor window for the contribution lifetime.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No editor-usage broadcast channel was created.",
+            "CriticalPathEffect": "Construction runs during BlockRestore, but performs no filesystem/network/provider work in the normal BroadcastChannel path."
+          }
+        ],
+        "ScalingInput": "One constant allocation/listener per editor window.",
+        "EffectiveConcurrency": "No work is scheduled until a message is accepted or a peer probe arrives.",
+        "CacheBehavior": "Injected delayed services remain proxies at startup; the agent-session model is still lazy until the closure is invoked.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Browser fallback environments may touch localStorage when posting later, not during startup.",
+        "Verdict": "No startup finding: the eager startup allocation is small and constant; the reportable eager/provider work occurs on the first submission/probe scenario instead."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 15 changed files and all diff pages. Reported the cross-window lazy-service/provider fan-out and the timer-backed shutdown join. Bounded telemetry reads/payload growth and the single startup channel do not meet the regression threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-18T17:40:37.910982331Z",
+    "CompletedAt": "2026-09-18T17:42:50.665089262Z",
+    "WallClockMilliseconds": 132754,
+    "ModelCalls": 16,
+    "InputTokens": 1115501,
+    "OutputTokens": 13145,
+    "TotalTokens": 1128646,
+    "ReasoningTokens": 5701,
+    "CacheReadTokens": 1008603,
+    "CacheWriteTokens": 106850,
+    "APIDurationMilliseconds": 118766,
+    "ToolCalls": 97,
+    "NanoAIUnits": 120078320000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1008603,
+      "cache_write": 106850,
+      "input": 48,
+      "output": 13145
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
