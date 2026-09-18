@@ -1,0 +1,251 @@
+{
+  "PullRequest": {
+    "Number": 336687,
+    "Title": "Improve named pipes",
+    "Body": "Fix #148034",
+    "URL": "https://github.com/microsoft/vscode/pull/336687",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b029fb142d7a1c7a656d8be926525d4e44c6d635",
+    "HeadRef": "lramos15/improve-named-pipes",
+    "HeadSHA": "2c5ac697086ece4fe2f7012564653e8dd5c5b970",
+    "CreatedAt": "2026-09-18T03:56:59Z",
+    "UpdatedAt": "2026-09-18T05:18:28Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-57ED47C6BA77",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/files/node/diskFileSystemProvider.ts",
+      "Side": "RIGHT",
+      "Line": 360,
+      "Severity": "low",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The added syscall, its serialized placement before reading, and the per-extension cold-start call path are explicit in repository code. Exact milliseconds vary with extension count, filesystem latency, and cache state, which is why severity is low rather than suppressing the concrete mechanism.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "filesystem metadata syscalls and libuv thread-pool work",
+      "PerformanceScaling": "The added descriptor `fstat` runs once for every `readFile` and read-only `open`; cold extension scanning invokes those paths concurrently for each installed extension manifest, so the extra boundary work grows linearly with extension count and other files loaded.",
+      "PerformanceOutcome": "increased startup and file-open latency, with additional filesystem/thread-pool contention",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "A regular `readFile` delegated directly to `fs.promises.readFile(path)`, and a read-only `open` performed only the open operation; FileService already started its own metadata resolution in parallel for each read.",
+      "ChangedBehavior": "Every regular read now awaits `open`, then an additional `fstat`, before any bytes can be read. This provider-level metadata call is serialized on the read critical path even when FileService is already resolving metadata for the same resource.",
+      "CausalDiffEvidence": "Added RIGHT line 360 introduces `await Promises.fstat(fd)` inside the helper now used by both `readFile` and every read-only `open`; no such provider-level pre-read metadata syscall existed on those paths before this diff.",
+      "Title": "Avoid a new metadata syscall on every regular-file read",
+      "Impact": "Cold extension scans issue one added metadata operation for every installed extension's `package.json` (the scanner maps all extension directories through `Promise.all`), while editor/file loads pay the same extra round trip. This is especially visible on high-latency or heavily monitored filesystems.",
+      "Evidence": "`FileService.doReadFileStream` starts `validateReadFile`, which calls `resolve(..., { resolveMetadata: true })`, alongside the provider read. The changed `openFileForRead` then independently awaits `Promises.fstat(fd)` before returning. `ExtensionsScanner.scanExtensionsFromLocation` uses `Promise.all` over all extension directories and `scanExtensionManifest` reads one `package.json` per extension, placing the added filesystem boundary on startup's extension-scan path. The warm user-extension cache reduces this to one cache read, but system scans and cold/invalid caches still fan out across installed extensions.",
+      "Recommendation": "Keep the nonblocking special-file protection, but coalesce the descriptor type check with the read implementation instead of adding an independent metadata round trip to every normal read (for example, carry the opened descriptor's stat into a read routine that consumes it rather than restatting, and preserve equivalent validation for direct provider/open callers)."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/bulkEdit/browser/bulkFileEdits.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 255,
+      "BasePath": "src/vs/workbench/contrib/bulkEdit/browser/bulkFileEdits.ts",
+      "BaseLine": 263,
+      "IntroducingPath": "src/vs/workbench/contrib/bulkEdit/browser/bulkFileEdits.ts",
+      "IntroducingCommit": "37249cba4aaffc7ea0ec2a9e7c2ae2ccb595a485",
+      "MechanismFamily": "eager-work",
+      "PerformanceCategory": "io",
+      "Mechanism": "Bulk delete eagerly read every non-folder entry to capture undo contents. A FIFO is reported as an unknown, non-folder file type, so reading a FIFO without a writer can block indefinitely before the delete operation runs.",
+      "Symptom": "Deleting a selection containing a named pipe can hang indefinitely before deletion because undo capture waits for pipe contents.",
+      "FixedBehavior": "The added file-type guard skips undo-content reads for entries that are neither regular files nor directories, allowing the delete batch to proceed without opening the FIFO for a blocking read.",
+      "Evidence": "Before the added guard, `DeleteOperation.perform` resolved each entry and then called `fileService.readFile` whenever the edit was not marked as a folder and did not exceed the size limit. The new test models `FileType.Unknown` and proves no read occurs, while the named-pipe tests create a FIFO without a writer and require all read APIs to reject rather than block. Added line 255 excludes that special-file path before undo capture.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "eager-work",
+      "cleanup-lifecycle",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold startup extension scanning and ordinary disk-backed file/editor reads",
+        "CriticalPath": "For each uncached file, FileService starts metadata validation and provider reading; the changed provider read cannot begin transferring bytes until `openFileForRead` completes `open` and the newly added `fstat`. Cold/system extension startup awaits the aggregate manifest scan, while warm user-cache validation is deferred and therefore off the immediate startup path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/files/common/fileService.ts:606,739",
+            "Operation": "Resolve file metadata for read validation",
+            "Cardinality": "Once per FileService read; N times for N uncached extension manifests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same metadata validation occurred before the PR.",
+            "CriticalPathEffect": "Runs in parallel with provider reading unless an etag requires it first; its result must still complete before FileService returns."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/files/node/diskFileSystemProvider.ts:357",
+            "Operation": "Open the disk path for reading",
+            "Cardinality": "Once per provider `readFile` or read-only `open`; N times for N manifests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "`fs.readFile(path)` or read-only `open` already opened the path, although `readFile` previously encapsulated it.",
+            "CriticalPathEffect": "Must complete before descriptor validation and reading."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/files/node/diskFileSystemProvider.ts:360",
+            "Operation": "Fetch descriptor metadata with `fstat`",
+            "Cardinality": "New once-per-read/open operation; N additional calls for N uncached manifests.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No provider-level descriptor metadata operation preceded regular reads/read-only opens.",
+            "CriticalPathEffect": "Serialized after open and before the first byte read, adding a boundary round trip and thread-pool work."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/files/node/diskFileSystemProvider.ts:221-223",
+            "Operation": "Read bytes and close descriptor",
+            "Cardinality": "Once per unbuffered read, or chunked reads plus one close for streams.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "`fs.promises.readFile(path)` encapsulated read/close, while stream reads already used open/read/close.",
+            "CriticalPathEffect": "Existing content I/O remains required; only its explicit descriptor plumbing changed."
+          }
+        ],
+        "ScalingInput": "Number of installed system extensions plus cold/invalid-cache user extensions; ordinary usage adds one extra operation per disk read or read-only stream open.",
+        "EffectiveConcurrency": "Extension directories are mapped through `Promise.all`; effective filesystem concurrency is then bounded by the Node/libuv filesystem worker pool. The new `fstat` is serial within each file but fans out across all concurrently scanned manifests.",
+        "CacheBehavior": "Disk content is not cached by this path. A warm user-extension scan reads one cache file and schedules validation after a 3-second throttler, but cold/invalid user caches and system scans read each extension manifest.",
+        "MechanismConfidence": "High: the added serialized `fstat`, FileService's independent metadata resolution, and the N-way manifest scan are explicit.",
+        "MagnitudeUncertainty": "Exact delay depends on extension count, filesystem latency, antivirus/network mounts, and whether the user-extension cache is warm; local descriptor metadata may be cheap.",
+        "Verdict": "Reportable low-severity I/O fan-out regression; finding submitted at the added `fstat`."
+      },
+      {
+        "Scenario": "Reading or deleting POSIX named pipes and other non-regular filesystem entries",
+        "CriticalPath": "Direct reads now open nonblocking on POSIX and reject after descriptor classification. Bulk delete resolves entries sequentially, skips undo capture for unknown types, and then performs the existing batched delete, so a FIFO without a writer no longer blocks progress.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/files/node/diskFileSystemProvider.ts:357-373",
+            "Operation": "Open FIFO with `O_NONBLOCK`, classify descriptor, and close on rejection",
+            "Cardinality": "One open, one `fstat`, and one close per attempted special-file read.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Read APIs could enter a read on a FIFO without a writer and block indefinitely.",
+            "CriticalPathEffect": "Completes promptly with an unavailable error instead of entering the blocking read path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/bulkEdit/browser/bulkFileEdits.ts:240",
+            "Operation": "Resolve each deletion target's metadata",
+            "Cardinality": "Once per effective distinct delete edit, processed sequentially.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same metadata lookup occurred before undo capture.",
+            "CriticalPathEffect": "Required before building the delete batch and unchanged by the PR."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/bulkEdit/browser/bulkFileEdits.ts:255-278",
+            "Operation": "Read file contents for undo and execute delete batch",
+            "Cardinality": "Regular files still incur one content read each; unknown/special entries now incur zero reads; the delete service receives one grouped batch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unknown non-folder entries were also read eagerly, which could block indefinitely on a FIFO.",
+            "CriticalPathEffect": "The removed FIFO read previously blocked the delete before the batch; regular-file undo behavior is unchanged."
+          }
+        ],
+        "ScalingInput": "Number and types of selected delete targets; one FIFO without a writer was sufficient to hang the pre-diff path.",
+        "EffectiveConcurrency": "Bulk-delete metadata/undo preparation is sequential per edit, followed by a grouped delete call. Provider read attempts are independent; no new burst is introduced.",
+        "CacheBehavior": "No content or negative cache participates; each operation resolves current filesystem state.",
+        "MechanismConfidence": "High: the control flow, FIFO fixture, and tests directly establish the blocking boundary and its removal.",
+        "MagnitudeUncertainty": "The hang mechanism on a FIFO without a writer is deterministic on the tested POSIX path; prevalence of such workspace entries is uncertain.",
+        "Verdict": "This PR fixes a concrete eager blocking-I/O regression; the introducing commit was recorded with `report_regression_fix` and no review finding was filed against the fix."
+      },
+      {
+        "Scenario": "Aborting a Copilot agent turn while SDK callbacks are pending or arrive late",
+        "CriticalPath": "The existing SDK `session.abort()` remains the abort critical path. Cancelled callbacks now await the single shared abort barrier before returning their cancellation response; disposal completes the barrier immediately.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:3556",
+            "Operation": "Abort the underlying Copilot SDK session",
+            "Cardinality": "Once per `abort()` invocation; repeated concurrent invocations share the new barrier but still follow the existing SDK abort call behavior.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Abort already awaited the SDK session; cancelled callbacks returned before that acknowledgment.",
+            "CriticalPathEffect": "Abort completion and newly delayed callback responses wait for this existing asynchronous SDK boundary."
+          }
+        ],
+        "ScalingInput": "Number of callbacks pending or delivered during one abort and duration of the SDK abort.",
+        "EffectiveConcurrency": "All callbacks cancelled during the same in-flight abort await one `DeferredPromise`; completion fans them out without per-callback subprocess, IPC, filesystem, database, or network work. Dispose releases all waiters.",
+        "CacheBehavior": "No cache; the barrier is per-session, exists only while abort is in flight, and is cleared on success, failure, or disposal.",
+        "MechanismConfidence": "High for the waiting behavior and cleanup; no evidence shows unbounded callback generation or a newly introduced expensive boundary.",
+        "MagnitudeUncertainty": "The maximum real callback count and SDK abort duration are not established, but the waiter lifetime is explicitly tied to the existing abort/dispose lifecycle.",
+        "Verdict": "No reportable performance regression: the delay intentionally coalesces callback completion behind an already-required abort acknowledgment, and lifecycle cleanup releases waiters."
+      },
+      {
+        "Scenario": "Explorer confirmation and bulk-edit undo handling for unknown file types",
+        "CriticalPath": "Explorer confirmation performs an in-memory scan of the already distinct selected elements; bulk edit then avoids undo construction for non-file/non-directory entries before the delete service call.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of distinct selected explorer entries or delete edits.",
+        "EffectiveConcurrency": "The added checks are synchronous O(N) predicates over the existing selection/edit loop; no new parallel work, queue, subprocess, IPC, filesystem, database, or network boundary is introduced.",
+        "CacheBehavior": "No cache is involved; existing resolved item/stat data is reused.",
+        "MechanismConfidence": "High: the changed lines only inspect existing booleans and, in bulk edit, remove a possible content read.",
+        "MagnitudeUncertainty": "Selection sizes vary, but the added constant-time predicates are negligible and replace downstream work for unknown entries.",
+        "Verdict": "No regression; the explorer check is negligible and the bulk-edit guard reduces I/O for unknown entries."
+      },
+      {
+        "Scenario": "Copilot E2E MCP readiness setup",
+        "CriticalPath": "Test setup now creates and subscribes to an empty chat and waits for the MCP-ready notification before dispatching replay. This is confined to the E2E suite and does not alter a shipped product path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/suites/copilotCoverageSuite.ts:293-305",
+            "Operation": "Issue `createChat`, `subscribe`, and wait for an action notification through the test client",
+            "Cardinality": "One create call, one subscribe call, and one readiness wait for this single replay test.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The test dispatched the turn directly without chat materialization/readiness synchronization.",
+            "CriticalPathEffect": "Adds test latency before replay but prevents startup races; no product critical path is affected."
+          }
+        ],
+        "ScalingInput": "Constant one test case and one MCP server.",
+        "EffectiveConcurrency": "Calls are intentionally serialized to establish readiness; no collection fan-out.",
+        "CacheBehavior": "No cache; readiness is awaited once per test session.",
+        "MechanismConfidence": "High, but scope is test-only.",
+        "MagnitudeUncertainty": "Agent-host startup duration varies, bounded by the existing 30-second test timeout.",
+        "Verdict": "No product performance finding; the added boundary calls are deterministic test synchronization."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 11 changed files and all diff pages. Submitted one low-severity filesystem boundary-fanout finding for the new per-read `fstat`, and recorded the bulk-delete FIFO hang as a regression fix. Checked regular/special-file I/O, extension-scan cache/concurrency, agent-abort lifecycle, explorer/bulk-edit paths, and test-only MCP IPC changes."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-18T05:24:53.084037657Z",
+    "CompletedAt": "2026-09-18T05:27:59.875705125Z",
+    "WallClockMilliseconds": 186791,
+    "ModelCalls": 10,
+    "InputTokens": 427154,
+    "OutputTokens": 12270,
+    "TotalTokens": 439424,
+    "ReasoningTokens": 6579,
+    "CacheReadTokens": 357422,
+    "CacheWriteTokens": 69702,
+    "APIDurationMilliseconds": 103711,
+    "ToolCalls": 63,
+    "NanoAIUnits": 73699880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 357422,
+      "cache_write": 69702,
+      "input": 30,
+      "output": 12270
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

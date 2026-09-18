@@ -1,0 +1,202 @@
+{
+  "PullRequest": {
+    "Number": 336677,
+    "Title": "terminal: Stabilize persistence replay smoke tests",
+    "Body": "Fixes microsoft/vscode-engineering#3893.\n\n## Summary\n\nStabilize the terminal persistence smoke tests introduced by #323980 by separating completed-output replay from subsequent live output:\n\n- Wait for the initial numbered output to finish before reloading the window or detaching the terminal.\n- Keep the producer alive in raw input mode during reconnect, then focus the restored terminal and send a continuation line to produce the final output without shell prompt or input-echo redraws.\n- Keep the strict assertion over the entire sequence, detecting missing, duplicated, or out-of-order entries without filtering them out.\n- Rename the tests to describe completed-output replay and remove the arbitrary detached delay.\n\n## Why\n\nThe Windows failure in [Azure build 474799](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=474799\u0026view=logs\u0026j=e089a2ac-f78d-54f8-98f1-223882dca528\u0026t=307b88cf-38b4-5b38-4b7e-700b4a7aaf02) captured `[21, 0, 1, ..., 99]`: live output arrived before the replayed buffer. Local validation with retries disabled also reproduced a missing entry when live output raced replay.\n\nThe macOS detach/attach trace also showed that replay was complete before a wrapped shell prompt redrew over entries 95–99. Keeping the producer alive avoids returning to that prompt; raw input additionally prevents Windows console input echo from overwriting replayed output.\n\nThis is a test-only change. It verifies replay and subsequent live delivery separately rather than relying on concurrent live/replay ordering; it does not change production behavior.\n\n## Validation\n\n- Smoke-test TypeScript compilation passed.\n- Targeted hygiene and ESLint passed.\n- Both Windows Insiders cases passed five consecutive runs with Mocha retries disabled: **10 passes**.\n- Sequence checks confirmed that duplicate, missing, and out-of-order entries still fail the assertion.\n- macOS / Electron-Smoke passed on commit 49bef25a9b8: [Code OSS CI](https://github.com/microsoft/vscode/actions/runs/35304294813/job/105473200953).",
+    "URL": "https://github.com/microsoft/vscode/pull/336677",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b029fb142d7a1c7a656d8be926525d4e44c6d635",
+    "HeadRef": "agents/fix-ci-test-failure-pull-323980",
+    "HeadSHA": "49bef25a9b8d66548baf3fe8457ab5b99619169e",
+    "CreatedAt": "2026-09-18T02:43:32Z",
+    "UpdatedAt": "2026-09-18T04:28:02Z",
+    "MergedAt": null,
+    "Labels": [
+      "vscode-build",
+      "engineering"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-0D948084D8B4",
+      "Focus": "performance-review",
+      "Path": "test/smoke/src/areas/terminal/terminal-persistence.test.ts",
+      "Side": "RIGHT",
+      "Line": 50,
+      "Severity": "low",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The timer period and count make the pre-reconnect gate's minimum duration deterministic, and `reloadWindow` explicitly awaits a new window plus restored workbench. The diff clearly moves that boundary from after the old \u003e=10-lines gate (about 1 second) to after line 99 (about 10 seconds). Exact reload duration varies by CI machine, affecting magnitude but not the lost overlap.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "Subprocess timer time plus the Electron window reload/workbench restoration boundary.",
+      "PerformanceScaling": "The added serialized delay grows as `count * interval` (100 * 100 ms here), capped in incremental impact by the roughly nine seconds that previously overlapped reload; retries multiply the added wall time.",
+      "PerformanceOutcome": "Increased smoke-test wall-clock latency and reduced CI throughput from lost overlap between terminal production and window reload.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The test waited only until at least 10 lines had arrived (about one second), initiated reload while the producer emitted the remaining 90 lines, and then waited for line 99, allowing reload and producer time to overlap.",
+      "ChangedBehavior": "The test now waits for all 100 rate-limited lines before invoking `reloadWindow`, serializing the producer's approximately 10-second run with the full window reload/workbench restore boundary.",
+      "CausalDiffEvidence": "RIGHT line 50 adds `await terminal.waitForTerminalText(...count - 1)` before the reconnect branch. With 100 values emitted by the changed/retained `setInterval(..., 100)`, this gate cannot pass until roughly 10 seconds after launch; line 53's awaited `reloadWindow` can only begin afterward.",
+      "Title": "Avoid serializing the 10-second producer with window reload",
+      "Impact": "Every non-Linux smoke run of the window-reload case takes up to roughly nine seconds longer; failures can repeat this because the enclosing Terminal suite allows three retries, increasing CI wall time and reducing smoke-test throughput.",
+      "Evidence": "`runCommandInTerminal` only writes the command and presses Enter, so the child Node process continues asynchronously. `waitForTerminalText` polls the terminal buffer until its predicate passes. `Code.reloadWindow` then awaits `waitForWindowReload` and `whenWorkbenchRestored`. Before the diff, reload started after about 10 emissions (~1 second) while the remaining ~9 seconds of output continued in the persistent terminal; final sequence waiting overlapped those operations. Now the pre-reconnect wait consumes the full ~10 seconds and only then starts reload, extending the smoke test by `min(reload duration, ~9 seconds)`.",
+      "Recommendation": "Preserve completed-output-before-reconnect semantics without the ten-second gate by emitting the initial 100-line sequence immediately (or with a much shorter interval), then entering raw-mode keepalive before awaiting completion and reloading."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Smoke test: completed terminal-output replay across window reload",
+        "CriticalPath": "Create terminal, launch Node producer, wait for sequence 99, reload the Electron window and await workbench restoration, await replay, focus terminal, send continuation, and observe sequence 100. The changed pre-reload completion wait and reload are fully serial on the test's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:48-50",
+            "Operation": "Launch and drive a Node producer through the integrated terminal/pty.",
+            "Cardinality": "One terminal-launched Node subprocess per test attempt; 100 timer callbacks at 100 ms plus one continuation callback.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same rate-limited subprocess ran, but reload started after about 10 emissions and overlapped the remaining production.",
+            "CriticalPathEffect": "The subprocess must now produce all 100 initial lines before reload can start; its full timer duration gates progress."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:53 and test/automation/src/code.ts:345-350",
+            "Operation": "Trigger Electron window reload, wait for the new window, then wait for the workbench to restore.",
+            "Cardinality": "One window reload per attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Reload started after roughly one second and overlapped up to the remaining nine seconds of producer output.",
+            "CriticalPathEffect": "Reload, new-window detection, and workbench restoration start only after the roughly 10-second producer gate."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:50 and test/automation/src/code.ts:328-330",
+            "Operation": "Read the rendered terminal buffer through the automation driver until sequence 99 appears.",
+            "Cardinality": "Roughly one terminal-buffer driver query per 100 ms while each predicate is unsatisfied; effective count depends on reload/replay timing.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The pre-reload predicate stopped after about 10 lines; the final predicate waited for line 99 after reload, allowing producer and reload time to overlap.",
+            "CriticalPathEffect": "Polling implements the completion gates. Total sequence polling is similar in order of magnitude, but the changed first gate keeps it active until line 99 before reload."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:63-64",
+            "Operation": "Focus the restored terminal and send the `continue` line through UI automation.",
+            "Cardinality": "One focus command and one terminal write/Enter dispatch per attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No post-replay continuation command was sent.",
+            "CriticalPathEffect": "These constant post-replay operations add a small fixed automation cost and are required to verify subsequent live delivery."
+          }
+        ],
+        "ScalingInput": "Initial sequence count times timer interval (100 * 100 ms), multiplied by test attempts and up to three retries in the enclosing Terminal suite.",
+        "EffectiveConcurrency": "Before the diff, the persistent Node producer emitted its remaining ~90 values concurrently with window reload. The new completion gate removes that overlap and serializes approximately 10 seconds of production ahead of reload. Automation polling remains sequential at 100 ms intervals.",
+        "CacheBehavior": "No cache participates. Terminal-buffer predicates poll live/replayed state; neither cold nor warm cache behavior coalesces the producer wait or window reload.",
+        "MechanismConfidence": "High: the timer duration, awaited completion predicate, branch ordering, and awaited reload/restoration implementation directly establish the serialized critical path.",
+        "MagnitudeUncertainty": "Electron reload duration varies by CI host, so the exact added time is between the reload duration and the approximately nine seconds of overlap removed. The deterministic timer/count establishes the mechanism regardless of that variance.",
+        "Verdict": "Reportable low-severity CI latency regression: the diff intentionally separates completed output from replay but unnecessarily retains the slow producer interval, losing the prior overlap with reload. Initial output can be generated quickly while preserving the new semantics."
+      },
+      {
+        "Scenario": "Smoke test: completed terminal-output replay across detach/attach",
+        "CriticalPath": "Create terminal, launch producer, wait for line 99, query session name, detach, assert hidden, attach, await replay, focus, send continuation, and await line 100.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:48-50",
+            "Operation": "Produce numbered terminal output and remain alive in raw input mode.",
+            "Cardinality": "One Node subprocess and one terminal/pty session per attempt; 100 timed writes and one continuation write.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Detachment began after about 10 lines while the producer continued writing during the detached interval.",
+            "CriticalPathEffect": "All initial writes must complete before detachment after the diff."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:55-59",
+            "Operation": "Resolve the terminal session, detach it, and attach it again through workbench commands.",
+            "Cardinality": "One terminal-group query, one detach command, and one attach command per attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same boundaries began around one second after launch, followed by a fixed 250 ms detached delay that this diff removes.",
+            "CriticalPathEffect": "These automation/terminal-service boundaries occur after producer completion and gate replay verification."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:63-64",
+            "Operation": "Focus the terminal and send the continuation line.",
+            "Cardinality": "One focus command and one terminal input after attachment.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No continuation operation existed.",
+            "CriticalPathEffect": "Constant fixed cost required to prove subsequent live delivery."
+          }
+        ],
+        "ScalingInput": "Producer count and interval, with one detach/attach cycle per attempt and suite retries on failure.",
+        "EffectiveConcurrency": "The new gate serializes producer completion before detach/attach. The old fixed 250 ms detached wait is removed, partially offsetting the lost overlap; detach and attach automation commands are sequential.",
+        "CacheBehavior": "No cache or coalescing affects detach/attach. The restored terminal reads the pty/session replay directly; successful prior attempts do not warm subsequent attempts.",
+        "MechanismConfidence": "High that ordering changed and overlap was removed; medium on meaningful net magnitude because attach latency and the removed delay determine the delta.",
+        "MagnitudeUncertainty": "Actual detach/attach duration is not measured, and removal of the prior 250 ms delay offsets part of the serialization cost. The net increase is therefore likely much smaller than for window reload.",
+        "Verdict": "No separate finding: although producer completion is serialized, the removed 250 ms wait offsets part of the added path and evidence does not establish a meaningful independent regression beyond the shared line already reported for window reload."
+      },
+      {
+        "Scenario": "Smoke test: verify live output after completed replay",
+        "CriticalPath": "After reconnect and replay, focus the terminal, write `continue`, dispatch Enter, poll until sequence 100, then compare the 101-entry array.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:63-69",
+            "Operation": "Send a continuation line through automation and read the terminal buffer until its output is visible.",
+            "Cardinality": "One UI command invocation, one terminal write, one key dispatch, and bounded 100 ms polling until one output appears.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The test ended when initial sequence 99 appeared and performed no post-reconnect live exchange.",
+            "CriticalPathEffect": "Adds a small constant tail to each test attempt and is necessary to separate replay from subsequent live delivery."
+          }
+        ],
+        "ScalingInput": "Constant one continuation event and a 101-element assertion per reconnect test.",
+        "EffectiveConcurrency": "All operations are sequential by design; one input produces one output and one bounded assertion. No concurrency burst or fan-out occurs.",
+        "CacheBehavior": "No cache. The continuation is a single live terminal input/output exchange after authoritative replay has appeared.",
+        "MechanismConfidence": "High: helper implementations show one write/key event and sequential polling; there is no collection scaling.",
+        "MagnitudeUncertainty": "Exact automation round-trip latency varies, but cardinality is fixed at one and bounded by the existing polling timeout.",
+        "Verdict": "No finding: the new boundary work is constant, bounded, and directly required by the changed test semantics."
+      }
+    ],
+    "Summary": "Completed the performance pass over the sole changed file and all three diff hunks. Traced subprocess, automation IPC, terminal-buffer polling, reload/restoration, detach/attach, cache behavior, and concurrency for both reconnect modes plus post-replay live delivery. Submitted one low-severity finding for the deterministic loss of producer/reload overlap; no production runtime behavior changed and no regression-fix learning signal applies."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-18T05:22:33.453224643Z",
+    "CompletedAt": "2026-09-18T05:23:55.998091513Z",
+    "WallClockMilliseconds": 82544,
+    "ModelCalls": 9,
+    "InputTokens": 148528,
+    "OutputTokens": 5632,
+    "TotalTokens": 154160,
+    "ReasoningTokens": 2132,
+    "CacheReadTokens": 123944,
+    "CacheWriteTokens": 24557,
+    "APIDurationMilliseconds": 66585,
+    "ToolCalls": 25,
+    "NanoAIUnits": 28511060000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 123944,
+      "cache_write": 24557,
+      "input": 27,
+      "output": 5632
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
