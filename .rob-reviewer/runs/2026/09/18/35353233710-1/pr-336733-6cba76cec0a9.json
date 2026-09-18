@@ -1,0 +1,136 @@
+{
+  "PullRequest": {
+    "Number": 336733,
+    "Title": "menus: Optimize one-shot menu action resolution",
+    "Body": "## Summary\n\nOptimize the menu-construction part of #336496 without adding a product-wide cache or changing tree-find behavior.\n\n- Resolve one-shot menu actions directly instead of constructing and disposing an event-tracking `MenuImpl`.\n- Filter contributions by the current context before sorting, and skip collection of context-key dependencies that only persistent menus need. Apply the same path to submenus.\n- Share action construction with persistent menus, preserving action arguments, alternate commands, enablement, toggled state, hidden state, and submenu notifications.\n- Remove the redundant second `MenuInfo.refresh()` (fixes #336495).\n- Normalize empty and omitted group names to the same default group in the comparator. This makes sorting consistent with grouping and avoids order differences between filtering before and after sorting.\n\nThere is deliberately **no cross-call cache or registry-version API**: each one-shot request rereads the registry, so in-place descriptor changes and implicit Command Palette exclusions remain current. No per-menu or per-row retained state is added.\n\n## Validation\n\n- `npm run gulp compile-client` — passed, zero errors.\n- Hygiene/ESLint on all three changed files — passed.\n- Electron `MenuService` suite — **19 tests passed**, including 13 new tests.\n- Three targeted performance/ordering regressions fail against the original implementation and pass with this change.\n- 200 deterministic mixed-group comparisons matched one-shot and persistent-menu output.\n\nLocal Windows microbenchmark: 875 registered items, 100 rows, two lookups per row; median of nine alternating runs, with output parity checked and no concurrent build.\n\n| Scenario | Before | After | Speedup |\n| --- | ---: | ---: | ---: |\n| Row-specific context (16 context values) | 939.3 ms | 74.5 ms | 12.6x |\n| All contributions applicable | 1944.1 ms | 1515.1 ms | 1.28x |\n\nThese are menu-resolution measurements, not an end-to-end reproduction of the reported 20-second freeze. The tree find widget's full-list refilter remains unchanged, so #336496 should remain open for that separate part.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336733",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "265cdf226b54b8cbe19f37e748ba229fd7714b97",
+    "HeadRef": "benibenj/agents/perf-fix-menu-actions-caching",
+    "HeadSHA": "6cba76cec0a9c2c65cdbb7e2ce19845f467e6c19",
+    "CreatedAt": "2026-09-18T08:54:25Z",
+    "UpdatedAt": "2026-09-18T10:18:47Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/actions/common/menuService.ts",
+      "FixedSide": "LEFT",
+      "FixedLine": 283,
+      "BasePath": "src/vs/platform/actions/common/menuService.ts",
+      "BaseLine": 283,
+      "IntroducingPath": "src/vs/platform/actions/common/menuService.ts",
+      "IntroducingCommit": "26852e0bcdec25c2f44fabd1ae9dfbcbc2ef2edb",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "Initial MenuInfo construction performed two consecutive full registry reads, sorts, grouping allocations, and context-key/submenu dependency walks with no intervening state change.",
+      "Symptom": "Menu creation paid roughly duplicate initialization CPU and allocation cost, amplified by large contribution sets and recursively constructed submenus.",
+      "FixedBehavior": "Removing the subclass constructor's second refresh leaves the superclass initialization pass as the sole initial registry read, sort, grouping, and dependency-collection pass while later registry-change refreshes remain intact.",
+      "Evidence": "MenuInfoSnapshot's constructor already invokes refresh(), which reads MenuRegistry, sorts menu items through the overridden MenuInfo._sort, groups them, and walks all items to collect context keys/submenu IDs. The deleted MenuInfo constructor line invoked refresh() a second time immediately after super(), duplicating that full pass for every persistent menu and each submenu MenuInfo created by the old action path.",
+      "Confidence": 0.99
+    },
+    {
+      "FixedPath": "src/vs/platform/actions/common/menuService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 40,
+      "BasePath": "src/vs/platform/actions/common/menuService.ts",
+      "BaseLine": 41,
+      "IntroducingPath": "src/vs/platform/actions/common/menuService.ts",
+      "IntroducingCommit": "603b0ee03b82cc77f90f56a5e0ecfbeee3213de1",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "Every one-shot menu lookup built and tore down event-tracking persistent-menu infrastructure, repeating registry scans, sorting, context-key collection, listener allocation, and disposal on synchronous per-row/per-selection paths.",
+      "Symptom": "Synchronous menu resolution latency and allocation/GC pressure scaled with the number of selected or rendered tree elements and registered menu contributions.",
+      "FixedBehavior": "One-shot requests now call createMenuActionGroups directly, avoiding persistent-menu listeners, schedulers, dependency collection, and immediate disposal; filtering also occurs before sorting, bounding sort/action construction to contributions matching the current row context.",
+      "Evidence": "The base getMenuActions implementation constructed MenuImpl, called getActions, and immediately disposed it. MenuImpl synchronously constructs MenuInfo, a RunOnceScheduler, a registry listener, disposable stores, and a debounce emitter; MenuInfo scans/sorts registry entries and collects context-key dependencies. Tree-view action resolution calls getMenuActions once for every selected element with a row-specific context, so all of that setup repeated serially per element even though no event could be observed before disposal. The added direct call at line 40 reads/filter/sorts the registry and constructs only the returned actions.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "eager-work",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Tree-view and other row-scoped context-menu action resolution, including multi-selection and full-list refilter/render paths",
+        "CriticalPath": "Each row or selected element synchronously creates a context overlay and resolves menu actions before action rendering/filtering can progress. The diff removes persistent-menu setup from this critical path; nested visible submenus are still resolved synchronously.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Cost scales with the number of selected/rendered elements times registered contributions, plus contributions in reachable visible submenus. Context filtering reduces effective sort and action-construction cardinality to matching items.",
+        "EffectiveConcurrency": "Calls are synchronous and serialized by the UI loop; there is no limiter or asynchronous fan-out. Effective multiplicity is one lookup per element passed to the caller, with each lookup scanning the registered contributions for that menu and each reachable visible submenu.",
+        "CacheBehavior": "There is intentionally no cross-call menu cache: cold and warm calls both reread the in-memory registry so dynamic registrations and descriptor mutations are observed. Hidden-state data is already resident in PersistedMenuHideState; no storage read occurs per lookup. There is no miss retry or negative-cache behavior.",
+        "MechanismConfidence": "High: the caller loop, synchronous registry scan/filter/sort, and removed MenuImpl listener/dependency setup are directly visible. No subprocess, IPC, filesystem, database, or network boundary is reached during action resolution.",
+        "MagnitudeUncertainty": "Exact element counts and extension contribution counts vary by workspace, but the repository call path proves one synchronous lookup per selected element and tests exercise 100 row contexts with 875 contributions. End-to-end freeze duration is not established from repository evidence.",
+        "Verdict": "No regression introduced. The changed path materially reduces repeated CPU/allocation work by avoiding short-lived event-tracking menus and filtering before sorting; minor group/filter allocations do not outweigh or create a realistic new performance mechanism."
+      },
+      {
+        "Scenario": "Command Palette and other one-shot whole-menu lookups",
+        "CriticalPath": "Opening/building the picker synchronously obtains menu actions before picks can be populated. CommandPalette registry enumeration includes all registered commands, then context filtering, sorting, grouping, and action construction occur on the critical path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "C is the number of registered commands/contributions; M is the subset whose when-clause matches. Before the diff sorting/dependency collection covered the full list through MenuInfo initialization, while after the diff sorting and action construction cover M.",
+        "EffectiveConcurrency": "A lookup is a single synchronous operation; command enumeration and action construction are serial. There is no asynchronous burst or coalescing opportunity introduced by the diff.",
+        "CacheBehavior": "Every lookup rereads the in-memory registry, including implicit command-palette entries; warm calls are not cached so registration and in-place descriptor changes remain visible. No external I/O occurs and no negative cache exists.",
+        "MechanismConfidence": "High: MenuRegistry.getMenuItems constructs an in-memory array and appends implicit commands; the new path filters before sorting and does not instantiate listeners/schedulers. No changed expensive boundary is present.",
+        "MagnitudeUncertainty": "The number of installed command contributions varies, and picker-open frequency is user dependent. The in-memory O(C) enumeration and O(M log M) matching-item sort are established, but exact latency is not measured here.",
+        "Verdict": "No reportable regression. The diff lowers critical-path CPU and allocations and preserves one registry read per request."
+      },
+      {
+        "Scenario": "Persistent menu creation, registry-driven refresh, and submenu action construction",
+        "CriticalPath": "createMenu synchronously constructs MenuInfo before returning the menu. Registry changes later schedule refresh through the existing debounce; getActions synchronously filters grouped items and constructs actions/submenus when consumers request them.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Initialization and refresh cost scale with registered items and recursively collected submenu items when submenu events are enabled; getActions scales with groups and visible submenu contents.",
+        "EffectiveConcurrency": "Initial construction and getActions are synchronous. Registry-change rebuilds remain coalesced by the existing RunOnceScheduler debounce; the diff does not increase concurrency or event fan-out.",
+        "CacheBehavior": "MenuInfo retains grouped registry metadata between refreshes. A registry event invalidates it through the existing scheduler. Context-dependent actions are reconstructed on each getActions call; no new cache or retained per-row state is added.",
+        "MechanismConfidence": "High: the superclass constructor performs refresh, the deleted subclass refresh duplicated it, and event/listener ownership remains with MenuImpl. Submenu registry access remains in-memory and synchronous.",
+        "MagnitudeUncertainty": "Persistent-menu sizes and registry-change rates vary, but constructor duplication is directly proven. The replacement of the outer group array on refresh and per-group filtered arrays are small in-memory allocations with no evidence of user-visible regression.",
+        "Verdict": "No introduced performance issue. Removing the redundant constructor refresh halves the duplicated initialization pass, while refresh coalescing, listener lifecycle, and submenu semantics remain bounded as before."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and traced row-scoped, command-palette, persistent-menu, and submenu paths. No actionable performance regression was introduced, so no findings were submitted. Recorded two concrete regression fixes: removal of per-call persistent-menu setup and removal of duplicate MenuInfo initialization refresh."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-18T14:01:40.830309245Z",
+    "CompletedAt": "2026-09-18T14:03:06.803653861Z",
+    "WallClockMilliseconds": 85973,
+    "ModelCalls": 8,
+    "InputTokens": 199854,
+    "OutputTokens": 5268,
+    "TotalTokens": 205122,
+    "ReasoningTokens": 2438,
+    "CacheReadTokens": 162019,
+    "CacheWriteTokens": 37811,
+    "APIDurationMilliseconds": 55435,
+    "ToolCalls": 28,
+    "NanoAIUnits": 35931860000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 162019,
+      "cache_write": 37811,
+      "input": 24,
+      "output": 5268
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
