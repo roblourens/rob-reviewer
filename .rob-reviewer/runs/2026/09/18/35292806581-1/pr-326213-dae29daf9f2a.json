@@ -1,0 +1,257 @@
+{
+  "PullRequest": {
+    "Number": 326213,
+    "Title": "Add tool search to Copilot agent host",
+    "Body": "Adds deferred tool search support to the Copilot agent host using the existing client-side semantic search.\n\nDraft until VS Code bumps to `@github/copilot-sdk@1.0.7` and `@github/copilot@1.0.71`.",
+    "URL": "https://github.com/microsoft/vscode/pull/326213",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3393362e1799b33f22b5c8a85399729374bbcf7f",
+    "HeadRef": "dev/bhavyau/agent-host-tool-search",
+    "HeadSHA": "dae29daf9f2a75cf138aff7fe25ef04e402302aa",
+    "CreatedAt": "2026-07-16T19:44:06Z",
+    "UpdatedAt": "2026-09-07T23:25:49Z",
+    "MergedAt": "2026-07-23T18:06:32Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-2A24DF6F6BBC",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts",
+      "Side": "RIGHT",
+      "Line": 1167,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The added storage point, reducer retention behavior, 1,000-envelope replay buffer, and cancellation path were all traced directly. Exact bytes depend on configured MCP tool counts and description lengths, but the retention and N-tools-per-search scaling are deterministic.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "unbounded-retention",
+      "PerformanceResource": "Copied tool-name/description objects and their serialized protocol payloads",
+      "PerformanceScaling": "Retained bytes grow with the complete deferred-tool corpus (all deferLoading tools across every configured MCP server) times the number of tool-search ready actions still in the 1,000-envelope replay buffer; canceled searches additionally accumulate one corpus per canceled turn for the session lifetime.",
+      "PerformanceOutcome": "Increased renderer/agent-host heap usage, larger reconnect snapshots/replays, and corresponding serialization and GC pressure for sessions with large MCP inventories.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Tool search ranked the extension's local tool registry directly; no tool corpus was copied into an Agent Host action, synchronized chat state, or the server replay buffer.",
+      "ChangedBehavior": "Each tool-search invocation maps every deferred SDK tool into a candidate array and attaches that full array to ChatToolCallReady._meta so it enters synchronized/replayable state.",
+      "CausalDiffEvidence": "The added `_meta: toToolCallMeta({ ...(tracked.meta ?? {}), toolSearchCandidates: candidates })` line is the first point where the previously local-only search corpus is inserted into persistent/replayable Agent Host state.",
+      "Title": "Keep the tool-search corpus out of replayable state",
+      "Impact": "With tool search enabled and a large MCP inventory, repeated searches retain repeated copies of every tool description. Successful calls remain in ProtocolServerHandler's 1,000-action replay buffer, and canceling a turn while search is running permanently leaves the corpus on that finalized turn, so long sessions can accumulate substantial heap and reconnect payloads.",
+      "Evidence": "_toToolSearchCandidates() copies every available tool whose deferLoading flag is set, and this added line stores the resulting array in ChatToolCallReady._meta. AgentHostStateManager applies that action to chat state, while ProtocolServerHandler unconditionally retains every emitted envelope in _replayBuffer (capacity 1,000). Although the normal completion path explicitly deletes toolSearchCandidates, old ready envelopes are not rewritten. More importantly, chat reducer endTurn() finalizes interrupted tool calls with tcBase(tc), which preserves tc._meta; _setupClientToolCall cancels its CTS on a terminal turn and handleSettled then returns without dispatching the metadata-clearing completion. Thus cancellation leaves the entire corpus in turns[].",
+      "Recommendation": "Pass the corpus through a targeted non-replayable client-tool request (or store it in a short-lived map keyed by toolCallId) rather than ChatToolCallReady._meta, and delete that entry on completion, cancellation, disconnect, and disposal. If the protocol action must remain, strip this transient field before replay buffering and explicitly remove it from terminal canceled/error states."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "unbounded-retention",
+      "serialization-allocation",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Launch a supported Copilot SDK session with Agent Host tool search enabled",
+        "CriticalPath": "Configuration/model gating, prompt composition, and SDK tool construction complete before the session can launch. The diff marks MCP/non-core client tools deferred and keeps the search/core/server tools eager; no additional filesystem or embedding request occurs during launch itself.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:606",
+            "Operation": "Passes tool-search configuration and all constructed SDK tools into session creation.",
+            "Cardinality": "One SDK session-creation boundary per launch/relaunch, carrying one definition per effective tool.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same SDK launch boundary existed and received all tool definitions, without tool-search configuration or defer flags.",
+            "CriticalPathEffect": "Required before the session becomes usable; deferral is intended to reduce later model-facing tool-schema payloads."
+          }
+        ],
+        "ScalingInput": "Number of client tools, server tools, and MCP tool definitions supplied to the SDK; construction is linear in the snapshot tool count.",
+        "EffectiveConcurrency": "Single launch path. Tool definitions are synchronously mapped before the SDK launch; no new parallel boundary work is scheduled here.",
+        "CacheBehavior": "No new cache is consulted on launch. Embedding caches remain lazy until the first actual search.",
+        "MechanismConfidence": "High: launcher and tool-construction paths were directly inspected.",
+        "MagnitudeUncertainty": "Actual startup savings depend on SDK implementation and tool count; the changed launch work itself is small and linear.",
+        "Verdict": "No reportable launch regression; the added local filtering/mapping is minor and the feature is disabled by default."
+      },
+      {
+        "Scenario": "First tool search in a session with a large MCP inventory",
+        "CriticalPath": "The model cannot use a deferred tool until the search override returns. The handler copies every deferred tool, sends the corpus to the owning client, invokes the extension tool, initializes embedding caches, computes a query embedding plus embeddings for cache misses, ranks all candidates, and returns up to five names.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:1158",
+            "Operation": "Emits ChatToolCallReady containing all deferred tool names/descriptions to the workbench client.",
+            "Cardinality": "One full-corpus action per search, broadcast to each relevant connected client; payload size is O(N plus total description bytes).",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Agent Host protocol action carried the semantic-search corpus.",
+            "CriticalPathEffect": "The owning client must receive the action before invoking semantic search."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts:3099",
+            "Operation": "Adds the full candidate corpus to the VS Code tool invocation routed to the Copilot extension host.",
+            "Cardinality": "One full-corpus invocation per search.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The extension tool read its own local registry and did not receive an Agent Host corpus.",
+            "CriticalPathEffect": "The extension tool cannot rank Agent Host/MCP tools until this transfer completes."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/extension/tools/common/virtualTools/toolEmbeddingsLocalCache.ts:57",
+            "Operation": "Lazily reads the persistent embeddings cache and later writes updated embeddings.",
+            "Cardinality": "One initialization read per ToolEmbeddingsComputer lifetime; writes are coalesced on a 5-second scheduler.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Existing extension tool search used the same cache lifecycle.",
+            "CriticalPathEffect": "The initial read is awaited by the first search; delayed writes are off the search critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/embeddings/common/remoteEmbeddingsComputer.ts:91",
+            "Operation": "Requests query and missing tool embeddings from the remote embeddings endpoint.",
+            "Cardinality": "One request for the query plus ceil(cold cache misses/100) sequential requests for tool descriptions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The extension's existing tool-search implementation already used this endpoint; the diff supplies the Agent Host runtime/MCP corpus to that implementation.",
+            "CriticalPathEffect": "All required embedding responses and ranking must complete before deferred tools are returned to the model."
+          }
+        ],
+        "ScalingInput": "N deferred tools after filtering `deferLoading`; there is no grouping or deduplication before transport/ranking. Remote embedding work for cold misses is split into ceil(N/100) sequential batches.",
+        "EffectiveConcurrency": "One search invocation waits for its own client result. Query embedding requests are not coalesced; missing tool embeddings are coalesced by the shared name-keyed promise map, while each invocation's remote batches are sequential.",
+        "CacheBehavior": "Cold use initializes the remote precomputed cache and reads the local binary cache. Missing tool embeddings are computed remotely and retained in memory, with a delayed local-file write. Warm searches reuse tool embeddings by name/hash but still compute a fresh query embedding and rebuild/rank the N-item corpus.",
+        "MechanismConfidence": "High: the end-to-end handler, transport, cache, and remote batching code were traced.",
+        "MagnitudeUncertainty": "Latency depends on cache hit rate, remote endpoint latency, and configured MCP inventory; the boundary sequence and N-scaling are explicit.",
+        "Verdict": "The cold search cost is inherent to the selected existing semantic-search implementation and is not separately reported; the replayable corpus retention from this path is reported."
+      },
+      {
+        "Scenario": "Successful repeated tool searches and reconnect replay",
+        "CriticalPath": "Each search publishes a full-corpus ready action; completion strips candidates from current ToolCallState, then returns selected tool references to the SDK. A reconnect may replay retained ready/completion envelopes before work resumes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/webSocketTransport.ts:88",
+            "Operation": "JSON-serializes each corpus-bearing action for each remote transport.",
+            "Cardinality": "One O(corpus bytes) serialization per relevant remote client per search; local transports also carry the same object across process boundaries.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Tool-call ready actions contained only small invocation metadata.",
+            "CriticalPathEffect": "Required before client-side search begins; repeated again if the action is replayed after reconnect."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:770",
+            "Operation": "Replays retained action envelopes after reconnect, including corpus-bearing ready actions.",
+            "Cardinality": "Up to the 1,000-envelope replay capacity, filtered by subscription and last-seen sequence.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The replay mechanism existed, but actions did not contain complete deferred-tool corpora.",
+            "CriticalPathEffect": "Reconnect reconciliation must transfer and apply replay actions before the client catches up."
+          }
+        ],
+        "ScalingInput": "N deferred tools per search times the number of full-corpus ready envelopes among the latest 1,000 server actions.",
+        "EffectiveConcurrency": "Each search is independent. Protocol broadcast is synchronous across relevant clients; each transport serializes its own message. No coalescing removes superseded corpus-bearing ready envelopes.",
+        "CacheBehavior": "Warm tool embeddings reduce remote tool-embedding calls, but do not reduce corpus copying, protocol serialization, or replay-buffer retention. Query embeddings remain per invocation.",
+        "MechanismConfidence": "High: unconditional replay buffering and reconnect replay were directly inspected.",
+        "MagnitudeUncertainty": "Typical corpus byte size and reconnect frequency vary, but retention of each successful ready envelope until FIFO eviction is deterministic.",
+        "Verdict": "Reportable as part of the submitted replayable-state retention finding."
+      },
+      {
+        "Scenario": "Cancel a turn while semantic tool search is running",
+        "CriticalPath": "The client dispatches ChatTurnCancelled, the reducer finalizes every nonterminal tool call as canceled, and the local invocation cancellation token is canceled. The embedding/tool invocation may settle afterward, but its callback returns without dispatching the candidate-stripping completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts:1941",
+            "Operation": "Sends turn cancellation to the agent host.",
+            "Cardinality": "One cancellation action per canceled turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Cancellation already finalized in-flight tool calls, but no full tool corpus existed in their metadata.",
+            "CriticalPathEffect": "Finalizes the turn promptly, but the reducer preserves tool-call `_meta`."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:750",
+            "Operation": "Returns a full chat-state snapshot when replay is unavailable, including retained canceled-turn metadata.",
+            "Cardinality": "One snapshot per restored subscription; payload grows with all retained canceled-search corpora.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Canceled turns contained ordinary small metadata, not every deferred tool description.",
+            "CriticalPathEffect": "Snapshot transfer and parsing are on reconnect/subscription critical path."
+          }
+        ],
+        "ScalingInput": "Complete deferred-tool corpus per canceled search, accumulating with canceled turns retained in a long-lived session.",
+        "EffectiveConcurrency": "Cancellation races with the in-flight embedding request. Regardless of which underlying work observes cancellation first, the client settlement callback suppresses completion once its CTS is canceled.",
+        "CacheBehavior": "Embedding caches do not release the corpus stored on protocol state. Reconnect snapshots include finalized turns and therefore the retained candidate arrays for the current server lifetime.",
+        "MechanismConfidence": "Very high: the ready action stores the corpus, endTurn preserves `_meta`, and the cancellation/settlement paths contain no stripping action.",
+        "MagnitudeUncertainty": "The number of users canceling specifically during search and MCP description sizes vary; the missing cleanup and per-cancel retention are deterministic.",
+        "Verdict": "Reportable memory/serialization regression; covered by the submitted finding."
+      },
+      {
+        "Scenario": "Sessions with the setting disabled or an unsupported model",
+        "CriticalPath": "At launch, the session checks the setting/model/tool presence and filters the client-only toolSearch registration; normal client and server tool execution otherwise follows the pre-existing path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Client snapshot tool count for one launch-time filter/map.",
+        "EffectiveConcurrency": "Single synchronous setup path; no embedding, filesystem, network, or extra IPC work is introduced.",
+        "CacheBehavior": "Embedding caches are untouched.",
+        "MechanismConfidence": "High from launch/session code and tests.",
+        "MagnitudeUncertainty": "None material.",
+        "Verdict": "No performance finding; default behavior remains bounded and tool search is off by default."
+      },
+      {
+        "Scenario": "Change the workbench tool-search setting",
+        "CriticalPath": "The configuration contribution computes one boolean and forwards a root-config update. The new value affects later launch-time decisions, not an already-running SDK session.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostCopilotCliSettingsContribution.ts:45",
+            "Operation": "Forwards the boolean root configuration value to Agent Host.",
+            "Cardinality": "One small action per actual setting change.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This setting key was not forwarded.",
+            "CriticalPathEffect": "Not on chat turn or rendering critical paths."
+          }
+        ],
+        "ScalingInput": "One configured key and one action per setting change.",
+        "EffectiveConcurrency": "Uses the existing root-config forwarder; no new burst or per-session loop was introduced.",
+        "CacheBehavior": "No cache interaction.",
+        "MechanismConfidence": "High from the configuration contribution and tests.",
+        "MagnitudeUncertainty": "None material.",
+        "Verdict": "No reportable performance regression."
+      }
+    ],
+    "Summary": "Completed the performance pass across all 21 changed files. Traced launch, cold/warm semantic search, remote embedding batches, local cache I/O, AHP/extension-host transport, successful completion, cancellation, reconnect, and setting propagation. Submitted one medium-severity finding for storing the full transient deferred-tool corpus in replayable state, which retains copies in the 1,000-action replay buffer and indefinitely in canceled turn history for the server/session lifetime. No concrete shipped regression fix was established, so no regression-fix record was submitted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-18T00:58:39.820694277Z",
+    "CompletedAt": "2026-09-18T01:01:43.017467001Z",
+    "WallClockMilliseconds": 183196,
+    "ModelCalls": 17,
+    "InputTokens": 1649605,
+    "OutputTokens": 15090,
+    "TotalTokens": 1664695,
+    "ReasoningTokens": 5695,
+    "CacheReadTokens": 1500809,
+    "CacheWriteTokens": 148745,
+    "APIDurationMilliseconds": 173454,
+    "ToolCalls": 146,
+    "NanoAIUnits": 164605260000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1500809,
+      "cache_write": 148745,
+      "input": 51,
+      "output": 15090
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

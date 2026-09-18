@@ -1,0 +1,208 @@
+{
+  "PullRequest": {
+    "Number": 336643,
+    "Title": "Fix on-device dictation failure outcomes",
+    "Body": "Fix on-device dictation sessions that could incorrectly report startup and finalization failures as successful empty completions.\n\n- Route an initial model `Error` snapshot through the existing model failure path, including startup invalidation, teardown, telemetry, and user notification.\n- Preserve backend finalization timeout provenance so an empty on-device fallback records `transcribe.timeout` and an error outcome.\n- Continue returning useful streamed partial transcripts when finalization times out.\n- Add focused regression coverage for startup errors and both timeout outcomes.\n\nValidation:\n- `npm run transpile-client`\n- `npm run test-browser-no-install -- --run src/vs/workbench/contrib/chat/test/browser/chatSpeechToTextService.test.ts` (Chromium, WebKit, Firefox; 28 tests each)\n- `git diff --check`\n\nFixes #336601\nFixes #336602\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336643",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "meganrogge",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e3b0d1675685a88eeb7577c59f063d2461c26ae2",
+    "HeadRef": "agents/fix-vscode-issues-336601-336602",
+    "HeadSHA": "c7e999e9376f5d572dd1a3fbaebdaeae810547df",
+    "CreatedAt": "2026-09-17T22:32:32Z",
+    "UpdatedAt": "2026-09-18T00:03:24Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 1076,
+      "BasePath": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts",
+      "BaseLine": 1070,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts",
+      "IntroducingCommit": "85264502e4c6c4db48604183dc78bee88807282d",
+      "MechanismFamily": "unbounded-retention",
+      "PerformanceCategory": "memory",
+      "Mechanism": "An initial on-device model error was ignored, allowing a recording to enter capture with no transcription session; every audio callback then crossed IPC and was retained in the utility process's `_pendingChunks` until manual stop or the 20-minute limit.",
+      "Symptom": "Sustained dictation after an early model-load/download failure causes steadily increasing utility-process memory and needless PCM encoding/IPC, potentially retaining about 38 MB of audio over the maximum session before object overhead.",
+      "FixedBehavior": "The added Error branch routes the initial snapshot through `_handleModelStatus`, which calls `_failModelSession`/`_failSession`; the changed generation invalidates startup, cancellation resets the utility-process pending chunk buffer, and capture is torn down before continuous PCM streaming can begin.",
+      "Evidence": "In the base revision, `_startLocalSession` explicitly excluded an initial `Error` snapshot from `_trackModelPreparation`, so no status listener handled that terminal state and startup continued into `_startCapture`/Recording. The utility-process `_openSession` leaves `_session` unset after the model failure, while `pushAudio` copies every PCM16 chunk and appends it to `_pendingChunks` whenever `_sessionActive` is still true. At 16 kHz mono PCM16 this retains roughly 32 KB/s (about 38 MB over the 20-minute dictation limit, plus per-chunk overhead) and also performs continuous audio IPC despite transcription being impossible.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "unbounded-retention",
+      "serialization-allocation",
+      "repeated-work",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Start on-device dictation when model preparation has already failed before the initial status snapshot",
+        "CriticalPath": "The user action awaits microphone acquisition, one local-transcription start IPC, and one model-status IPC. The added Error handling invalidates startup synchronously; utility-process cancellation is dispatched but not awaited, and the editor/session listeners are then disposed when start resolves without Recording.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts:_acquireStream",
+            "Operation": "Acquire the microphone MediaStream.",
+            "Cardinality": "Once per accepted dictation start.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same microphone acquisition was on the startup critical path.",
+            "CriticalPathEffect": "Must complete before backend startup and capture."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts:_startLocalSession",
+            "Operation": "Start the utility-process transcription session and fetch its model status.",
+            "Cardinality": "One start IPC and one status IPC per session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two calls occurred before the diff, but an Error snapshot was ignored.",
+            "CriticalPathEffect": "Both complete before renderer capture begins; start itself launches model work asynchronously."
+          },
+          {
+            "Kind": "network/filesystem",
+            "Location": "src/vs/platform/localTranscription/node/localTranscriptionService.ts:_ensureModel",
+            "Operation": "Provision the native runtime/model on a cold cache and load model files.",
+            "Cardinality": "One coalesced model preparation per selected model; warm cache skips download and reuses the loaded model.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cold-cache provisioning was launched before the diff.",
+            "CriticalPathEffect": "Runs behind local start and controls whether a transcription session can open, though audio capture normally begins while preparation continues."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts:_failSession",
+            "Operation": "Cancel the failed local transcription session.",
+            "Cardinality": "At most two cancel dispatches for this terminal startup race because the existing stale-start guard also cancels; there is no per-audio-chunk fan-out after capture is prevented.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No cancellation occurred for an initial Error snapshot; startup proceeded to continuous PCM encoding/IPC and the utility process retained chunks while no native session existed.",
+            "CriticalPathEffect": "Not awaited by the renderer; it releases utility-process state off the startup return path."
+          }
+        ],
+        "ScalingInput": "Before the fix, recording duration controlled retained PCM: 16 kHz mono PCM16 is about 32 KB/s, up to about 38 MB over the 20-minute session limit plus chunk overhead. The changed path terminates before that duration-scaled work begins.",
+        "EffectiveConcurrency": "Dictation is a renderer singleton and the utility service supports one active session. Cold model preparation is represented by one coalesced `_modelPromise`; the new failure path can issue two bounded cancel IPCs (the failure handler and the existing stale-start guard), with no collection fan-out.",
+        "CacheBehavior": "A warm loaded model normally reports Ready and bypasses this branch. Cold cache misses may download hundreds of MB through the existing coalesced model promise. Failed preparation clears the utility model promise so a later explicit retry can prepare again; this diff does not add a cache lookup or defeat coalescing.",
+        "MechanismConfidence": "High: the status branch, generation guard, capture path, PCM format, worker `_pendingChunks`, singleton ownership, and duration limit are all directly traced.",
+        "MagnitudeUncertainty": "The prevalence of an Error status winning the initial snapshot race is unknown, but the former continuous PCM retention and the new bounded cancellation path are explicit in code.",
+        "Verdict": "No regression. The PR fixes a concrete unbounded-retention/continuous-IPC path; the introducing commit was recorded separately."
+      },
+      {
+        "Scenario": "Stop on-device dictation when backend finalization times out",
+        "CriticalPath": "Stop flushes capture, performs one stop IPC, waits up to 8 seconds, then returns the streamed transcript while cancel/teardown drains in the background. The diff only carries a timeout bit and conditionally scans the transcript to classify an empty result.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts:_finishBackend",
+            "Operation": "Stop the utility-process ASR session and, after timeout, request cancellation.",
+            "Cardinality": "One stop IPC and at most one cancel IPC per finalization.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical stop, timeout, cancel, and teardown behavior existed before; only the returned value shape lacked timeout provenance.",
+            "CriticalPathEffect": "Stop is critical for up to the existing 8-second deadline; cancellation after timeout is off the result-return path, while the next local start waits for teardown."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts:_cleanupWithLanguageModel",
+            "Operation": "Optionally send a bounded transcript to a language model for cleanup.",
+            "Cardinality": "At most one request for a nonempty transcript of at most 4,000 characters when the experimental setting is enabled.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same optional cleanup request and bounds applied before the diff.",
+            "CriticalPathEffect": "Existing optional request remains on finalization critical path with a 5-second timeout. The new empty-timeout classification skips it when filler stripping produces no text."
+          }
+        ],
+        "ScalingInput": "The added `stripDictationFillers` call is linear in transcript length and runs only after an 8-second on-device timeout; final return already performs the same normalization. Transcript cleanup is separately capped at 4,000 characters.",
+        "EffectiveConcurrency": "One active stop is coalesced by `_pendingStop`. Local audio appends are serialized; timeout cleanup waits for one stop and one cancel operation in `Promise.all`, and a later local start waits for that teardown.",
+        "CacheBehavior": "Model/cache state does not change the new timeout bookkeeping. Existing pending teardown prevents a warm replacement session from racing native cleanup; no new cache is introduced.",
+        "MechanismConfidence": "High: timeout duration, IPC count, serialization, transcript scan, and optional network request are explicit.",
+        "MagnitudeUncertainty": "Very long filler-only transcripts can make the extra regex pass larger, but it is one bounded-frequency scan after a rare timeout and has no credible user-visible cost relative to the existing deadline.",
+        "Verdict": "No reportable regression. No boundary, wait, or concurrency increase is introduced; the extra one-shot scan only classifies timeout telemetry/outcome."
+      },
+      {
+        "Scenario": "Stop cloud (MAI) dictation with or without a final transcription",
+        "CriticalPath": "The stop path sends one websocket `ptt_end` and waits for the existing final-transcript event or the existing 35-second deadline, then optionally runs the unchanged bounded LLM cleanup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts:_finishBackend",
+            "Operation": "Send `ptt_end` over the existing transcription connection and await the final server message.",
+            "Cardinality": "One send and one final waiter per stop.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same send and wait occurred; the diff wraps the transcript with timeout provenance but does not consume that flag for MAI.",
+            "CriticalPathEffect": "Existing critical-path wait of up to 35 seconds."
+          }
+        ],
+        "ScalingInput": "Constant work per stop apart from existing transcript-length processing; no collection cardinality is introduced.",
+        "EffectiveConcurrency": "One active dictation turn and one deferred final waiter; `_pendingStop` prevents duplicate finalization. No fan-out or burst is added.",
+        "CacheBehavior": "No cache participates in cloud finalization; connection/session ownership is unchanged.",
+        "MechanismConfidence": "High: the changed method and MAI branch are directly visible.",
+        "MagnitudeUncertainty": "Network latency varies, but its deadline and placement are unchanged.",
+        "Verdict": "No performance regression."
+      },
+      {
+        "Scenario": "Start dictation when the service resolves without entering Recording",
+        "CriticalPath": "The editor installs temporary listeners/decorations, awaits the service start, checks the resulting state, and now immediately disposes those resources rather than retaining them until a later event. The 20-minute timer is only created for an actual Recording session, as before.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/speechToText/dictationSession.ts:startDictation",
+            "Operation": "Delegate to service startup, which may include microphone, IPC, filesystem, or network work depending on backend/cache state.",
+            "Cardinality": "One service start per user start action; no per-editor fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same service startup was awaited, but successful no-op starts could leave the active editor and listeners retained.",
+            "CriticalPathEffect": "The service start remains awaited. The added state checks and disposal are synchronous and bounded by the handful of session listeners."
+          }
+        ],
+        "ScalingInput": "Cleanup is constant per failed/no-op start and removes a fixed set of listeners and editor references; active recording duration no longer extends their lifetime in this case.",
+        "EffectiveConcurrency": "One active module-level dictation owner; replacement starts await cancellation before attaching the next owner.",
+        "CacheBehavior": "Inherited from the selected backend; this UI cleanup neither reads nor invalidates caches.",
+        "MechanismConfidence": "High: ownership and disposal are explicit in the changed function.",
+        "MagnitudeUncertainty": "No material uncertainty: the disposal count and timer condition are fixed.",
+        "Verdict": "No regression; this improves cleanup lifecycle behavior."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and all diff pages. No diff-introduced performance issue met the reporting threshold. The initial on-device Error handling removes a proven continuous PCM IPC/unbounded audio-retention path and was recorded as a regression fix; finalization changes add only bounded bookkeeping and one timeout-only transcript scan, while dictation-session changes release listeners earlier."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-18T01:01:44.799468819Z",
+    "CompletedAt": "2026-09-18T01:03:40.646993043Z",
+    "WallClockMilliseconds": 115847,
+    "ModelCalls": 11,
+    "InputTokens": 462407,
+    "OutputTokens": 7828,
+    "TotalTokens": 470235,
+    "ReasoningTokens": 3304,
+    "CacheReadTokens": 396651,
+    "CacheWriteTokens": 65723,
+    "APIDurationMilliseconds": 88097,
+    "ToolCalls": 43,
+    "NanoAIUnits": 64396740000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 396651,
+      "cache_write": 65723,
+      "input": 33,
+      "output": 7828
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
