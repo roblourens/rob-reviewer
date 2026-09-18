@@ -1,0 +1,119 @@
+{
+  "PullRequest": {
+    "Number": 335980,
+    "Title": "Terminal auto-approve: Confirm unresolved redirect globs",
+    "Body": "- Require confirmation when a redirect destination contains an unresolved pathname glob.\n- Preserve fully quoted Bash wildcard filenames as literal destinations; require confirmation for PowerShell wildcard destinations even when quoted.\n- Keep existing quote stripping for non-glob destinations so Bash quote concatenation and PowerShell escaped apostrophes do not make absolute paths look workspace-relative.\n- Leave null sinks and file-descriptor redirects unchanged.\n- Cover destination classification and session permissions, including confirmation-rule eligibility.\n\nTesting:\n\n- `npm run typecheck-client`\n- `npm run eslint -- src/vs/platform/agentHost/node/commandAutoApprover.ts src/vs/platform/agentHost/test/node/commandAutoApprover.test.ts src/vs/platform/agentHost/test/node/sessionPermissions.test.ts`\n- `npm run test-node -- --run src/vs/platform/agentHost/test/node/commandAutoApprover.test.ts --run src/vs/platform/agentHost/test/node/sessionPermissions.test.ts` (102 passing)\n- Verified both new quote-handling regression tests fail on the previous PR head and pass with the fix.\n\nManual checks:\n\n- In an Agent Host session with default permissions, verify unresolved wildcard redirects and quoted destinations outside the workspace require confirmation; cancel rather than approving.\n- Verify normal workspace destinations, null sinks, and file-descriptor redirects retain their existing approval behavior.\n\n-----------------------------------------\nInspirations from:\n\n- Safe-sink ordering and existing quote stripping come from [`classifyFileRedirect`](https://github.com/microsoft/vscode/blob/9b46b4eb4fe899d4c28da3c595b6018b5ca1f265/src/vs/platform/agentHost/node/commandAutoApprover.ts#L73-L92).\n- Workspace containment and destination policy remain owned by [`SessionPermissionManager`](https://github.com/microsoft/vscode/blob/9b46b4eb4fe899d4c28da3c595b6018b5ca1f265/src/vs/platform/agentHost/node/sessionPermissions.ts#L565-L618).\n",
+    "URL": "https://github.com/microsoft/vscode/pull/335980",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "anthonykim1",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ec729c0d3ddb1eaeec73026c3156fb4c3bec4666",
+    "HeadRef": "anthonykim1/block-redirect-glob-expansion",
+    "HeadSHA": "8802fa19ed1649af798c5475e0dfe9adf0b5e2aa",
+    "CreatedAt": "2026-09-12T21:52:26Z",
+    "UpdatedAt": "2026-09-18T19:52:15Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Auto-approving a Bash or PowerShell shell tool call with literal or fully quoted redirect destinations",
+        "CriticalPath": "A provider pending-confirmation signal reaches AgentSideEffects._handleToolReady, which awaits SessionPermissionManager.getAutoApproval; CommandAutoApprover synchronously parses the command, walks tree-sitter captures, classifies each redirect, checks workspace containment, and then responds to the provider. The added regular-expression scans are on this critical path but are linear over each redirect destination and add no I/O.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/commandAutoApprover.ts:loadTreeSitterResources",
+            "Operation": "Read the Bash and PowerShell grammar WASM files during auto-approver initialization",
+            "Cardinality": "Two explicit filesystem reads once per process, coalesced by treeSitterResourcesPromise across sessions",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two grammar reads and initialization wait existed before the diff.",
+            "CriticalPathEffect": "Session creation starts initialization in parallel with provider creation and waits for both before completing; these reads do not occur per redirect or per approval event."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentSideEffects.ts:_handleToolReady",
+            "Operation": "Send the approval response to the agent/provider after the local policy decision",
+            "Cardinality": "At most one permission response for the tool-ready event on this path",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same permission response was sent after redirect classification before the diff.",
+            "CriticalPathEffect": "The provider cannot proceed until the approval response, but the diff adds only local linear string scans before the unchanged response."
+          }
+        ],
+        "ScalingInput": "Command-line length and number of redirect captures. Effective cardinality is one classification per captured redirect per evaluation; ordinary commands contain one or a few redirects. Total added CPU scales O(total redirect destination characters).",
+        "EffectiveConcurrency": "Classification and path checks run synchronously on the Node event loop, so concurrent pending-confirmation signals do not create a resource burst; their synchronous sections serialize. Provider session creation runs auto-approver initialization in parallel with provider creation, but session creation waits for both.",
+        "CacheBehavior": "Tree-sitter resources are coalesced by the process-global treeSitterResourcesPromise, and compiled rule objects are cached by configuration identity. The new stateless destination checks have no cache, but each scan is linear and bounded by command input; cold initialization behavior and warm parsing behavior are unchanged.",
+        "MechanismConfidence": "High confidence from the changed hunk and traced capture loop that the only added resource cost is up to three linear scans of rawDest for each non-safe redirect; no allocation proportional beyond regex matching, retained state, or new expensive boundary is introduced.",
+        "MagnitudeUncertainty": "Real command lengths and redirect counts vary, but shell command inputs are realistically small and the added regexes have disjoint alternatives without catastrophic backtracking. Exact nanosecond-level overhead is unmeasured and does not support a reportable regression.",
+        "Verdict": "No reportable performance regression. Before the diff, each redirect was parsed, safe-sink checked, quote-stripped, and workspace-checked; after it, unresolved globs are rejected after bounded linear scans. The added CPU is dominated by the existing tree-sitter parse/query and does not change boundary cardinality or concurrency."
+      },
+      {
+        "Scenario": "Requiring confirmation and computing rule eligibility for an unresolved redirect glob",
+        "CriticalPath": "The first getAutoApproval evaluation parses and classifies the command, returning noMatch because the changed glob check yields an undefined destination. AgentSideEffects then calls isAutoApproveRuleResolvable, causing the existing second synchronous evaluation before dispatching the confirmation-ready action. The diff changes the classification result and adds linear scans, but did not introduce the second evaluation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentSideEffects.ts:_handleToolReady via AgentHostStateManager.dispatchServerAction",
+            "Operation": "Emit the tool-ready confirmation action for presentation to the client",
+            "Cardinality": "One action envelope per pending tool call requiring confirmation",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A non-auto-approved, non-resolvable shell command already performed the eligibility evaluation and emitted one confirmation action.",
+            "CriticalPathEffect": "The confirmation UI/action follows both local evaluations, as it did previously; the diff does not add or multiply envelopes."
+          }
+        ],
+        "ScalingInput": "Total command length and number of redirect captures, evaluated twice only on the existing unresolved-confirmation path. Effective added work is at most two executions of the quote/glob scans per redirect for this scenario, O(total redirect text).",
+        "EffectiveConcurrency": "Both evaluations are synchronous and serialized on the Node event loop. There is no Promise.all fan-out, subprocess launch, filesystem access, or network request caused by the changed check.",
+        "CacheBehavior": "Warm tree-sitter languages and cached rule configuration are reused. Parse trees and redirect classifications are intentionally per-event and not retained; the diff introduces no cache keys, misses, negative-cache behavior, or lifecycle changes.",
+        "MechanismConfidence": "High confidence that the noMatch path evaluates twice and that the added regex checks run per redirect in each evaluation; equally high confidence that the scans are linear and introduce no boundary fan-out or retention.",
+        "MagnitudeUncertainty": "Commands with generated, unusually long redirect tokens could increase linear scan time, but the pre-existing parser already processes the full command twice on this path. There is no evidence that the new scans become independently user-visible at realistic sizes.",
+        "Verdict": "No reportable performance regression. The PR preserves existing evaluation multiplicity and client/provider boundary counts; it adds only bounded linear CPU work needed to classify unresolved globs."
+      }
+    ],
+    "Summary": "Reviewed all three changed files and the complete production call path through command parsing, session permission evaluation, provider response, client action dispatch, and one-time tree-sitter initialization. No actionable performance issue was introduced, and the PR is a correctness/security classification change rather than a performance-regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-18T20:00:34.889786759Z",
+    "CompletedAt": "2026-09-18T20:01:35.858593542Z",
+    "WallClockMilliseconds": 60968,
+    "ModelCalls": 10,
+    "InputTokens": 321241,
+    "OutputTokens": 4375,
+    "TotalTokens": 325616,
+    "ReasoningTokens": 1642,
+    "CacheReadTokens": 270644,
+    "CacheWriteTokens": 50567,
+    "APIDurationMilliseconds": 49464,
+    "ToolCalls": 33,
+    "NanoAIUnits": 44871260000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 270644,
+      "cache_write": 50567,
+      "input": 30,
+      "output": 4375
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
