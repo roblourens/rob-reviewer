@@ -1,0 +1,299 @@
+{
+  "PullRequest": {
+    "Number": 336806,
+    "Title": "agentHost: retroactively recognise unmarked crash orphans",
+    "Body": "Follow-up to #336480. Colleagues who hit the phantom-session bug **before** that fix shipped still see the rows, and always will — #336480 is prevention-only, and a session orphaned before it landed carries no marker for suppression to act on.\n\n## Evidence\n\nFrom a reporter's logs, the row `copilotcli:/e50ba1ea-84a3-4728-9093-15c58e9330ae`:\n\n- Restore fails with `Provider copilotcli is not ready to open …` — the **non-provisional** branch, which only runs when the session has no marker.\n- Its provider catalog *was* readable: `sessions_v2 import for provider copilotcli … marker set` at 15:02:14, and the failure fired at 15:19:54.\n- The row is **catalog-served**, not a provider fallback: 28 sessions logged `is ineligible` that run (matching the 27 fallbacks in `651 catalog-served, 27 provider fallback`), and this session is not among them.\n\nSo the catalog serves stale metadata written at creation for a backing that never materialized, and nothing will ever retract it.\n\n## The change\n\nReconciliation already visits exactly this population. #336434 added the `sourceUnresolvable` outcome for a session whose provider is registered but cannot describe it, and parks it. At that point this change adds the missing evidence:\n\n**If the session's local storage holds no conversation turns, write the durable `sessionProvisional:` marker retroactively.**\n\nThe next listing then suppresses it through the path #336480 already ships, which filters the assembled result and so covers catalog-served rows. A pre-fix orphan is converted into exactly the shape the existing fix handles.\n\nWhy here rather than in listing: doing this at listing would mean a provider round-trip and a storage open for every catalog-served row — ~651 of them in the logs above — which is precisely the cost the catalog exists to avoid. Reconciliation visits each session once and then parks it, so the probe does not repeat.\n\n**Cost: zero extra opens per listing.** Reconciliation reuses the database reference it has already acquired; the only new work is one turn-existence query, and only for source-unresolvable sessions.\n\n## Why this is safe without a marker\n\nSuppression still requires *positive evidence that the session is empty*. A session with any conversation turn is never marked, so real user content cannot be hidden. The existing guards are unchanged: the provider's catalog must be established readable before a miss counts as authoritative, a provider that throws or is unavailable is never treated as evidence of absence, and anything uncertain fails open. Under-suppressing costs a junk row; over-suppressing costs a user's work.\n\nNothing is deleted. The row stays on disk and reappears if the provider ever vouches for it again.\n\n## Tests\n\nThe repro matches the reported shape — a catalog-served, unmarked orphan with empty local storage — and fails without the fix:\n\n```\nneutralised: 0 passing, 1 failing   (session stayed listed, provisionalMarkers: [])\nrestored:    1 passing\n```\n\nGuards alongside it: a catalog-served session **with** turns is never marked or suppressed; an unavailable provider is never treated as evidence; the marked-orphan fast path still works without consulting local storage.\n\n5,422 passing across the agentHost node suites, typecheck and eslint clean.\n\n## Scope\n\nPrevention plus retroactive recognition; still no deletion. Affected users need no action — the row disappears on its own once reconciliation has visited it.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336806",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b77357b84538cb8376b7ac6958ed244643d8765d",
+    "HeadRef": "sandy081/agents/suppress-unmarked-orphan-sessions",
+    "HeadSHA": "54b5a742813792fc6942a2aa2d846c9e48364b11",
+    "CreatedAt": "2026-09-18T17:40:11Z",
+    "UpdatedAt": "2026-09-18T21:10:41Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-66F9240D55E0",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentService.ts",
+      "Side": "RIGHT",
+      "Line": 1987,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed branch, database-open ordering, retry scheduling, batch/concurrency bounds, and before/after multiplicity are all explicit in production code and corroborated by focused tests. The only uncertainty is how long a provider catalog remains unreadable and how many affected sessions a profile has, which limits severity rather than mechanism confidence.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Per-session filesystem stat calls, SQLite connection opens/migrations on cache misses, and provider metadata resolutions",
+      "PerformanceScaling": "While a registered provider's catalog remains unreadable, reconciliation processes up to 50 dirty sessions per five-minute pass at concurrency 4; with N affected sessions the cursor rotates through them in ceil(N/50) passes and then repeats for the lifetime of the unavailable/deferred catalog.",
+      "PerformanceOutcome": "Sustained background filesystem and SQLite I/O, with avoidable CPU and disk/virus-scanner contention every reconciliation interval.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "When provider metadata returned undefined, reconciliation classified the row as sourceUnresolvable, performed at most one tryOpenDatabase attempt, and then excluded the row from subsequent passes via _parkedSessions until a provider/discovery wake signal or the hourly safety sweep.",
+      "ChangedBehavior": "The new readability guard changes the same metadata miss to providerUnavailable. That outcome leaves payloadDirty set and does not park the row, so every periodic pass selects it again; runMigrationExclusive has already called tryOpenDatabase before this classification.",
+      "CausalDiffEvidence": "Added RIGHT line 1987 diverts an undefined metadata result from the pre-existing sourceUnresolvable/park path to providerUnavailable, directly changing one-time storage work into periodic repeated work.",
+      "Title": "Park unreadable provider catalogs instead of reopening every session",
+      "Impact": "A provider whose SDK/catalog stays deferred or unavailable causes the host to repeatedly stat and reopen session.db files in the background. The repository explicitly identifies these per-session storage accesses as the dominant cost and notes that filesystem/virus-scanner costs vary by an order of magnitude; profiles with many registered sessions sustain a 50-row I/O batch every five minutes.",
+      "Evidence": "_resolveCatalogReconciliationSource first awaits _getCatalogReconciliationMetadata and the added lines 1987-1989 return providerUnavailable when the catalog is unreadable. _reconcileSession reaches that resolver only inside AgentHostCatalogSyncService.runMigrationExclusive, which first calls ISessionDataService.tryOpenDatabase. The real implementation performs IFileService.stat and acquires/opens the SQLite database. _listDirtySessions excludes only _parkedSessions; tests prove providerUnavailable opens twice across two passes while sourceUnresolvable opens once and is absent from the second pass. _scheduleNextPass runs periodic passes at DEFAULT_INTERVAL_MS=5 minutes with batch size 50 and concurrency 4.",
+      "Recommendation": "Represent an unreadable catalog as a deferred/parked source state after the first attempt, and wake/schedule those rows when the provider catalog becomes readable (retaining the existing hourly safety sweep). Alternatively add a cheap preflight that skips tryOpenDatabase when there is neither a readable catalog nor live-session metadata, while preserving retries needed for correctness."
+    },
+    {
+      "ID": "PERF-E38A1B6D3084",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts",
+      "Side": "RIGHT",
+      "Line": 368,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The durable marker-to-listing call path, repeated list lifecycle, filesystem/SQLite boundaries, Copilot RPC fallback, and unbounded concurrency are explicit in production code. Only the number of historical crash orphans per profile is uncertain, so severity is medium rather than high.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Per-orphan filesystem stats and SQLite metadata reads for default-chat/session databases plus provider SDK/RPC metadata lookups",
+      "PerformanceScaling": "For M retroactively marked orphans, every non-overlapping listSessions call performs M suppression probes. _withoutUnmaterializedProvisionalSessions launches them together with unbounded Promise.all, so aggregate I/O/RPC work and burst concurrency both grow linearly with the accumulated orphan count.",
+      "PerformanceOutcome": "Higher session-list latency and bursty filesystem/SQLite/provider work on every refresh, defeating the catalog-served fast path for all retroactively marked rows.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "An unmarked historical orphan with an eligible central catalog row was returned by the catalog-served path without provider or session-database reads; the code’s list diagnostics define catalog-served rows as costing neither boundary.",
+      "ChangedBehavior": "The new setSessionProvisional call durably adds every confirmed empty historical orphan to _provisionalSessionKeys. Thereafter every listSessions computation enters _withoutUnmaterializedProvisionalSessions and calls _registeredSessionMetadata for each such row before it can suppress it.",
+      "CausalDiffEvidence": "RIGHT line 368 newly turns previously unmarked, catalog-served historical rows into durable provisional-marker entries, moving per-row database/provider validation onto every future listSessions critical path for that population.",
+      "Title": "Keep retroactive orphan checks off the listing critical path",
+      "Impact": "After reconciliation hides historical crash orphans, each session-list refresh is blocked on probing every hidden row. _registeredSessionMetadata first calls _readDefaultChatProviderData, which can stat/open both the default-chat and session SQLite databases, then calls provider.getChatMetadata. For Copilot, these catalog-served rows are not included in fallback prewarming, so getChatMetadata falls back to one getSessionMetadata SDK RPC per orphan. Settled list results are intentionally removed from the in-flight map, so later refreshes repeat the fan-out.",
+      "Evidence": "The added marker write at line 368 is mirrored into _provisionalSessionKeys by the new callback. _computeSessions serves eligible central rows without provider/storage reads, but if any provisional key exists it then awaits _withoutUnmaterializedProvisionalSessions. That method maps all listed rows with Promise.all and invokes _registeredSessionMetadata for each marked row. _registeredSessionMetadata awaits _readDefaultChatProviderData and provider.getChatMetadata; the former performs up to two tryOpenDatabase calls, while CopilotAgent.getChatMetadata performs getSessionMetadata RPC when no prewarmed entry exists. Prewarming is only established for fallbackProviders earlier in the list, whereas these rows are catalog eligible. _startSessionListComputation deletes settled entries, so this work recurs on subsequent calls.",
+      "Recommendation": "Persist a distinct “reconciliation-confirmed empty orphan” state that listing can suppress directly, and revalidate it in background reconciliation on provider discovery/materialization/readability wake signals (with the existing periodic safety sweep). Alternatively cache the negative provider result and invalidate it on those same signals, rather than re-running database and provider probes for every list."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Background reconciliation retroactively recognizes an empty, catalog-served historical crash orphan after startup and the first listing",
+        "CriticalPath": "This runs off the initial listing/startup critical path because scheduling is gated by startupSettled. Within reconciliation, provider metadata resolution, the local turn-existence query, durable marker write, and dirty-marker re-read must complete before the row is parked and hidden.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts:_listDirtySessions",
+            "Operation": "List registered/dirty central catalog rows and receipts",
+            "Cardinality": "One grouped registry/catalog read per pass, then at most 50 selected rows",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same central reads selected dirty rows before the change",
+            "CriticalPathEffect": "Required before the background batch can be selected"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sessionDataService.ts:tryOpenDatabase via AgentHostCatalogSyncService.runMigrationExclusive",
+            "Operation": "Stat session.db and acquire/open its SQLite connection",
+            "Cardinality": "Once per selected source-available row; at most 50 per pass, concurrency 4",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Reconciliation already acquired this database before resolving the source",
+            "CriticalPathEffect": "Must complete before source resolution; background rather than startup/listing critical path"
+          },
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_getCatalogReconciliationMetadata",
+            "Operation": "Resolve per-session metadata through provider getChatMetadata; provider-specific implementations may use SDK RPC",
+            "Cardinality": "Once per selected row, bounded by reconciliation concurrency 4",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same metadata resolution occurred before classification",
+            "CriticalPathEffect": "Determines whether the row is source-unresolvable"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts:hasConversationTurns",
+            "Operation": "Query EXISTS over turns and local_turns",
+            "Cardinality": "One query per source-unresolvable row that has a local database",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No turn-existence query was performed",
+            "CriticalPathEffect": "Must return empty before the durable marker can be written"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts:_markEmptySourceUnresolvableAsProvisional and _park",
+            "Operation": "Upsert durable sessionProvisional metadata and re-read payloadDirty before parking",
+            "Cardinality": "One new central metadata write for each confirmed empty orphan; payloadDirty re-read already existed",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The row was parked without a provisional-marker write",
+            "CriticalPathEffect": "Completes before in-memory suppression notification and parking"
+          }
+        ],
+        "ScalingInput": "Dirty registered sessions, selected in batches of at most 50; effective parallelism is 4. The added turn query and marker write occur only for rows whose registered provider is readable but cannot describe the session.",
+        "EffectiveConcurrency": "A Limiter bounds reconciliation to 4 sessions. Per-session synchronization is serialized by SequencerByKey. Marker callbacks invalidate the list epoch but do not themselves start concurrent list work.",
+        "CacheBehavior": "The already-acquired session database reference is reused for hasConversationTurns. After the attempt, source-unresolvable rows are held in the in-memory parked set and skipped by warm periodic passes; restart or the hourly safety sweep retries them. The provisional marker is durable and mirrored in memory.",
+        "MechanismConfidence": "High: call order, query count, database-reference reuse, batching, and parking are explicit.",
+        "MagnitudeUncertainty": "The number of historical empty crash orphans is unknown, but per-pass work is capped at 50 and concurrency at 4.",
+        "Verdict": "The one-time background turn query and marker write are bounded and intentional; no finding for this scenario itself."
+      },
+      {
+        "Scenario": "Background reconciliation encounters a source-unresolvable session that contains conversation turns",
+        "CriticalPath": "Off startup/listing critical path. The local turn query must complete before reconciliation decides not to mark the row, then the central dirty-marker check completes before parking.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sessionDataService.ts:tryOpenDatabase",
+            "Operation": "Stat/open existing session database",
+            "Cardinality": "Once on the first attempt in-process, then only after explicit/hourly wake or restart",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same database acquisition preceded source resolution",
+            "CriticalPathEffect": "Background reconciliation waits for it"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts:hasConversationTurns",
+            "Operation": "EXISTS query over turns and local_turns",
+            "Cardinality": "One query per attempted row",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No content probe existed",
+            "CriticalPathEffect": "Prevents marking sessions with content"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts:_park",
+            "Operation": "Read central payloadDirty to safely park",
+            "Cardinality": "One read per attempted row",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same parking validation occurred",
+            "CriticalPathEffect": "Ensures no concurrent mutation is hidden before parking"
+          }
+        ],
+        "ScalingInput": "Source-unresolvable dirty sessions with existing local databases; at most 50 selected per pass and 4 active concurrently.",
+        "EffectiveConcurrency": "Global reconciliation limiter of 4 plus per-session sequencing. No marker callback/list invalidation occurs when turns exist.",
+        "CacheBehavior": "The query uses the already-open database. Positive turn existence is not separately cached, but the row is parked immediately, so it is skipped until a wake, restart, or hourly safety sweep.",
+        "MechanismConfidence": "High: the positive-turn branch and subsequent parking are direct.",
+        "MagnitudeUncertainty": "Wake frequency depends on provider/discovery activity, but ordinary five-minute passes skip parked rows.",
+        "Verdict": "No reportable regression: the added query is one bounded guard per parked attempt and reuses the existing reference."
+      },
+      {
+        "Scenario": "A registered provider remains present but its provider catalog is unreadable or deferred",
+        "CriticalPath": "After startup, each periodic reconciliation waits for per-session storage acquisition and provider metadata resolution before the new readability guard returns providerUnavailable. This is background work, but can contend with foreground disk/SDK work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sessionDataService.ts:tryOpenDatabase",
+            "Operation": "Stat session.db and acquire/open per-session SQLite",
+            "Cardinality": "Up to 50 operations per five-minute pass, repeating while the provider catalog is unreadable",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The first pass paid this cost, then sourceUnresolvable parking suppressed ordinary periodic repeats",
+            "CriticalPathEffect": "Background pass waits for each operation and it can contend with user work"
+          },
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_getCatalogReconciliationMetadata",
+            "Operation": "Call provider getChatMetadata, potentially an SDK RPC",
+            "Cardinality": "Once per selected row per retry pass",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One call before parking rather than periodic repeated calls",
+            "CriticalPathEffect": "Must return before unreadable-catalog classification"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts:_listDirtySessions and _reconcileSession",
+            "Operation": "Read central registration/receipt/dirty state",
+            "Cardinality": "Grouped reads each pass plus per-selected-row validation",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Pass-level reads remained, but parked rows were filtered before per-row work",
+            "CriticalPathEffect": "Required by each repeated background pass"
+          }
+        ],
+        "ScalingInput": "All dirty sessions owned by the unreadable provider. Up to 50 are retried every five-minute pass; for N rows the cursor rotates through ceil(N/50) passes and then repeats indefinitely while unreadable.",
+        "EffectiveConcurrency": "Reconciliation bounds active rows to 4, but repeats batches for the lifetime of the state. Per-session database references are disposed after each attempt.",
+        "CacheBehavior": "There is no negative cache or parking for providerUnavailable. payloadDirty remains set. Disposed database references mean later passes repeat filesystem stats and can reopen SQLite. Before the diff, the same undefined metadata result was sourceUnresolvable and entered the parked negative state.",
+        "MechanismConfidence": "Very high: production scheduling and a focused test explicitly show providerUnavailable opening twice across two passes versus one open then no outcome for sourceUnresolvable.",
+        "MagnitudeUncertainty": "Catalog unavailability duration and affected profile size vary; deferred SDK download and persistent provider failures establish that the state need not be brief.",
+        "Verdict": "Reportable repeated-I/O regression; finding submitted at agentService.ts:1987."
+      },
+      {
+        "Scenario": "Session-list refresh after reconciliation has durably marked one or more historical empty orphans",
+        "CriticalPath": "Every successful listSessions computation assembles catalog rows, then awaits authoritative provisional-session suppression before returning. The new hidden rows therefore add work directly to user-visible listing latency.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_computeSessions",
+            "Operation": "Read registry and central catalog metadata for the list",
+            "Cardinality": "Grouped central work for all registered sessions, with catalog resolution concurrency 4",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The orphan was catalog-served by this path without later provider/storage validation",
+            "CriticalPathEffect": "Existing list critical path"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_readDefaultChatProviderData",
+            "Operation": "Stat/open default-chat session.db and, on fallback, owner session.db to read provider data",
+            "Cardinality": "Up to two tryOpenDatabase operations per retroactively marked orphan per list refresh",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Unmarked catalog-served historical orphans did not enter provisional suppression and paid zero session-storage accesses",
+            "CriticalPathEffect": "Suppression awaits all probes before listSessions returns"
+          },
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_registeredSessionMetadata and src/vs/platform/agentHost/node/copilot/copilotAgent.ts:getChatMetadata",
+            "Operation": "Call provider getChatMetadata; Copilot falls back to client.getSessionMetadata per row when not prewarmed",
+            "Cardinality": "One provider lookup per retroactively marked orphan per list, launched concurrently across M rows",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No provider lookup for the unmarked catalog-served row",
+            "CriticalPathEffect": "Directly blocks suppression and list completion"
+          },
+          {
+            "Kind": "database",
+            "Location": "Provider getChatMetadata implementations (Copilot/Claude/Codex)",
+            "Operation": "Read provider-specific stored metadata/overlays inside provider metadata lookup",
+            "Cardinality": "Provider-dependent additional per-row reads",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Not reached for catalog-served unmarked historical orphans",
+            "CriticalPathEffect": "Part of the awaited provider lookup"
+          }
+        ],
+        "ScalingInput": "M accumulated retroactively marked orphan rows among the catalog-served result. Every settled later list recomputes; suppression performs M probes.",
+        "EffectiveConcurrency": "Concurrent callers for one mode coalesce into one computation, but distinct settled refreshes repeat. Within suppression, Promise.all launches all M marked-row probes without a limiter. Provider internals may apply their own unrelated limiters.",
+        "CacheBehavior": "Eligible central catalog rows are warm/catalog-served and normally avoid provider/session storage. The durable provisional marker defeats that fast path at the later suppression phase. Settled list computations are deliberately removed from the in-flight map. Copilot metadata prewarming covers fallback providers only, so catalog-served orphan probes generally miss it. No negative-result cache exists.",
+        "MechanismConfidence": "Very high: marker mirroring, suppression call flow, uncached settled list lifecycle, database probes, and Copilot RPC fallback are explicit.",
+        "MagnitudeUncertainty": "Historical orphan count and refresh frequency vary, but each marked row deterministically adds repeated boundaries; profiles with multiple past crashes amplify both latency and concurrency.",
+        "Verdict": "Reportable listing-critical-path fan-out; finding submitted at agentHostCatalogReconciliationService.ts:368."
+      }
+    ],
+    "Summary": "Completed the performance pass across all seven changed files. Submitted two diff-caused findings: periodic per-session storage/provider retries for unreadable catalogs, and repeated unbounded per-orphan storage/provider fan-out on future listSessions calls after retroactive marking. The new hasConversationTurns query itself is bounded, reuses the reconciliation database reference, and is not independently reportable."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-19T00:25:16.927799011Z",
+    "CompletedAt": "2026-09-19T00:27:32.001181598Z",
+    "WallClockMilliseconds": 135073,
+    "ModelCalls": 15,
+    "InputTokens": 896556,
+    "OutputTokens": 11402,
+    "TotalTokens": 907958,
+    "ReasoningTokens": 3398,
+    "CacheReadTokens": 797266,
+    "CacheWriteTokens": 99245,
+    "APIDurationMilliseconds": 119096,
+    "ToolCalls": 79,
+    "NanoAIUnits": 104335140000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 797266,
+      "cache_write": 99245,
+      "input": 45,
+      "output": 11402
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
