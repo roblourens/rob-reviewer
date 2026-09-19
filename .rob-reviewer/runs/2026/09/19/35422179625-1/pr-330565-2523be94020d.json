@@ -1,0 +1,191 @@
+{
+  "PullRequest": {
+    "Number": 330565,
+    "Title": "Adding reasoning summary as exp setting.",
+    "Body": "",
+    "URL": "https://github.com/microsoft/vscode/pull/330565",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "dileepyavan",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3c33351abba1d462637d875ec01ce0d88c41f114",
+    "HeadRef": "DileepY/reasoning_summary",
+    "HeadSHA": "2523be94020d8861c174afa8c484a5abd0dc3238",
+    "CreatedAt": "2026-08-12T23:04:57Z",
+    "UpdatedAt": "2026-08-14T07:33:41Z",
+    "MergedAt": "2026-08-14T07:32:41Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-EAA2CE491194",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts",
+      "Side": "RIGHT",
+      "Line": 616,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed await, its second RPC implementation, the stdio transport, and the caller's initialization/registration ordering are directly traced. Exact round-trip duration and experiment cohort size are unknown, which limits severity but not the mechanism.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "missing-coalescing",
+      "PerformanceResource": "A synchronous request/response RPC over the Copilot CLI subprocess stdio connection",
+      "PerformanceScaling": "Adds one subprocess RPC round trip for every GPT-5.6 session create or resume in the startup-experiment cohort; concurrent session launches each add their own call, with no cache or coalescing.",
+      "PerformanceOutcome": "Increased session creation/resume latency on the user-visible initialization critical path",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "GPT-5.6 creation performed one post-launch `options.update` for verbosity, and no reasoning-summary RPC existed. Resumption did not issue a reasoning-summary update.",
+      "ChangedBehavior": "When the experiment is enabled, `_applyGpt56Customizations` first awaits the verbosity RPC and then separately awaits `_applyReasoningSummary`, which issues another `session.rpc.options.update`.",
+      "CausalDiffEvidence": "The added line 616 awaits `_applyReasoningSummary` after line 613 has already awaited `_applyVerbosity`; `_applyReasoningSummary` performs the newly added `session.rpc.options.update({ reasoningSummary })` at line 633.",
+      "Title": "Coalesce the reasoning summary into the existing options update",
+      "Impact": "For users assigned the startup experiment (or enabling the setting), every GPT-5.6 new or resumed chat waits for an avoidable extra subprocess round trip before becoming usable. The cost repeats per materialized session and is especially visible when restoring/resuming chats.",
+      "Evidence": "`CopilotAgent` constructs the SDK with `RuntimeConnection.forStdio`, so `session.rpc.options.update` crosses the CLI subprocess boundary. `CopilotSessionLauncher._finalizeSession` awaits `_applyGpt56Customizations` before constructing the wrapper, and `CopilotAgentSession.initializeSession` awaits launcher completion before subscribing and registering the live session. Thus the two updates are serialized on session initialization rather than off-path. Both values target the same `options.update` request object and are fixed for this branch (`verbosity: 'medium'`, `reasoningSummary: 'concise'`).",
+      "Recommendation": "When reasoning summaries are enabled, issue one `options.update({ verbosity: 'medium', reasoningSummary: 'concise' })`; otherwise retain the single verbosity update. This preserves application-before-registration ordering while removing the extra round trip."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "missing-coalescing",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Workbench startup/experiment hydration forwards the reasoning-summary setting to the local Agent Host",
+        "CriticalPath": "The contribution reconciles after Agent Host enablement and schema hydration. Its dispatch updates host root configuration but is not itself on a chat turn's model-response path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostCopilotCliSettingsContribution.ts:56 and AgentHostRootConfigForwarder._push",
+            "Operation": "Dispatch `RootConfigChanged` for the new reasoning-summary key to the local Agent Host",
+            "Cardinality": "At most one additional dispatch on initial reconciliation when the schema advertises the key and the experiment supplies a value, then one per actual setting change after equality suppression.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No reasoning-summary root-config key was forwarded, so this dispatch did not exist.",
+            "CriticalPathEffect": "Off the model-response critical path; it prepares configuration consumed by later session launches."
+          }
+        ],
+        "ScalingInput": "One new configuration key per local window/Agent Host start or actual setting change; structural equality and schema tracking reduce effective cardinality to at most one dispatch for each changed value.",
+        "EffectiveConcurrency": "Reconcile starts key pushes independently without awaiting them; the new synchronous value computation adds at most one dispatch alongside the existing key pushes, with no collection-scale fan-out.",
+        "CacheBehavior": "`_schemaSeen` prevents repeated hydration pushes and `structuralEquals` suppresses unchanged values; absent experiment values are skipped rather than negative-cached.",
+        "MechanismConfidence": "High: the new descriptor, schema gate, equality check, and dispatch path are directly visible.",
+        "MagnitudeUncertainty": "The number of windows and startup-experiment assignments is unknown, but deduplication tightly bounds this to one extra small IPC per relevant hydration/change.",
+        "Verdict": "No separate finding: this is bounded, deduplicated configuration propagation rather than scaling fan-out."
+      },
+      {
+        "Scenario": "Create a GPT-5.6 Copilot Agent session",
+        "CriticalPath": "`CopilotAgentSession.initializeSession` awaits `CopilotSessionLauncher.launch`; launcher awaits `createSession`, sandbox configuration when present, and GPT-5.6 option customization before constructing the wrapper. The live session is registered only afterward, so every option RPC is on user-visible session materialization latency.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_createSession",
+            "Operation": "Create the SDK session over the Copilot CLI stdio runtime connection",
+            "Cardinality": "One pre-existing create RPC per new session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same create RPC was awaited.",
+            "CriticalPathEffect": "Required and awaited before any session can be used."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:613-616",
+            "Operation": "Update GPT-5.6 session verbosity and reasoning-summary options over the CLI stdio RPC channel",
+            "Cardinality": "Reasoning-summary disabled: one verbosity update as before. Enabled: two sequential option updates, one for verbosity and one newly added for reasoning summary.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Creation issued the verbosity update only; no reasoning-summary update existed.",
+            "CriticalPathEffect": "Both calls complete before wrapper construction and live-session registration; the second call directly adds one round trip to launch latency."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_storeSessionMetadata",
+            "Operation": "Persist materialized session metadata after initialization",
+            "Cardinality": "One existing metadata persistence operation per materialized session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same metadata persistence followed initialization.",
+            "CriticalPathEffect": "Occurs after the changed option updates and remains on materialization completion, but its count and placement are unchanged."
+          }
+        ],
+        "ScalingInput": "One launch transaction per new chat. With reasoning summary enabled, the diff adds one reasoning-summary RPC to each GPT-5.6 create; no cache or grouping serves multiple sessions.",
+        "EffectiveConcurrency": "Within one launch, create/sandbox/verbosity/reasoning updates are serialized. Separate chat launches may overlap without a shared limiter, but each incurs its own sequential RPC chain.",
+        "CacheBehavior": "No option-state cache or launch coalescing exists; every new session receives fresh fixed option updates. The startup experiment value is read synchronously from root config.",
+        "MechanismConfidence": "High: update count, stdio transport, and awaiting through registration are directly traced.",
+        "MagnitudeUncertainty": "Local stdio round-trip duration and experiment cohort size are not measured; those affect severity, while the extra serialized boundary call is certain.",
+        "Verdict": "Reported the avoidable second option RPC because one update payload can carry both fixed fields without moving required configuration off the critical path."
+      },
+      {
+        "Scenario": "Resume or restore a GPT-5.6 Copilot Agent session",
+        "CriticalPath": "The resume path awaits the SDK resume RPC, then `_finalizeSession`, all post-launch option updates, wrapper construction, listener subscription, and usage-metric refresh before registering/returning the live session. Thus the changed updates delay restored-chat availability.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:launch",
+            "Operation": "Resume the SDK session over the Copilot CLI stdio runtime connection",
+            "Cardinality": "Normally one resume RPC per restored chat; an existing custom-agent-not-found fallback can issue a second resume, unchanged by this diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same resume/fallback behavior existed.",
+            "CriticalPathEffect": "Required and awaited before customization and registration."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:610-616",
+            "Operation": "Apply GPT-5.6 verbosity and optional reasoning summary with `session.rpc.options.update`",
+            "Cardinality": "Disabled: one newly applied verbosity RPC per GPT-5.6 resume. Enabled: two sequential RPCs per resume, with the reasoning-summary call introduced by this feature.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Resume applied sandbox configuration if needed and returned a wrapper; it did not apply GPT-5.6 verbosity or reasoning-summary updates.",
+            "CriticalPathEffect": "Runs after resume but before wrapper construction and registration, adding one or two local subprocess round trips versus none on the old resume path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:initializeSession",
+            "Operation": "Refresh resumed-session usage metrics through the initialized SDK session",
+            "Cardinality": "One existing refresh per resumed session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same usage refresh ran immediately after launcher completion.",
+            "CriticalPathEffect": "Already followed launch; the new option updates shift this and registration later without changing its own cardinality."
+          }
+        ],
+        "ScalingInput": "One transaction per resumed chat backing. Each GPT-5.6 resume now gets a verbosity update; experiment-enabled resumes additionally get a reasoning-summary update. Restoring multiple chats repeats this per chat.",
+        "EffectiveConcurrency": "The option updates are sequential per resumed session. Independent chat resumes can overlap through separate lifetime operations, with no cross-session option-update coalescing.",
+        "CacheBehavior": "No warm-state shortcut is used for these options even on an existing session; each resume reapplies them. Root configuration is a cached synchronous read but RPC results are not cached.",
+        "MechanismConfidence": "High for the changed RPC count and sequencing; lower only for exact user-visible milliseconds and how broadly GPT-5.6 restore is exercised.",
+        "MagnitudeUncertainty": "Typical restore cardinality and local RPC latency are unknown. The resume verbosity call appears to be an intentional consistency change and lacks a behavior-preserving way to remove it with the current SessionConfig API; the coalescible enabled case remains actionable.",
+        "Verdict": "The enabled two-RPC sequence is covered by the submitted coalescing finding. The single newly added resume verbosity RPC is not separately reported because it implements the intended resume behavior and the code states SessionConfig cannot currently carry it."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and every diff page. One medium-confidence-impact/high-mechanism-confidence issue was submitted: experiment-enabled GPT-5.6 launch/resume serializes two option RPCs where one coalesced update can preserve ordering. Configuration forwarding is bounded and deduplicated; no cache-retention, cleanup, rendering, filesystem fan-out, or concurrency-burst regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-19T04:52:02.421102316Z",
+    "CompletedAt": "2026-09-19T04:53:24.903112945Z",
+    "WallClockMilliseconds": 82482,
+    "ModelCalls": 12,
+    "InputTokens": 530435,
+    "OutputTokens": 6891,
+    "TotalTokens": 537326,
+    "ReasoningTokens": 2347,
+    "CacheReadTokens": 460997,
+    "CacheWriteTokens": 69402,
+    "APIDurationMilliseconds": 73246,
+    "ToolCalls": 51,
+    "NanoAIUnits": 66937280000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 460997,
+      "cache_write": 69402,
+      "input": 36,
+      "output": 6891
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
