@@ -1,0 +1,177 @@
+{
+  "PullRequest": {
+    "Number": 336921,
+    "Title": "mcp: handle HTTP stream cancellation during disposal",
+    "Body": "Stopping or disposing an HTTP MCP server can abort a pending SSE read. The reader is already errored, but the cleanup path called `reader.cancel()` and discarded the rejected promise, surfacing an unhandled `AbortError` during otherwise normal teardown.\r\n\r\n- Skip redundant reader cancellation once disposal has already aborted the fetch.\r\n- Await cancellation for active read failures, keeping cleanup in the handled promise chain and genuine failures visible.\r\n- Add a disposal regression and an active-read-error control in the existing MCP host test suite.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/336921",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ac717e6cb298133160d287113b2b1c421cb981ab",
+    "HeadRef": "fix/mcp-http-abort-cleanup",
+    "HeadSHA": "f109cc4bdbb0b439d590b3863131e4d0be821d44",
+    "CreatedAt": "2026-09-20T15:07:39Z",
+    "UpdatedAt": "2026-09-20T15:39:20Z",
+    "MergedAt": null,
+    "Labels": [
+      "mcp"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Send an MCP request whose HTTP response is an SSE stream and the response reader fails while the handle remains active",
+        "CriticalPath": "Main-thread message IPC invokes ExtHostMcpService.$sendMessage; the handle performs the existing POST fetch, reads/parses the SSE response, publishes messages by IPC, and resolves send after the read loop ends. On a read failure, the changed await observes reader.cancel() before the existing warning path completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadMcp.ts:97 and src/vs/workbench/api/common/extHostMcp.ts:145",
+            "Operation": "Dispatch the MCP request from the main thread to the extension host",
+            "Cardinality": "One IPC call per outgoing MCP message",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC dispatch occurred before the diff.",
+            "CriticalPathEffect": "Starts request processing and is already on the send critical path"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/api/common/extHostMcp.ts:_sendStreamableHttp/_doSSE",
+            "Operation": "POST the MCP message and consume its response body",
+            "Cardinality": "One POST per message, plus response-body reads per delivered chunk",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same POST and stream reads occurred before the diff.",
+            "CriticalPathEffect": "The fetch and response stream determine send completion"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostMcp.ts:_handleSuccessfulStreamableHttp and _log",
+            "Operation": "Publish parsed MCP response messages or the stream warning to the main thread",
+            "Cardinality": "One receive-message IPC per parsed MCP message; at most one warning for this failed response",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same publication paths existed before the diff.",
+            "CriticalPathEffect": "Message publication is required for response delivery; warning publication follows failure"
+          }
+        ],
+        "ScalingInput": "One response reader per in-flight POST request. The initial request is serialized while transport mode is unknown; after HTTP mode is established, sends can be concurrent, so failures scale with concurrently in-flight requests rather than SSE events or payload items.",
+        "EffectiveConcurrency": "A Sequencer serializes only requests while mode is Unknown. Established HTTP requests can overlap without a shared limiter; each failed response independently reaches this catch once.",
+        "CacheBehavior": "No cache participates. Authentication discovery/token behavior is unchanged, and neither warm nor cold state changes the stream cleanup branch.",
+        "MechanismConfidence": "High: ReadableStream cancellation on an already errored stream returns a rejected promise with the stored error and does not execute the underlying source cancellation algorithm. Awaiting it adds promise observation but no network cancellation or input-scaling work.",
+        "MagnitudeUncertainty": "Real deployments may vary in the number of simultaneous HTTP requests and stream failures, but the changed cancellation branch is reached only after the reader is already errored.",
+        "Verdict": "No reportable regression. Before the diff cancellation was invoked without awaiting and the original read error was thrown; after the diff the same already-settled rejection is awaited. This handles the promise chain without adding a network boundary or multiplicative work."
+      },
+      {
+        "Scenario": "Dispose or stop an HTTP MCP handle while an SSE response read is pending",
+        "CriticalPath": "Disposal marks the handle's DisposableStore disposed, aborts the shared fetch signal, and cancels the token. The pending read rejects; the changed disposed check returns before reader.cancel(), allowing teardown to complete without the redundant cancellation promise.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadMcp.ts:96 and src/vs/workbench/api/common/extHostMcp.ts:135",
+            "Operation": "Request MCP server stop from the main thread",
+            "Cardinality": "One IPC call per server stop",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same stop IPC and close sequence occurred before the diff.",
+            "CriticalPathEffect": "Initiates close; normal session close may complete before handle disposal"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/api/common/extHostMcp.ts:_closeSession",
+            "Operation": "Optionally send the existing HTTP DELETE session-close request",
+            "Cardinality": "At most one DELETE per HTTP MCP handle with a session ID",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same DELETE was awaited before disposal.",
+            "CriticalPathEffect": "The stop path awaits this request before disposing the handle"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/api/common/extHostMcp.ts:McpHTTPHandle constructor disposal callback",
+            "Operation": "Abort active fetches/readers via the existing AbortController during disposal",
+            "Cardinality": "One shared abort signal per handle, affecting its active requests",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same abort occurred, followed by an unnecessary reader.cancel() call whose rejected promise was discarded.",
+            "CriticalPathEffect": "Unblocks pending stream reads during teardown"
+          }
+        ],
+        "ScalingInput": "At most one backchannel reader plus the currently in-flight response readers per handle; cost scales with active requests at teardown, not message history.",
+        "EffectiveConcurrency": "All active fetches share the handle AbortController and are aborted together. Each read loop independently observes disposal; no new work is scheduled by the diff.",
+        "CacheBehavior": "No cache participates in stop/disposal.",
+        "MechanismConfidence": "High: DisposableStore sets isDisposed before invoking registered abort/cancellation callbacks, so the changed catch branch returns before reader.cancel() for teardown-triggered failures.",
+        "MagnitudeUncertainty": "The number of active response readers at disposal depends on concurrent requests, but the diff removes rather than adds a per-reader cleanup call on this path.",
+        "Verdict": "No regression. The diff reduces redundant cleanup work and prevents a discarded rejected promise during disposal; it adds no retained resource or blocking boundary."
+      },
+      {
+        "Scenario": "Maintain the streamable-HTTP GET backchannel across an active stream read failure",
+        "CriticalPath": "The handle performs the existing GET, reads SSE notifications, reports the read failure, and re-enters the existing retry loop after its delay. The changed await occurs after the response stream is already errored and before the retry loop resumes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/api/common/extHostMcp.ts:_attachStreamableBackchannel",
+            "Operation": "GET and consume the MCP asynchronous-notification SSE backchannel",
+            "Cardinality": "One active GET per handle, repeated after failures according to the existing retry loop",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same GET, read loop, and reconnect schedule existed before the diff.",
+            "CriticalPathEffect": "Required for asynchronous notifications but off the outgoing message critical path"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostMcp.ts:_attachStreamableBackchannel",
+            "Operation": "Publish each backchannel MCP notification to the main thread",
+            "Cardinality": "One IPC call per parsed message event",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same event publication occurred before the diff.",
+            "CriticalPathEffect": "Required for delivering asynchronous notifications"
+          }
+        ],
+        "ScalingInput": "One backchannel per HTTP MCP handle. Failures scale with reconnect attempts across active handles, with the existing retry delay capped at 30 seconds.",
+        "EffectiveConcurrency": "Each handle has one sequential backchannel loop; multiple MCP handles may reconnect independently. The diff neither adds parallelism nor removes backoff.",
+        "CacheBehavior": "No response cache is used. Session ID and Last-Event-ID are per-handle state and unchanged.",
+        "MechanismConfidence": "High: the stream is already errored when this catch executes, and the existing per-handle loop preserves its retry delay and single-stream concurrency.",
+        "MagnitudeUncertainty": "Backchannel failure frequency and number of simultaneously configured servers vary, but cancellation remains constant-time promise observation per failed stream.",
+        "Verdict": "No reportable regression. Awaiting the already-rejected cancellation promise does not add network cancellation, increase retry frequency, or fan out work."
+      }
+    ],
+    "Summary": "Reviewed the complete two-file diff and traced active response failures, handle disposal, and backchannel reconnects. The production change only changes error-promise handling after a stream read failure and removes redundant cancellation during disposal; no actionable performance regression or qualifying performance-regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-20T17:05:03.952664506Z",
+    "CompletedAt": "2026-09-20T17:06:14.967014256Z",
+    "WallClockMilliseconds": 71014,
+    "ModelCalls": 9,
+    "InputTokens": 212364,
+    "OutputTokens": 4764,
+    "TotalTokens": 217128,
+    "ReasoningTokens": 1697,
+    "CacheReadTokens": 172032,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 57374,
+    "ToolCalls": 33,
+    "NanoAIUnits": 32542080000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 172032,
+      "cache_write": 0,
+      "input": 40332,
+      "output": 4764
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
