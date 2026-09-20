@@ -1,0 +1,304 @@
+{
+  "PullRequest": {
+    "Number": 243221,
+    "Title": "mcp: initial work",
+    "Body": "This adds initial support for MCP discovery and connections in VS Code.\n\n- It finds servers installed in claude_desktop_config as a demo, and also supports `.vscode/mcp.json`\n- This works for both local and remotes.\n- There is a command `MCP: List Servers` that allows listing and manually starting/stopping servers\n- When MCP servers are started, they can be used as tools in chat.\n\nGranular changes can be found in commits within this PR. Closes #242864, more issues will come under the `chat-mcp` tag for future work.",
+    "URL": "https://github.com/microsoft/vscode/pull/243221",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "connor4312",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "856dbe90b01e06f97ee16b4e3fbe8f63e93e4639",
+    "HeadRef": "connor4312/mcp-1",
+    "HeadSHA": "7d2f5bb1aee0ce20c6259d96b0d81f0aa9f9a0db",
+    "CreatedAt": "2025-03-11T17:01:52Z",
+    "UpdatedAt": "2025-04-25T23:25:51Z",
+    "MergedAt": "2025-03-11T21:47:49Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-C3099A1CB0D5",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/api/node/extHostMpcNode.ts",
+      "Side": "RIGHT",
+      "Line": 85,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The duplicate listeners, duplicate string conversion, two IPC methods, and file-backed logger are directly traced. Payload magnitude varies, but the protocol explicitly permits base64 image/blob content.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Message bytes, string allocations, extension-host-to-renderer IPC calls, and filesystem log writes",
+      "PerformanceScaling": "For every stdout JSON line, cost scales with payload bytes and message rate: the line is converted to a string and sent once as a log and again as the protocol message. MCP tool results can contain arbitrary text, embedded blobs, and base64 image data.",
+      "PerformanceOutcome": "Higher tool-call latency, IPC/CPU pressure, and excessive log I/O for large or frequent results",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, MCP stdout payloads were not copied through an additional logging IPC and persisted to a per-server log file.",
+      "ChangedBehavior": "The new PassThrough data listener sends the complete stdout line through $onDidPublishLog, while the second data listener on the same stream sends that same line through $onDidReceiveMessage. McpServerConnection then writes the first copy with ILogger.info to a logger backed by the logs folder.",
+      "CausalDiffEvidence": "Added line 85 forwards every complete server stdout payload as an info log in addition to the protocol-forwarding call added on line 88.",
+      "Title": "Stop duplicating every server payload into the log channel",
+      "Impact": "A server returning a multi-megabyte image/blob or streaming frequent messages makes VS Code allocate and transfer the full content twice and persist an extra copy before/alongside normal JSON parsing, causing avoidable stalls and disk traffic.",
+      "Evidence": "Lines 84-88 attach two data listeners to the same debug stream. One performs '[Server Says] ' + line.toString() and an RPC; the other performs line.toString() and a second RPC. MainThreadMcp parses the protocol copy, while McpServerConnection forwards the log copy to ILogger.info; createLogger(id) resolves to a file under logsHome.",
+      "Recommendation": "Do not info-log raw protocol payloads. Log bounded metadata or byte counts, and gate any capped payload tracing behind an explicit trace/debug mode so the normal path performs one IPC transfer."
+    },
+    {
+      "ID": "PERF-4B4EB6411BD5",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/api/node/extHostMpcNode.ts",
+      "Side": "RIGHT",
+      "Line": 109,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "Map ownership, the only deletion site, terminal-state call flow, and monotonically increasing restart ids are explicit. Per-entry size varies but unbounded lifetime growth is certain under repeated spontaneous exits.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "Retained ChildProcess objects, AbortControllers, stdio streams, pipeline objects, and event-listener closures",
+      "PerformanceScaling": "Retention grows by one full subprocess object graph for every server that exits or errors without first receiving an explicit $stopMcp; each restart uses a new numeric id and adds another map entry for the extension-host lifetime.",
+      "PerformanceOutcome": "Unbounded retained memory and increasing GC pressure across crash/restart cycles",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, the extension host had no MCP child-process map and retained no MCP subprocess object graphs.",
+      "ChangedBehavior": "The new code inserts every spawned child into nodeServers, but deletion only occurs in $stopMcp. The child exit handler reports Stopped/Error to the main thread without removing its id, and the main thread then drops its own id mapping, so no later stop call can clean the extension-host entry.",
+      "CausalDiffEvidence": "Added line 109 roots every spawned child in nodeServers without a corresponding removal in the newly added terminal exit/error path.",
+      "Title": "Remove exited MCP children from the server map",
+      "Impact": "A misconfigured or unstable MCP server that exits and is repeatedly restarted steadily grows extension-host memory even though all prior processes are dead.",
+      "Evidence": "nodeServers.set retains abortCtrl and child at line 109. $stopMcp is the sole delete site. The exit callback at lines 100-107 only publishes state, and MainThreadMcp deletes its _servers entry on Stopped/Error; a restart allocates a new id via _serverIdCounter.",
+      "Recommendation": "Use a once-only close/exit cleanup that removes the entry (guarded so it only deletes the same child) and disposes its stream pipeline/listeners; keep explicit stop cleanup idempotent."
+    },
+    {
+      "ID": "PERF-0A303A5907A9",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/mcp/common/mcpServer.ts",
+      "Side": "RIGHT",
+      "Line": 168,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The event-to-request call path and absence of per-refresh cancellation, sequencing, or coalescing are explicit. Notification burst frequency varies by server, but even legitimate dynamic initialization can overlap slow or paginated list calls.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "missing-coalescing",
+      "PerformanceResource": "Concurrent JSON-RPC requests, pending DeferredPromises/cancellation listeners, IPC messages, and MCP server work",
+      "PerformanceScaling": "Each tools/list_changed notification starts one additional refresh per server, with potentially multiple paginated boundary calls per refresh; replacements do not cancel or dispose the previous ObservablePromise, so concurrency and retained pending requests grow linearly with notification count.",
+      "PerformanceOutcome": "Excessive IPC/server work and memory growth, reducing responsiveness and throughput",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR there was no MCP tool-list notification path and no corresponding burst of tools/list requests.",
+      "ChangedBehavior": "The added listener invokes updateTools for every notification. updateTools immediately calls handler.listTools and merely replaces the observable wrapper; all older requests remain active under the same connection-lifetime cancellation token.",
+      "CausalDiffEvidence": "Added line 168 installs a direct one-notification-to-one-refresh listener without checking for an in-flight refresh or coalescing queued changes.",
+      "Title": "Coalesce tool-list refresh notifications",
+      "Impact": "A dynamic server that emits a burst while loading plugins—or a server that emits changes while previous list requests are slow—causes overlapping full tool enumerations. If it stops replying, every notification leaves another entry and listener in _pendingRequests until the whole connection is torn down.",
+      "Evidence": "populateLiveData creates one CancellationTokenSource for the connection, line 168 maps every onDidChangeToolList event directly to updateTools, and updateTools constructs a new ObservablePromise around handler.listTools. ObservablePromise has no disposal/cancellation behavior, while sendRequest retains each DeferredPromise in _pendingRequests until response or token cancellation.",
+      "Recommendation": "Serialize refreshes per server and coalesce notifications while one is in flight into a single dirty rerun, or cancel the superseded list request with a refresh-scoped token."
+    },
+    {
+      "ID": "PERF-E3352DCA9B76",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/mcp/browser/mcp.contribution.ts",
+      "Side": "RIGHT",
+      "Line": 34,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed registration phase, eager observable read, service-construction chain, and synchronous JSON parse are all explicit. Exact cache size in bytes varies by installed servers, which affects severity rather than the mechanism.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "Synchronous JSON parsing and allocation of persisted tool metadata objects",
+      "PerformanceScaling": "Cost grows with both persisted PROFILE and WORKSPACE tool-cache payloads; each cache permits 128 server entries, while each entry can contain an unbounded number and size of tool descriptions and JSON schemas.",
+      "PerformanceOutcome": "Increased startup latency by blocking editor/UI restoration on cache deserialization",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, workbench restore did not instantiate the MCP service or synchronously deserialize MCP tool metadata.",
+      "ChangedBehavior": "The new BlockRestore contribution immediately reads `mcpService.servers`; that forces the delayed McpService, whose constructor creates two McpServerMetadataCache instances and synchronously calls storageService.getObject for each scope.",
+      "CausalDiffEvidence": "Added line 34 registers McpContextKeysController at WorkbenchPhase.BlockRestore; its immediate servers read forces the newly added service and its two synchronous cache loads before restore.",
+      "Title": "Defer MCP cache loading until after workbench restore",
+      "Impact": "Every window start reaches this path. On warm starts for users with cached MCP tools, potentially large schemas are parsed and materialized before an editor can be shown, even though MCP discovery itself is intentionally scheduled AfterRestored.",
+      "Evidence": "WorkbenchPhase.BlockRestore is documented as blocking an editor from showing. McpContextKeysController's constructor immediately starts an autorun that reads IMcpService.servers. McpService constructs PROFILE and WORKSPACE metadata caches, and McpServerMetadataCache synchronously calls getObject; the storage implementation parses the stored JSON synchronously. Discovery is registered one line earlier for AfterRestored, so no real server count can arrive during restore.",
+      "Recommendation": "Register the context-key/action-rendering contributions AfterRestored (matching discovery), or keep them lazy and avoid touching IMcpService until discovery or the MCP UI is first used."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "missing-coalescing",
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "serialization-allocation",
+      "concurrency-burst",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Window startup and editor/UI restoration",
+        "CriticalPath": "McpContextKeysController is instantiated in BlockRestore and immediately reads IMcpService.servers, forcing McpService construction before editors can show. Its two metadata-cache constructors synchronously deserialize storage on this critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpServer.ts:45 McpServerMetadataCache constructor",
+            "Operation": "Read and synchronously JSON-parse persisted mcpToolCache data",
+            "Cardinality": "Exactly two reads/parses per McpService construction, one PROFILE and one WORKSPACE; bytes scale with cached metadata.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No MCP cache was loaded during restore before this PR.",
+            "CriticalPathEffect": "Blocks BlockRestore and therefore delays editors/UI from showing."
+          }
+        ],
+        "ScalingInput": "Persisted tool metadata in PROFILE and WORKSPACE scopes: up to 128 server keys in each LRU, with unbounded tools, descriptions, and input-schema bytes per key.",
+        "EffectiveConcurrency": "Both cache constructions and getObject parses run synchronously and serially on the renderer startup path; no deferral or background boundary exists.",
+        "CacheBehavior": "Cold/empty caches make the two lookups cheap. Warm caches synchronously parse and materialize all stored entries on every window start; the cache is entry-count bounded but not byte bounded.",
+        "MechanismConfidence": "High: registration phase, forced property read, service constructor, and synchronous storage parse were traced directly.",
+        "MagnitudeUncertainty": "Typical cache byte size depends on configured servers and their schemas, but large tool schemas are permitted and the two synchronous parses are definitively on the blocking phase.",
+        "Verdict": "Reportable eager startup work because MCP discovery itself occurs only AfterRestored, so forcing and deserializing the service during BlockRestore provides no earlier usable discovery result."
+      },
+      {
+        "Scenario": "Post-restore discovery of local, remote, and configured MCP servers",
+        "CriticalPath": "McpDiscovery runs AfterRestored, so environment IPC, Claude configuration reads, and watcher creation are off the editor-restore critical path. Configuration inspection and mapping run after restore as well.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/mcp/electron-sandbox/nativeMpcDiscovery.ts:30 NativeMcpDiscovery.start",
+            "Operation": "Load local platform/home environment from the main process",
+            "Cardinality": "One IPC call per desktop window after restore.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No MCP environment IPC existed.",
+            "CriticalPathEffect": "Off restore critical path because McpDiscovery is AfterRestored."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/mcp/common/discovery/nativeMcpRemoteDiscovery.ts:39 RemoteNativeMpcDiscovery.start",
+            "Operation": "Load platform/home environment from the remote server",
+            "Cardinality": "One IPC call per connected remote window after restore.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No remote MCP discovery IPC existed.",
+            "CriticalPathEffect": "Off restore critical path; only gates remote MCP discovery."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/mcp/common/discovery/nativeMcpDiscoveryAbstract.ts:77 setDetails/updateFile",
+            "Operation": "Read Claude Desktop configuration and create an exact-file watcher",
+            "Cardinality": "One initial read and one watcher per local/remote adapter; current effective cardinality is at most two per remote desktop window.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These configuration files were not read or watched by VS Code.",
+            "CriticalPathEffect": "Only delays MCP collection availability after restore."
+          }
+        ],
+        "ScalingInput": "Three configuration scopes plus one Claude config adapter locally and, when connected, one remotely; server-definition mapping scales with configured server count.",
+        "EffectiveConcurrency": "Local and remote discovery instances start independently. Each filesystem adapter performs one initial read and uses a 500 ms RunOnceScheduler for watcher changes; there is no unbounded per-file fan-out with the current single adapter.",
+        "CacheBehavior": "No discovery-result cache. Existing or missing Claude files are read once after restore; watcher events are coalesced over 500 ms. Configuration changes are equality-checked before registry updates.",
+        "MechanismConfidence": "High: scheduling phase, exact adapter count, watcher debounce, and boundaries are explicit.",
+        "MagnitudeUncertainty": "Remote filesystem/IPC latency varies, but placement after restore and fixed current adapter cardinality bound user-visible startup impact.",
+        "Verdict": "No additional finding: discovery boundaries are fixed-cardinality, coalesced on changes, and off the restore critical path."
+      },
+      {
+        "Scenario": "Starting, stopping, crashing, and restarting a stdio MCP server",
+        "CriticalPath": "A manual start or first tool call resolves variables, sends one start RPC to the owning extension host, spawns one child, waits for Running, performs initialize, then performs an initial tools/list before live tools are available.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadMcp.ts:48 delegate.start",
+            "Operation": "Send start/stop/messages between renderer and extension host",
+            "Cardinality": "One start RPC per launch; state events per lifecycle transition; message RPCs scale with protocol traffic.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No MCP launch IPC existed.",
+            "CriticalPathEffect": "Start and state IPC are on the path to a usable server."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/api/node/extHostMpcNode.ts:65 startNodeMpc",
+            "Operation": "Spawn configured MCP command with piped stdio",
+            "Cardinality": "One child per server start; servers can start concurrently across definitions.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "VS Code did not spawn MCP server commands.",
+            "CriticalPathEffect": "Spawn and initialization block first tool use and manual start completion."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpRegistry.ts:77 resolveConnection",
+            "Operation": "Deep-clone/resolve launch variables and serialize newly resolved input values to storage",
+            "Cardinality": "Once when constructing each new connection; skipped interaction storage when definitions have no variableReplacement.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No MCP launch configuration was resolved or stored.",
+            "CriticalPathEffect": "Runs before subprocess launch and therefore delays start."
+          }
+        ],
+        "ScalingInput": "One subprocess per concurrently started server. Aggregate concurrency across different servers is unbounded; repeated spontaneous exits/restarts increase retained map entries by one per attempt.",
+        "EffectiveConcurrency": "McpServer serializes start calls per server with a Sequencer, but different servers start independently. Explicit stop aborts and deletes its child; spontaneous exit/error does not delete the extension-host map entry.",
+        "CacheBehavior": "Saved variable inputs avoid repeated prompts. Cached tools can populate UI before start but do not avoid initialize or live tools/list after connection. There is no negative cache for failed starts.",
+        "MechanismConfidence": "High: monotonically increasing ids, sole explicit-stop deletion, terminal state flow, and retained map were traced.",
+        "MagnitudeUncertainty": "Per-child retained object size is runtime-dependent, but retention is unbounded across crash/restart history and ownership proves old entries remain rooted.",
+        "Verdict": "Reportable cleanup-lifecycle leak for spontaneous exits. Cross-server spawn concurrency was considered but not separately reported because starts are user/agent initiated and no changed bulk-start path was found."
+      },
+      {
+        "Scenario": "MCP protocol traffic, live tool refresh, and tool invocation",
+        "CriticalPath": "Each protocol request is JSON-stringified in the renderer, crosses to the extension host, travels over child stdin/stdout, crosses back, and is parsed in MainThreadMcp. Tool calls await this path. On connection and each tools/list_changed notification, a paginated tools/list request refreshes registrations.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/node/extHostMpcNode.ts:85 stdout logging listener",
+            "Operation": "Forward the full stdout line as a log RPC in addition to forwarding it as the protocol-message RPC",
+            "Cardinality": "Two renderer-bound IPC calls per stdout JSON line instead of the one needed for protocol delivery; bytes in both calls equal the full payload plus a prefix.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No MCP payload duplication or MCP per-server log write existed.",
+            "CriticalPathEffect": "Runs synchronously on every incoming message and adds allocation/IPC/logging work alongside tool-result delivery."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpServerConnection.ts:82 launch log listener",
+            "Operation": "Write the duplicated raw protocol payload through a file-backed per-server logger",
+            "Cardinality": "One info log entry for every inbound protocol line, in addition to stderr/log notifications and state logs.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Raw MCP protocol results were not persisted to logs.",
+            "CriticalPathEffect": "Adds filesystem/log-buffer pressure to protocol handling; magnitude scales with payload bytes."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpServer.ts:168 tool-list change listener",
+            "Operation": "Issue tools/list JSON-RPC requests through renderer/extension-host/child boundaries",
+            "Cardinality": "One complete, potentially paginated enumeration per notification per server, with no reduction for in-flight refreshes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No MCP tool-list refresh traffic existed.",
+            "CriticalPathEffect": "Refresh completion controls updated tool registration; overlapping requests compete with normal tool traffic."
+          }
+        ],
+        "ScalingInput": "Message count and payload bytes, including arbitrary text/blob/base64 image tool results; number of notifications; pages and tools per list response; number of simultaneously connected servers.",
+        "EffectiveConcurrency": "Each paginated refresh is serial page-by-page, but refreshes created by separate notifications overlap without a limiter or coalescer. Different servers are independent. Every inbound stdout line also triggers two extension-host-to-renderer RPCs.",
+        "CacheBehavior": "Warm metadata supplies pre-start tools only. Once connected, the initial and notification-triggered live list requests always run; replacing ObservablePromise does not cancel prior work. Responses update the cache later.",
+        "MechanismConfidence": "High: both stdout listeners, file-backed logger, notification listener, pending-request map, and non-cancelling ObservablePromise were traced.",
+        "MagnitudeUncertainty": "Normal server payloads and notification rates vary, but large binary results are explicitly allowed and the duplicate transfer plus unbounded refresh concurrency are deterministic.",
+        "Verdict": "Two reportable regressions: duplicate full-payload IPC/logging and missing refresh coalescing. Pagination accumulation was considered but omitted because realistic page counts were not established strongly enough for a separate finding."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 53 changed files and every diff page. Submitted four introduced regressions covering restore-blocking cache deserialization, uncoalesced tool refreshes, duplicate full-payload IPC/file logging, and retained exited child-process graphs."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-20T19:27:01.803825844Z",
+    "CompletedAt": "2026-09-20T19:30:17.563991427Z",
+    "WallClockMilliseconds": 195760,
+    "ModelCalls": 15,
+    "InputTokens": 1393682,
+    "OutputTokens": 16064,
+    "TotalTokens": 1409746,
+    "ReasoningTokens": 7025,
+    "CacheReadTokens": 1266688,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 187519,
+    "ToolCalls": 127,
+    "NanoAIUnits": 133593120000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1266688,
+      "cache_write": 0,
+      "input": 126994,
+      "output": 16064
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
