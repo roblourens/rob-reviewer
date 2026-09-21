@@ -1,0 +1,165 @@
+{
+  "PullRequest": {
+    "Number": 336968,
+    "Title": "Fix account policy enforcement in the Agents window",
+    "Body": "Initialize configuration defaults before registering policies so the Agents window applies account restrictions correctly, and preserve policy updates received while configuration files load. Hide the Welcome invitation and reject direct launch commands when Agent mode is disabled.\r\n\r\nBefore the change, the \"Try out the new Agents Window\" showed up on the Editor Welcome even though Agents were disabled by token policy:\r\n\u003cimg width=\"771\" height=\"231\" alt=\"Screenshot 2026-09-20 at 9 55 30 PM\" src=\"https://github.com/user-attachments/assets/a10bc422-2261-45d4-9849-6821610133d4\" /\u003e\r\n\r\nNow, the \"Try…\" no longer shows and even if the user circumvents it (e.g. using `code --agents …` to launch the Agents Window directly), policy is properly applied so it shows the disabled state:\r\n\r\n\u003cimg width=\"914\" height=\"570\" alt=\"Screenshot 2026-09-20 at 9 55 37 PM\" src=\"https://github.com/user-attachments/assets/fee136f7-609e-4d0e-955c-53b1b3d25230\" /\u003e\r\n\r\n\r\n### Repro\r\n1. Sign into Copilot. Using `scripts/mock-policy-server`, mock `/copilot_internal/v2/token` with `{\"token\":\"agent_mode=0;editor_preview_features=0;mcp=0\"}` and route that endpoint through the proxy. Leave other endpoints on passthrough.\r\n2. Remove any manual `chat.agent.enabled` override and run **Developer: Sync Account Policy**.\r\n3. Confirm the editor's normal Agents button disappears, then open **Welcome → Try out the new Agents window**.\r\n\r\n**Before:** the invitation remains and opens an unblocked Agents window, although both windows receive `chat_agent_enabled: false`.\r\n\r\n**After:** the invitation is hidden, and an Agents window opened directly with `--agents` shows **Agents Disabled**. Verified with mocked account policy; successful model execution was not tested with the synthetic token.\r\n\r\n### Validation\r\nClient build and lint pass; 191 focused tests pass, including startup policy changes and existing draft handoff coverage.\r\n\r\nFixes https://github.com/microsoft/vscode-internalbacklog/issues/9102.",
+    "URL": "https://github.com/microsoft/vscode/pull/336968",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "rwoll",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "c0f6c8cd52aeceb78b91631bce1b37d161a93d3f",
+    "HeadRef": "rwoll-issue-reproduction",
+    "HeadSHA": "dbe2957c74988fe72f78fe5891496f707531d889",
+    "CreatedAt": "2026-09-21T04:54:47Z",
+    "UpdatedAt": "2026-09-21T06:42:43Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-CF56F6769B62",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/services/configuration/browser/configurationService.ts",
+      "Side": "RIGHT",
+      "Line": 119,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The changed await order, all three concrete file-read call paths, and the startup await are directly traced. The exact milliseconds vary by filesystem and whether the cache marker is present, which affects magnitude rather than mechanism.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "filesystem reads and desktop file-provider IPC",
+      "PerformanceScaling": "The added delay is one full cached-defaults read before the user-settings and workspace reads can start; it grows with cache filesystem/IPC latency and applies on each Agents window startup when the shared default-overrides cache marker exists.",
+      "PerformanceOutcome": "increased Agents window startup latency from serialized configuration I/O",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The previous Promise.all started the default-overrides cache read, user settings read, and workspace configuration read together, so their I/O latencies overlapped.",
+      "ChangedBehavior": "The new await completes DefaultConfiguration.initialize before invoking UserConfiguration.initialize or WorkspaceConfiguration.initialize, placing the cached-defaults read in front of both independent reads.",
+      "CausalDiffEvidence": "Added RIGHT line 119 (`await this.defaultConfiguration.initialize();`) completes the default initializer before lines 120-124 construct the remaining initialization promises; previously all initializers were invoked in one Promise.all.",
+      "Title": "Keep independent configuration reads parallel",
+      "Impact": "Opening an Agents window with cached default overrides now waits for that cache-file round trip before user and workspace configuration I/O even begins, adding that round trip to the visible startup critical path instead of overlapping it.",
+      "Evidence": "DefaultConfiguration.initialize calls initializeCachedConfigurationDefaultsOverrides, which calls configurationCache.read when `DefaultOverridesCacheExists` is set (`workbench/services/configuration/browser/configuration.ts:54-82`). The production ConfigurationCache implements that read with `fileService.readFile` (`workbench/services/configuration/common/configurationCache.ts:31-33,65-72`). UserConfiguration.initialize reaches UserSettings.loadConfiguration, another `fileService.readFile` (`platform/configuration/common/configurationModels.ts:564-572`), while WorkspaceConfiguration.initialize awaits its own reload (`workbench/services/configuration/browser/configuration.ts:662-680`). SessionsMain awaits ConfigurationService.initialize before returning the configuration service and proceeding with workbench setup (`sessions/electron-browser/sessions.main.ts:359-375`; web.main.ts:64-79).",
+      "Recommendation": "Start the independent user and workspace initialization promises immediately, await only the default promise before calling `policyConfiguration.initialize()`, then await policy/user/workspace together. This preserves the required default-before-policy ordering and the final post-load model capture without serializing unrelated file reads."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "eager-work",
+      "cleanup-lifecycle",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Opening the desktop or web Agents window and initializing effective configuration/policy",
+        "CriticalPath": "SessionsMain/web main awaits ConfigurationService.initialize before publishing the service and continuing workbench setup. The changed path now awaits the conditional default-overrides cache read and default-model construction, then runs policy, user, and workspace initialization together, then loads folder configuration. This is startup-critical.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/configuration/browser/configuration.ts:54-82; src/vs/workbench/services/configuration/common/configurationCache.ts:31-33,65-72",
+            "Operation": "Read the cached default-configuration overrides file through ConfigurationCache/FileService",
+            "Cardinality": "Zero reads when the cache marker is absent; otherwise exactly one cache-file read per Agents window initialization.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same read existed but started alongside user and workspace initialization in the original Promise.all.",
+            "CriticalPathEffect": "The changed await makes the full read complete before independent user/workspace reads can start, adding its latency serially to startup."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/configuration/common/configurationModels.ts:564-572; src/vs/workbench/services/configuration/browser/configuration.ts:662-680",
+            "Operation": "Read and parse user settings and the workspace configuration",
+            "Cardinality": "One user-settings read and one workspace-configuration read at initial startup; both run concurrently after the new default await.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Both reads began concurrently with the default-overrides read.",
+            "CriticalPathEffect": "Both must complete before ConfigurationService.initialize progresses, and the diff delays when they are issued until after the default cache boundary."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/configuration/common/configurations.ts:149-177; src/vs/platform/policy/common/multiplexPolicyService.ts:26-32; src/vs/workbench/services/policies/common/accountPolicyService.ts:145-250",
+            "Operation": "Submit the resolved, batched policy-definition dictionary to policy backends, including native managed settings on desktop when relevant",
+            "Cardinality": "One batched update per policy backend during initialization; backends execute in parallel, not per setting.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Policy initialization raced the empty default model, so Agents-window startup generally submitted no discovered setting definitions; the diff intentionally moves this required policy work after defaults.",
+            "CriticalPathEffect": "Policy initialization awaits the update so effective policy is available before configuration service startup completes. This ordering is required for the PR's policy behavior."
+          }
+        ],
+        "ScalingInput": "One default-overrides cache entry per profile, one user settings resource, one workspace file, the registered configuration-key set for policy definition discovery, and then the number of workspace folders. The reported regression is fixed-cardinality per window but scales with cache filesystem/IPC latency.",
+        "EffectiveConcurrency": "Before the diff, default cache, policy, user, and workspace initialization were all invoked in one Promise.all. After the diff, default initialization is serialized first; policy/user/workspace then run concurrently. Multiplex policy backends are internally updated with Promise.all, and existing folder loads occur afterward.",
+        "CacheBehavior": "Default overrides are read from the per-profile ConfigurationCache only when the shared localStorage marker exists; a new ConfigurationService instance has no warm in-memory value, so each Agents window performs the cache-file read. User and native workspace resources bypass this configuration cache and are read directly. Missing cache content returns an empty value; there is no retry loop.",
+        "MechanismConfidence": "High: the changed await order and each filesystem/IPC call path are directly established in repository code.",
+        "MagnitudeUncertainty": "Disk/IPC latency and prevalence of a populated default-overrides cache vary by profile and platform, so the finding is medium rather than high severity. The serialization and startup reachability are deterministic whenever the cache marker is present.",
+        "Verdict": "Reportable: the required default-before-policy dependency was implemented by unnecessarily serializing independent user/workspace I/O, increasing Agents-window startup latency. One finding was submitted."
+      },
+      {
+        "Scenario": "Rendering and dynamically updating the Agents invitation on Welcome and Agent Sessions pages",
+        "CriticalPath": "Banner DOM creation runs synchronously while each page builds its content. Entitlement or agent-enable changes invoke one visibility callback that reads configuration and writes display/disabled state; no geometry read, relayout loop, or awaited boundary is on this path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "At most one banner per active page build. Getting Started rebuilds dispose the prior banner store first; Agent Sessions rebuilds clear sessionsControlDisposables first. Cost does not scale with sessions or walkthrough rows.",
+        "EffectiveConcurrency": "One sentiment listener and one configuration listener per live banner, plus existing account listeners on Getting Started. Rebuilds dispose old listeners before replacement; callbacks are synchronous and unqueued.",
+        "CacheBehavior": "The current configuration and sentiment are in-memory service state. getDefaultAccount waits on the account service's already-running initialization barrier and does not itself start an additional refresh or network request; its continuation is guarded by banner disposal.",
+        "MechanismConfidence": "High: all creation sites and disposable ownership were inspected, and DefaultAccountService.getDefaultAccount only waits for existing initialization.",
+        "MagnitudeUncertainty": "DOM/style costs are browser-dependent but bounded to one hidden element and low-frequency policy/entitlement events.",
+        "Verdict": "No additional finding: always creating the potentially hidden banner adds bounded DOM/listener work, but disposal is correct and no new network/filesystem boundary or scaling render mechanism is introduced."
+      },
+      {
+        "Scenario": "Launching an Agents window from banner, palette, title actions, or direct commands",
+        "CriticalPath": "Each changed action performs an in-memory IConfigurationService.getValue check before gathering handoff state and invoking the existing nativeHostService.openAgentsWindow boundary. Disabled launches stop before native IPC; enabled launches continue on the existing path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/electron-browser/agentSessions/agentSessionsActions.ts:128,264,340",
+            "Operation": "Request native host to open an Agents window",
+            "Cardinality": "At most one native call per enabled command invocation; zero when disabled.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every invocation that reached these actions could issue the same single native openAgentsWindow request regardless of agent-enable policy.",
+            "CriticalPathEffect": "Existing critical-path launch boundary for enabled commands. The diff adds an in-memory guard before it and avoids the boundary for disabled commands."
+          }
+        ],
+        "ScalingInput": "One command invocation at a time. OpenWorkspaceInAgentsWindowAction performs the guard twice through its nested helper, but this is two constant-time in-memory lookups and does not scale with workspace/session size.",
+        "EffectiveConcurrency": "No new queue or burst: each invocation awaits the existing single native launch request. The guard neither spawns nor duplicates window-open requests.",
+        "CacheBehavior": "AgentEnabled is read from the already-materialized configuration model; no cache miss or external lookup occurs.",
+        "MechanismConfidence": "High: every changed action and helper path was inspected.",
+        "MagnitudeUncertainty": "Configuration lookup duration is negligible and independent of payload size; native window startup cost is pre-existing.",
+        "Verdict": "No finding: the added guards are constant-time and can only reduce expensive native launches when policy disables Agent mode."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files and all diff pages. Submitted one medium-severity startup finding for serializing a conditional cache-file read ahead of independent user/workspace reads. Checked banner creation/listener lifecycle, dynamic visibility writes, policy-definition batching/native IPC, and direct launch command boundaries; no other diff-introduced performance regression met the evidence threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-21T07:05:35.503328844Z",
+    "CompletedAt": "2026-09-21T07:07:07.062762758Z",
+    "WallClockMilliseconds": 91559,
+    "ModelCalls": 14,
+    "InputTokens": 802357,
+    "OutputTokens": 9503,
+    "TotalTokens": 811860,
+    "ReasoningTokens": 3822,
+    "CacheReadTokens": 710429,
+    "CacheWriteTokens": 91886,
+    "APIDurationMilliseconds": 81849,
+    "ToolCalls": 80,
+    "NanoAIUnits": 93382960000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 710429,
+      "cache_write": 91886,
+      "input": 42,
+      "output": 9503
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
