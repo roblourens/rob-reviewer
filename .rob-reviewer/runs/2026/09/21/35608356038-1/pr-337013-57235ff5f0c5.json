@@ -1,0 +1,207 @@
+{
+  "PullRequest": {
+    "Number": 337013,
+    "Title": "Enable Modern UI Update by default",
+    "Body": "Set the default value for the Modern UI Update setting to true, enhancing the user interface experience with updated styles and layouts. This change improves the visual consistency across the application. Testing can be done by verifying the UI elements reflect the new design upon launch.\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337013",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "mrleemurray",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "94a39f4cb65288f75dfeeb9a4aa0e7146244e33c",
+    "HeadRef": "mrleemurray/modern-white-parrot",
+    "HeadSHA": "57235ff5f0c5634f5b5525d50e811cc2bc8c70d9",
+    "CreatedAt": "2026-09-21T10:47:11Z",
+    "UpdatedAt": "2026-09-21T13:15:12Z",
+    "MergedAt": null,
+    "Labels": [
+      "modernization"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-D140BAD91ADA",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/browser/workbench.contribution.ts",
+      "Side": "RIGHT",
+      "Line": 836,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The default-to-class-to-layout call path and the per-tab synchronous CSSOM/geometry operations are explicit. Exact milliseconds vary by tab/group count and platform, so severity is medium, but the mechanism and default exposure are high confidence.",
+      "PerformanceCategory": "layout",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceResource": "main-thread style recalculation, layout, and per-tab DOM/CSSOM reads and writes",
+      "PerformanceScaling": "Every editor-group layout now processes every open tab in that group; the cost grows linearly with tab count and repeats on window/part resize, editor opens, decoration changes, toolbar changes, selection changes, and group activation.",
+      "PerformanceOutcome": "increased layout latency and dropped frames during resizing and tab/editor interactions",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "With the setting defaulting to false, users without an explicit opt-in skipped the connected-tabs branch: `layoutConnectedTabLabels(false)` only removed stale properties and did not perform per-tab computed-style/text measurements or the connected-tab bounds reads.",
+      "ChangedBehavior": "Defaulting Modern UI on also enables the default `Connected` editor-tab style, so normal workbench layouts enter `layoutConnectedTabLabels(true)` and connected clipping measurement for every editor group.",
+      "CausalDiffEvidence": "The added `default: true` at line 836 makes `ModernUIContribution` add `.modern-ui-connected-editor-tabs` by default; `MultiEditorTabsControl.doLayoutTabs` detects that class and calls `layoutConnectedTabLabels(true)` on each scheduled layout.",
+      "Title": "Keep connected-tab measurement off the routine layout path",
+      "Impact": "A realistic workspace with dozens of open tabs now incurs O(tab count) synchronous style/layout work on the main thread for each resize frame and common tab updates, causing visibly slower editor switching/opening and resize jank; multiple editor groups multiply the work serially.",
+      "Evidence": "`multiEditorTabsControl.ts:2068-2140` iterates all tabs on every layout, removes a class, then for each tab calls `getComputedStyle` on the tab/name/suffix/badge and writes CSS custom properties before the next tab; it subsequently reads every `offsetWidth`. These interleaved DOM writes and CSSOM/geometry reads can repeatedly force style/layout. The same layout then reads `offsetWidth`/`scrollWidth`, three `getBoundingClientRect()` values, and pseudo-element styles at 2325-2386. Layout is requested by editor opens (628-686), decoration/toolbar changes (619-636), selection/group changes (838-858), label changes (885), and editor-group resizing (`editorGroupView.ts:2239`).",
+      "Recommendation": "Preserve the default-on UI while taking intrinsic connected-tab measurement out of routine layout: cache each tab's minimum width until its label/font/theme/options change, batch all required computed-style/geometry reads before class/style writes, and leave resize layouts to compare cached minima against current widths. Keep clipping measurement limited to the active tab."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "repeated-work",
+      "eager-work",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Launch or restore a normal workbench for a user without an explicit Modern UI setting",
+        "CriticalPath": "Configuration resolution now returns true before workbench layout; initial layout seeds Modern UI/floating-panel classes, and the BlockRestore contribution applies the remaining classes and metrics before restore completes. Initial editor-group layout and painting are on the startup critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/browser/parts/editor/multiEditorTabsControl.ts:2068-2140",
+            "Operation": "Browser CSSOM and geometry access for each connected tab, including multiple `getComputedStyle` calls and `offsetWidth` after class/style writes",
+            "Cardinality": "For T restored tabs in a group, roughly 2-4 computed-style reads plus text/DOM work per non-compact tab, then T width reads; repeated independently for G editor groups.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The implementation existed for opt-in users, but the false default kept ordinary profiles out of the connected-tab measurement branch.",
+            "CriticalPathEffect": "Runs in each group's scheduled initial layout before the restored tab strip has settled and painted."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/browser/parts/editor/multiEditorTabsControl.ts:2352-2386",
+            "Operation": "Active-tab clipping geometry via three `getBoundingClientRect` calls, computed styles, pseudo-element style, and other width reads",
+            "Cardinality": "One active-tab clipping measurement per non-wrapping connected editor group layout.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Skipped when the workbench lacked `.modern-ui-connected-editor-tabs`, which was the default before this change.",
+            "CriticalPathEffect": "Synchronously establishes tab geometry before scrollbar/reveal layout can finish."
+          }
+        ],
+        "ScalingInput": "Number of restored editor groups, open tabs, visible workbench parts, and auxiliary windows. Tab work uses the number of tabs in each group; CSS class application uses the small number of workbench containers.",
+        "EffectiveConcurrency": "Workbench DOM/style/layout work is serialized on the renderer main thread. Per-group tab layouts are animation-frame scheduled and coalesced within a group, but restored groups still execute their own O(tab-count) layout passes.",
+        "CacheBehavior": "Connected-tab text widths have a 256-entry LRU, which can avoid repeated canvas `measureText` calls for identical font/text keys, but every layout still performs per-tab computed-style reads, DOM queries, property writes, and width reads. Cold startup has no populated text cache; warm layouts retain only those text widths.",
+        "MechanismConfidence": "High: the changed default, resulting classes, BlockRestore timing, and synchronous per-tab layout path are all explicit in code.",
+        "MagnitudeUncertainty": "Startup impact depends on restored tab/group count and browser/platform style-engine cost; small sessions may not show measurable delay.",
+        "Verdict": "Reportable as part of the submitted finding because the default exposes all ordinary profiles to tab-count-scaled synchronous style/layout work; the same mechanism is more visibly repeated during runtime interactions."
+      },
+      {
+        "Scenario": "Resize the window/parts or open, switch, rename, decorate, pin, or select editors with multiple tabs",
+        "CriticalPath": "Each trigger requests `MultiEditorTabsControl.layout`; work is coalesced to the next animation frame, but `doLayoutTabs` must synchronously measure and update connected labels and clipping before the frame's tab layout completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/browser/parts/editor/multiEditorTabsControl.ts:2068-2140",
+            "Operation": "Interleaved per-tab class/style mutation, computed-style reads, text measurement lookup, and width reads",
+            "Cardinality": "O(T) for every effective group layout, where T is the group's open-tab count.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Profiles using the old false default did not enter the connected measurement branch; routine layouts only performed the legacy tab layout.",
+            "CriticalPathEffect": "Consumes the animation-frame budget before tabs and editor geometry can be presented, so high T can produce resize or interaction jank."
+          }
+        ],
+        "ScalingInput": "Open tabs per group after no deduplication; dozens of tabs are realistic, and multiple visible groups multiply the work. Frequency follows resize frames and tab/editor events.",
+        "EffectiveConcurrency": "One scheduled layout per editor group per animation frame; all style/layout work is serialized on the UI thread, with no worker or shared limiter across groups.",
+        "CacheBehavior": "The text-width LRU can be warm, but font/style extraction and geometry are not cached. There is no negative state or coalescing across editor groups; layout requests within one group are RAF-coalesced.",
+        "MechanismConfidence": "Very high: callers for resize, editor open, decorations, toolbar changes, selections, activation, and labels are explicit, as are the CSSOM and geometry reads.",
+        "MagnitudeUncertainty": "Exact dropped-frame threshold varies with machine, theme, labels, tab count, and group count.",
+        "Verdict": "Reportable; this is the concrete runtime trigger and impact for the submitted medium-severity finding."
+      },
+      {
+        "Scenario": "Automation opens or reads chat model configuration when the auxiliary bar is initially too narrow",
+        "CriticalPath": "The test waits for button visibility, obtains the auxiliary-bar box, enumerates candidate top-level vertical sashes, queries each box sequentially, drags the nearest sash, then sleeps 300 ms before retrying. All Playwright operations are on the test's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "test/automation/src/chat.ts:323-335",
+            "Operation": "Playwright locator enumeration and one `boundingBox` browser query for each top-level vertical sash",
+            "Cardinality": "Previously zero sash enumeration plus one auxiliary-bar box query per retry; now one locator enumeration and S sash-box queries per retry, normally a handful and usually one retry.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The test inferred the sash from the auxiliary bar's left edge and issued no per-sash browser queries.",
+            "CriticalPathEffect": "Adds bounded automation IPC latency only when the picker needs expansion; it does not affect product runtime."
+          }
+        ],
+        "ScalingInput": "Number S of top-level workbench vertical sashes after `.part` descendants are excluded, multiplied by retries until the model button appears. In normal layouts S is small; the loop is bounded by 20 seconds and exits immediately when already expanded.",
+        "EffectiveConcurrency": "Sash bounding-box requests are awaited sequentially. Retries are serialized with a 300 ms delay; there is no concurrent IPC burst.",
+        "CacheBehavior": "No sash-box caching between retries because geometry changes after each drag. The already-expanded path performs only the visibility check and no sash enumeration.",
+        "MechanismConfidence": "High for the added IPC count; low concern for product performance because this code is test-only and bounded.",
+        "MagnitudeUncertainty": "Exact S and retry count depend on test layout, but the selector excludes numerous internal part sashes and successful dragging should end the loop promptly.",
+        "Verdict": "No finding: the added fan-out is small, bounded, test-only, and needed to locate the offset sash under the new card layout."
+      },
+      {
+        "Scenario": "Terminal persistence smoke test reloads the window or detaches/reattaches a PTY after producing 100 lines",
+        "CriticalPath": "A Node producer emits 100 lines over about 10 seconds, the test waits for completion, performs one reload or detach/attach, focuses the terminal, waits for replay, writes `continue`, and polls for the final line. These operations remain sequential and test-critical.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:44",
+            "Operation": "Spawn a Node process in the integrated PTY and emit 100 timed lines",
+            "Cardinality": "One producer per test variant, unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same fixed producer and output count ran before the change.",
+            "CriticalPathEffect": "Dominates setup time at roughly 10 seconds before reconnect and remains unchanged."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:53",
+            "Operation": "Drive command palette selection and mark/wait for one workbench window reload",
+            "Cardinality": "One command-palette execution and one reload for the reload variant, unchanged; label matching replaces command-ID matching and `keepOpen` avoids waiting for the old palette to close.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same reload command was selected once by command ID and the helper waited for quick input closure.",
+            "CriticalPathEffect": "Triggers the intended reload and waits for the replacement workbench; no extra round trip loop is introduced on the successful path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/src/areas/terminal/terminal-persistence.test.ts:62-63",
+            "Operation": "Focus the terminal and poll its rendered buffer for replay completion",
+            "Cardinality": "One focus command and one replay wait per variant, merely reordered.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same focus and terminal-buffer wait occurred in the opposite order.",
+            "CriticalPathEffect": "The replay wait remains on the test critical path after focus rather than before it; its count and predicate are unchanged."
+          }
+        ],
+        "ScalingInput": "Fixed count of 100 terminal lines and two fixed reconnect variants; there is no user-sized collection or increased concurrency.",
+        "EffectiveConcurrency": "The producer subprocess runs asynchronously while the test polls, but reconnect/focus/replay/write steps are awaited serially. No new parallelism or burst was introduced.",
+        "CacheBehavior": "No cache is involved. Terminal buffer polling observes live/replayed state; reload restores persisted workbench/PTY state once.",
+        "MechanismConfidence": "High: helper implementations show exact matching and `keepOpen` alter synchronization semantics, not successful-path operation count.",
+        "MagnitudeUncertainty": "Driver retry behavior can vary under flaky UI timing, but the successful-path boundary counts are unchanged and all loops were pre-existing.",
+        "Verdict": "No performance finding: no subprocess/IPC cardinality, data volume, or concurrency increase is introduced."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files. Submitted one medium-confidence-high finding for default-enabling connected-tab measurement that performs tab-count-scaled synchronous CSSOM/layout work on routine editor layouts. The chat automation adds only bounded test IPC, and the terminal test preserves boundary cardinality and data volume."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-21T13:58:45.620685593Z",
+    "CompletedAt": "2026-09-21T14:00:20.09487537Z",
+    "WallClockMilliseconds": 94474,
+    "ModelCalls": 16,
+    "InputTokens": 1021431,
+    "OutputTokens": 9133,
+    "TotalTokens": 1030564,
+    "ReasoningTokens": 2630,
+    "CacheReadTokens": 916533,
+    "CacheWriteTokens": 104850,
+    "APIDurationMilliseconds": 82722,
+    "ToolCalls": 88,
+    "NanoAIUnits": 107371520000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 916533,
+      "cache_write": 104850,
+      "input": 48,
+      "output": 9133
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

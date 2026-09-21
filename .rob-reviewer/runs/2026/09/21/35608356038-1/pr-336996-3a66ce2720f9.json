@@ -1,0 +1,168 @@
+{
+  "PullRequest": {
+    "Number": 336996,
+    "Title": "test: fix resolver tunnel port allocation and bind errors",
+    "Body": "## Summary\nNarrowed to the test resolver only. The browser-tools HTTP fixture is handled independently by #336988; this PR no longer changes that test.\n\n- When the requested local port equals the remote port (the test resolver runs both on the same machine), let the OS allocate a free local port instead of assuming `remotePort + 1` is available. The adjacent port can be occupied or reserved on Windows, and remote port 65535 would otherwise produce an invalid local port.\n- Reject tunnel creation on a server bind error instead of leaving the promise pending.\n- Preserve explicitly requested distinct local ports and existing privileged-port behavior.\n\nThis addresses the resolver failure behind the rollback in #336381. It is not an additional failure established in Azure build 475409, and #336988 does not require this change because it uses the browser remote proxy without explicitly opening a tunnel.\n\n## Validation\n- After narrowing: both test extensions compile with zero errors; scoped hygiene (including ESLint) and `git diff --check` pass.\n- Direct compiled-resolver probes passed: remote port 65535 allocates a valid local port; an occupied explicitly requested local port rejects with `EADDRINUSE`.\n- The resolver implementation is unchanged from `ec5a082570d`, validated by [Azure build 475477](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=475477): **succeeded**, with all Electron and Remote integration jobs passing on Windows x64, Linux x64, and macOS ARM64. That revision still included the now-removed HTTP fixture, which explicitly exercised tunnel creation in remote tests.\n- The scope-only follow-up commit has not been rerun in Azure.",
+    "URL": "https://github.com/microsoft/vscode/pull/336996",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "chrmarti",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3f11d906eac610b57c3e8d25994d60de04245ce2",
+    "HeadRef": "chrmarti/fix-browser-tools-http-fixture",
+    "HeadSHA": "3a66ce2720f90c2a6225c9956ef301975d059ed7",
+    "CreatedAt": "2026-09-21T09:42:37Z",
+    "UpdatedAt": "2026-09-21T11:17:43Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "extensions/vscode-test-resolver/src/extension.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 612,
+      "BasePath": "extensions/vscode-test-resolver/src/extension.ts",
+      "BaseLine": 586,
+      "IntroducingPath": "extensions/vscode-test-resolver/src/extension.ts",
+      "IntroducingCommit": "15e58cea4d308ff39f9d70ff2ebcbccffa4149a5",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "latency",
+      "Mechanism": "An ignored server bind error leaves the tunnel provider promise and per-port in-progress state pending indefinitely.",
+      "Symptom": "A test-resolver tunnel request hangs indefinitely when its local port cannot be bound.",
+      "FixedBehavior": "A server bind failure now rejects tunnel creation, allowing the open-tunnel critical path and factory-in-progress cleanup to complete instead of waiting indefinitely.",
+      "Evidence": "The base implementation creates the tunnel promise with an unused rejection callback and listens without a server error handler. A bind failure therefore leaves the provider promise pending. ExtHostTunnelService awaits the provider, and AbstractTunnelService stores that promise and retains its factory-in-progress key until settlement, so tunnel opening cannot complete. The changed line forwards the pre-listen server error to the promise rejection callback.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "cache-lifecycle",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open a new test-resolver tunnel when the preferred local port equals the remote port",
+        "CriticalPath": "The workbench sends one tunnel-provider IPC request, the extension host invokes tunnelFactory, and tunnel opening waits for net.Server.listen to bind before returning the selected local address. This bind is on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadTunnelService.ts:$setTunnelProvider forwardPort",
+            "Operation": "Invoke the remote authority resolver tunnel factory in the extension host.",
+            "Cardinality": "One call per cold unique remote host/port; warm requests reuse the tunnel service entry.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider IPC call occurred on cold tunnel creation.",
+            "CriticalPathEffect": "The response must return before tunnel opening completes."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/vscode-test-resolver/src/extension.ts:613 createTunnelService",
+            "Operation": "Bind a loopback TCP server for the local tunnel endpoint.",
+            "Cardinality": "One bind per cold tunnel creation, after host/port coalescing.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One bind was also performed, using remotePort + 1 when the preferred local and remote ports matched; the diff instead requests one OS-assigned free port.",
+            "CriticalPathEffect": "The listen callback must run before the tunnel is returned."
+          }
+        ],
+        "ScalingInput": "The number of distinct remote endpoints opened in the test session; repeated requests for one endpoint are coalesced/cached.",
+        "EffectiveConcurrency": "AbstractTunnelService caches successful tunnels by remote host/port and prevents a second factory invocation for the same remote port while creation is in progress. Different remote ports may be created concurrently, unchanged by this diff.",
+        "CacheBehavior": "Cold creation performs one IPC and one bind. Successful tunnels are cached by remote host/port and refcounted; warm opens reuse the promise/tunnel without another bind. There is no separate negative cache introduced by the port-selection change.",
+        "MechanismConfidence": "High: the diff, provider call chain, bind, and tunnel map behavior are directly visible.",
+        "MagnitudeUncertainty": "Kernel ephemeral-port selection cost is platform-dependent, but it replaces rather than adds a bind and is normally constant-time relative to this test workflow.",
+        "Verdict": "No reportable regression. The diff changes the requested bind port from an adjacent fixed port to port 0 without increasing boundary-call count, serialized work, allocation, or retained state."
+      },
+      {
+        "Scenario": "Open a tunnel with an explicitly requested distinct local port, including a bind conflict",
+        "CriticalPath": "One provider IPC and one loopback server bind must settle before the tunnel request can complete. On bind failure, the added listener now rejects that critical-path promise instead of leaving it pending.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostTunnelService.ts:151 registered provider callback",
+            "Operation": "Await the resolver's tunnelFactory result across the main-thread/extension-host boundary.",
+            "Cardinality": "One call for a cold remote endpoint; same-endpoint attempts during creation are suppressed and successful endpoints are cached.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC was issued, but a bind error left its provider promise unresolved.",
+            "CriticalPathEffect": "Tunnel opening waits for the provider result."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/vscode-test-resolver/src/extension.ts:613 createTunnelService",
+            "Operation": "Attempt to bind the explicitly requested loopback port.",
+            "Cardinality": "One bind attempt per cold endpoint; no retry loop or fan-out is added.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same bind was attempted, but its error was not connected to the tunnel promise, causing an indefinite wait.",
+            "CriticalPathEffect": "Success returns the tunnel; failure now rejects immediately through the added one-shot listener."
+          }
+        ],
+        "ScalingInput": "Distinct tunnel endpoints whose requested local ports are unavailable; realistic test runs generally open only a small number.",
+        "EffectiveConcurrency": "One factory call is active per remote port; distinct remote ports may proceed concurrently. The finally handler clears the in-progress key once the newly rejected promise settles.",
+        "CacheBehavior": "Successful tunnels remain cached/refcounted. A failed bind now settles and releases the factory-in-progress key. The tunnel map's handling of provider rejection is outside this diff; compared with the previous pending promise, the change does not add retained entries or retries.",
+        "MechanismConfidence": "High: Node server error semantics and the awaited provider path directly establish the before/after behavior.",
+        "MagnitudeUncertainty": "Bind-conflict prevalence varies by platform and test environment, but the prior indefinite wait and the changed rejection mechanism are certain.",
+        "Verdict": "No introduced performance issue. This is a latency/cleanup improvement; the concrete indefinite-wait regression fix was recorded separately."
+      },
+      {
+        "Scenario": "Proxy traffic through an established test-resolver tunnel",
+        "CriticalPath": "After listen succeeds, each accepted local TCP connection opens one remote TCP connection; that connect is on the data path for that client connection.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/vscode-test-resolver/src/extension.ts:589 createTunnelService connection callback",
+            "Operation": "Open one TCP connection to the remote address and pipe bytes bidirectionally.",
+            "Cardinality": "One remote connection per accepted local client connection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical per-connection connect and piping behavior.",
+            "CriticalPathEffect": "Required for that client's proxied traffic, but not for initial tunnel creation because it runs only after a client connects."
+          }
+        ],
+        "ScalingInput": "Number of simultaneous or sequential client connections through the established tunnel.",
+        "EffectiveConcurrency": "Connections are handled independently by Node's server; no new limiter, queue, or concurrency burst is introduced.",
+        "CacheBehavior": "The established server/tunnel is reused for its endpoint until disposal; this diff does not change connection caching or tunnel disposal.",
+        "MechanismConfidence": "High: the connection callback is unchanged and remains downstream of the modified bind setup.",
+        "MagnitudeUncertainty": "Traffic volume is test-dependent, but the diff does not alter its cardinality or per-connection work.",
+        "Verdict": "No reportable regression because runtime proxy traffic work, concurrency, and network-call count are unchanged."
+      }
+    ],
+    "Summary": "Reviewed the complete one-file diff and traced tunnel creation, caching/coalescing, IPC, TCP bind, error, disposal, and traffic paths. No diff-introduced performance regression was found. The PR changes one bind-port choice without adding work and fixes an existing indefinite tunnel-creation wait on bind errors; that regression fix was recorded with its blamed introducing commit."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-21T13:56:24.354441882Z",
+    "CompletedAt": "2026-09-21T13:58:41.989966344Z",
+    "WallClockMilliseconds": 137635,
+    "ModelCalls": 13,
+    "InputTokens": 286776,
+    "OutputTokens": 5184,
+    "TotalTokens": 291960,
+    "ReasoningTokens": 2082,
+    "CacheReadTokens": 253439,
+    "CacheWriteTokens": 33298,
+    "APIDurationMilliseconds": 108143,
+    "ToolCalls": 29,
+    "NanoAIUnits": 37170160000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 253439,
+      "cache_write": 33298,
+      "input": 39,
+      "output": 5184
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
