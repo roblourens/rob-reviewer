@@ -1,0 +1,229 @@
+{
+  "PullRequest": {
+    "Number": 337201,
+    "Title": "agentHost: isolate persisted state after E2E failures",
+    "Body": "Related microsoft/vscode-engineering#3886\r\n\r\n- Give the next Agent Host E2E test fresh home, user-data, and Codex directories after a failed test or cleanup/replay-verification error.\r\n- Retain the old directories for diagnostics until suite teardown removes them all.\r\n- Preserve healthy shared-server reuse and persistence across intentional within-test restart/crash operations.\r\n\r\nRestarting only the process leaves sessions on disk when disposal fails. Those sessions can then appear in an unrelated later `list_sessions` unread assertion. This fixes that cascading test contamination; it does not claim to fix the original intermittent runtime restore timeout.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337201",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0d9ade07b60c165f44c9c3d8366dff640d33392d",
+    "HeadRef": "agents/vscode-copilot-e2e-root-cause-analysis",
+    "HeadSHA": "775ca042145ee3813248b0c3411187673ee0578b",
+    "CreatedAt": "2026-09-22T03:43:09Z",
+    "UpdatedAt": "2026-09-22T05:28:38Z",
+    "MergedAt": null,
+    "Labels": [
+      "vscode-build",
+      "engineering",
+      "agent-host"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "cache-lifecycle",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Healthy replay-mode tests reuse the shared Agent Host server across test cases",
+        "CriticalPath": "Suite setup creates one temporary home and Codex directory; each test acquires a client and either launches the server initially or resets the in-process replay proxy. The diff does not add work to subsequent healthy acquires because _needsFreshDataDirectory remains false.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:_createDataDirectories",
+            "Operation": "Create the suite's temporary home and .codex directory with mkdtempSync and mkdirSync",
+            "Cardinality": "Exactly once per lease during construction on the healthy path",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The constructor performed the same one mkdtempSync and one mkdirSync directly.",
+            "CriticalPathEffect": "Synchronous but constant-sized suite setup work before the first server launch"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:AgentHostE2EServerLease.acquire",
+            "Operation": "Launch the Agent Host child process and provider runtime through IAgentHostTarget.launch/startRealServer",
+            "Cardinality": "One initial launch, then proactive recycling after at most 40 tests or 25 model-backed tests",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same shared launch and recycling limits applied.",
+            "CriticalPathEffect": "Must become ready before the test client connects; this is unchanged by the diff"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:startRealServer",
+            "Operation": "Use the local CAPI replay proxy/mock upstream for model traffic",
+            "Cardinality": "Per model request, served by the existing replay fixture; reset once per test",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same replay proxy and fixture reset path was used.",
+            "CriticalPathEffect": "Model-backed tests await replayed responses, but the diff does not alter request count or proxy scheduling"
+          }
+        ],
+        "ScalingInput": "Number of healthy tests in a suite, bounded per server by 40 total or 25 model-backed tests; directory creation remains once per lease.",
+        "EffectiveConcurrency": "Tests and lease operations are sequential under Mocha hooks; server recycling and client connection are awaited, with no new parallel burst.",
+        "CacheBehavior": "Warm shared server/provider caches remain reused for healthy tests. Replay fixtures are reset per test as before; no cache key, miss, or negative-cache behavior changed.",
+        "MechanismConfidence": "High: the acquire guard is false until a failed release or cleanup error, and the unchanged shared-server branch is directly visible.",
+        "MagnitudeUncertainty": "Exact server startup duration varies by provider and platform, but this diff adds no startup or filesystem operation on this healthy hot path.",
+        "Verdict": "No regression; the dominant healthy-suite path preserves server, subprocess, replay-proxy, and persistent-directory reuse."
+      },
+      {
+        "Scenario": "A failed test or teardown cleanup error is followed by another test",
+        "CriticalPath": "release serially disposes sessions, closes the client/proxy, and stops the existing server. The next acquire synchronously creates a fresh home and .codex directory, then performs the server launch that was already required after forceRestart or cleanup failure.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:AgentHostE2EServerLease.release",
+            "Operation": "Dispose terminals and sessions through TestProtocolClient calls during release",
+            "Cardinality": "Per created session and its claimed terminals; unchanged by the diff",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cleanup RPCs ran before determining that the server must restart.",
+            "CriticalPathEffect": "Awaited before restart and before the next test can acquire a server"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:AgentHostE2EServerLease.release",
+            "Operation": "Stop the failed/current Agent Host process, including Windows descendant handling",
+            "Cardinality": "One stop per failed test or cleanup-error event",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "forceRestart and cleanup errors already stopped the server.",
+            "CriticalPathEffect": "Awaited in teardown; next test cannot launch until release finishes"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:AgentHostE2EServerLease.acquire",
+            "Operation": "Create a new temporary home and .codex directory",
+            "Cardinality": "One mkdtempSync plus one mkdirSync for each failed release that is followed by another acquire",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The restarted server reused the existing home, user-data, and Codex paths; no new root was created.",
+            "CriticalPathEffect": "New constant-sized synchronous work immediately before the already-required server launch"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:AgentHostE2EServerLease.acquire",
+            "Operation": "Launch a replacement Agent Host child process using the new isolated paths",
+            "Cardinality": "One replacement launch after each failed release that is followed by another test",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A replacement process was launched against the old persistent directories.",
+            "CriticalPathEffect": "Already on the next-test critical path before the diff; only launch paths change"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:startRealServer",
+            "Operation": "Start/reuse the local replay proxy and mock model upstream as part of replacement server startup",
+            "Cardinality": "One local proxy/mock setup per replacement launch; model request count remains fixture-driven",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same replacement launch initialized the replay boundary.",
+            "CriticalPathEffect": "Startup awaits the local proxy before forking the server; unchanged cardinality"
+          }
+        ],
+        "ScalingInput": "Number of failed tests or cleanup failures followed by another test; each such event creates one additional isolated root. Test suites are finite, and healthy tests do not increase this count.",
+        "EffectiveConcurrency": "Release, directory creation, and replacement launch are awaited serially. There is no aggregate launch or filesystem concurrency introduced.",
+        "CacheBehavior": "The next server intentionally starts with cold home/user-data/provider disk state so stale sessions cannot contaminate it. In-memory provider reuse was already lost because the process was force-restarted; healthy shared-server caches remain unaffected.",
+        "MechanismConfidence": "High for the added operations and serial critical path; low evidence for any material latency impact beyond negligible directory creation.",
+        "MagnitudeUncertainty": "Provider-specific disk caches may slightly affect replacement startup, but the repository provides no evidence of a significant disk-cache dependency; the directly added filesystem work is two constant operations after an already-failed test.",
+        "Verdict": "No actionable performance regression. The small failure-only cold-directory cost is bounded and necessary for state isolation, while expensive process restart and model-boundary cardinality are unchanged."
+      },
+      {
+        "Scenario": "Suite teardown removes active and retired isolated homes",
+        "CriticalPath": "dispose first closes the replay proxy and stops any live server, then removeTempDirs synchronously recursively deletes every tracked root, retrying serially until all are gone or the existing shared 30-second deadline expires.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:AgentHostE2EServerLease.dispose",
+            "Operation": "Close the replay proxy and stop the final Agent Host process",
+            "Cardinality": "At most one live server per lease",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The final server was stopped before deleting the single shared root.",
+            "CriticalPathEffect": "Must complete before filesystem deletion so provider watchers and descendants release handles"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:removeTempDirs",
+            "Operation": "Recursively remove all tracked temporary roots with rmSync, with read-only repair and retries",
+            "Cardinality": "One root for a failure-free lease, plus one root per failed/cleanup-error release followed by another acquire; each root is attempted serially within one 30-second aggregate deadline",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the single shared root was passed to removeTempDirs, but it retained the same accumulated sessions and logs from failed tests; the new scheme adds small duplicated root/config overhead.",
+            "CriticalPathEffect": "Blocks suite teardown, as did deletion of the prior shared root"
+          }
+        ],
+        "ScalingInput": "Number of isolated roots and total files written across them. Root count grows linearly with failure events, while total persisted test state was already retained in the old shared root until teardown.",
+        "EffectiveConcurrency": "All recursive removals are synchronous and serial; retries share one aggregate timeout rather than multiplying the timeout per directory.",
+        "CacheBehavior": "No cleanup cache. removeTempDirs consumes the tracked array once; failed paths are retried in a local pending list under the same deadline.",
+        "MechanismConfidence": "High: the array retention and splice-based serial cleanup are explicit, and the prior single home also retained accumulated contents until teardown.",
+        "MagnitudeUncertainty": "Exact bytes and deletion time depend on provider logs and failed-test artifacts, but partitioning does not duplicate the dominant per-test artifacts; only constant directory/startup files are added per failure.",
+        "Verdict": "No reportable unbounded-retention or cleanup-lifecycle regression. Retention is suite-scoped, failure-driven, intentionally diagnostic, and cleanup remains bounded by the existing aggregate timeout."
+      },
+      {
+        "Scenario": "Intentional within-test restart or crash-and-restart persistence checks",
+        "CriticalPath": "restart/crashAndRestart stops or kills the current process, then launches against the same _startOptions and existing replay proxy before reconnecting the client. The fresh-directory flag is only set by release after failure/cleanup errors, not by these methods.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:AgentHostE2EServerLease._restart",
+            "Operation": "Stop or kill and relaunch the Agent Host process",
+            "Cardinality": "Once per explicit restart action in a persistence scenario",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical process restart path and cardinality.",
+            "CriticalPathEffect": "Fully awaited by the test before persistence assertions continue"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts:AgentHostE2EServerLease._restart",
+            "Operation": "Read and write persisted session/user data through the relaunched process using the same paths",
+            "Cardinality": "Provider/session dependent, but no new directory creation occurs for intentional restarts",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same home, user-data, and Codex directories were preserved.",
+            "CriticalPathEffect": "Persistence restore is on the test critical path, unchanged by the diff"
+          }
+        ],
+        "ScalingInput": "Number of explicit restart calls in persistence tests, generally one per scenario; unrelated to failed-test count until release runs.",
+        "EffectiveConcurrency": "Process stop/kill and relaunch are sequential and awaited; the replay proxy sequence is preserved rather than duplicated.",
+        "CacheBehavior": "Persistent disk state and replay-proxy consumed sequence remain warm across intentional restarts exactly as before.",
+        "MechanismConfidence": "High from direct call-flow inspection of restart, crashAndRestart, _restart, and release.",
+        "MagnitudeUncertainty": "None material to the diff; the changed release flag is not reached during the intentional restart operation.",
+        "Verdict": "No regression; intentional persistence tests retain the prior paths and process-boundary behavior."
+      }
+    ],
+    "Summary": "Reviewed all changed files and hunks under the performance focus. Traced healthy shared reuse, failure-triggered isolation, suite teardown retention/cleanup, and intentional restart scenarios through filesystem, IPC, subprocess, and local replay/network boundaries. The diff adds one constant pair of filesystem operations only after failures and partitions already-retained state; it does not increase expensive server/model boundary cardinality or concurrency. No valid performance finding or regression-fix learning record was warranted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-22T06:09:17.498985603Z",
+    "CompletedAt": "2026-09-22T06:10:17.613778432Z",
+    "WallClockMilliseconds": 60114,
+    "ModelCalls": 9,
+    "InputTokens": 254458,
+    "OutputTokens": 5969,
+    "TotalTokens": 260427,
+    "ReasoningTokens": 1429,
+    "CacheReadTokens": 203627,
+    "CacheWriteTokens": 50804,
+    "APIDurationMilliseconds": 49690,
+    "ToolCalls": 38,
+    "NanoAIUnits": 45495880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 203627,
+      "cache_write": 50804,
+      "input": 27,
+      "output": 5969
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

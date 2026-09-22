@@ -1,0 +1,192 @@
+{
+  "PullRequest": {
+    "Number": 337096,
+    "Title": "Show HydraFusion phases with compact progress pills",
+    "Body": "Show routing and phase progress with compact pills and a HydraFusion response footer. Fix cancelled-turn replay and missing tool approvals.\r\n\r\nFor: https://github.com/microsoft/vscode-internalbacklog/issues/8971",
+    "URL": "https://github.com/microsoft/vscode/pull/337096",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "42579b8d1a35d670adb4a966eef04b59738e944d",
+    "HeadRef": "dev/bhavyau/hydrafusion-phase-progress",
+    "HeadSHA": "48aa7cda6b72a3b8e8941505f0300ab2b75739b5",
+    "CreatedAt": "2026-09-21T17:26:16Z",
+    "UpdatedAt": "2026-09-22T05:32:57Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-E65C9FB1B530",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/mapSessionEvents.ts",
+      "Side": "RIGHT",
+      "Line": 433,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The two constructor loops, unconditional call site, and serial restore call path are explicit. The exact millisecond impact depends on history size and device speed, but the added O(N) work and its placement before history publication are certain.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "CPU work and per-turn Map/Set entries allocated while traversing persisted SDK events",
+      "PerformanceScaling": "Each cold reconstruction now adds two serial O(N) traversals over all persisted SDK events and retains O(U) request-correlation entries, where N is event count and U is root user-turn count; this applies even when the history contains zero Fusion events.",
+      "PerformanceOutcome": "Increased latency and allocation/GC pressure before long chat histories can be displayed.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The mapper already performed its existing preprocessing and mapping passes, but did not build Fusion request/SDK-turn correlation indexes or make these two extra full-history traversals.",
+      "ChangedBehavior": "Constructing FusionReplayState with the complete event array synchronously runs both constructor loops to index user-message interaction/turn IDs and assistant-turn ownership before the mapper's normal event pass.",
+      "CausalDiffEvidence": "The added line 433 unconditionally constructs `FusionReplayState(events)`; the newly added constructor in `copilotFusionReplay.ts` contains two `for (const event of events)` loops, so this line introduces two full-log scans for all histories.",
+      "Title": "Avoid rescanning every session history for Fusion ownership",
+      "Impact": "Opening or reconnecting to a long Copilot chat blocks history reconstruction on two additional scans of thousands of persisted events; ordinary non-HydraFusion sessions pay the same cost despite never using the replay state.",
+      "Evidence": "The added `new FusionReplayState(events)` executes on every `mapSessionEvents` call. Its constructor iterates `events` once to index every root `user.message`, then iterates the full array again to correlate `assistant.turn_start`; `mapSessionEvents` subsequently performs its existing main traversal. `CopilotAgentSession._computeMappedEvents` awaits this mapper after `session.getEvents()` and before returning turns, so the added CPU/allocation is on the cold session-open critical path. The surrounding `_mappedEventsMemo` coalesces warm callers, but does not avoid this cost on each cold reconstruction/invalidation wave.",
+      "Recommendation": "Collect the user/interaction/SDK-turn ownership data inside an existing preprocessing pass in `mapSessionEvents` and pass that index to replay state, or otherwise use a no-Fusion fast path that does not add another full traversal; preserve the current memoization and ordering semantics."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "unbounded-retention",
+      "synchronous-ui-work",
+      "serialization-allocation",
+      "cache-lifecycle",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold open or reconnect of a persisted Copilot chat history",
+        "CriticalPath": "The SDK `getEvents()` result must be fetched, optional edit metadata loaded, and `mapSessionEvents` fully reconstructed before `getMessages()` can return history for display. The new Fusion replay indexing is serial CPU work on this path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_computeMappedEvents",
+            "Operation": "Fetch the persisted SDK session event log via `session.getEvents()`.",
+            "Cardinality": "One fetch per cold reconstruction wave; concurrent parent/subagent message readers share `_mappedEventsMemo`.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single event-log fetch occurred before the diff.",
+            "CriticalPathEffect": "Must finish before reconstruction starts and history can be returned."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/mapSessionEvents.ts:mapSessionEvents",
+            "Operation": "Batch-load stored file-edit records for all edit tool calls.",
+            "Cardinality": "At most one batched database call per reconstruction when edit tool calls exist, regardless of edit-call count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same batched read existed before the diff.",
+            "CriticalPathEffect": "Awaited before the final event mapping pass."
+          }
+        ],
+        "ScalingInput": "Total persisted SDK event count N and root request count U. The diff adds two full N-event traversals plus O(U) correlation entries for every history, including histories with no Fusion events.",
+        "EffectiveConcurrency": "Reconstruction is serial after event retrieval; `_mappedEventsMemo` coalesces concurrent warm callers, so the regression is once per cold/invalidation wave rather than once per caller.",
+        "CacheBehavior": "Cold reconstruction pays the added scans. Warm `getMessages`/`getSubagentMessages` calls reuse the memo until an SDK event invalidates it; there is no Fusion-presence fast path.",
+        "MechanismConfidence": "High: the unconditional constructor call and its two loops are directly visible on the awaited reconstruction path.",
+        "MagnitudeUncertainty": "Exact delay depends on event-log length and CPU speed, but long-lived chats commonly have many events per turn and the unconditional additional traversals are explicit.",
+        "Verdict": "Reportable repeated whole-history CPU/allocation regression; finding submitted."
+      },
+      {
+        "Scenario": "Live HydraFusion routing, phase progress, and completion rendering",
+        "CriticalPath": "SDK Fusion events are synchronously correlated, projected to a bounded set of state actions, dispatched to the chat state, and rendered as workflow notifications and phase pills.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_emitFusionProgress and _publishActivity",
+            "Operation": "Publish chat response-part, tool lifecycle, and session-activity actions to the client-facing agent-host state stream.",
+            "Cardinality": "One route milestone, one start/ready pair per new phase, one completion per phase, and updates only when the normalized activity label changes; realistic plans contain a small number of phases.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Fusion events were unhandled and produced no phase-progress actions.",
+            "CriticalPathEffect": "Required for visible live progress and performed as events arrive."
+          }
+        ],
+        "ScalingInput": "Number of Fusion phases and normalized activity transitions, not raw model-output chunks; duplicate phase starts and unchanged activity labels are suppressed.",
+        "EffectiveConcurrency": "SDK events are handled sequentially; there is no spawned subprocess or unbounded parallel work. Pending ownership buffering is capped at 256 events.",
+        "CacheBehavior": "Per-turn progress maps are reset at turn boundaries. Each rendered phase pill caches its resolved model name and invalidates it on model/vendor registry changes.",
+        "MechanismConfidence": "High: event filtering, deduplication, bounded buffering, and action emission are explicit.",
+        "MagnitudeUncertainty": "The SDK may emit varying activity transitions, but output work is coalesced by activity label and phase identity.",
+        "Verdict": "No additional reportable regression; the new work is bounded by workflow phases and necessary for the requested live presentation."
+      },
+      {
+        "Scenario": "Cancelling a HydraFusion turn or resolving an early tool permission request",
+        "CriticalPath": "Cancellation finalizes currently running presentation-only phases before the turn closes. An early permission request can synthesize one visible tool-start action before the provider publishes its normal start.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostStateManager.ts:_finalizeCancelledFusionPhases; src/vs/platform/agentHost/node/agentSideEffects.ts:_handleToolReady",
+            "Operation": "Dispatch terminal metadata for each running Fusion phase and, when needed, one early real tool-start action.",
+            "Cardinality": "Cancellation scans active response parts and dispatches once per still-running Fusion phase; normal workflows have only a small phase plan and typically one active phase. Permission synthesis occurs once per missing tool start and is deduplicated by `_permissionToolStarts`.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Cancellation did not finalize Fusion metadata, and an approval could wait for the provider's later start action.",
+            "CriticalPathEffect": "Occurs synchronously before cancellation/permission UI state can settle."
+          }
+        ],
+        "ScalingInput": "Active response-part count and number of concurrently running phases; permission entries scale with pending approvals and are removed on turn completion/channel cleanup.",
+        "EffectiveConcurrency": "Actions are dispatched serially; no network, filesystem, subprocess, or database operation was added.",
+        "CacheBehavior": "The permission-start map is cleaned per completed turn and channel; Fusion progress state is reset at turn boundaries.",
+        "MechanismConfidence": "High for the loop and lifecycle cleanup; low magnitude because realistic cardinality is bounded.",
+        "MagnitudeUncertainty": "Concurrent running phases are expected to be very small; no evidence shows large fan-out.",
+        "Verdict": "No reportable performance regression; the synchronous work has bounded realistic cardinality and explicit cleanup."
+      },
+      {
+        "Scenario": "Rendering visible Fusion phase pills and workflow notifications",
+        "CriticalPath": "Visible response parts create a phase toolbar/view item, resolve a model display name, update status, and run an elapsed-time timer only while a phase is active.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Visible phase-pill count times registered language-model count on initial model-name resolution or model-registry invalidation; active timers scale with concurrently running visible phases, normally one.",
+        "EffectiveConcurrency": "UI updates execute synchronously on the renderer thread; each active pill has one one-second interval and completed pills cancel it.",
+        "CacheBehavior": "Model names are cached by model ID and parent session resource; cache invalidates on language-model/vendor changes. Chat list/content disposal owns listeners and timers.",
+        "MechanismConfidence": "High for listener/timer ownership and cache behavior.",
+        "MagnitudeUncertainty": "Model-registry changes are infrequent and rendering is constrained to visible chat content; no evidence establishes problematic fan-out.",
+        "Verdict": "No reportable regression; visible phase cardinality and recurring work are bounded, and retained resources are disposed with the content part."
+      },
+      {
+        "Scenario": "Importing or serializing a local conversation containing Fusion phase summaries",
+        "CriticalPath": "Existing in-memory tool invocation conversion maps each chat part to protocol response parts; no external operation is added by the phase-status branches.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of tool invocation parts in the imported conversation; the added phase checks and metadata projection are constant work per invocation.",
+        "EffectiveConcurrency": "Serial in-memory conversion with no queue or burst across an external resource.",
+        "CacheBehavior": "No cache is involved or newly required.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Conversation size varies, but the diff does not add nested collection work or boundary calls on this path.",
+        "Verdict": "No reportable performance regression."
+      }
+    ],
+    "Summary": "Completed the performance pass across all changed files. One medium-severity repeated-work regression was submitted for unconditional double scanning of persisted histories during cold reconstruction; live progress, cancellation/permission, UI rendering, and import paths were bounded or lifecycle-managed."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-22T06:05:32.381032535Z",
+    "CompletedAt": "2026-09-22T06:08:02.902605608Z",
+    "WallClockMilliseconds": 150521,
+    "ModelCalls": 11,
+    "InputTokens": 1079115,
+    "OutputTokens": 11579,
+    "TotalTokens": 1090694,
+    "ReasoningTokens": 5312,
+    "CacheReadTokens": 932445,
+    "CacheWriteTokens": 146637,
+    "APIDurationMilliseconds": 133612,
+    "ToolCalls": 91,
+    "NanoAIUnits": 133787500000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 932445,
+      "cache_write": 146637,
+      "input": 33,
+      "output": 11579
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
