@@ -1,0 +1,248 @@
+{
+  "PullRequest": {
+    "Number": 337300,
+    "Title": "agentHost: Keep external Codex sessions and transcripts live",
+    "Body": "Codex conversations created or updated in the ChatGPT app now stay current in the Agents Window after explicit Codex activation. This covers both newly discovered list rows and messages sent externally after the conversation is already open in VS Code.\n\n- Watch the app-server's resolved `codexHome` and nested session directories. Coalesce catalog invalidations, share scans with migration, retain trailing invalidations, and retry failures. After initial native legacy repair, use `thread/list` with `useStateDbOnly` and reuse unchanged metadata.\n- Refresh subscribed transcripts through the provider-owned history API without `thread/resume` or taking the external writer lock. Reads coalesce at one second with a five-second fallback; paginated histories read the recent tail with overlap. Unchanged native turns retain mapped identity. Watching ends with the chat subscription, release, or shutdown.\n- Route passive snapshots through the host hydration path, preserve local turns and drafts, and defer across local execution. Existing AHP truncation/load actions refresh the retained snapshot without invoking provider truncation or turn execution. A provider-neutral contributed-session history event updates the open workbench model while retaining unchanged requests and unsent input.\n- Publish metadata/recency updates through the existing root-summary path; keep internal backing suppression, visibility filters, host title overrides, and `ISession.isExternal` grouping. Refresh the list on host reconnect and reject stale responses.\n\n**Activation:** enabling/listing Codex alone does not activate it or download its SDK. Discovery starts after explicit session creation/restoration. The existing startup account probe is unchanged.\n\n**Native limits:** live viewing follows persisted items/turns. Codex 0.153 does not expose another process's unpersisted token deltas through its history API and can report an unfinished external turn as interrupted. Simultaneously sending from VS Code while ChatGPT owns the thread still obeys Codex's single-writer rule; passive viewing never acquires that lock.\n\n**Validation**\n\n- Red regressions first for catalog creation/updates and the follow-up sequence: open a conversation, send another turn externally, remain selected or reselect.\n- `npm run compile-client`: passed with zero errors.\n- Codex unit suites: **580 passed**.\n- Agent Service, state manager, local Sessions provider: **932 passed**, 27 existing skips.\n- Agent Host chat handler and Chat Service: **552 passed**.\n- Targeted ESLint, layering check, diff checks, and commit hygiene: passed.\n- Real native probe with two pinned app-server 0.153 processes and an isolated home/local mock model endpoint: catalog creation/rename and observed transcript updates passed for both `legacy` and `paginated` histories. The production Codex provider opened one turn, then published two turns after a later external message, without resuming the writer.\n- Rebuilt Code OSS opened on the user's example conversation and displays its previously missing exchange. The user's final live retest is pending.\n\n[Manual cross-app scenario](src/vs/platform/agentHost/test/node/codex/chatDiscovery.manual.md). Agent Host living architecture and code-local contracts are updated; high-level Sessions specifications and generated protocol are unchanged.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337300",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "Giuspepe",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "795bdddaca300d81ee8bdedfbe3bae2209f45b5d",
+    "HeadRef": "agents/codex-sessions-display-issue",
+    "HeadSHA": "9bf73c3ee718e3117bb4bcc8d408eed42c7a5e32",
+    "CreatedAt": "2026-09-22T15:41:17Z",
+    "UpdatedAt": "2026-09-22T18:24:52Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-D4126B94D18C",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/codex/codexChatHistory.ts",
+      "Side": "RIGHT",
+      "Line": 48,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The unconditional reschedule, exact subscription lifetime, two-call minimum app-server path, page size, and per-chat/global-concurrency behavior are explicit in the changed code. Only the exact CPU duration varies by history size and number of open editors.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Codex app-server JSON-RPC calls, full turn-page parsing, and periodic downstream history hydration",
+      "PerformanceScaling": "Each subscribed chat performs 12 refreshes per minute while idle; each refresh makes at least thread/read plus thread/turns/list (up to additional 100-turn pages), so total work is 24*N subprocess calls per minute for N retained chat subscriptions despite the global limiter only capping concurrency.",
+      "PerformanceOutcome": "persistent background CPU/IPC and app-server contention, with extra database/hydration work every 30 seconds even when the transcript is unchanged",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, opening a Codex chat read its history once; there was no recurring passive-history poll for an unchanged subscribed chat.",
+      "ChangedBehavior": "The new scheduler unconditionally schedules another refresh after every run, using a five-second delay whenever no invalidation is pending, so an unchanged chat is polled forever until its subscription is disposed.",
+      "CausalDiffEvidence": "Added line 48 calls `this._scheduler.schedule(this._dirty ? 1000 : 5000)` from `finally`, including successful clean refreshes, creating the recurring idle poll that did not exist before the diff.",
+      "Title": "Back off idle transcript polling",
+      "Impact": "Leaving one or more Codex conversations open now wakes the Agent Host and Codex subprocess every five seconds. With several retained editors this can keep both processes continuously busy and increase battery/CPU use even when no external client is writing.",
+      "Evidence": "CodexChatHistory._run always schedules at 5 seconds on the clean path. Each callback reaches CodexAgent._refreshChatHistory -\u003e _readSession, whose paginated path issues thread/read(includeTurns:false) and thread/turns/list(itemsView:'full', limit 100), with more pages when the overlap anchor is absent. _chatHistoryReads limits concurrency to 2 but does not coalesce different chats. In addition, CodexAgent only suppresses equal snapshots for 30 seconds, so unchanged polling periodically fires a full snapshot that AgentService hydrates after opening workspace-transition storage.",
+      "Recommendation": "Keep the one-second watcher-driven refresh, but after a clean/unchanged read exponentially back off to the existing safety interval (or stop until invalidated), resetting the fast window on filesystem invalidation; also suppress equal snapshots without the 30-second expiry."
+    },
+    {
+      "ID": "PERF-97016B05DAF2",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostStateManager.ts",
+      "Side": "RIGHT",
+      "Line": 558,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The full-array action, replay retention, subscribed-client broadcast, JSON transport, and full-history workbench conversion are directly traced. Magnitude depends on transcript size and persisted update frequency, so severity is medium rather than high.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "serialized Turn payload bytes, replay-buffer arrays/objects, protocol messages, and workbench ChatModel update allocations",
+      "PerformanceScaling": "For U persisted external updates to a chat containing H turns of average payload size S, this path sends and processes O(U*H*S) data rather than O(changed suffix); the server replay buffer can retain many of those full-history action arrays up to its 1,000-envelope cap.",
+      "PerformanceOutcome": "increased IPC volume, Agent Host/workbench CPU and GC pressure, retained memory, and potential chat UI stalls for long or tool-heavy conversations",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before the PR, an external Codex transcript was materialized once when opened or reselected; later external writes did not repeatedly traverse the Agent Host protocol and rebuild the open workbench model.",
+      "ChangedBehavior": "Every changed passive snapshot now clears the chat and dispatches ChatTurnsLoaded with a copy of the entire merged turn list, even when only the newest turn or response changed.",
+      "CausalDiffEvidence": "Added line 558 dispatches `ChatTurnsLoaded` with `turns: [...turns]` for each passive refresh; paired with the added preceding truncate, this converts a one-turn external change into a full-history protocol payload.",
+      "Title": "Publish transcript deltas instead of full histories",
+      "Impact": "Keeping a long external Codex conversation open while another client sends messages or persists tool/assistant items repeatedly serializes and parses the whole transcript and reconverts it on the UI path. Cost grows with both conversation length and update count, and old full snapshots remain in the server replay buffer.",
+      "Evidence": "CodexAgent preserves an overlap and maps only changed native turns, but AgentService then rebuilds the complete merged array. This added line places all turns in a ChatTurnsLoaded envelope after ChatTruncated. ProtocolServerHandler stores every envelope in its 1,000-entry replay buffer and broadcasts it to subscribed clients, whose transport JSON-serializes it. AgentHostSessionHandler then runs turnsToHistory over state.turns, and ChatService scans the full history and reconstructs the changed request/response parts on the workbench thread.",
+      "Recommendation": "Carry the common turn prefix/change suffix through a dedicated passive-history delta/replace action, and coalesce replay entries per chat, so subscribers update only changed turns while preserving local turns and drafts."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Explicit Codex activation followed by continuous native catalog discovery",
+        "CriticalPath": "After explicit create/restore activates Codex, an initial app-server catalog scan must complete before discovery publication; later filesystem invalidations wait through the five-second coalescing delay and a serialized scan before metadata reaches the session list.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts::_doListCodexChats",
+            "Operation": "Paginated app-server thread/list requests",
+            "Cardinality": "One request per 100 effective catalog entries, up to 50 pages, per coalesced invalidation or 60-second safety refresh.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Before the diff, Codex discovery used one memoized scan with bounded retries rather than continuous watcher/safety scans.",
+            "CriticalPathEffect": "Blocks that discovery refresh and its metadata publication, but not an already-rendered conversation."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts::_doListCodexChats/_isKnownCodexChat",
+            "Operation": "Initial rollout-prefix and per-session ownership metadata reads",
+            "Cardinality": "Cold or changed threads only; unchanged warm entries reuse metadata and ownership classification.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Initial discovery already classified every listed thread; the diff adds caches so unchanged continuous scans do not repeat these reads.",
+            "CriticalPathEffect": "Blocks first/changed discovery publication for those entries."
+          }
+        ],
+        "ScalingInput": "Number of native Codex threads after filtering subagents; thread/list pages contain 100 threads and are capped at 50 pages (5,000 threads).",
+        "EffectiveConcurrency": "Catalog scans are single-flight via _codexChatList and CodexChatDiscovery._running; migration shares that promise. Per-changed-thread ownership checks use a limiter of 4. Invalidations retain one trailing scan.",
+        "CacheBehavior": "Cold scan may repair legacy catalogs and inspect rollout/database ownership. Warm scans use useStateDbOnly, cache metadata by a stable thread key, skip rollout/database work for unchanged threads, and suppress unchanged discovery publications. A 60-second safety scan recovers missed watcher events.",
+        "MechanismConfidence": "High: paging, cache keys, single-flight behavior, safety timer, and ownership limiter are explicit in code and tests.",
+        "MagnitudeUncertainty": "User catalog sizes and app-server thread/list latency vary; the warm state-database path and one-minute fallback keep the periodic scan from meeting the finding threshold beyond the separately reported transcript polling.",
+        "Verdict": "No additional finding: continuous scans are intentionally coalesced/serialized, and warm metadata plus ownership caches bound per-thread work."
+      },
+      {
+        "Scenario": "Watching an open external Codex transcript while it is idle or updated by ChatGPT",
+        "CriticalPath": "A filesystem invalidation waits one second, or the idle fallback waits five seconds, then a Codex history read must finish; changed snapshots additionally load workspace-transition metadata, hydrate/interleave turns, replace host chat state, cross the AHP transport, and update the open workbench ChatModel.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts::_doReadSession",
+            "Operation": "thread/read followed by thread/turns/list with full items",
+            "Cardinality": "At least two app-server calls every five seconds per subscribed idle chat (24*N calls/minute), plus extra turn pages when the overlap anchor is absent.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "History was read on materialization/reselection only; no recurring passive poll existed.",
+            "CriticalPathEffect": "Blocks each passive refresh and competes with other Codex app-server work; idle polling remains off the visible critical path but consumes persistent background resources."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts::_loadWorkspaceTransitions",
+            "Operation": "Open session storage and read workspace-transition metadata",
+            "Cardinality": "Once per provider history event, including unchanged snapshots republished after the 30-second suppression window.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This read occurred during initial history restoration, not periodically for an unchanged open transcript.",
+            "CriticalPathEffect": "Blocks hydration before a passive snapshot can be applied."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostStateManager.ts::refreshChatHistory",
+            "Operation": "Broadcast ChatTruncated plus ChatTurnsLoaded containing the complete Turn array",
+            "Cardinality": "Two actions per changed snapshot; the full payload is O(H*S) and is sent to each subscribed protocol client, for O(U*H*S) total bytes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The full transcript crossed this path once when the session was opened; subsequent external writes were not live-broadcast.",
+            "CriticalPathEffect": "Blocks delivery to the workbench and triggers full-history conversion/diffing before the visible model is current."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts::_broadcastAction and replay buffer",
+            "Operation": "Retain action envelopes and JSON-serialize full transcript messages",
+            "Cardinality": "Every history action is retained among up to 1,000 envelopes and serialized for each relevant client.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No repeated full-history action was generated for passive external updates.",
+            "CriticalPathEffect": "Adds Agent Host CPU/allocations and transport bytes before client application."
+          }
+        ],
+        "ScalingInput": "Number N of concurrently subscribed Codex chats, each chat's turn count H and payload size S, and persisted external update count U. Warm paginated reads overlap near the prior penultimate turn, usually one 100-turn page.",
+        "EffectiveConcurrency": "Each chat has its own scheduler; provider history reads share a global limiter of 2. AgentService coalesces refreshes by chat key, but different chats remain independent. Workbench history application is synchronous per received event.",
+        "CacheBehavior": "Cold history reads all pages and rollout metadata. Warm reads request the recent tail and preserve mapped identity for unchanged turns. Equal native snapshots are suppressed only for 30 seconds; the scheduler still polls every five seconds, and every changed snapshot carries the complete merged history downstream.",
+        "MechanismConfidence": "Very high: scheduler timing, minimum app-server requests, limiter behavior, full-array action, replay retention, transport serialization, and UI application were all traced.",
+        "MagnitudeUncertainty": "Exact persisted-item frequency and transcript payload size vary by Codex version and workload; mechanism, minimum polling rate, and full-snapshot scaling are explicit.",
+        "Verdict": "Two findings reported: perpetual five-second idle subprocess polling, and full-history serialization/model work for every changed snapshot."
+      },
+      {
+        "Scenario": "Publishing changed external-session metadata and recency into the Sessions list",
+        "CriticalPath": "A changed catalog row is classified, optionally checked for a persisted title override, marked dirty in the orchestrator database, reconciled, and emitted through root-summary notifications before list ordering/title updates appear.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts::_refreshDiscoveredSessionMetadata",
+            "Operation": "Read custom title metadata for a restored external session whose native title changed",
+            "Cardinality": "At most once per effective changed-title session per discovery publication, not once per unchanged catalog item.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Known registered rows were not live-refreshed from rediscovery, so this title-override read did not occur on that path.",
+            "CriticalPathEffect": "Blocks that row's metadata refresh so host title overrides remain authoritative."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts::_registerDiscoveredChats",
+            "Operation": "Mark changed session payloads dirty and persist recency updates",
+            "Cardinality": "One batched dirty-mark call for changed metadata sessions plus grouped recency persistence.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The existing path persisted discovered registrations/recency, but did not mark all changed metadata fields for live known-row refresh.",
+            "CriticalPathEffect": "Precedes catalog reconciliation/publication for the affected rows."
+          }
+        ],
+        "ScalingInput": "Effective count of changed catalog rows after Codex metadata-key caching; unchanged rows are filtered before AgentService handling.",
+        "EffectiveConcurrency": "AgentService processes candidates through its existing discovery limiter and batches registry lookups; catalog reconciliation remains scheduled/coalesced.",
+        "CacheBehavior": "Codex compares complete metadata against _discoveredCodexChats and reuses _codexChatMetadata for unchanged native rows. Persisted title storage is opened only when a restored external row's provider title changed.",
+        "MechanismConfidence": "High: changed-row filtering and conditional persisted-title read are explicit.",
+        "MagnitudeUncertainty": "The number of externally renamed/restored sessions per scan is normally small and reduced by provider-side change detection.",
+        "Verdict": "No finding: expensive storage work is conditional on effective metadata changes, bounded by existing limiters/batches, and required to preserve host overrides."
+      },
+      {
+        "Scenario": "Rebinding the local Sessions provider after Agent Host restart",
+        "CriticalPath": "On host-start, listeners are rebound and one listSessions request refreshes the catalog; a generation check prevents an older in-flight listing from replacing the restarted host's result.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/localAgentHostSessionsProvider.ts",
+            "Operation": "listSessions after local Agent Host start/reconnect",
+            "Cardinality": "One additional listing per host-start event, with overlapping old responses discarded by generation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The provider rebound notification listeners but waited for another trigger instead of immediately listing the restarted host.",
+            "CriticalPathEffect": "Required to reconcile sessions missed while disconnected and open the new host's discovery barrier."
+          }
+        ],
+        "ScalingInput": "Number of sessions returned by the restarted host; one list response updates the cached facades.",
+        "EffectiveConcurrency": "Refreshes can overlap, but generations make only the newest response authoritative; superseded responses skip reconciliation and retries.",
+        "CacheBehavior": "The last successful snapshot remains visible across failures. A successful empty response clears it; reconnect deliberately refreshes instead of trusting the prior-host cache.",
+        "MechanismConfidence": "High: event placement, one request, and stale-generation guards are explicit and tested.",
+        "MagnitudeUncertainty": "Host restarts are infrequent; list size affects response processing but not request fan-out.",
+        "Verdict": "No finding: the added request is one per reconnect, necessary for correctness, and stale concurrent work is suppressed."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 22 changed files and traced catalog discovery, passive transcript polling/hydration/transport/UI application, metadata reconciliation, and reconnect refreshes. Reported two diff-introduced regressions: unconditional five-second idle history polling and repeated full-history protocol/model processing. No concrete regression-fix learning signal met the blame requirement."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-22T19:21:36.450308094Z",
+    "CompletedAt": "2026-09-22T19:26:17.668758351Z",
+    "WallClockMilliseconds": 281218,
+    "ModelCalls": 17,
+    "InputTokens": 1375663,
+    "OutputTokens": 15987,
+    "TotalTokens": 1391650,
+    "ReasoningTokens": 7903,
+    "CacheReadTokens": 1257319,
+    "CacheWriteTokens": 118293,
+    "APIDurationMilliseconds": 268611,
+    "ToolCalls": 107,
+    "NanoAIUnits": 141433660000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1257319,
+      "cache_write": 118293,
+      "input": 51,
+      "output": 15987
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
