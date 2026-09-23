@@ -1,0 +1,215 @@
+{
+  "PullRequest": {
+    "Number": 337367,
+    "Title": "chat: Correlate code-block copy and insert telemetry",
+    "Body": "## Summary\n\nMake chat code-block copy/insert events attributable to the request and chat that produced the code, and avoid counting known failed operations as acceptance. This provides the core correlation needed to measure code-block actions in Agent Host chats; the shared action paths also cover local chat.\n\nPreviously, these events omitted the originating request and chat-session IDs, and an insertion could be reported even when no editor was available or the edit was not applied. The four code-block actions now populate `sourceRequestId` and canonical `chatSessionId`, using the same session identity as chat request telemetry.\n\nToolbar and whole-block keyboard copies report after the clipboard write resolves. Insertions report only when the bulk edit is applied, a notebook cell is created, or the new-file editor opens. Native selected-copy handling still falls through synchronously to the editor; its telemetry observes the copy gesture rather than certifying clipboard completion.\n\n## Implementation notes\n\n- Add the optional session field and its telemetry classification, and mark the accepted-event AH boolean as a measurement.\n- Add regression coverage for local, Copilot, Claude, Codex, and remote AH correlation, failed/cancelled operations, notebook insertion, and native-copy fallback.\n- This is the VS Code emitter portion only. Downstream scorecard mapping and denominator definitions require separate changes; live ingestion and end-to-end scorecard joins have not been verified.",
+    "URL": "https://github.com/microsoft/vscode/pull/337367",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "amunger",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "5784197e5a85269550bed86abd9ebfd32a24adf5",
+    "HeadRef": "amunger/chat-codeblock-telemetry-correlation",
+    "HeadSHA": "59c20cd422d1ba1e1d57a8940dcbd815ce788f89",
+    "CreatedAt": "2026-09-22T21:51:15Z",
+    "UpdatedAt": "2026-09-22T23:16:58Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Copy a chat code block from the toolbar or with the whole-block keyboard command",
+        "CriticalPath": "One clipboard write must complete before the newly delayed telemetry/reporting runs; the clipboard operation itself was already the user-visible copy boundary before the PR. Awaiting it extends the command promise but does not add work to clipboard completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/actions/chatCodeblockActions.ts:167 and :289; NativeClipboardService.writeText",
+            "Operation": "Write the code-block text to the native clipboard; browser builds use navigator.clipboard instead.",
+            "Cardinality": "Exactly one clipboard write per explicit copy gesture, with no collection fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single clipboard write was started per gesture without awaiting its promise.",
+            "CriticalPathEffect": "The write is the copy operation's critical path. The diff waits for the existing operation before reporting telemetry but does not increase clipboard latency or call count."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts:423 and MainThreadChatAgents2 onDidPerformUserAction",
+            "Operation": "Notify the owning chat extension of the copy action when an agent ID is present.",
+            "Cardinality": "At most one extension-host notification per successful copy, unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same notification was emitted immediately after starting the clipboard write.",
+            "CriticalPathEffect": "For full-block copies it is now enqueued after clipboard completion rather than immediately; it is not required for the clipboard result and is not awaited."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/editTelemetry/browser/telemetry/aiEditTelemetry/aiEditTelemetryServiceImpl.ts:102",
+            "Operation": "Queue the existing codeAccepted telemetry event with two additional scalar correlation fields.",
+            "Cardinality": "One event per successful user copy, unchanged; payload grows by request/session identifier strings only.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same event was queued with no chatSessionId and an undefined sourceRequestId.",
+            "CriticalPathEffect": "Synchronous event preparation occurs after clipboard completion but network delivery is not awaited."
+          }
+        ],
+        "ScalingInput": "One user gesture and one code-block string; clipboard bytes scale with code length exactly as before, while added telemetry bytes scale with bounded identifier lengths.",
+        "EffectiveConcurrency": "One clipboard operation per gesture. The PR serializes reporting after that operation rather than launching additional concurrent work.",
+        "CacheBehavior": "No cache participates. Repeated gestures intentionally perform separate clipboard writes and telemetry events; there is no miss/retry amplification.",
+        "MechanismConfidence": "High confidence from the action handlers, clipboard implementations, MultiCommand dispatch, and synchronous telemetry/event paths.",
+        "MagnitudeUncertainty": "Clipboard IPC duration varies by platform, but no new call or repeated work is introduced; only command-promise/report ordering changes.",
+        "Verdict": "No reportable regression: the diff preserves boundary cardinality and resource volume, and the added correlation serialization is constant per explicit gesture."
+      },
+      {
+        "Scenario": "Copy a selected range from the embedded code-block editor",
+        "CriticalPath": "The changed implementation reports the action and then returns false so the existing native editor copy implementation performs the clipboard operation synchronously.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/actions/chatCodeblockActions.ts:294 and editor clipboard CopyAction",
+            "Operation": "Fall through to the native/editor copy implementation, which may write to the clipboard.",
+            "Cardinality": "One native copy per keyboard gesture, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Telemetry/reporting also ran before falling through to the same native copy implementation.",
+            "CriticalPathEffect": "Clipboard handling remains on the copy gesture's critical path; the diff does not move or duplicate it."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts:423",
+            "Operation": "Notify the chat extension of the copy gesture.",
+            "Cardinality": "At most one notification per gesture, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same notification and cardinality.",
+            "CriticalPathEffect": "Synchronous enqueue before native copy, unchanged in placement."
+          }
+        ],
+        "ScalingInput": "Selected text length and one gesture; text extraction and telemetry delta computation already scaled with the selected text before this PR.",
+        "EffectiveConcurrency": "Single synchronous gesture path; no changed parallel fan-out.",
+        "CacheBehavior": "No cache or coalescing is used or needed for distinct copy gestures.",
+        "MechanismConfidence": "High confidence from the changed branch and MultiCommand fallback implementation.",
+        "MagnitudeUncertainty": "Selection sizes vary, but the diff only adds constant-size identifiers and a closure.",
+        "Verdict": "No reportable regression: no expensive work was added or moved onto a hotter path."
+      },
+      {
+        "Scenario": "Insert a code block into the active text editor or notebook",
+        "CriticalPath": "Text insertion waits for the existing bulk edit; notebook insertion creates one cell synchronously. The PR only checks the existing result before emitting acceptance telemetry.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/workbench/contrib/chat/browser/actions/codeBlockOperations.ts:124",
+            "Operation": "Apply one ResourceTextEdit through the bulk edit service.",
+            "Cardinality": "One bulk edit containing one text edit per insertion gesture, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same bulk edit was awaited, after which telemetry was emitted regardless of its result.",
+            "CriticalPathEffect": "Required for insertion and already awaited before the PR; inspecting isApplied adds no boundary."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts:423",
+            "Operation": "Notify the chat extension of a successful insertion.",
+            "Cardinality": "At most one notification per successful insertion; failed insertions now emit none.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One notification was emitted after every attempted operation, including unsuccessful attempts.",
+            "CriticalPathEffect": "Occurs after the edit and is not awaited across the extension-host boundary."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/editTelemetry/browser/telemetry/aiEditTelemetry/aiEditTelemetryServiceImpl.ts:102",
+            "Operation": "Queue codeAccepted telemetry with correlation identifiers.",
+            "Cardinality": "At most one event per successful insertion; the PR reduces events for failures.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One event was queued after an attempted insertion, without correlation identifiers.",
+            "CriticalPathEffect": "Synchronous event preparation after insertion; delivery is not awaited."
+          }
+        ],
+        "ScalingInput": "One code block and one target per explicit gesture. Reindent/edit construction scales with code size as before; no per-cell or per-session loop was introduced.",
+        "EffectiveConcurrency": "One bulk edit or cell insertion per gesture, serialized as before.",
+        "CacheBehavior": "No cache participates; no repeated misses or retained keys.",
+        "MechanismConfidence": "High confidence from InsertCodeBlockOperation and its action caller.",
+        "MagnitudeUncertainty": "Bulk-edit cost depends on code size and editor state, but the diff does not increase it.",
+        "Verdict": "No reportable regression: result validation reduces downstream reporting on failures and adds only constant per-success metadata."
+      },
+      {
+        "Scenario": "Insert a chat code block into a new untitled editor",
+        "CriticalPath": "Opening the untitled editor is the required user-visible operation. The PR now waits for the existing openEditor promise before reporting success, so the command promise tracks the operation rather than adding a new operation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/workbench/contrib/chat/browser/actions/chatCodeblockActions.ts:406",
+            "Operation": "Create and open one untitled editor populated with the code block.",
+            "Cardinality": "Exactly one openEditor call per gesture, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same openEditor call was started without awaiting it; telemetry was emitted immediately.",
+            "CriticalPathEffect": "Required before the scenario is visibly complete. The diff awaits the same promise and performs reporting only after success."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts:423",
+            "Operation": "Notify the owning extension after a successful new-file open.",
+            "Cardinality": "At most one notification per successful gesture; canceled opens now emit none.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Enqueued immediately after starting openEditor, including when opening later failed or was canceled.",
+            "CriticalPathEffect": "Enqueued after editor opening and not awaited across IPC."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/editTelemetry/browser/telemetry/aiEditTelemetry/aiEditTelemetryServiceImpl.ts:102",
+            "Operation": "Queue successful insertion telemetry with correlation identifiers.",
+            "Cardinality": "At most one event per successful open, reduced from one per attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Queued immediately per attempt without the new identifiers.",
+            "CriticalPathEffect": "Small synchronous preparation after the required open; delivery is asynchronous."
+          }
+        ],
+        "ScalingInput": "One editor and one code-block string per explicit gesture; no collection or history scaling.",
+        "EffectiveConcurrency": "One open operation per invocation. Reporting is serialized after it, with no concurrency burst.",
+        "CacheBehavior": "Untitled editor creation is intentionally per gesture; no cache is involved.",
+        "MechanismConfidence": "High confidence from the changed action body and editor-service call count.",
+        "MagnitudeUncertainty": "Editor activation cost varies with installed language features, but the diff neither duplicates that work nor adds another editor open.",
+        "Verdict": "No reportable regression: awaiting the existing critical operation changes completion semantics but adds no expensive work or realistic user-visible delay beyond opening the editor itself."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and traced copy, selected-copy, active-editor/notebook insertion, new-file insertion, telemetry, extension-host notification, clipboard IPC, and editor/bulk-edit boundaries. No actionable performance regression was introduced, and the PR does not establish a shipped performance-regression fix requiring blame attribution."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-23T00:24:14.340520952Z",
+    "CompletedAt": "2026-09-23T00:25:44.851888034Z",
+    "WallClockMilliseconds": 90511,
+    "ModelCalls": 10,
+    "InputTokens": 346386,
+    "OutputTokens": 5985,
+    "TotalTokens": 352371,
+    "ReasoningTokens": 1632,
+    "CacheReadTokens": 289521,
+    "CacheWriteTokens": 56835,
+    "APIDurationMilliseconds": 78902,
+    "ToolCalls": 57,
+    "NanoAIUnits": 51980340000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 289521,
+      "cache_write": 56835,
+      "input": 30,
+      "output": 5985
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
