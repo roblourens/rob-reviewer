@@ -1,0 +1,137 @@
+{
+  "PullRequest": {
+    "Number": 337438,
+    "Title": "test: preserve WSL import failure diagnostics",
+    "Body": "## Summary\n- Capture the decoded WSL2 import output, exit code, installer result, Windows/WSL versions, partial import files, and bounded WSL/Host Compute/Hyper-V events when the smoke-test distro import fails.\n- Save diagnostics under `.build/logs/wsl-dev-container/` before cleanup removes the partial import, so existing CI logs artifacts preserve the evidence.\n- Leave WSL installation, retry, and cleanup behavior unchanged.\n\nMotivated by the [Windows Electron setup failure in build 476284](https://dev.azure.com/monacotools/a6d41577-0fa3-498e-af22-257312ff0545/_build/results?buildId=476284\u0026view=logs\u0026j=15ec5277-fdc6-550c-b203-acb65f44f31c\u0026t=95193302-a421-588f-30a2-3600268fa4c0), where `wsl --import --version 2` returned `0x80041001` without enough evidence to identify the cause.\n\n## Validation\n- PowerShell parser reports no errors.\n- Exercised `Write-WslDiagnostics` locally without importing a distro; verified the persisted log contains the required sections.\n- `git diff --check` passed.\n\nA Windows CI run is needed to validate the failure path on a hosted agent.",
+    "URL": "https://github.com/microsoft/vscode/pull/337438",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "chrmarti",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e81ea68fc0228ba2eb01fc9848c30d2e41a26d56",
+    "HeadRef": "test-wsl-import-failure-logs",
+    "HeadSHA": "0f6e0a74f6c02f0c663661e0ab5fa5db7d8dd781",
+    "CreatedAt": "2026-09-23T08:52:28Z",
+    "UpdatedAt": "2026-09-23T09:42:30Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Successful WSL smoke-test provisioning through the distro import",
+        "CriticalPath": "The existing kernel installer and single `wsl.exe --import` subprocess must complete before provisioning continues. The diff records the start time and captures the import's native output before replaying it; no new subprocess, filesystem scan, IPC, or network operation is placed on the successful critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/smoke/wslDevContainer.ps1:187-203",
+            "Operation": "Wait for `msiexec.exe`, then execute one `wsl.exe --import` of the pinned Ubuntu rootfs.",
+            "Cardinality": "Exactly one installer and one import per setup run.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same installer and one synchronous WSL import ran before the diff; the diff only logs the installer exit code and captures/replays the import output.",
+            "CriticalPathEffect": "Both must complete before the smoke environment can progress."
+          }
+        ],
+        "ScalingInput": "Captured allocation scales with lines emitted by one `wsl --import`; this command is normally silent or emits only a small status/error message, independent of rootfs bytes processed.",
+        "EffectiveConcurrency": "One setup invocation runs the installer and import serially; there is no parallel fan-out or queueing change.",
+        "CacheBehavior": "No cache participates in import execution. The downloaded archive and setup directory are per-run, and the changed output capture has no cold/warm distinction.",
+        "MechanismConfidence": "High confidence that the boundary count and serialization are unchanged; only small command output is newly retained until import completion.",
+        "MagnitudeUncertainty": "Exact native output varies by installed WSL version, but there is no evidence of realistically large import output or an added boundary call.",
+        "Verdict": "No reportable regression: the success path adds only bounded output buffering and logging around an unchanged single import."
+      },
+      {
+        "Scenario": "Failed WSL distro import and diagnostic artifact collection",
+        "CriticalPath": "After the unchanged import returns nonzero, diagnostics run serially before the script throws, so their work delays only terminal failure reporting and artifact preservation, not successful provisioning.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/smoke/wslDevContainer.ps1:201-211 and Write-WslDiagnostics",
+            "Operation": "Run the failed import once, then collect WSL version, status, and distribution-list output.",
+            "Cardinality": "One failed import; one `wsl --version` query newly added, plus the pre-existing one status and one list query.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The failed import was followed by `wsl --status` and `wsl --list --verbose`; it did not query `wsl --version`.",
+            "CriticalPathEffect": "The version query adds one small subprocess only after setup has already failed; status/list were already on this failure path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "test/smoke/wslDevContainer.ps1:86-93, 206-211",
+            "Operation": "Enumerate the top level of the partial install directory and create/append the import diagnostics log.",
+            "Cardinality": "One non-recursive directory enumeration and one log file per failed setup.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Diagnostics were printed only to task output and partial import files were not enumerated.",
+            "CriticalPathEffect": "These operations precede the terminal throw so the partial state survives later cleanup."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/wslDevContainer.ps1:66-121",
+            "Operation": "Query operating-system/computer CIM data, optional features, services, and reboot indicators.",
+            "Cardinality": "One new OS CIM query; the existing computer CIM query, two feature queries, four service lookups, and bounded registry checks remain once per failed import.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The OS CIM query was absent; the remaining system-state checks already ran after import failure.",
+            "CriticalPathEffect": "Runs only during terminal failure diagnosis."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "test/smoke/wslDevContainer.ps1:123-142",
+            "Operation": "Discover Lxss event logs and fetch at most 20 events in the import time window from each distinct discovered/fixed WSL, Host Compute, Hyper-V Compute, Worker, and VMMS log.",
+            "Cardinality": "One discovery plus N+4 deduplicated serial event-log queries, where N is the small installed set of Lxss logs; each result is capped at 20 events. Previously there were exactly three serial fixed-log queries capped at 10 events.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No event-log discovery occurred; only Lxss Operational, Hyper-V Compute, and Hyper-V Worker were queried over the preceding ten minutes.",
+            "CriticalPathEffect": "Adds bounded diagnostic latency after failure and before the script reports failure."
+          }
+        ],
+        "ScalingInput": "Work scales with the number of installed Lxss event logs, with output capped to 20 events per distinct log; partial-file enumeration is top-level only. Realistic hosted agents expose only a small finite log set.",
+        "EffectiveConcurrency": "All diagnostics are serialized by PowerShell. Event queries execute one at a time for each distinct discovered/fixed log; no concurrency burst is introduced.",
+        "CacheBehavior": "No diagnostics are cached or coalesced, but the function is invoked once per failed setup and every result is consumed immediately. Warm-cache behavior is controlled by Windows services rather than repository code.",
+        "MechanismConfidence": "High confidence in the added failure-only boundary calls and their cardinality from the changed loop and caps; low evidence that their bounded latency or allocation is large enough to constitute a regression.",
+        "MagnitudeUncertainty": "Windows event service latency and the number of provider logs vary by runner image. However, collection occurs once on a terminal failure, is serial, and has per-log event caps, so no concrete harmful scaling mechanism is established.",
+        "Verdict": "No reportable regression: additional boundary fan-out is intentional, bounded, and confined to preserving diagnostics after an already terminal import failure."
+      }
+    ],
+    "Summary": "Reviewed the complete one-file diff and traced successful import and failed-import diagnostic paths. Considered output buffering/allocation and added filesystem, WSL, CIM, and event-log fan-out; all new expensive work is either negligible on success or bounded to a once-per-run terminal failure path. No valid performance finding or regression-fix record was established."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-23T09:51:56.555408721Z",
+    "CompletedAt": "2026-09-23T09:53:50.509466655Z",
+    "WallClockMilliseconds": 113954,
+    "ModelCalls": 6,
+    "InputTokens": 85655,
+    "OutputTokens": 4014,
+    "TotalTokens": 89669,
+    "ReasoningTokens": 2139,
+    "CacheReadTokens": 63598,
+    "CacheWriteTokens": 22039,
+    "APIDurationMilliseconds": 102166,
+    "ToolCalls": 15,
+    "NanoAIUnits": 21598620000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 63598,
+      "cache_write": 22039,
+      "input": 18,
+      "output": 4014
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
