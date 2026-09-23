@@ -1,0 +1,180 @@
+{
+  "PullRequest": {
+    "Number": 337396,
+    "Title": "test: Harden Windows Agent Host descendant cleanup",
+    "Body": "## Summary\n\n- capture the name and command line of Windows Agent Host test-server descendants before graceful shutdown\n- prune inaccessible process branches that stale Windows parent PIDs can attach to a reused server PID\n- after a failed `taskkill`, suppress the error only when the captured process identity is no longer present\n- add focused coverage for stale-PPID branches, exited or reused PIDs, and genuine kill failures\n\n## Context\n\nThe Windows Electron integration run in Azure build 475775 passed the `Protocol WebSocket - Session Config` test body, then failed during suite teardown after `taskkill` raced with descendant exit and the fallback `process.kill(pid, 0)` returned `EPERM`.\n\nA subsequent 20x flaky run in Azure build 476056 reproduced both variants of the lifecycle race:\n\n- exit code 128 when the captured PID no longer existed\n- exit code 255 when stale Toolhelp parent-PID metadata attached a protected critical-system branch to the reused Agent Host PID\n\nThe previous fallback could not distinguish these cases reliably. Signal zero requests termination access on Windows, while a numeric PID alone does not preserve process identity across reuse.\n\n## Validation\n\n- `npm run eslint -- src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.test.ts`\n- `npm run compile-client`\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.test.ts` — 5 passing, 1 Windows-only pending on macOS\n- `./scripts/test-integration.sh --run src/vs/platform/agentHost/test/node/protocol/sessionConfig.integrationTest.ts` — 6 passing\n\n(Written by Copilot)",
+    "URL": "https://github.com/microsoft/vscode/pull/337396",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "36527d3e2b28e174dea35f7bfd8d256028a2179a",
+    "HeadRef": "agents/windows-agent-host-teardown-fix",
+    "HeadSHA": "efeb786a15ba7bd3a26f8fef60c6f148fff60671",
+    "CreatedAt": "2026-09-23T03:19:19Z",
+    "UpdatedAt": "2026-09-23T04:56:18Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Windows Agent Host integration-test graceful shutdown, including suite teardown and harness restarts",
+        "CriticalPath": "Capture descendants, send EOF, wait for the Agent Host server to exit, then verify and terminate any still-matching descendants before teardown/restart can finish. All added identity probes are on this teardown critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:getServerDescendants (lines 704-711)",
+            "Operation": "Native Windows process-tree enumeration with command-line capture for the server subtree",
+            "Cardinality": "One enumeration per live server teardown on Windows; it returns the server-rooted process list, then local traversal deduplicates PIDs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same teardown already performed one native getProcessList call; the diff adds command-line data to preserve identity and replaces filter/map with linear map-and-traversal processing.",
+            "CriticalPathEffect": "Must complete before EOF is sent because descendants become undiscoverable after the parent exits."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:isSameWindowsProcessRunning and stopServer (lines 713-721, 788-799)",
+            "Operation": "Native Windows process-tree enumeration with command-line capture to compare PID, name, and command line",
+            "Cardinality": "One concurrent probe per captured readable descendant, plus one additional probe only for descendants whose taskkill fails.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no pre-kill native identity query; after a taskkill failure the old code used process.kill(pid, 0) once.",
+            "CriticalPathEffect": "Runs after graceful server exit and must finish before teardown/restart completes."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:stopServer (lines 788-799)",
+            "Operation": "Forcefully terminate a descendant process tree through killTree/taskkill",
+            "Cardinality": "At most one taskkill per captured descendant that still has the same identity; descendants that already exited or whose PID was reused are now skipped.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old code attempted taskkill for every captured descendant and only probed PID existence after a failure.",
+            "CriticalPathEffect": "Existing cleanup boundary after server exit; completion is awaited before teardown/restart proceeds."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:stopServer (lines 763-784)",
+            "Operation": "Close the child server's stdin pipe to request graceful shutdown and await its exit event",
+            "Cardinality": "One EOF request and one exit wait per server teardown.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged; the PR preserves the same graceful-shutdown sequence.",
+            "CriticalPathEffect": "Graceful shutdown is the central teardown critical path and may wait up to the configured timeout."
+          }
+        ],
+        "ScalingInput": "The captured Agent Host descendant tree after deduplication by PID; each reachable process with a readable command line contributes one identity probe and at most one taskkill, with a second probe only when taskkill fails.",
+        "EffectiveConcurrency": "The initial descendant snapshot and server shutdown are sequential. After server exit, Promises.settled over descendants launches identity probes concurrently across all captured descendants; successful matches then launch the pre-existing per-descendant taskkill operations, also concurrently. There is no explicit limiter, but cardinality is bounded by one test server's process tree rather than suite size.",
+        "CacheBehavior": "The first call cold-loads @vscode/windows-process-tree; subsequent calls use Node's module cache. Process identity observations are intentionally not cached because exit and PID reuse make them time-sensitive. There is no cross-server coalescing, and each server teardown has an independent descendant set.",
+        "MechanismConfidence": "High confidence in the added per-descendant native probes and their unbounded-within-tree concurrent scheduling; high confidence that this path is test-only and bounded to one server tree. That bounded scope prevents treating the extra probes as a concrete reportable regression.",
+        "MagnitudeUncertainty": "Exact descendant counts and native enumeration duration vary by provider and Windows host. The tree is test-server-scoped and teardown-only, and repository harness cleanup disposes terminals while shared-server recycling bounds accumulated provider processes, so evidence does not support a severe or user-facing burst.",
+        "Verdict": "No finding. The PR adds boundary work, but it is on test cleanup rather than product interaction, is bounded by one server's descendants, and directly prevents taskkill from targeting reused PIDs. The diff also skips taskkill for already-exited/reused descendants, partially offsetting the added probes."
+      },
+      {
+        "Scenario": "Stale-parent-PID branch pruning during Windows descendant capture",
+        "CriticalPath": "The native process list must be captured, indexed, and traversed before graceful shutdown can begin; local collection work is therefore on teardown's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:getServerDescendants (lines 704-711)",
+            "Operation": "Obtain the native process list consumed by collectServerDescendants",
+            "Cardinality": "One native call per Windows server teardown, unchanged from the base behavior.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One getProcessList call followed by filter/map; the diff still performs one call and adds linear indexing/traversal.",
+            "CriticalPathEffect": "Blocks EOF so descendants can be captured while the server PID still exists."
+          }
+        ],
+        "ScalingInput": "Number of IProcessInfo records returned for the requested server root, with each record indexed once and each reachable readable descendant visited once.",
+        "EffectiveConcurrency": "Single synchronous O(P + D) local pass after the one asynchronous native snapshot; no additional tasks or boundary fan-out are created by collection.",
+        "CacheBehavior": "No cache is appropriate because process parentage and identities are point-in-time data. The Map and Set are per-teardown temporary allocations and are released after collection/cleanup.",
+        "MechanismConfidence": "High confidence from the changed Map/Set traversal and single call site.",
+        "MagnitudeUncertainty": "Returned process-list size depends on the native module and stale Toolhelp metadata, but local work remains linear and the new pruning can reduce downstream cleanup of unrelated branches.",
+        "Verdict": "No finding. The replacement remains linear, uses temporary bounded structures, prevents recursion cycles, and prunes unreadable branches rather than increasing downstream work."
+      },
+      {
+        "Scenario": "Focused Agent Host cleanup unit tests on all platforms",
+        "CriticalPath": "Each of three new failure-path tests starts a short-lived Node child, waits for readiness, invokes stopServer with injected process operations, and awaits cleanup before that test finishes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.test.ts:runDescendantKillFailureTest (lines 20-58)",
+            "Operation": "Spawn and gracefully stop a Node child used to exercise descendant-kill failure races",
+            "Cardinality": "One child launch in each of three new tests, for three launches per execution of this focused test suite.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These three tests and subprocess launches did not exist.",
+            "CriticalPathEffect": "Child readiness and shutdown are awaited, so launches add constant test-suite latency."
+          }
+        ],
+        "ScalingInput": "Exactly three newly added test cases, each with one Node child and one synthetic descendant; work is constant and does not scale with repository or user input.",
+        "EffectiveConcurrency": "The test runner executes these suite cases serially under the normal suite contract. Within each case there is one child process; injected identity and kill operations are sequential for the single synthetic descendant.",
+        "CacheBehavior": "No reusable result or negative cache is relevant. Node executable/module startup benefits only from operating-system caches; every test intentionally owns an independent child lifecycle.",
+        "MechanismConfidence": "High confidence in the constant subprocess count from the three direct helper invocations.",
+        "MagnitudeUncertainty": "Exact Node startup cost varies by runner, but the count is fixed at three and isolated to a focused test suite.",
+        "Verdict": "No finding. The added subprocess cost is small, fixed, test-only coverage of real ChildProcess shutdown behavior, and does not create scaling or retained-resource risk."
+      },
+      {
+        "Scenario": "Non-Windows Agent Host integration-test graceful shutdown",
+        "CriticalPath": "getServerDescendants returns an empty list immediately, then the existing EOF/exit sequence completes; descendant identity checks are never entered.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:stopServer (lines 763-784)",
+            "Operation": "Close server stdin and await child exit",
+            "Cardinality": "One per server teardown.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical EOF and exit waiting behavior.",
+            "CriticalPathEffect": "Unchanged shutdown critical path."
+          }
+        ],
+        "ScalingInput": "Zero descendants from this helper by platform guard.",
+        "EffectiveConcurrency": "No descendant probe or taskkill work; only the existing single server shutdown sequence.",
+        "CacheBehavior": "The Windows native module is not imported, so there is no cold-load or cache behavior on this path.",
+        "MechanismConfidence": "High confidence from the explicit !isWindows early return.",
+        "MagnitudeUncertainty": "None material for the changed mechanism because platform gating fixes descendant cardinality at zero.",
+        "Verdict": "No finding. The new Windows identity logic is unreachable and no performance behavior changes on this path."
+      }
+    ],
+    "Summary": "Reviewed both complete changed-file diffs and traced Windows/non-Windows teardown, stale-PPID collection, harness restart/cleanup callers, added test subprocesses, native process enumeration, IPC shutdown, and taskkill boundaries. No high-confidence actionable performance regression was established; the only added fan-out is bounded, test-only identity validation required for safe PID-reuse cleanup."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-23T04:59:13.84679223Z",
+    "CompletedAt": "2026-09-23T05:00:56.077965057Z",
+    "WallClockMilliseconds": 102231,
+    "ModelCalls": 7,
+    "InputTokens": 156772,
+    "OutputTokens": 5814,
+    "TotalTokens": 162586,
+    "ReasoningTokens": 2607,
+    "CacheReadTokens": 118231,
+    "CacheWriteTokens": 38520,
+    "APIDurationMilliseconds": 91209,
+    "ToolCalls": 26,
+    "NanoAIUnits": 35625640000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 118231,
+      "cache_write": 38520,
+      "input": 21,
+      "output": 5814
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

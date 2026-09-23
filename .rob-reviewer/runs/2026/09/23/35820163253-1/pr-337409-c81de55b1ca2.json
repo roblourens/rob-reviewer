@@ -1,0 +1,155 @@
+{
+  "PullRequest": {
+    "Number": 337409,
+    "Title": "Reduce automatic post-edit review for OpenAI Agent Host models",
+    "Body": "Reduce automatic post-edit rereading and full-diff review in Copilot Agent Host sessions using OpenAI-family models, while retaining required validation and targeted inspection when a check fails or correctness is uncertain.\r\n\r\n## Changes\r\n\r\n- Register an OpenAI-family prompt contributor that appends three sentences to the SDK's `code_change_rules` section.\r\n- Preserve the SDK foundation, identity, universal instructions, and existing tool-dependent prompt layers.\r\n- Apply the guidance throughout the session without introducing a setting.\r\n- Cover model routing and layer preservation with tests; update the nine affected GPT prompt snapshots and contributor documentation.\r\n\r\n## Validation\r\n- Detailed benchmark results, runtime-delivery checks, observed behavior, and limitations are recorded in microsoft/vscode-internalbacklog#9579.\r\n\r\ncc: @dileepyavan \r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337409",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3ac31b9b8e10c20c8f609d8c581403242eadeb3d",
+    "HeadRef": "bhavyaus/ahp-openai-targeted-review",
+    "HeadSHA": "c81de55b1ca2c6bbc1249ace39457388baa14220",
+    "CreatedAt": "2026-09-23T04:37:26Z",
+    "UpdatedAt": "2026-09-23T04:56:53Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-13B1B047B494",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/chatContributions/workspaceContext/workspaceContextContribution.ts",
+      "Side": "RIGHT",
+      "Line": 64,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed call, dispatcher await, and provider-dispatch ordering are explicit. `AgentHostWorkspaceFiles` proves each cold root spawns `rg --files`, uses a four-operation global limiter, and races caller cancellation without stopping the underlying work. The added test proves a slow scan delays the send by the full 2000 ms. Only real-world filesystem speed and prevalence of large/multi-root workspaces affect magnitude.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "ripgrep subprocesses, filesystem traversal, and up to 50,000 retained URI objects per root",
+      "PerformanceScaling": "Cold cost grows with the number of independent workspace roots and files visited: one ripgrep scan per root, up to four concurrently, with each scan collecting up to 50,000 paths. The caller waits for all roots or the 2000 ms timeout; queued/running scans survive cancellation.",
+      "PerformanceOutcome": "blocked first-turn critical path, with continued I/O after timeout",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, outgoing-turn contributions did not enumerate workspace files, so provider dispatch incurred zero ripgrep/file-tree work on this path.",
+      "ChangedBehavior": "Every first outgoing Copilot turn for a chat now synchronously enumerates all independent workspace roots and renders their file tree before provider dispatch.",
+      "CausalDiffEvidence": "Added line 64 awaits `this._workspaceFiles.getFiles(root, cancellation.token)` inside `Promise.all` for every independent workspace root before the contribution returns; the newly registered contribution is then awaited by `AgentSideEffects` before `agent.chats.sendMessage`.",
+      "Title": "Move workspace scanning off the first-turn critical path",
+      "Impact": "On the first message of each new or empty Copilot chat, a large, slow, network-mounted, or multi-root workspace can add up to two seconds before the request even reaches the model; timed-out scans continue consuming filesystem and subprocess capacity afterward.",
+      "Evidence": "`WorkspaceContextContribution.onOutgoingTurn` awaits `getFiles` for all `enumerationRoots`. `AgentHostWorkspaceFiles._enumerate` spawns ripgrep and collects up to 50,000 URIs per root; its cancellation path explicitly leaves shared enumeration running. `AgentHostChatContributions.outgoingTurn` awaits contributions serially, and `AgentSideEffects` awaits that result before `agent.chats.sendMessage`. The contribution owns a new `AgentHostWorkspaceFiles`, separate from the existing completion provider's cache, so prior file-completion activity does not make this path warm.",
+      "Recommendation": "Start the bounded snapshot asynchronously when the session/chat working directories become known and attach it only if ready by first send (or share the existing workspace-files service/cache); do not await a cold full-workspace scan on the send path, and ensure abandoned queued/running scans are canceled when no consumer remains."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "eager-work",
+      "concurrency-burst",
+      "cache-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Send the first message in a Copilot Agent Host chat with one or more local workspace roots.",
+        "CriticalPath": "After working-directory resolution, model selection, and attachments, `AgentSideEffects` awaits all outgoing-turn contributions; this contribution awaits every root enumeration before provider dispatch. A slow scan therefore blocks first-token progress for up to 2000 ms. After timeout, the user request proceeds but underlying scans remain active/off the request critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/workspaceContext/workspaceContextContribution.ts:64 -\u003e src/vs/platform/agentHost/node/agentHostWorkspaceFiles.ts:_enumerate",
+            "Operation": "Spawn ripgrep with `--files --hidden --follow` for each root and collect paths.",
+            "Cardinality": "On a cold contributor cache, one `rg --files` subprocess per minimal independent file root; nested and duplicate roots are deduplicated. Up to four run concurrently, and each may emit at most 50,000 paths. A warm root within 30 seconds spawns none.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The outgoing first-turn path performed no ripgrep enumeration for workspace context.",
+            "CriticalPathEffect": "All cold root scans are awaited before `agent.chats.sendMessage`, bounded only by the new 2000 ms caller timeout. Running/queued scans continue after that timeout."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostWorkspaceFiles.ts:_enumerate, reached from WorkspaceContextContribution.ts:64",
+            "Operation": "Traverse workspace directories and read ignore metadata through ripgrep.",
+            "Cardinality": "One recursive traversal per cold independent root, respecting ignore files and stopping output collection at 50,000 paths; traversal may still touch a much larger tree before producing/limiting output.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No workspace-wide filesystem traversal was initiated by sending the first chat message.",
+            "CriticalPathEffect": "Filesystem traversal determines the pre-provider wait and can consume disk/network-filesystem bandwidth concurrently with checkpoint work; it continues after caller timeout."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentSideEffects.ts:agent.chats.sendMessage",
+            "Operation": "Send the user turn and host instructions to the model provider.",
+            "Cardinality": "One existing provider send per accepted turn. The first turn gains one bounded host instruction of at most roughly 2,000 structure characters plus wrapper text.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider request occurred without waiting for workspace enumeration and without the workspace snapshot payload.",
+            "CriticalPathEffect": "The existing model-network request is delayed until snapshot work completes; its first-turn payload is also modestly larger."
+          }
+        ],
+        "ScalingInput": "The effective cardinality is the number of deduplicated, non-nested file roots and up to 50,000 returned paths per root; first-turn frequency is once for every new or restored-empty Copilot chat.",
+        "EffectiveConcurrency": "All roots are submitted with `Promise.all`; a process-wide limiter permits four ripgrep enumerations concurrently and queues the rest. Contributions themselves execute serially. Cancellation rejects only each caller promise, so running and queued root scans continue under the limiter.",
+        "CacheBehavior": "`WorkspaceContextContribution` owns a separate `AgentHostWorkspaceFiles` cache, so existing file-completion enumeration cannot warm it. Within this contributor, in-flight requests coalesce per root and successful results stay warm for 30 seconds; failures are removed. The first-turn memento limits attachment to once per chat, but each new/empty peer chat can consume the cached result or trigger a cold scan after expiry. Caller timeout does not cancel or evict the shared enumeration.",
+        "MechanismConfidence": "High: the added await, subprocess implementation, limiter, non-canceling timeout semantics, separate cache ownership, and pre-provider call ordering are directly traced; the new test explicitly asserts a 2000 ms delay for a slow filesystem.",
+        "MagnitudeUncertainty": "Local small repositories may enumerate quickly, while large, ignored-poor, network-mounted, or multi-root workspaces can reach the tested two-second bound. Workspace-size and filesystem-latency prevalence are unknown, affecting severity but not the mechanism.",
+        "Verdict": "Reportable medium-severity latency regression: the diff adds cold per-root filesystem subprocesses to the first-turn critical path and allows abandoned scans to continue after timeout."
+      },
+      {
+        "Scenario": "Create or resume an Agent Host session using an OpenAI-family model.",
+        "CriticalPath": "Model-family matching and construction of the three-line section override happen synchronously during session configuration before SDK launch/resume. The work is constant-size and negligible relative to the existing launch boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:939 via agentHostPromptRegistry.resolveSystemMessageConfig",
+            "Operation": "Configure and launch/resume a Copilot SDK session with the resolved system prompt.",
+            "Cardinality": "One existing SDK/provider session launch or resume for each launch event; later model turns use the resulting system-message configuration. The diff adds only three fixed sentences.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same launch/resume occurred with the default `code_change_rules` section and without the three appended sentences.",
+            "CriticalPathEffect": "The network boundary already existed; the diff adds a small bounded prompt payload and no extra round trip."
+          }
+        ],
+        "ScalingInput": "One constant-size resolution per session launch/resume across matching GPT, OpenAI-alias, and legacy o-series model IDs.",
+        "EffectiveConcurrency": "No new asynchronous work, queue, subprocess, or fan-out is introduced; one resolver instance and one small string/section object are created per launch/resume.",
+        "CacheBehavior": "Prompt configuration is recomputed once per SDK session create/resume. There is no per-turn matching/allocation loop in the host registry; the added content is static and bounded.",
+        "MechanismConfidence": "High: registry documentation and code show resolution once per launch/resume, while the new resolver performs only lowercase/prefix/regex matching and fixed string assembly.",
+        "MagnitudeUncertainty": "Exact provider token accounting is SDK-dependent, but the added content is fixed-size and cannot scale with workspace, history, or turn count in host-side construction.",
+        "Verdict": "No reportable performance regression: host CPU/allocation and provider payload growth are bounded and small, with no new expensive boundary or multiplicative path."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 17 changed files. One actionable regression was submitted: cold workspace enumeration now blocks first provider dispatch for up to two seconds and fans out per independent root, while timed-out scans continue. The OpenAI prompt contributor adds only constant-size launch-time work and no new expensive boundary."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-23T05:00:59.081433109Z",
+    "CompletedAt": "2026-09-23T05:03:06.900094722Z",
+    "WallClockMilliseconds": 127818,
+    "ModelCalls": 8,
+    "InputTokens": 292001,
+    "OutputTokens": 7168,
+    "TotalTokens": 299169,
+    "ReasoningTokens": 2876,
+    "CacheReadTokens": 235106,
+    "CacheWriteTokens": 56871,
+    "APIDurationMilliseconds": 117251,
+    "ToolCalls": 46,
+    "NanoAIUnits": 52185340000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 235106,
+      "cache_write": 56871,
+      "input": 24,
+      "output": 7168
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
