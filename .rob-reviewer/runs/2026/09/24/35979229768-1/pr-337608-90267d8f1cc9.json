@@ -1,0 +1,300 @@
+{
+  "PullRequest": {
+    "Number": 337608,
+    "Title": "agentHost: fix chat-folder separation review findings",
+    "Body": "Follow-up to #337594. It fixes the Copilot review comments on that PR and the findings from a full review of the chat-folder separation feature (steps 1–7). Chats in one session can work in different folders; these fixes keep each chat's surfaces and host work scoped to its own folders.\n\n## Agent Merge and folder keys\n- **Host folder keys:** the host publishes its folder keys and scope ids (`workingDirectoryKeys` / `workingDirectoryScopeIds` in session `_meta`) for every session and chat folder. The client uses them instead of recomputing keys with its own path-case rules. This fixes a Linux remote host used from a macOS or Windows client, where per-folder GitHub info, Agent Merge settings and restored Git state were lost, or distinct folders were merged. State persisted in the old format still resolves through the local fallback.\n- **Older hosts:** a host that doesn't publish the keys doesn't support per-folder Agent Merge. For it, the client writes the legacy session-folder setting and rejects peer-folder writes.\n- **Peer chats:** the Agent Merge changeset is advertised on the chat that owns the folder's Agent Merge, with a chat-owned Compare template, and the client follows that chat's turns. The session-level reader no longer returns another folder's state.\n- **Folder loading:** Agent Merge state observables react when a peer chat's folder finishes loading, and change events fire after the full state snapshot is applied.\n- **Session folder identity:** the session folder resolves to the session's own GitHub info, so single-folder main chats keep the session workspace.\n\n## Changesets, checkpoints, Git and PR state\n- **Session Changes:** always computed over all session folders, whatever supplies the list summary. Lifecycle refresh schedules it only for session owners.\n- **Checkpoints:** history is tracked per repository. Turn and Compare lookups use the chat's own checkout, so terminal-only changes in another folder are captured.\n- **Pull request attachment:** repository and branch come from the same folder-scoped owner.\n- **Stale branch state:** the default chat's Git state is cleared, live and persisted, when its repository goes away.\n- **PR status:** a reused status watch updates its folder descriptor when the representative chat changes.\n\n## Session and chat lifecycle\n- **Pinning a peer:** keeps the peer's provider backing data.\n- **Forks:** copy the source chat's own folders.\n- **Removing a folder:** rejected while a chat is still scoped to it.\n- **Resume:** resuming an additional checkout uses that checkout's own worktree record.\n- **Quick chats:** `create_session` with the current session and a workspace is rejected from a quick chat, with an actionable error. The model-facing descriptions are unchanged.\n- **GitHub state migration:** the legacy row is deleted only once its state is migrated, and one removal mechanism is used. Persisted `__proto__` keys are rejected.\n\n## Agents Window\n- **Chat actions:** input banner actions (Fix Checks, comments) go to the chat that shows the pull request. Tasks run, and are added and configured, in the active chat's folder.\n- **Session Changes:** available again in multi-folder sessions, rendered with the whole session workspace.\n- **Terminal:** visibility and active terminal follow the active chat's folder.\n- **Sessions list:** peer chat rows and hovers no longer take the main worktree's pending state. The hidden folder row takes no space. Height reconciliation no longer loads detailed state for offscreen chats.\n\n## Not changed\n- The old `github` session meta key isn't restored for mixed client/host versions, as the plan decided.\n- The two definitions of \"session folder\" (the default chat's first folder vs the session summary's first folder) stay as they are; they only differ in rare cases.\n- Other folders keep baselining pre-existing pull requests regardless of isolation. This is now documented and tested as intended.\n\n## Validation\n- Typecheck and eslint are clean.\n- 7,917 Agent Host tests, 4,505 sessions tests and 1,728 workbench agent-session tests pass.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337608",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "4212437dd11e9c7e728caa26a269540c87343930",
+    "HeadRef": "sandy081/sessions-folder-separation-fixes",
+    "HeadSHA": "90267d8f1cc9cc70ee25ab5eba394c70d41e3480",
+    "CreatedAt": "2026-09-24T01:21:32Z",
+    "UpdatedAt": "2026-09-24T08:39:22Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-08588E034D55",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostCheckpointService.ts",
+      "Side": "RIGHT",
+      "Line": 290,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed loop, the session-wide checkpoint table ordering, and AgentHostGitService.revParse's `_runGit(... ['rev-parse', ...])` implementation directly prove sequential subprocess fan-out. The exact number of intervening turns varies by workflow, which affects severity but not the mechanism.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Sequential `git rev-parse` subprocesses plus a full checkpoint-ref database read",
+      "PerformanceScaling": "For a checkpoint in repository R, cost grows with the number of session checkpoint refs since R was last active; a first checkpoint in a newly used repository scans the entire session checkpoint history. Multi-folder capture repeats this per repository, serially.",
+      "PerformanceOutcome": "Increased end-of-turn checkpoint latency and Git process churn, delaying the post-checkpoint Session Changes refresh and reducing host throughput.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Checkpoint capture fetched only the immediately previous checkpoint ref and then performed the existing single parent `revParse`; it did not probe every older session checkpoint ref.",
+      "ChangedBehavior": "When the immediately previous session checkpoint does not exist in the current repository, the new reverse loop awaits `revParse` for each older ref until one happens to exist there.",
+      "CausalDiffEvidence": "Added line 290 places `await this._gitService.revParse(repositoryRootUri, checkpointRef)` inside a reverse loop over every value returned by `getAllCheckpointRefs()`.",
+      "Title": "Avoid walking checkpoint history with one Git process per ref",
+      "Impact": "In a realistic multi-folder session where users alternate chats or spend many turns in another checkout, switching back can make checkpoint completion and the Changes surface wait on dozens of serial Git invocations; a repository first used late in a long session scans every prior checkpoint.",
+      "Evidence": "`SessionDatabase.getAllCheckpointRefs()` returns all checkpoint refs ordered over the whole session, without repository identity. `_getRepositoryParentRef` walks that list in reverse and awaits each probe. `AgentHostGitService.revParse` invokes `_runGit` with `git rev-parse --verify --quiet`, so a chat returning to repo A after N turns in other folders executes up to N+1 Git subprocesses before checkpoint capture can continue. Capture itself is serialized by the per-session sequencer, and the turn-end contribution refreshes Session Changes only after this checkpoint promise settles.",
+      "Recommendation": "Persist/index the latest checkpoint ref per repository (or resolve all candidate refs in one batched Git invocation) so parent lookup is O(1) boundary calls per repository while preserving repository-specific ancestry."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/sessions/contrib/sessions/browser/views/sessionsList.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 4683,
+      "BasePath": "src/vs/sessions/contrib/sessions/browser/views/sessionsList.ts",
+      "BaseLine": 4664,
+      "IntroducingPath": "src/vs/sessions/contrib/sessions/browser/views/sessionsList.ts",
+      "IntroducingCommit": "a41ff3b280860ecb39d1ac68e1e74dae100951b9",
+      "MechanismFamily": "eager-work",
+      "PerformanceCategory": "ipc",
+      "Mechanism": "The row-height autorun read every chat's `_withDetails`-wrapped workspace, including offscreen rows; observing that wrapper acquires the chat's detailed state subscription, so opening/reconciling a large sessions list eagerly loaded details for all chats.",
+      "Symptom": "Sessions-list height reconciliation caused unnecessary detail subscriptions and host traffic for offscreen chats, increasing list-load work with chat count.",
+      "FixedBehavior": "The changed autorun reads session/chat workspaces only when `getRelativeTop` confirms the row is fully visible, and sizes offscreen rows without observing workspace details.",
+      "Evidence": "The deleted unconditional workspace reads were inside a loop over every collected chat row. `AdditionalChat.workspace` is wrapped by `_withDetails`, whose observation calls `_acquireDetails()`. The added visibility branch avoids those reads for offscreen rows; `getRelativeTop` returns null outside the fully visible viewport. Blame identifies the base line as introduced by the prior chat-folder presentation change.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "unbounded-retention",
+      "eager-work",
+      "synchronous-ui-work",
+      "cleanup-lifecycle",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Complete a turn in one chat/repository of a multi-folder session, capture checkpoints, and refresh Session Changes",
+        "CriticalPath": "Turn-start tree capture finishes before the provider receives the prompt. End-of-turn checkpoint capture is off the provider-response critical path, but the authoritative Session Changes refresh after checkpoint capture waits for it; changed checkpoint ancestry lookup is therefore on the Changes-surface refresh path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts:getAllCheckpointRefs",
+            "Operation": "Read all session checkpoint refs from SQLite in row order",
+            "Cardinality": "Once for turn numbering and, after an immediate repository miss, once again for parent lookup; result size grows with completed checkpointed turns",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Parent lookup queried only the immediately previous checkpoint ref",
+            "CriticalPathEffect": "Parent lookup cannot continue until the full list is read"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostCheckpointService.ts:_getRepositoryParentRef",
+            "Operation": "Run `git rev-parse --verify --quiet` to test whether each candidate ref exists in the current repository",
+            "Cardinality": "One for the immediate previous ref plus up to one per older session checkpoint until a same-repository ref is found; repeated serially for each captured repository",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the existing single parent-ref resolution was performed; older refs were not probed",
+            "CriticalPathEffect": "Blocks completion of checkpoint capture and thus the post-checkpoint Session Changes refresh"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts:_computeRepositoryCheckpointDiffs",
+            "Operation": "Resolve repository/checkpoint refs and compute Git file diffs across session repositories",
+            "Cardinality": "One repository-resolution/diff sequence per distinct repository, deduplicated by `resolveSessionRepositories`, limited to four concurrent repositories",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Multi-folder Session Changes already used repository fan-out when selected; the diff changes ownership and latest-turn selection but retains a limiter",
+            "CriticalPathEffect": "Blocks publication of aggregate Session Changes but not provider turn completion"
+          }
+        ],
+        "ScalingInput": "Number of working repositories and, for each repository, the number of session checkpoint refs since that repository last produced a checkpoint; effective diff concurrency is four repositories, while checkpoint capture and ancestry probes are serialized.",
+        "EffectiveConcurrency": "Checkpoint work is serialized per session by a sequencer; `_getRepositoryParentRef` awaits every Git probe sequentially. Session repository diffs use a shared limiter of four and static recomputes coalesce same-key pending requests.",
+        "CacheBehavior": "Baseline refs are reused. There is no repository-indexed cache for the latest applicable checkpoint; every non-immediate parent miss rereads all checkpoint refs and reprobes them. Static recompute requests coalesce, and prior changeset state supports incremental tracked-edit computation only in single-chat fallback paths.",
+        "MechanismConfidence": "High: database ordering, loop placement, subprocess implementation, serialization, and refresh sequencing are all explicit.",
+        "MagnitudeUncertainty": "Typical sessions may have few intervening turns, but switching back after tens of turns in other folders or first using a repository late in a session produces the proven linear subprocess walk.",
+        "Verdict": "Reportable medium-severity boundary fan-out: repository parent lookup now scales in sequential Git subprocesses with unrelated checkpoint history."
+      },
+      {
+        "Scenario": "Add, remove, restore, fork, or resume chat-scoped working folders and read per-folder GitHub/Git/Agent Merge state",
+        "CriticalPath": "Folder identity publication is synchronous in state-action handling; peer persistence and restore/resume database reads must finish before the associated lifecycle operation proceeds. Agent Merge reads are local state derivations.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:updateWorkingDirectories",
+            "Operation": "Rewrite persisted peer-chat catalog after a chat folder change",
+            "Cardinality": "One queued write per chat-folder mutation",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Used `upsert`, with the same single persistence boundary but could drop provider data",
+            "CriticalPathEffect": "Awaited by the folder update flow"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_resolveWorkingDirectoryForResume",
+            "Operation": "Read additional-worktree records before choosing the correct resume owner",
+            "Cardinality": "One read per resumed materialization",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Resumed directly through the session worktree record without this lookup",
+            "CriticalPathEffect": "On first-send/resume working-directory resolution"
+          },
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_publishWorkingDirectoryIdentities",
+            "Operation": "Publish updated session metadata containing host folder keys and scope IDs",
+            "Cardinality": "One state update only when metadata structurally changes after relevant folder/chat actions",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Did not publish these identity maps",
+            "CriticalPathEffect": "Synchronous state propagation after the action"
+          }
+        ],
+        "ScalingInput": "Current session folders, chat count, and historical distinct working-directory/scope combinations retained in metadata.",
+        "EffectiveConcurrency": "Peer-chat store writes are queued per session. Restore and resume reads are awaited. Identity map construction is synchronous and folder/chat loops are serial, but expected active cardinality is small.",
+        "CacheBehavior": "Host-authored folder keys/scope IDs are retained in session metadata and serialized for restore; removed historical identities are not pruned. Agent Merge folder snapshots are merged in memory and observables use structural equality. No miss retry or network cache change was introduced.",
+        "MechanismConfidence": "High for retention and boundary placement; lower for harmful magnitude.",
+        "MagnitudeUncertainty": "Historical identity maps can grow with distinct folder churn, but normal sessions use few folders and retention appears intentional to preserve old-format/re-added state; no concrete harmful scale was established.",
+        "Verdict": "No finding: database boundary counts remain one per lifecycle action, and the theoretical retained-map growth lacks a sufficiently realistic high-impact trigger."
+      },
+      {
+        "Scenario": "Run/configure tasks and create or switch terminals for the active chat's folder and Agent Host",
+        "CriticalPath": "Task configuration reads must finish before picker display; task launch waits for task resolution and terminal creation. Active-session switching waits for terminal lookup/creation and visibility reconciliation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/contrib/chat/browser/sessionsTasksService.ts:_readTasksFromBothTargets",
+            "Operation": "Read workspace and user tasks.json",
+            "Cardinality": "Two target reads per one-shot task query; unchanged, now routed to the active chat workspace",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same reads used the session workspace",
+            "CriticalPathEffect": "Blocks task picker/dependency resolution"
+          },
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/sessions/contrib/terminal/browser/sessionsTerminalContribution.ts:_terminalMatchesScope",
+            "Operation": "Resolve terminal initial CWD and Agent Host backend while finding/reconciling terminals",
+            "Cardinality": "At most one extra CWD check for same-CWD untracked candidates after initial lookup; visibility scans all user-visible terminals, with tracked scopes resolving locally",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Matched candidates and visibility primarily by CWD without Agent Host scoping",
+            "CriticalPathEffect": "Blocks terminal visibility update during session/chat switch"
+          },
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/sessions/contrib/terminal/browser/agentHostSessionTaskRunner.ts:runTask",
+            "Operation": "Create/use an Agent Host terminal and send resolved task commands",
+            "Cardinality": "One terminal launch/use per task run plus dependency command count; unchanged cardinality",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same operation targeted the session folder instead of the active chat folder",
+            "CriticalPathEffect": "Task launch path"
+          }
+        ],
+        "ScalingInput": "Two tasks.json targets, dependency count, total terminal instances, and tracked terminals for the active session.",
+        "EffectiveConcurrency": "Workspace and user task files are read sequentially as before. Terminal candidate and visibility loops await terminal CWD checks sequentially; per-session terminal operations use generation cancellation to prevent stale updates.",
+        "CacheBehavior": "No new task cache. Tracked terminal scope and Agent Host instance maps provide warm O(1) host/scope matches and are removed on disposal/rehome. Untracked restored terminals fall back to CWD/host checks.",
+        "MechanismConfidence": "High for routing and cleanup behavior.",
+        "MagnitudeUncertainty": "Terminal counts are generally small; the added same-CWD host check did not establish a meaningful regression.",
+        "Verdict": "No finding: host-aware routing preserves task/terminal boundary cardinality, scope maps are cleaned up, and added terminal matching work is bounded by visible terminal count."
+      },
+      {
+        "Scenario": "Render and scroll the Sessions list with many expanded peer chats and reconcile dynamic row heights",
+        "CriticalPath": "Visible-row workspace reads and DOM row-height updates occur on the UI rendering path. Offscreen row sizing now avoids observing detailed workspace state.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:AdditionalChat._withDetails",
+            "Operation": "Acquire detailed chat state subscription when workspace is observed",
+            "Cardinality": "Before the fix, one acquisition per chat row in the list; after the diff, only visible/rendered rows observe workspace details",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The base revision unconditionally read every chat workspace during height reconciliation",
+            "CriticalPathEffect": "Previously inflated list reconciliation/load traffic; now offscreen work is deferred"
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/sessions/contrib/sessions/browser/views/sessionsList.ts:reconcileChatRowHeights",
+            "Operation": "Read observables and update cached tree row heights",
+            "Cardinality": "Still loops all rows, but expensive workspace reads are limited to fully visible rows; offscreen rows receive a constant/approval-derived height",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Performed workspace-derived sizing for every row",
+            "CriticalPathEffect": "Synchronous UI work during list updates"
+          }
+        ],
+        "ScalingInput": "Number of expanded chat rows versus number fully visible in the viewport; workspace detail acquisition cardinality is now viewport-bounded.",
+        "EffectiveConcurrency": "A single autorun loops rows synchronously; one animation-frame correction is scheduled when a rendered row first reveals a folder line.",
+        "CacheBehavior": "Tree element heights are cached. Offscreen rows use a workspace-independent base height; when rendered, their workspace details are acquired and height is corrected on the next frame.",
+        "MechanismConfidence": "High; recorded as a regression fix with introducing blame.",
+        "MagnitudeUncertainty": "Exact host traffic depends on provider subscription sharing, but `_withDetails` directly acquires details per observed chat and the old loop covered all rows.",
+        "Verdict": "Performance improvement, not a finding: the diff removes eager offscreen detail loading and bounds rich row work to the viewport."
+      },
+      {
+        "Scenario": "Show Session Changes, Agent Merge changes, PR banners/status, and submit feedback in the chat that owns a folder",
+        "CriticalPath": "Changeset/chat subscriptions must produce state before UI updates; explicit Fix Checks/comment actions wait for the target chat widget and existing PR/feedback operations. PR status remains background watched.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/agentHostSessionChangesets.ts:AgentHostAgentMergeChangeset",
+            "Operation": "Subscribe to the owning chat and compare-turn changeset",
+            "Cardinality": "One owning-chat subscription and one current compare changeset subscription per active Agent Merge changeset",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Subscribed to the default chat instead of the owning chat",
+            "CriticalPathEffect": "Blocks display of Agent Merge change count/details"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostPullRequestStatusService.ts:_updateWatch",
+            "Operation": "Maintain PR status subscription",
+            "Cardinality": "One reused subscription per PR key; diff updates descriptor without creating another watch",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Reused the same watch but retained the old folder descriptor",
+            "CriticalPathEffect": "Background status updates, not action critical path"
+          },
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/sessions/contrib/agentFeedback/browser/agentFeedbackService.ts:submitFeedback",
+            "Operation": "Locate target chat widget and submit one feedback/chat request",
+            "Cardinality": "One widget lookup and one request for the selected feedback batch",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same request targeted the session resource rather than the owning chat",
+            "CriticalPathEffect": "Explicit user action waits for request acceptance"
+          }
+        ],
+        "ScalingInput": "Session repository count for aggregate changes, number of watched PR folders, feedback items selected, and active changeset file count.",
+        "EffectiveConcurrency": "Changeset repository diffs use limiter four. Existing PR watches are reused by key. Feedback submission is one request. Observable recomputations are structurally deduplicated.",
+        "CacheBehavior": "Changeset state is cached/persisted; selected changesets reuse subscriptions. PR subscription objects are reused and only their folder descriptor is updated. Agent Merge folder snapshots are retained and equality-checked. No new network cache misses are introduced.",
+        "MechanismConfidence": "High for subscription reuse and action cardinality.",
+        "MagnitudeUncertainty": "Aggregate Session Changes cost depends on repository count, but duplicate lifecycle triggers coalesce and the PR replaces prior per-owner computations rather than proving additional total boundary work.",
+        "Verdict": "No finding: routing changes preserve or reduce expensive-boundary cardinality, and aggregate Git work remains limited/coalesced."
+      }
+    ],
+    "Summary": "Reviewed all 51 changed files and traced multi-folder checkpoint/changeset lifecycle, folder identity and Agent Merge state, task/terminal routing, changes/session-list UI, PR feedback/status, and restore flows. Reported one sequential Git subprocess fan-out in repository-specific checkpoint ancestry. Recorded the offscreen chat-detail loading removal as a concrete regression fix. Historical working-directory identity retention is unbounded in theory but requires sustained distinct-folder churn and appears intentional for compatibility, so evidence was insufficient for an additional finding."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-24T09:14:34.145597305Z",
+    "CompletedAt": "2026-09-24T09:17:22.975760635Z",
+    "WallClockMilliseconds": 168830,
+    "ModelCalls": 10,
+    "InputTokens": 1088733,
+    "OutputTokens": 12194,
+    "TotalTokens": 1100927,
+    "ReasoningTokens": 3931,
+    "CacheReadTokens": 933265,
+    "CacheWriteTokens": 155438,
+    "APIDurationMilliseconds": 154079,
+    "ToolCalls": 105,
+    "NanoAIUnits": 139449600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 933265,
+      "cache_write": 155438,
+      "input": 30,
+      "output": 12194
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

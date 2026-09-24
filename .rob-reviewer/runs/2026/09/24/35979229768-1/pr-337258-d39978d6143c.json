@@ -1,0 +1,194 @@
+{
+  "PullRequest": {
+    "Number": 337258,
+    "Title": "agentHost: fix account-scoped Copilot SKU telemetry for Codex",
+    "Body": "## Summary\n\nFix Codex Agent Host `copilotSku` attribution at the authentication/telemetry lifecycle, without dashboard imputation.\n\n- Read the raw entitlement SKU from the existing token-scoped `/copilot_internal/user` cache. Codex no longer depends on Copilot initializing a process-wide common property.\n- Capture account context for turns at provider dispatch (including authentication that finishes during host preparation), and retain that guarded context for completion, failure, hang, usage, tool, and forwarded SDK telemetry.\n- Keep unchanged-credential and proactive refreshes from erasing valid metadata, while distinguishing rejected credentials. Retry failed discovery on reauthentication; omit unknown, malformed, expired, invalidated, or superseded metadata.\n- Prevent older authentication completions from replacing replayable credentials, and make late provider initialization wait for the current authentication request.\n- Scope discovery to its original GitHub endpoint and prevent old failures from evicting newer cache entries. Retire Copilot and Claude credentials/proxy handles when the endpoint changes; this is necessary because they share the corrected CAPI cache. Codex already retired its credential on that transition.\n\n## Root cause and ownership\n\nPreviously, only `CopilotAgent` published `copilotSku` through `setCommonProperty`. Codex independently fetched CAPI metadata, so its first turns could be missing a SKU; another provider's authentication could also clear or overwrite the shared value.\n\nThe replacement is explicit provider/account context, not another shared mutable SKU. Point-in-time events read their provider's current account; delayed events carry a captured, invalidatable context. Unattributed events no longer borrow another provider's account. The field remains optional, preserving historical and legitimately missing-SKU compatibility.\n\n## Privacy\n\nThe existing `copilotSku` GDPR classification remains unchanged: a string, `SystemMetaData` / `FeatureInsight`. No tokens, account identities, new telemetry fields, settings, or policy controls are added. There is no guessed SKU, historical backfill, or change to dashboards, notes, OTel configuration, or telemetry consent gates.\n\n## Red → green evidence\n\nThe first regression used real Codex authentication, `CopilotApiService`, `AgentHostAuthenticationService`, the turn tracker/reporter, and the real telemetry service/appender merge; only external HTTP/SDK boundaries were controlled.\n\n```sh\nnpm run transpile-client\nTMPDIR=\"$PWD/.r\" ./scripts/test.sh \\\n  --run src/vs/platform/agentHost/test/node/codex/codexSkuTelemetry.test.ts \\\n  --grep 'authenticated CAPI account SKU'\n```\n\nBefore implementation: **0 passing, 1 failing**, actual `[undefined]` versus `['copilot_for_business_seat']`. After the first fix: **1 passing**.\n\nFurther observed assertion-red/green slices cover account replacement/removal, out-of-order resolution and replay, late provider initialization, unchanged credentials, failed discovery/retry, dispatch-time authentication, old-endpoint discovery/401 responses, expired-cache endpoint races, non-string SKUs, and delayed tool events. Real Copilot/Codex service tests cover independent provider initialization/clearing; real Claude proxy/API tests ensure the shared cache change cannot send retired credentials to a newly configured endpoint.\n\n## Validation\n\nA short workspace-local scratch directory was used for `TMPDIR` and removed afterwards.\n\n- `npm run compile` — **passed**, including client and built-in extension compilation.\n- `npm run typecheck-client` — **passed**; the final compile also typechecked the subsequent source changes.\n- Targeted ESLint on all changed TypeScript files — **passed**.\n- `git diff --check` — **passed**.\n- Related unit suites below — **1,055 passing, 1 pending**.\n\n```sh\nTMPDIR=\"$PWD/.r\" ./scripts/test.sh \\\n  --run src/vs/platform/agentHost/test/node/codex/codexSkuTelemetry.test.ts \\\n  --run src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts \\\n  --run src/vs/platform/agentHost/test/node/codex/codexModelRefresh.test.ts \\\n  --run src/vs/platform/agentHost/test/node/codex/codexProxyService.test.ts \\\n  --run src/vs/platform/agentHost/test/node/shared/copilotApiService.test.ts \\\n  --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts \\\n  --run src/vs/platform/agentHost/test/node/claudeAgent.test.ts \\\n  --run src/vs/platform/agentHost/test/node/copilotGitHubTelemetryForwarder.test.ts \\\n  --run src/vs/platform/agentHost/test/node/agentHostTelemetryService.test.ts \\\n  --run src/vs/platform/agentHost/test/node/agentHostTelemetryReporter.test.ts \\\n  --run src/vs/platform/agentHost/test/node/agentHostTurnTelemetry.test.ts \\\n  --run src/vs/platform/agentHost/test/node/agentHostTurnHangTelemetry.test.ts \\\n  --run src/vs/platform/agentHost/test/node/agentHostToolCallTelemetry.test.ts \\\n  --run src/vs/platform/agentHost/test/node/agentHostProviderService.test.ts \\\n  --run src/vs/platform/agentHost/test/node/agentHostServices.test.ts\n\nTMPDIR=\"$PWD/.r\" ./scripts/test.sh \\\n  --run src/vs/platform/agentHost/test/node/agentService.test.ts \\\n  --grep 'AgentService.*[Aa]uthenticat'\n```\n\nThe separate authentication selector passed **12 tests**: **1,067 passing total**, plus the one pending test.\n\n## Real launch verification\n\nUsed the launch skill's prelaunch, settings, and CDP-readiness helpers with workspace-local isolated user-data, extension, shared-data, `HOME`, `COPILOT_HOME`, and `CODEX_HOME` directories. The agent did not extract, inspect, or print credential values or copy another profile's credential store. The existing in-app GitHub authentication path supplied authentication.\n\nTwo real Codex turns, including one after rebuilding/restarting the host and replaying authentication, returned the requested smoke-check replies:\n\n- provider `codex`\n- model `@provider=vscode-proxy:gpt-5.3-codex`\n- result `success`\n- the same nonempty raw `copilotSku` on both runs\n- real CAPI `responses` HTTP **200**\n- unchanged source worktree and unchanged Git worktree list\n\nThe payload was observed at the real `AgentHostTelemetryReporter.turnCompleted` boundary using a non-pausing debugger logpoint; this does **not** claim verification of remote telemetry ingestion. The launch also ran the real Codex app-server/account probe. Cropped screenshots and bounded, non-identity evidence were retained locally; debug probes, runtime profiles, helper scripts, and task-owned processes were removed.\n\nLive account switching, credential invalidation, and configured enterprise-host switching were not performed against the user's accounts; those cases are covered by the deterministic service/lifecycle regressions. The opt-in external CAPI integration test was updated for disposal ownership but was not run separately.\n\n## Baseline\n\nStarted from freshly fetched `origin/main` at `f2375bfd46fb664b40159f09f9e4727f20f1f8c8`, with a clean isolated worktree on `agents/codex-sku-lifecycle-20260922`.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337258",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "Giuspepe",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "4212437dd11e9c7e728caa26a269540c87343930",
+    "HeadRef": "agents/codex-sku-lifecycle-20260922",
+    "HeadSHA": "d39978d6143c4ae4ca197671cc3d067d38d98b83",
+    "CreatedAt": "2026-09-22T11:14:51Z",
+    "UpdatedAt": "2026-09-24T09:03:51Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "boundary-fanout",
+      "repeated-work",
+      "cleanup-lifecycle",
+      "serialization-allocation",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold GitHub authentication with Copilot, Codex, and Claude providers active",
+        "CriticalPath": "The authenticate RPC fans out to matching providers with Promise.allSettled and completes only after Copilot/Codex account or MCP endpoint resolution and Claude proxy acquisition finish. Copilot's restricted-telemetry resolution is fire-and-forget, but Copilot SKU and Codex MCP endpoint discovery are on the authentication critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/shared/copilotApiService.ts:_buildClientForToken",
+            "Operation": "GET /copilot_internal/user to discover CAPI endpoints and raw entitlement metadata",
+            "Cardinality": "One request per effective GitHub token on a cold cache; concurrent Copilot and Codex consumers share the same IClientRequest promise.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Cold changed-token Copilot and Codex authentication already resolved data through the same per-token CAPI client cache and performed this discovery.",
+            "CriticalPathEffect": "Codex authentication awaits endpoint discovery; Copilot authentication awaits SKU resolution. The shared request therefore gates cold authentication once, not once per provider."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeProxyService.ts:ClaudeProxyService.start",
+            "Operation": "Acquire or bind the loopback Claude HTTP proxy",
+            "Cardinality": "One shared runtime acquisition for the active Claude credential; concurrent acquires share the proxy server lifecycle.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Claude authentication already started the proxy for a new token; the diff adds stale-completion guards without adding starts.",
+            "CriticalPathEffect": "Claude authentication awaits the proxy handle before completing."
+          }
+        ],
+        "ScalingInput": "Number of distinct credentials, not turns, tools, models, or providers. A normal authentication has one Copilot-scoped credential.",
+        "EffectiveConcurrency": "Provider authentication runs in parallel. Per-token CAPI discovery is promise-coalesced; Claude proxy binding is shared by its acquire lifecycle. There is no per-provider network fan-out for the same token.",
+        "CacheBehavior": "Cold cache performs one discovery. Successful entries remain usable for 30 minutes and concurrent callers coalesce. 401/403 invalidates the exact client; endpoint changes invalidate all cells. Non-auth failures remain retryable, while successful metadata is read from the existing cell.",
+        "MechanismConfidence": "High: authentication fan-out, shared promise cache, and network call are directly traced.",
+        "MagnitudeUncertainty": "Actual network duration varies by GitHub endpoint, but the effective request count and critical-path placement are established.",
+        "Verdict": "No reportable regression: the diff preserves one effective cold discovery and adds race/lifecycle guards rather than additional fan-out."
+      },
+      {
+        "Scenario": "Warm unchanged-credential forwarding and proactive authentication refresh",
+        "CriticalPath": "Most repeated token forwarding is suppressed by the workbench's per-connection AgentHostAuthTokenCache. If an unchanged token reaches a provider, Copilot and Codex now consult the shared CAPI entry before authentication completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/shared/copilotApiService.ts:_getEntryForToken",
+            "Operation": "Refresh /copilot_internal/user when the per-token entry enters its refresh window or prior discovery failed",
+            "Cardinality": "Zero calls for a warm entry outside the five-minute refresh window; at most one coalesced call for concurrent consumers when refresh is needed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Codex reused its cached MCP configuration and Copilot returned early for an unchanged credential, so those exact provider methods did not initiate a retry. Other CAPI consumers still refreshed the same entry when needed.",
+            "CriticalPathEffect": "A refresh-window miss or retry is awaited by authentication; ordinary warm forwarding resolves from memory."
+          }
+        ],
+        "ScalingInput": "Distinct host connections and credential refreshes; it does not scale with turns or tools. Successful network refresh is bounded to once per token per TTL.",
+        "EffectiveConcurrency": "Same-token requests are deduplicated in the workbench and, if multiple connections still forward concurrently, coalesced by the service's per-token promise.",
+        "CacheBehavior": "Warm success is memory-only. Refresh-window callers share one promise. Failed discovery can be retried on reauthentication, which is the intended recovery behavior; no successful request is repeated per provider.",
+        "MechanismConfidence": "High for cache behavior and boundaries.",
+        "MagnitudeUncertainty": "The prevalence of unchanged-token RPCs from multiple connections is uncertain, but client deduplication and server coalescing bound effective network cardinality.",
+        "Verdict": "No actionable regression: the newly reachable network retry is bounded, coalesced, and specifically enables recovery after failed discovery; ordinary warm authentication adds only map/promise work."
+      },
+      {
+        "Scenario": "Turn, tool, usage, hang, and forwarded SDK telemetry attribution",
+        "CriticalPath": "Turn dispatch captures an account context, and terminal/tool telemetry reads its copilotSku getter while constructing existing telemetry payloads. This work is not on model-network dispatch beyond small synchronous map/time checks.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of active turns and telemetry events. Each context retains a token reference, a cache-cell reader, and a small closure until existing turn/tool cleanup.",
+        "EffectiveConcurrency": "One captured context per tracked turn plus existing per-tool timing references; tool trackers reuse the turn context rather than creating per-tool CAPI requests. Concurrent turns remain independent and perform no network work through the getter.",
+        "CacheBehavior": "Getters read only the existing cache cell; they do not launch discovery. Captured cells are invalidated on rejected credentials, endpoint changes, and service disposal. Turn and tool maps already remove entries on completion/session cleanup.",
+        "MechanismConfidence": "High: all added context capture/read call paths are synchronous and their cleanup owners are visible.",
+        "MagnitudeUncertainty": "Exact telemetry-event volume varies by turn, but payload growth is one bounded SKU string and context objects are tied to existing lifecycle owners.",
+        "Verdict": "No reportable CPU, serialization, or retention regression; added work is bounded metadata propagation with existing lifecycle cleanup."
+      },
+      {
+        "Scenario": "GitHub enterprise endpoint switch while providers and caches are live",
+        "CriticalPath": "The endpoint event synchronously invalidates CAPI cells and provider credential generations. Copilot asynchronously clears credentials and requests a client restart; Claude releases its proxy handle; Codex clears its proxy token and model state. Subsequent authentication performs discovery against the new endpoint.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_requestClientRestart/_applyPendingClientRestart",
+            "Operation": "Stop the Copilot SDK client subprocess so startup-baked endpoint configuration is replaced",
+            "Cardinality": "One coalesced stop/restart request per endpoint change; pending restart reasons are merged and cleared synchronously before stop.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Endpoint changes already called _restartClientIfStartupConfigChanged and restarted the client when the enterprise host changed. The new credential-clear request coalesces into the same pending restart.",
+            "CriticalPathEffect": "Restart is deferred past active turns and runs asynchronously from the endpoint event; a later Copilot use recreates the client."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeAgent.ts endpoint-change listener",
+            "Operation": "Release the refcounted loopback Claude proxy handle",
+            "Cardinality": "At most one active handle is disposed for the provider on each endpoint change.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Claude retained the existing proxy handle across endpoint changes.",
+            "CriticalPathEffect": "Cleanup is asynchronous from configuration notification and prevents use of retired credentials; next authenticated use reacquires the shared proxy."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/shared/copilotApiService.ts:_buildClientForToken",
+            "Operation": "Discover endpoints after reauthentication on the new GitHub host",
+            "Cardinality": "One coalesced request for the new credential/endpoint cache generation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Discovery occurred when a token first needed a client, but the old base cache could preserve endpoint-derived state; the diff ensures endpoint-specific invalidation.",
+            "CriticalPathEffect": "Subsequent authentication waits for new-endpoint discovery; the configuration change itself does not issue the request."
+          }
+        ],
+        "ScalingInput": "Endpoint-change events, normally rare configuration transitions, not sessions or turns. Session reconciliation scales with existing Codex sessions only when the credential generation changes.",
+        "EffectiveConcurrency": "Provider listeners run independently. Copilot subprocess restarts are coalesced, CAPI in-flight results cannot repopulate invalidated cells, and stale Claude proxy startups dispose their late handle.",
+        "CacheBehavior": "All per-token CAPI cells are invalidated on endpoint change; old captured readers become empty. New authentication creates a fresh endpoint-specific entry and concurrent consumers share it.",
+        "MechanismConfidence": "High: listener, invalidation, restart coalescing, and stale-completion guards are directly traced.",
+        "MagnitudeUncertainty": "Provider-specific cleanup duration varies, but event cardinality is rare and cleanup prevents more costly stale-resource use.",
+        "Verdict": "No performance finding: added cleanup is bounded to rare endpoint changes, and the existing expensive Copilot restart remains coalesced and off active-turn critical paths."
+      },
+      {
+        "Scenario": "Late provider registration during an in-flight authentication request",
+        "CriticalPath": "Provider registration starts authentication replay in the background. Replay now waits for matching current authentication requests to settle before replaying stored credentials; normal provider lookup and dispatch do not await the replay promise.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostAuthenticationService.ts:replay",
+            "Operation": "Wait on the already-running provider authentication/discovery promise; replay itself does not launch an additional boundary call until the authoritative request completes",
+            "Cardinality": "One wait per currently pending matching resource snapshot; replacements wake waiters, which then observe the latest request. Subsequent replay invokes provider authentication once per stored resource.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Replay immediately iterated stored tokens and could race an in-flight replacement instead of waiting for the authoritative request.",
+            "CriticalPathEffect": "Registration and normal provider availability remain synchronous; only background replay and orderly shutdown await completion."
+          }
+        ],
+        "ScalingInput": "Number of simultaneously pending authentication resources during rare late provider initialization, normally one Copilot resource.",
+        "EffectiveConcurrency": "Pending requests are awaited together with Promise.all. New replacements are observed by the loop; there is no duplicate concurrent replay of the superseded credential.",
+        "CacheBehavior": "After the wait, replay reads the latest stored, unexpired token. CAPI work reached by replay uses the same per-token coalescing cache.",
+        "MechanismConfidence": "High for the wait and its non-critical placement.",
+        "MagnitudeUncertainty": "An unusually slow external authentication can prolong background replay, but provider use is not gated by _authenticationReplays.",
+        "Verdict": "No reportable latency regression because the new wait is background lifecycle coordination and avoids duplicate/stale authentication work rather than blocking provider dispatch."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 23 changed files and traced authentication, cache, provider replay, endpoint transition, subprocess/proxy cleanup, and telemetry lifecycles. No high-confidence actionable performance regression was introduced, and the PR does not provide evidence of fixing a shipped performance regression requiring blame attribution."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-24T09:11:59.415746783Z",
+    "CompletedAt": "2026-09-24T09:14:29.413381107Z",
+    "WallClockMilliseconds": 149997,
+    "ModelCalls": 8,
+    "InputTokens": 496528,
+    "OutputTokens": 9907,
+    "TotalTokens": 506435,
+    "ReasoningTokens": 4024,
+    "CacheReadTokens": 395612,
+    "CacheWriteTokens": 100892,
+    "APIDurationMilliseconds": 130457,
+    "ToolCalls": 81,
+    "NanoAIUnits": 86094080000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 395612,
+      "cache_write": 100892,
+      "input": 24,
+      "output": 9907
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
