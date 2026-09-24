@@ -1,0 +1,185 @@
+{
+  "PullRequest": {
+    "Number": 337765,
+    "Title": "Honor useTsgo in web TypeScript extension",
+    "Body": "I'm working on getting TS's Wasm build working. The web build of VS Code wasn't respecting the useTsgo setting; make that work the same as desktop.",
+    "URL": "https://github.com/microsoft/vscode/pull/337765",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "jakebailey",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "a7c45e2e1a2f759998d494b117819bda72b84c25",
+    "HeadRef": "typescript-web-tsgo-takeover",
+    "HeadSHA": "f706499fa25da3980f5e55c6ecd08925fb762f45",
+    "CreatedAt": "2026-09-24T18:12:50Z",
+    "UpdatedAt": "2026-09-24T19:22:48Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-2B109428F1D9",
+      "Focus": "performance-review",
+      "Path": "extensions/typescript-language-features/src/extension.browser.ts",
+      "Side": "RIGHT",
+      "Line": 71,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The new branch recreation path is explicit, the global listener ownership gap is visible in dependentRegistration.ts, and the activated host's nested global Conditions are directly traced through LanguageProvider and ATA. The exact bytes retained per cycle are unmeasured, which limits severity, but the retention and linear growth mechanism do not depend on timing or an external service.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "workspace/editor event listeners, retired TypeScriptServiceClientHost graphs, and provider registrations",
+      "PerformanceScaling": "After a JS/TS document activates the client, every normal→Tsgo→normal cycle leaves another set of conditional-feature listeners rooted by global VS Code events; later configuration/editor events fan out linearly with the number of mode switches and can recreate registrations from every retired instance.",
+      "PerformanceOutcome": "retained memory and increasing event-dispatch/provider work over a long-lived web extension host",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The browser extension created one normal TypeScript client registration for its lifetime, so switching experimental.useTsgo did not repeatedly construct and retire client feature registrations.",
+      "ChangedBehavior": "The added top-level conditionalRegistration now disposes and recreates the normal client branch whenever experimental.useTsgo or the native extension condition flips.",
+      "CausalDiffEvidence": "RIGHT line 71 wraps the browser client in a mode-switching conditionalRegistration; its false branch constructs the client and all nested language-feature conditional registrations anew on each re-entry.",
+      "Title": "Dispose conditions when replacing the web client",
+      "Impact": "In a web session where a developer tries Tsgo, switches back, and repeats while JS/TS is open, each cycle retains another disposed TypeScript client/provider graph and adds callbacks to common configuration/editor events. Memory and callback/provider work continue growing until the extension host is reloaded.",
+      "Evidence": "An activated host creates two standard LanguageProviders, whose formatting, copy/paste, code-lens, and tag-closing registrations create Conditions backed by vscode.workspace/window events; registerAtaSupport adds another. Condition calls onUpdate(...) without retaining the returned Disposable, and ConditionalRegistration.dispose() disposes only state.registration, not its conditions or condition.onDidChange subscriptions. Therefore disposing the new branch cannot detach these globally rooted listeners; their callbacks retain each ConditionalRegistration's doRegister closure and disposed client, and a later condition change can call update() and install a registration again after disposal.",
+      "Recommendation": "Make Condition own the Disposable returned by onUpdate, make ConditionalRegistration own and dispose both its conditions and onDidChange subscriptions, and prevent update() after disposal before relying on this registration for a recreatable client branch."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "repeated-work",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Activate the web extension with Tsgo enabled and the native extension installed",
+        "CriticalPath": "Activation reads the unified setting and extension inventory, then registers only the disable command; TypeScript client construction, workspace preload, ATA providers, and worker startup are off this path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Constant work per extension activation; extension inventory lookup checks three known IDs.",
+        "EffectiveConcurrency": "No changed asynchronous expensive work is started by this branch.",
+        "CacheBehavior": "No TypeScript client or preload cache is created. Extension lookup uses the VS Code extension registry.",
+        "MechanismConfidence": "High: the selected doRegister branch contains only CommandManager and DisableTsgoCommand construction.",
+        "MagnitudeUncertainty": "None material; this branch removes normal-mode work rather than adding a scaling boundary.",
+        "Verdict": "No performance regression on initial Tsgo activation."
+      },
+      {
+        "Scenario": "Open a supported JS/TS document in normal web mode",
+        "CriticalPath": "lazilyActivateClient first awaits remote workspace preload for all eligible GitHub virtual workspace folders, then forces TypeScriptServiceClientHost construction and starts the browser TypeScript worker. This ordering is unchanged from before the PR.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/typescript-language-features/src/extension.browser.ts:174 RemoteWorkspaceContentsPreloader.doPreload",
+            "Operation": "Remote repository API loadWorkspaceContents preloads repository contents",
+            "Cardinality": "One call per eligible GitHub virtual workspace folder on cold loader activation, coalesced within that loader instance",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same preload ran with the same per-folder Promise.all fan-out before lazy client activation.",
+            "CriticalPathEffect": "All calls are awaited before the TypeScript worker/client is constructed."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/typescript-language-features/src/tsServer/serverProcess.browser.ts WorkerServerProcess",
+            "Operation": "Create a browser Worker and MessageChannel-based synchronous filesystem/tsserver channels",
+            "Cardinality": "The normal TypeScript service starts the configured worker set once for the activated client",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Normal web mode created the same worker through the same lazy client path.",
+            "CriticalPathEffect": "Worker startup begins after workspace preload and is required for language service readiness."
+          }
+        ],
+        "ScalingInput": "Eligible vscode-vfs GitHub workspace folders after scheme/authority filtering; normally one, potentially one call per multi-root folder.",
+        "EffectiveConcurrency": "All eligible folder preloads run concurrently through Promise.all with no local limiter; worker creation follows only after all complete.",
+        "CacheBehavior": "RemoteWorkspaceContentsPreloader coalesces calls per folder in _preload until a root watcher invalidates it. The remote extension's own cold/warm cache behavior is not visible in this repository.",
+        "MechanismConfidence": "High for call ordering, cardinality, and local coalescing; downstream network bytes are unknown.",
+        "MagnitudeUncertainty": "Repository size and remote preload latency vary; downstream remote-extension caching is not visible.",
+        "Verdict": "No reportable boundary regression for the ordinary normal-mode activation path."
+      },
+      {
+        "Scenario": "Toggle experimental.useTsgo between normal and Tsgo modes after a JS/TS client has activated",
+        "CriticalPath": "A configuration event synchronously evaluates the outer conditions, disposes the normal store (including killing the worker), and registers the alternate branch. Returning to normal mode immediately sees the already-open supported document, awaits workspace preload, and starts a fresh worker.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/typescript-language-features/src/extension.browser.ts:110 startPreloadWorkspaceContentsIfNeeded",
+            "Operation": "Reinvoke loadWorkspaceContents through a newly created preloader on normal-mode re-entry",
+            "Cardinality": "One call per eligible GitHub virtual workspace folder per normal-mode re-entry when a supported document remains open",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The browser extension had one lifetime-scoped preloader/client and did not react to useTsgo mode changes.",
+            "CriticalPathEffect": "Awaited before the replacement worker can start."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/typescript-language-features/src/extension.browser.ts:99 client host ownership and src/tsServer/serverProcess.browser.ts",
+            "Operation": "Terminate the current TypeScript Worker on disposal and create a replacement Worker/MessageChannels on normal-mode re-entry",
+            "Cardinality": "One configured worker set per activated normal-mode re-entry",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Changing useTsgo did not tear down or recreate the browser worker because the setting was not honored.",
+            "CriticalPathEffect": "Replacement startup is required for TypeScript language features after switching back."
+          }
+        ],
+        "ScalingInput": "Number of completed mode-toggle cycles, multiplied by two standard LanguageProviders and their nested conditional features; remote preload cardinality is eligible GitHub workspace-folder count per normal re-entry.",
+        "EffectiveConcurrency": "Each outer condition update is synchronous. On normal re-entry, folder preloads fan out concurrently and worker startup follows them; separate user-driven toggle cycles are sequential.",
+        "CacheBehavior": "Each normal re-entry creates fresh local preloaders, so their _preload promises are cold; downstream remote API caching is unknown. More importantly, global event subscriptions from nested Conditions are not released, so retired registrations accumulate rather than being invalidated.",
+        "MechanismConfidence": "High for branch recreation, worker teardown/startup, and leaked global listeners; high uncertainty only in downstream preload cost.",
+        "MagnitudeUncertainty": "Users normally toggle an experimental setting infrequently, and the remote API may cache loaded contents; this keeps repeated boundary work from supporting a separate high-confidence finding.",
+        "Verdict": "Reported the unbounded listener/client retention: nested Conditions do not release global subscriptions when the new recreatable branch is disposed, so memory and event work grow per cycle. Repeated preload/worker work is intentional to restore normal mode and lacks enough downstream cost evidence for a separate finding."
+      },
+      {
+        "Scenario": "Dispose the normal branch while remote workspace preload is still pending",
+        "CriticalPath": "Disposal marks lazilyActivateClient as disposed and disposes current preload watchers; the in-flight remote API promise may finish, but the added guard prevents forcing TypeScript client/worker construction afterward.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/typescript-language-features/src/extension.browser.ts:174",
+            "Operation": "Already-started loadWorkspaceContents calls may complete after disposal",
+            "Cardinality": "At most one in-flight call per eligible folder for that disposed loader",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Preload could also be in flight during extension disposal; the old callback would force lazy client creation when it completed.",
+            "CriticalPathEffect": "Off the retired branch's critical path after disposal; completion is ignored for activation."
+          }
+        ],
+        "ScalingInput": "Eligible remote workspace folders with unresolved preload calls at the moment of a mode switch or extension shutdown.",
+        "EffectiveConcurrency": "In-flight folder preloads remain concurrent; no replacement worker is started by their completion after disposal.",
+        "CacheBehavior": "The disposed loader's in-flight promise is not canceled, but its result cannot activate the retired client. No additional cache state is retained through that branch.",
+        "MechanismConfidence": "High: isDisposed is set synchronously and checked before lazyClientHost.value.",
+        "MagnitudeUncertainty": "The remote API exposes no cancellation contract, so whether the underlying fetch itself can be stopped is unknown.",
+        "Verdict": "The added guard improves cleanup behavior and introduces no regression."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and their client lifecycle, conditional-registration ownership, preload, worker, ATA, and provider call paths. Submitted one medium cleanup-lifecycle finding for mode-switch-driven retention and event fan-out; no other changed boundary or scheduling mechanism met the evidence threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-24T21:47:44.048708551Z",
+    "CompletedAt": "2026-09-24T21:51:05.902392293Z",
+    "WallClockMilliseconds": 201853,
+    "ModelCalls": 12,
+    "InputTokens": 376569,
+    "OutputTokens": 9435,
+    "TotalTokens": 386004,
+    "ReasoningTokens": 4757,
+    "CacheReadTokens": 324258,
+    "CacheWriteTokens": 52275,
+    "APIDurationMilliseconds": 186258,
+    "ToolCalls": 61,
+    "NanoAIUnits": 57992220000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 324258,
+      "cache_write": 52275,
+      "input": 36,
+      "output": 9435
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

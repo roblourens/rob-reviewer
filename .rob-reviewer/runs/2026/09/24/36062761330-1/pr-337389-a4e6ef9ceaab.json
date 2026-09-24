@@ -1,0 +1,222 @@
+{
+  "PullRequest": {
+    "Number": 337389,
+    "Title": "Persist full Claude shell output in chat sessions",
+    "Body": "Part of: https://github.com/microsoft/vscode/issues/328596\r\nFollow-up to: https://github.com/microsoft/vscode/pull/335016\r\n\r\n- Copy complete output that Claude spills for a top-level `Bash` result into the owning chat session database before publishing its completion, within the existing 10 MiB limit. This also covers PowerShell commands routed through Claude's generic `Bash` tool.\r\n- Attach an exited non-PTY resource built with `buildNonPtyShellTerminalUri`, so the existing card provides its preview and **Open Full Output (Read-Only)** live and after restore without keeping a terminal alive.\r\n- Reattach the resource only when the stored row exists, while preserving inline results, background commands, subagent shell calls, and output Claude did not persist.\r\n- Build the live and restored preview from Claude's `\u003cpersisted-output\u003e` notice and report successful results as exit code 0, matching the existing card behavior.\r\n- Remove the staged terminal content, mapper tracking, and database row when cancellation wins before synchronous publication, including the microtask gap after async capture.\r\n- Keep retained output owned by its turn and session so truncation and session deletion use the existing database cleanup paths.\r\n\r\n\r\n\r\n### Validation\r\n\r\n- `scripts/test.sh --runGlob \"**/agentHost/test/node/claude{SdkMessageRouter,TerminalOutput}.test.js\"` (12 passing), including the cancellation gap, capture ordering, cleanup, and restore coverage.\r\n- ESLint on the files changed by the review fix.\r\n- Earlier full branch validation: `npm run typecheck-client` and `npm run test-node -- --runGlob \"**/agentHost/test/{node,common}/**/*.test.js\"` (8141 passing).\r\n- Manual verification on macOS 26.6.2 arm64 with Code - OSS 1.140.0 and Claude Haiku 4.5: a 262,199-character result opened in full from the live card and after **Developer: Restart Local Agent Host** plus **Developer: Reload Window**; the editor remained read-only.\r\n\r\n-----------------------------------------\r\nInspirations from:\r\n\r\n- Storing saved output before publishing completion follows [`CopilotAgentSession`](https://github.com/microsoft/vscode/blob/4212437dd11e9c7e728caa26a269540c87343930/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L5960-L5983) from #335016.\r\n- Reattaching stored output during restore mirrors [`_restoreStoredShellOutputsForChat`](https://github.com/microsoft/vscode/blob/4212437dd11e9c7e728caa26a269540c87343930/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L3745-L3771).\r\n- Serving completed output without a live terminal relies on [`AgentService._resolveRetainedTerminalState`](https://github.com/microsoft/vscode/blob/4212437dd11e9c7e728caa26a269540c87343930/src/vs/platform/agentHost/node/agentService.ts#L5834-L5898).\r\n- Staging content for the synchronous mapper follows [`ClaudeFileEditObserver.observeUser`](https://github.com/microsoft/vscode/blob/4212437dd11e9c7e728caa26a269540c87343930/src/vs/platform/agentHost/node/claude/claudeFileEditObserver.ts#L114-L142) and [`cacheFileEdit` / `takeFileEdit`](https://github.com/microsoft/vscode/blob/4212437dd11e9c7e728caa26a269540c87343930/src/vs/platform/agentHost/node/claude/claudeMapSessionEvents.ts#L151-L167).\r\n- Rechecking cancellation after an async boundary mirrors the final pre-commit abort gate in [`ClaudeAgentSession`](https://github.com/microsoft/vscode/blob/8b5ffd533c57a2746740b70e30435d67b05e6e36/src/vs/platform/agentHost/node/claude/claudeAgentSession.ts#L712-L719).\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337389",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "anthonykim1",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "9bf9ae764da438b1234a8243dc9e47173ef58ee7",
+    "HeadRef": "anthonykim1/terminal-full-output-claude",
+    "HeadSHA": "a4e6ef9ceaab585d195bb3f3685152fa3d634265",
+    "CreatedAt": "2026-09-23T01:15:23Z",
+    "UpdatedAt": "2026-09-24T20:39:39Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-92560852BE68",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts",
+      "Side": "RIGHT",
+      "Line": 125,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The added critical-path await, per-call SQL implementation, serialization behavior, and unfiltered Bash-call cardinality are directly visible in the changed and transitive code. Exact milliseconds vary by session length and disk/cache state, which affects severity rather than mechanism confidence.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "serialized SQLite queries and JS/native callback crossings",
+      "PerformanceScaling": "On each Claude chat history load, the number of awaited database queries grows linearly with the count of completed top-level Bash calls in the transcript, even when all of those calls kept their output inline and terminal_outputs is empty. The session database's _queueTurnData and mutation sequencers make the effective query concurrency one.",
+      "PerformanceOutcome": "increased chat restore latency on shell-heavy sessions",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Claude history reconstruction fetched and mapped the SDK transcript and then returned the turns; it did not stat/open the session database or perform per-tool SQLite lookups.",
+      "ChangedBehavior": "After reconstructing turns, restore collects every completed Bash tool call, opens the session database, and awaits getTerminalOutputSize separately inside a loop before the history can be returned.",
+      "CausalDiffEvidence": "Added line 125 places `await database.object.getTerminalOutputSize(toolCall.toolCallId)` inside the newly added loop over every completed Bash tool call, and added claudeAgent.ts line 1964 awaits the whole restore operation on every history read.",
+      "Title": "Filter and batch retained-output checks during restore",
+      "Impact": "Reopening a shell-heavy Claude session with dozens or hundreds of ordinary Bash calls now adds dozens or hundreds of serialized SQLite SELECTs to the chat-load critical path. Warm filesystem/SQLite caches reduce each lookup's duration but do not remove the linear sequence of native database callbacks.",
+      "Evidence": "ClaudeAgent._readChatMessages now awaits _terminalOutputs.restore before returning history (claudeAgent.ts:1963-1964). restore gathers all completed Bash calls without first checking for Claude's \u003cpersisted-output\u003e notice, then line 125 awaits getTerminalOutputSize for each one. SessionDatabase.getTerminalOutputSize executes one SELECT per call through _queueTurnData (sessionDatabase.ts:945-949), and _queueTurnData serializes work through _turnUsageSequencer and _mutationSequencer (sessionDatabase.ts:430-432). Capture only creates rows for messages with persistedOutputPath and a matching persisted-output terminal, so inline Bash calls can be rejected before touching SQLite.",
+      "Recommendation": "Before querying, restrict candidates to results containing the persisted-output notice, then resolve candidate IDs with one batched terminal_outputs query (or expose a single API returning stored IDs) and attach resources from that set. This preserves restore semantics while removing per-Bash serialized database fan-out."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Complete a top-level Claude Bash/PowerShell command whose result was spilled to a persisted-output file",
+        "CriticalPath": "The SDK user result is not mapped or published until capture reads the saved file, creates the turn row, and stores the output blob. This newly added filesystem and SQLite work is intentionally on the completion critical path so the attached resource is available when published.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts:71",
+            "Operation": "Read Claude's saved output file with a 10 MiB size limit",
+            "Cardinality": "One read for each qualifying foreground top-level Bash result with persistedOutputPath; inline, background, subagent, and non-Bash results perform zero reads",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Claude returned/published the model-facing result without copying the saved file",
+            "CriticalPathEffect": "The tool completion waits for the bounded read"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts:76-79",
+            "Operation": "Create the owning turn and insert/update its terminal output BLOB",
+            "Cardinality": "Two awaited database operations per qualifying spilled result, storing at most 10 MiB",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No terminal-output database row was created for Claude shell results",
+            "CriticalPathEffect": "The completion waits until durable storage succeeds"
+          }
+        ],
+        "ScalingInput": "Number and byte size of foreground top-level shell results that Claude spills; each result is bounded to 10 MiB and handled once",
+        "EffectiveConcurrency": "The SDK pipeline awaits router.handle per message; file read and database writes for a result are sequential, while the session database also sequences turn-data writes",
+        "CacheBehavior": "There is no application cache or coalescing; each qualifying result is copied once. OS filesystem/SQLite caches may make warm access faster. Nonqualifying results are rejected before boundary work.",
+        "MechanismConfidence": "High: the awaited read and writes and 10 MiB bound are explicit in the changed call path.",
+        "MagnitudeUncertainty": "Large spilled shell output is workload-dependent, and exact read/write latency depends on disk state. Work is bounded and required by the feature's publish-after-store contract.",
+        "Verdict": "No additional finding: this adds bounded I/O and allocation, but it is the core persistence operation and preserves the stated availability ordering; no avoidable multiplicity was found."
+      },
+      {
+        "Scenario": "Open or restore a Claude chat with a shell-heavy history",
+        "CriticalPath": "ClaudeAgent fetches/maps the SDK transcript and now awaits ClaudeTerminalOutputs.restore before returning turns to AgentService, so database discovery and all existence checks block chat restoration.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sessionDataService.ts:114-126, reached from claudeTerminalOutput.ts:119",
+            "Operation": "Stat the per-session database path before opening it",
+            "Cardinality": "One stat per getMessages restore when at least one completed Bash call exists",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Claude getMessages returned after SDK transcript mapping without consulting the session database",
+            "CriticalPathEffect": "Chat history cannot be returned until the stat completes"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts:125 -\u003e src/vs/platform/agentHost/node/sessionDatabase.ts:945-949",
+            "Operation": "SELECT length(output) for a tool_call_id",
+            "Cardinality": "One query for every completed top-level Bash call in the reconstructed transcript, including inline-output calls with no possible retained row",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Zero terminal-output existence queries on Claude history restore",
+            "CriticalPathEffect": "All lookups are awaited before history is returned"
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeAgent.ts:2015",
+            "Operation": "Fetch the complete SDK transcript with includeSystemMessages",
+            "Cardinality": "One existing SDK fetch per getMessages call",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same SDK fetch and mapping occurred before the diff",
+            "CriticalPathEffect": "Existing prerequisite to reconstruct history; the diff adds database work after it"
+          }
+        ],
+        "ScalingInput": "Count of completed Bash calls across all restored turns; realistic long-lived coding chats can contain dozens or hundreds, while effective retained-output cardinality is usually much smaller",
+        "EffectiveConcurrency": "The restore loop awaits each lookup and SessionDatabase queues turn-data operations through sequencers, yielding effective query concurrency of one",
+        "CacheBehavior": "getMessages reconstructs and restores on every call with no memoization. Warm OS/SQLite caches reduce individual query cost but do not coalesce or eliminate the per-call SQL callbacks. A missing database is negatively resolved by one stat for that invocation only.",
+        "MechanismConfidence": "Very high: the new await chain, unfiltered candidate collection, per-ID SELECT, and database sequencers are directly traced.",
+        "MagnitudeUncertainty": "Exact added milliseconds depend on history length and storage speed; the linear serialized boundary fan-out is certain.",
+        "Verdict": "Reported: unfiltered per-Bash serialized SQLite fan-out adds avoidable history-load latency."
+      },
+      {
+        "Scenario": "Open Full Output from a live or restored retained shell-output card",
+        "CriticalPath": "Resolving the non-PTY resource ensures session/chat state exists, then reads the one stored output BLOB before returning terminal state.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:5925",
+            "Operation": "Stat/open the session database",
+            "Cardinality": "One database discovery per requested retained terminal resource",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The resolver already used this path for retained non-PTY terminal resources; the diff makes Claude cards point to it",
+            "CriticalPathEffect": "The read-only full-output view waits for database discovery"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:5927 and sessionDatabase.ts:952-964",
+            "Operation": "Read and decode one terminal output BLOB, bounded to 10 MiB",
+            "Cardinality": "One logical output read per user open; internally size and BLOB are read in the existing database implementation",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Existing retained-terminal resources used the same resolver; Claude results did not previously expose such a resource",
+            "CriticalPathEffect": "The editor cannot show full output until the blob is loaded"
+          }
+        ],
+        "ScalingInput": "Size of the single selected output, capped at 10 MiB, and number of explicit opens",
+        "EffectiveConcurrency": "Each resource resolution performs its own awaited database read; no changed burst or collection fan-out was introduced here",
+        "CacheBehavior": "No application blob cache; repeated opens reread the database, with only underlying OS/SQLite warm-cache benefit",
+        "MechanismConfidence": "High: the changed resource construction reaches an established one-resource resolver path.",
+        "MagnitudeUncertainty": "Decode/allocation cost varies with output size, but is bounded and user-triggered.",
+        "Verdict": "No finding: the diff reuses the existing on-demand retained-terminal path with one bounded read per explicit open."
+      },
+      {
+        "Scenario": "Cancel a turn while retained shell output is being captured",
+        "CriticalPath": "Cancellation is checked after the file read, after database storage, and again before synchronous publication. If cancellation wins after storage, cleanup deletes the row before returning.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts:71-73",
+            "Operation": "Potentially finish the in-flight saved-output read before observing abort",
+            "Cardinality": "At most one bounded read for the cancelling qualifying result",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No saved-output read existed on cancellation",
+            "CriticalPathEffect": "Cancellation completion may wait for an already-started read because no cancellation token is passed to readFile"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts:81-83 and 99-100",
+            "Operation": "Delete a just-stored terminal output when cancellation wins",
+            "Cardinality": "At most one delete for the qualifying cancelled tool result; the second router check covers the post-capture microtask gap",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No terminal-output row required cleanup",
+            "CriticalPathEffect": "The cancelled handler waits for cleanup, preventing retained database growth"
+          }
+        ],
+        "ScalingInput": "One currently completing spilled shell result; output read is capped at 10 MiB",
+        "EffectiveConcurrency": "Capture and cleanup are awaited serially in the per-message router",
+        "CacheBehavior": "No cache; cancellation removes staged mapper state and any stored row rather than retaining a negative entry",
+        "MechanismConfidence": "High: all abort gates and cleanup boundaries are explicit.",
+        "MagnitudeUncertainty": "A cancellation during a slow maximum-size read can be delayed by that read, but the operation is bounded and one-at-a-time.",
+        "Verdict": "No finding: cancellation can wait for bounded in-flight I/O, but cleanup ownership is complete and prevents memory/database retention."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 10 changed files. One medium-confidence-severity history-restore boundary-fanout regression was submitted; live capture, resource opening, bounded allocation, and cancellation cleanup did not establish additional actionable regressions."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-24T21:42:36.370461507Z",
+    "CompletedAt": "2026-09-24T21:44:30.331397901Z",
+    "WallClockMilliseconds": 113960,
+    "ModelCalls": 9,
+    "InputTokens": 351112,
+    "OutputTokens": 6948,
+    "TotalTokens": 358060,
+    "ReasoningTokens": 2282,
+    "CacheReadTokens": 288196,
+    "CacheWriteTokens": 62889,
+    "APIDurationMilliseconds": 99427,
+    "ToolCalls": 48,
+    "NanoAIUnits": 56879140000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 288196,
+      "cache_write": 62889,
+      "input": 27,
+      "output": 6948
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
