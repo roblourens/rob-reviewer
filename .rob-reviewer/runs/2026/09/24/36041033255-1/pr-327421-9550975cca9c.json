@@ -1,0 +1,258 @@
+{
+  "PullRequest": {
+    "Number": 327421,
+    "Title": "Harden Agent Host E2E and protocol integration tests",
+    "Body": "Hardens the Agent Host E2E and protocol integration tests following the failures reported in [this PR comment](https://github.com/microsoft/vscode/pull/327213#issuecomment-5064384775).\n\n## Changes\n\n- use platform-aware protocol operation timeouts with extra Windows and coverage headroom\n- register pending JSON-RPC calls before sending to avoid fast-response races\n- centralize bounded graceful server shutdown with forced termination fallback\n- await server shutdown across protocol suites to avoid process overlap\n- track and clean up secondary WebSocket clients on failure paths\n- replace wall-clock sleeps with protocol barriers and turn-specific notification matching\n- add retry-backed temporary resource cleanup for Windows\n\n## Validation\n\n- `npm run typecheck-client`\n- `npm run precommit`\n- Agent Host protocol integration tests: 115 passing, 1 pending\n- reported terminal E2E cases for Claude: 2 passing\n- reported terminal E2E cases for Copilot: 2 passing\n- final code review: no findings\n\n(Written by Copilot)",
+    "URL": "https://github.com/microsoft/vscode/pull/327421",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e04b6ae5cc95d3f73d7dec621d98a2257936f091",
+    "HeadRef": "roblou/agents/flaky-tests-hardening-e2e-protocol",
+    "HeadSHA": "9550975cca9c0d739ebbcabb6019c7293512c858",
+    "CreatedAt": "2026-07-24T23:41:17Z",
+    "UpdatedAt": "2026-09-08T23:25:33Z",
+    "MergedAt": "2026-07-25T19:10:37Z",
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/test/node/protocol/agentHostServer.integrationTest.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 20,
+      "BasePath": "src/vs/platform/agentHost/test/node/protocol/agentHostServer.integrationTest.ts",
+      "BaseLine": 18,
+      "IntroducingPath": "src/vs/platform/agentHost/test/node/protocol/agentHostServer.integrationTest.ts",
+      "IntroducingCommit": "5a3a2c742334af82ef19db3a5eec93b658628f44",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "subprocess",
+      "Mechanism": "Non-awaited child termination let the next protocol suite start while the previous Agent Host process could remain alive for up to its three-second persistence flush, creating transient subprocess, CPU, memory, and filesystem contention between suites.",
+      "Symptom": "Protocol integration runs could carry overlapping Agent Host child processes across suite boundaries, increasing resource contention and contributing to slow or flaky test transitions.",
+      "FixedBehavior": "Protocol suites now end stdin to initiate graceful shutdown and await the child process's exit before suite teardown completes, with a bounded force-kill fallback. This prevents consecutive suites from overlapping Agent Host subprocesses during shutdown.",
+      "Evidence": "Before this PR, suite teardown called ChildProcess.kill() and returned without observing process exit. The server's SIGTERM handler disposes the WebSocket server and then awaits sessionDataService.whenIdle() for up to 3 seconds before process.exit(0), so the next suite could fork and exercise another Agent Host while the prior child was still flushing and disposing. The changed teardown now awaits stopServer(server), whose exit listener is registered before ending stdin and whose promise resolves only when that child exits (or after bounded forced termination). The same corrected pattern is applied across the protocol suites.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "concurrency-burst",
+      "boundary-fanout",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Protocol integration suites start one Agent Host child, exchange local WebSocket JSON-RPC traffic, and tear the suite down.",
+        "CriticalPath": "Each suite waits for one forked server startup, then each test waits on its own local WebSocket calls/notifications. The changed suite teardown now waits for server exit before the next suite progresses; this deliberately removes prior off-critical-path overlap.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:startServer",
+            "Operation": "Fork the Agent Host server.",
+            "Cardinality": "One fork per suite, unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same server was forked once per suite.",
+            "CriticalPathEffect": "Startup must complete before suite tests run."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:stopServer",
+            "Operation": "End child stdin, await graceful shutdown and persistence flush, then force-kill after a bound if needed.",
+            "Cardinality": "One shutdown per changed suite; no per-test fan-out.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Most suites issued nonblocking ChildProcess.kill() and immediately completed teardown, allowing the exiting child to overlap the next suite.",
+            "CriticalPathEffect": "Now blocks suite completion until the old child exits, preventing the next suite from overlapping it."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:TestProtocolClient.call/waitForNotification",
+            "Operation": "Send local WebSocket JSON-RPC requests and receive responses/notifications.",
+            "Cardinality": "One operation per explicit call/wait. Four local ping barriers were added across the changed tests, replacing fixed 100-300 ms sleeps and heavier turn execution.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The affected ordering checks used fixed sleeps or a full mock turn; all other protocol calls already existed.",
+            "CriticalPathEffect": "Each explicit await gates the corresponding test assertion; successful operations complete immediately rather than waiting for the old wall-clock sleeps."
+          }
+        ],
+        "ScalingInput": "One child per protocol suite (13 changed suite teardowns), one primary client per test, and at most one secondary client in the changed multi-client/resource cases. Suites and test calls are effectively serial, not an aggregate fan-out.",
+        "EffectiveConcurrency": "Requests within each test are predominantly awaited serially. Suite teardown is now serialized with the next suite; stopServer has one in-flight shutdown per suite and a bounded 5-second normal or 30-second Windows/coverage fallback.",
+        "CacheBehavior": "No request cache is added or defeated. The child remains warm within a suite and is still replaced once at suite teardown.",
+        "MechanismConfidence": "High: the fork, WebSocket request flow, server shutdown handler, three-second database-idle cap, and awaited exit path are directly traced.",
+        "MagnitudeUncertainty": "Exact graceful-shutdown duration depends on pending SQLite writes, but it is bounded and the removed process overlap is concrete. Passing RPCs do not consume the longer failure timeout.",
+        "Verdict": "No reportable regression. The added teardown latency is intentional, bounded cleanup that removes overlapping subprocesses; ping barriers reduce normal-path latency. The old overlap was recorded as a regression fix."
+      },
+      {
+        "Scenario": "Multi-client protocol tests create and clean up secondary WebSocket clients on success and failure paths.",
+        "CriticalPath": "A test creates at most one secondary client, awaits its local connect/RPC work, then synchronous teardown closes both clients before the next test.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/test/node/protocol/multiClient.integrationTest.ts:createSecondaryClient/teardown",
+            "Operation": "Open and close loopback WebSocket clients.",
+            "Cardinality": "One secondary socket for each affected test, unchanged from before; tracking only extends ownership to teardown.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Tests created the same secondary sockets and closed them near successful test completion, but failure paths could skip close.",
+            "CriticalPathEffect": "Connection setup remains on the test path; close runs at teardown and now also runs after failures."
+          }
+        ],
+        "ScalingInput": "At most one tracked secondary client per test in this suite; the array is spliced every teardown, so cardinality does not grow across tests.",
+        "EffectiveConcurrency": "Primary and secondary sockets can receive broadcasts concurrently, but test actions are awaited serially. Cleanup iterates a bounded one-element collection.",
+        "CacheBehavior": "No cache is involved; notification arrays and tracked client ownership end with each test client.",
+        "MechanismConfidence": "High: each construction now pushes exactly one object and teardown splices and closes all tracked clients.",
+        "MagnitudeUncertainty": "WebSocket close duration is not awaited, but the changed mechanism does not increase socket count or lifetime beyond the current test.",
+        "Verdict": "No regression. The diff bounds client retention to one test and improves failure-path cleanup without increasing effective connection cardinality."
+      },
+      {
+        "Scenario": "Resource-operation tests create one temporary directory per test, perform filesystem RPCs, and remove the directory during teardown.",
+        "CriticalPath": "Filesystem operations reached through local WebSocket RPCs gate each test. Teardown synchronously closes clients and removes the single test directory before the next test.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/test/node/protocol/resourceOperations.integrationTest.ts:teardown",
+            "Operation": "Recursively delete the per-test temporary directory with bounded retries.",
+            "Cardinality": "One deletion per test, with up to five retries only under transient lock contention.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same synchronous recursive deletion ran once without retry options and failed immediately under contention.",
+            "CriticalPathEffect": "Teardown blocks before the next test, as it did previously; only transient failure handling can add up to roughly 500 ms."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/test/node/protocol/resourceOperations.integrationTest.ts",
+            "Operation": "Use a secondary loopback WebSocket for the shared-watch test.",
+            "Cardinality": "One secondary client in one test, unchanged; it is now retained in a teardown-owned array.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same client existed and was closed only at the successful end of the test.",
+            "CriticalPathEffect": "Connection and RPC work remain on that test's path; teardown cleanup is bounded."
+          }
+        ],
+        "ScalingInput": "One temporary directory per test; retry work occurs only when deletion fails and is capped at five retries with 100 ms delay.",
+        "EffectiveConcurrency": "Resource RPCs are awaited serially. Cleanup is synchronous and serialized with the next test; no deletion burst is introduced.",
+        "CacheBehavior": "No cache is added. Filesystem state is isolated by a fresh temporary directory per test.",
+        "MechanismConfidence": "High: retry count, delay, one-directory lifecycle, and secondary-client cardinality are explicit.",
+        "MagnitudeUncertainty": "Transient Windows lock frequency is environment-dependent, but retry cost is strictly bounded and only replaces immediate cleanup failure.",
+        "Verdict": "No reportable regression. Bounded retries can lengthen only a failed/contended cleanup and avoid leaked temp resources; normal cleanup cardinality is unchanged."
+      },
+      {
+        "Scenario": "Session-config persistence test restarts the Agent Host twice around a SQLite-backed metadata write.",
+        "CriticalPath": "Phase one writes config over WebSocket and must fully stop the first child before phase two starts and reads the persisted session state. Both server stops are on the test's required critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/protocol/sessionConfig.integrationTest.ts",
+            "Operation": "Gracefully stop each of two Agent Host children between persistence phases.",
+            "Cardinality": "Two stops per test, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The test manually ended stdin and awaited each exit with no fallback; it now calls the equivalent shared helper with a bounded force-kill fallback.",
+            "CriticalPathEffect": "Both stops already gated phase transition/test completion and still do."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostServerMain.ts:shutdown",
+            "Operation": "Flush in-flight per-session SQLite writes during server shutdown, then read persisted config after restart.",
+            "Cardinality": "One idle flush per shutdown; exactly two shutdowns in this test.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Manual graceful shutdown invoked the same server shutdown and persistence flush.",
+            "CriticalPathEffect": "The first flush is required before restart can validate persistence."
+          }
+        ],
+        "ScalingInput": "Exactly two sequential server instances and two shutdowns for one test; no collection fan-out.",
+        "EffectiveConcurrency": "The phases are intentionally serialized. stopServer waits for the server's single persistence-idle barrier, capped inside the server at three seconds, with a bounded outer kill fallback.",
+        "CacheBehavior": "Phase two intentionally uses a cold server process with the same user-data directory; no cache is introduced or invalidated differently by the helper extraction.",
+        "MechanismConfidence": "High: the old manual end-and-exit sequence and new stopServer path both invoke the same stdin shutdown handler.",
+        "MagnitudeUncertainty": "Actual SQLite flush duration varies, but cardinality and critical-path placement are unchanged.",
+        "Verdict": "No regression. This is a helper consolidation with an added bound, not new database or subprocess work."
+      },
+      {
+        "Scenario": "Agent Host E2E replay harness recycles or disposes shared provider servers and associated local replay/mock network services.",
+        "CriticalPath": "Normal replay tests reuse a warm server; recycle/dispose waits for proxy closure and child exit. Per-test recording already stops each server after replay/proxy flushing.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts",
+            "Operation": "Stop the real Agent Host child, which may own a provider subprocess.",
+            "Cardinality": "Unchanged: once per recording test, failed shared test, threshold recycle, or suite disposal.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A harness-local stopServer ended stdin, awaited exit, and force-killed after 30 seconds.",
+            "CriticalPathEffect": "Already awaited before restart/disposal; the shared helper keeps the same graceful-exit behavior and shortens only the non-Windows fallback bound."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/agentHostE2ETestHarness.ts and serverIntegrationTestHelpers.ts:startRealServer",
+            "Operation": "Close/reset the local CAPI replay proxy and mock LLM server.",
+            "Cardinality": "One proxy reset per reused test and one close per server lifecycle, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same replay/mock services were reset and closed around server lifecycle events.",
+            "CriticalPathEffect": "Proxy close remains ordered before child stop where fixture flushing requires it."
+          }
+        ],
+        "ScalingInput": "A shared server is recycled after the existing maximum tests-per-server threshold; recording uses one server per test. The diff does not change either cardinality.",
+        "EffectiveConcurrency": "Server disposal is serialized with recycle, failed-test restart, or suite disposal. The shared stop helper removes the prior local implementation but does not add parallel work.",
+        "CacheBehavior": "Replay cache/proxy state is reset per test on a warm shared server and closed before child shutdown; this behavior is unchanged. Cold start occurs only on existing recycle/record paths.",
+        "MechanismConfidence": "High: all acquire/release/recycle call sites and the extracted helper behavior were traced.",
+        "MagnitudeUncertainty": "Provider-specific child shutdown time varies, but the normal path and lifecycle cardinality are unchanged; Linux forced termination is now bounded sooner.",
+        "Verdict": "No reportable regression. The extraction preserves awaited cleanup and does not defeat warm-server reuse or replay caching."
+      },
+      {
+        "Scenario": "Failure and coverage paths wait for missing protocol responses or notifications.",
+        "CriticalPath": "Only a missing response/notification keeps the operation timer alive; successful operations clear timers immediately. On Windows the default failure bound is 8 seconds, and under coverage it is 30 seconds.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:getProtocolOperationTimeout",
+            "Operation": "Wait on a protocol timeout timer when a loopback JSON-RPC response or notification never arrives.",
+            "Cardinality": "One timer per outstanding operation; effective cardinality is generally one on the serial test path.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The default failure bound was five seconds on all platforms.",
+            "CriticalPathEffect": "Longer bounds increase failure-detection latency only on Windows/coverage; passing operations are unaffected."
+          }
+        ],
+        "ScalingInput": "Cost scales with concurrently outstanding failed operations, but these tests issue operations predominantly serially and fail on the first rejected await.",
+        "EffectiveConcurrency": "No shared burst is introduced; one timer is registered per pending call/wait and removed on response, close, or timeout.",
+        "CacheBehavior": "No cache is involved. Pending-call and waiter maps are cleared on response or client close.",
+        "MechanismConfidence": "High for timeout behavior and serial call structure; low uncertainty only concerns how often failures occur.",
+        "MagnitudeUncertainty": "The frequency of genuinely missing responses in CI is unknown; when it occurs, the extra failure latency is bounded and does not multiply across the predominantly serial path.",
+        "Verdict": "No actionable performance regression. The added wait is restricted to already-failing platform/coverage runs and is a bounded stabilization tradeoff rather than normal-path work."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 15 changed files and all diff pages. No diff-introduced performance finding met the reporting bar. The review traced subprocess shutdown, loopback WebSocket/HTTP calls, filesystem cleanup, SQLite flushes, replay-cache lifecycle, timeout behavior, and effective concurrency. One concrete cleanup-lifecycle regression fix was recorded: protocol suites now await child exit and prevent cross-suite subprocess overlap."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-24T18:31:23.424620985Z",
+    "CompletedAt": "2026-09-24T18:33:15.90118651Z",
+    "WallClockMilliseconds": 112476,
+    "ModelCalls": 9,
+    "InputTokens": 317690,
+    "OutputTokens": 7496,
+    "TotalTokens": 325186,
+    "ReasoningTokens": 2360,
+    "CacheReadTokens": 263977,
+    "CacheWriteTokens": 53686,
+    "APIDurationMilliseconds": 101822,
+    "ToolCalls": 44,
+    "NanoAIUnits": 52404880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 263977,
+      "cache_write": 53686,
+      "input": 27,
+      "output": 7496
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

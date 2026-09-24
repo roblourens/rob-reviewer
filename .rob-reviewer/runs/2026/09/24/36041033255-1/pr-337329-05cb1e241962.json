@@ -1,0 +1,168 @@
+{
+  "PullRequest": {
+    "Number": 337329,
+    "Title": "build: preserve npm pack errors and retry transient failures",
+    "Body": "## Summary\n\n- Preserve actionable `npm pack` diagnostics, package context, and original errors.\n- Retry only recognized transient pack failures, up to three attempts, while retaining private staging permissions.\n- Harden Agent Host **test** cleanup: wait up to one second for the owned root to exit after a failed kill and always remove exit listeners. Preserve upstream individual-PID descendant safeguards.\n\nFour helper/test files only; no production process-killing or CI-policy changes. Inspired by [build 20260922.44](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=476075\u0026view=results), which recovered unchanged; this is hardening, not a confirmed incident-specific fix.\n\n## Validation\n\nAll **32 executable checks pass** on `05cb1e24196`, including native Windows cleanup, integration, and smoke tests. Copilot re-review completed with **no findings**; prior Copilot threads are resolved.",
+    "URL": "https://github.com/microsoft/vscode/pull/337329",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "jruales",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "13de4561e248a9e0c4e1f832d5cf1793e6500a3c",
+    "HeadRef": "jruales-copilot-package-fetch",
+    "HeadSHA": "05cb1e241962cb3c8bfaaef4b73df75c9fdf96d0",
+    "CreatedAt": "2026-09-22T18:23:57Z",
+    "UpdatedAt": "2026-09-24T17:50:22Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 771,
+      "BasePath": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts",
+      "BaseLine": 752,
+      "IntroducingPath": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts",
+      "IntroducingCommit": "3e7bfbfa333db65e6e264209c6bc69e7676d6e4b",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "memory",
+      "Mechanism": "Repeated failed test-server cleanup left one pending exit listener and Promise closure attached to the still-live ChildProcess per attempt, retaining objects and eventually producing EventEmitter listener growth until the process exited.",
+      "Symptom": "Repeated teardown failures accumulated retained exit listeners/closures on a live test server, causing memory growth and eventual MaxListenersExceededWarning overhead.",
+      "FixedBehavior": "The changed finally block always detaches stopServer's exit listener on success or failure, bounding retained listeners and Promise closures to one cleanup invocation instead of accumulating across repeated failed teardown attempts.",
+      "Evidence": "In the base implementation, stopServer registered an 'exit' listener but removed it only in the already-exited branch. If descendant capture or killTree failed while the owned server remained alive, the function rejected after its bounded waits while that listener and its pending Promise closure remained attached. The added repeated-failed-cleanup test exercises this exact path three times and asserts listenerCount('exit') returns to zero after each call; the changed finally block now provides that lifecycle guarantee.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cleanup-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Desktop/remote packaging materializes target-specific Copilot and OS proxy packages, including the version-matched built-in Copilot native payload.",
+        "CriticalPath": "Package presence/version checks, npm packing, integrity hashing, extraction, and target copying are synchronous on the packaging task's critical path. The diff only extends this path after a recognized transient npm-pack failure; successful first attempts have no added wait.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess/network",
+            "Location": "build/lib/npmPackage.ts:packNpmPackage",
+            "Operation": "Runs `npm pack package@version`, which may access the npm registry.",
+            "Cardinality": "Before: one attempt per cold logical materialization. After: still one on success, up to three serial attempts only when stderr/code identifies a transient network/HTTP failure.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cold materialization ran one synchronous npm-pack subprocess and failed immediately on any error.",
+            "CriticalPathEffect": "The subprocess is required before integrity verification and extraction can proceed; retries can add up to two subprocess durations and two 1-second delays on a transient-failure path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/lib/npmPackage.ts:ensureNpmPackage/materializeNpmPackageVersion/packNpmPackage",
+            "Operation": "Creates/removes private staging directories, deletes partial retry outputs, reads the tarball for SHA-512, and extracts the package.",
+            "Cardinality": "One hash and extraction per successful logical materialization; after the diff, one bounded cleanup of the private staging contents before each of at most two retries.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no retry cleanup because the first npm-pack failure ended materialization and the outer finally removed the staging directory once.",
+            "CriticalPathEffect": "All operations are synchronous on the packaging task, but retry cleanup is bounded by the failed package's staging output and occurs only after transient failures."
+          }
+        ],
+        "ScalingInput": "One logical materialization per required target package for a build target: existing ensure-package directories eliminate the npm call, while a built-in Copilot version mismatch requires one exact-version materialization. Each logical materialization now has at most three serial pack attempts, not per-file fan-out.",
+        "EffectiveConcurrency": "Each materialization is synchronous and retries serially. There is no burst: at most one npm subprocess per materialization is active, and the 1-second waits occur only between recognized transient failures.",
+        "CacheBehavior": "ensureNpmPackage uses package-directory existence as a warm positive cache and performs no npm work when present. Exact-version built-in materialization reuses the app-root package when versions match; otherwise it performs a cold fetch into a private temporary directory. The diff does not change cache keys, coalescing, or negative-cache behavior.",
+        "MechanismConfidence": "High: changed lines explicitly add a three-attempt serial loop, failure classification, private-directory cleanup, and fixed delays around the existing synchronous npm boundary.",
+        "MagnitudeUncertainty": "Registry failure duration and package tarball size vary, but retry count is hard-bounded and successful/warm builds do not pay the retry work.",
+        "Verdict": "No reportable regression. The extra work is deliberately restricted to recognized transient failures, bounded to two retries, preserves one active subprocess at a time, and leaves the common successful and warm-cache paths without extra boundary calls."
+      },
+      {
+        "Scenario": "Agent Host integration/E2E teardown gracefully stops or force-kills an owned test server and then validates/kills captured descendants.",
+        "CriticalPath": "Teardown and crash/restart await the owned server's exit before tests can continue. Snapshot capture and graceful shutdown retain the existing deadline; forced termination is used only after graceful timeout or explicit crash cleanup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/test/node/serverIntegrationTestHelpers.ts:getServerDescendants/isSameWindowsProcessRunning",
+            "Operation": "Queries the native Windows process-tree API for the root snapshot and descendant identity checks.",
+            "Cardinality": "One root snapshot plus the same pre-existing per-descendant identity/retry checks; unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same snapshot and descendant identity-check sequence ran before this change.",
+            "CriticalPathEffect": "These checks are awaited during teardown to avoid leaking or killing reused descendant PIDs."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/base/node/processes.ts:killTree via serverIntegrationTestHelpers.ts:killServer",
+            "Operation": "Spawns taskkill.exe on Windows or terminateProcess.sh through /bin/sh elsewhere to kill the root tree.",
+            "Cardinality": "Zero when graceful shutdown succeeds; one forceful root-tree subprocess after timeout or for explicit kill, both before and after the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "stopServer invoked killTree directly with the same forceful flag and one-call cardinality; killServer also invoked the same boundary.",
+            "CriticalPathEffect": "Teardown waits for root termination. A failed kill still gets the same bounded one-second opportunity for the already-owned process exit event to arrive before surfacing the error."
+          }
+        ],
+        "ScalingInput": "One root server per teardown/restart and the captured descendant list on Windows. Root force-kill cardinality remains at most one; per-descendant process identity checks and bounded retries scale with the same captured descendant count as before.",
+        "EffectiveConcurrency": "Root snapshot and root termination remain sequential. Descendant identity checks/kills use the pre-existing Promises.settled fan-out, with independent bounded retries; the diff does not increase aggregate descendant concurrency.",
+        "CacheBehavior": "No cache is involved. The process-tree snapshot is captured once before the root exits because later discovery is impossible; descendant identities are intentionally re-read after termination to avoid stale PID reuse.",
+        "MechanismConfidence": "High: call sites, process-tree implementation, killTree subprocess implementation, and teardown callers were traced. The diff centralizes root killing and adds unconditional listener cleanup without adding boundary operations.",
+        "MagnitudeUncertainty": "Process-tree query and taskkill latency depend on platform and child count, but changed call cardinality and timeout bounds are explicit.",
+        "Verdict": "No reportable regression. Root kill cardinality, descendant fan-out, and timeout behavior are preserved, while finally blocks bound exit-listener lifetime. The repaired listener-retention regression was recorded separately for regression learning."
+      },
+      {
+        "Scenario": "The new npm-package helper tests exercise success, bounded retry, diagnostics, integrity failure, and extraction failure for both materialization entry points.",
+        "CriticalPath": "Local fixture creation, tar compression, hashing, extraction, and temporary-directory cleanup run synchronously in the build-library test process. Injected pack callbacks avoid npm subprocess and registry work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "build/lib/test/npmPackage.test.ts:createFixture and npmPackage suite",
+            "Operation": "Creates a small package fixture/tarball, hashes and extracts it, and removes isolated temporary directories.",
+            "Cardinality": "One small fixture per generated test case, with at most three injected pack attempts and no network calls.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These helper-specific tests did not exist.",
+            "CriticalPathEffect": "Adds bounded local filesystem work to this targeted build-library test suite only."
+          }
+        ],
+        "ScalingInput": "A fixed test matrix over two entry points and a bounded set of error codes; no input-dependent or repository-size-dependent fan-out.",
+        "EffectiveConcurrency": "Tests use synchronous fixture operations and injected callbacks; each case runs its at-most-three attempts serially with retryDelay set to zero.",
+        "CacheBehavior": "Every case creates an isolated temporary fixture, so no cross-test cache exists; this is intentional test isolation and all directories are removed by test hooks or helper finally blocks.",
+        "MechanismConfidence": "High: every test supplies a local packPackage callback and zero retry delay, so no hidden npm/network boundary is reached.",
+        "MagnitudeUncertainty": "Exact test-run time depends on filesystem speed, but the fixture and matrix are fixed and small.",
+        "Verdict": "No reportable regression. Added test cost is bounded, local, and directly covers the changed retry and cleanup behavior."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and every diff page. No diff-introduced actionable performance issue met the reporting threshold. The bounded npm retry path preserves common-path boundary cardinality, and Agent Host cleanup preserves subprocess/process-query scaling while fixing exit-listener retention; that concrete cleanup-lifecycle fix was recorded with blame."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-24T18:29:17.143878885Z",
+    "CompletedAt": "2026-09-24T18:31:19.03050545Z",
+    "WallClockMilliseconds": 121886,
+    "ModelCalls": 11,
+    "InputTokens": 404377,
+    "OutputTokens": 7473,
+    "TotalTokens": 411850,
+    "ReasoningTokens": 3884,
+    "CacheReadTokens": 350830,
+    "CacheWriteTokens": 53514,
+    "APIDurationMilliseconds": 93193,
+    "ToolCalls": 42,
+    "NanoAIUnits": 55749400000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 350830,
+      "cache_write": 53514,
+      "input": 33,
+      "output": 7473
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

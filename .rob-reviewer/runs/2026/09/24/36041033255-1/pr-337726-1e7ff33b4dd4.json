@@ -1,0 +1,164 @@
+{
+  "PullRequest": {
+    "Number": 337726,
+    "Title": "test: Render component fixtures in parallel",
+    "Body": "Screenshot capture currently renders every component fixture serially in one browser, making it the longest part of the Component Fixtures workflow.\n\nThis change:\n- renders screenshots in two complementary, workload-balanced component explorer shards\n- assigns each shard a separate port-search range to avoid concurrent server startup races\n- validates and merges shard manifests and images into the existing `.screenshots/current` format, preserving downstream error and screenshot-diff checks\n\nAll fixtures remain covered; no screenshot or interaction-test coverage is removed.\n\nValidation:\n- full local sharded render: 3,417 fixtures in 3m34s\n- merged output: 3,417 unique fixture IDs and 0 missing images\n- standalone TypeScript check for `renderFixtures.mts`\n- build tooling typecheck\n- workflow YAML parse and `git diff --check`",
+    "URL": "https://github.com/microsoft/vscode/pull/337726",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "aeschli",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b2ecc9b331104f38e3594217c5fe59a78293fc7e",
+    "HeadRef": "aeschli/agents/component-fixture-render-shards",
+    "HeadSHA": "1e7ff33b4dd48695c3c3c3122160cd8322805f6d",
+    "CreatedAt": "2026-09-24T15:21:33Z",
+    "UpdatedAt": "2026-09-24T15:38:34Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-E49492716316",
+      "Focus": "performance-review",
+      "Path": "test/componentFixtures/renderFixtures.mts",
+      "Side": "RIGHT",
+      "Line": 128,
+      "Severity": "medium",
+      "Confidence": 0.93,
+      "ConfidenceRationale": "The two-process call path and allSettled wait semantics are explicit in the changed file, as is the absence of cancellation ownership. The exact frequency of early process failures is uncertain, which limits severity, but the full-shard cost whenever this trigger occurs is deterministic.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "A component-explorer Node process and its transitive npm/rspack dev server and browser processes, including their CPU and memory usage.",
+      "PerformanceScaling": "The wasted work grows with the number and cost of fixtures assigned to the surviving shard; an immediate failure in one shard leaves nearly a complete half-suite render running.",
+      "PerformanceOutcome": "Delayed failed-workflow latency and wasted CI CPU/memory/subprocess work.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The workflow invoked one component-explorer renderer directly, so a renderer startup or process failure ended the screenshot command without an independent full render continuing on the critical path.",
+      "ChangedBehavior": "The new coordinator starts two renderer subprocesses and awaits them with Promise.allSettled, which cannot return until both subprocesses close even when one has already rejected.",
+      "CausalDiffEvidence": "RIGHT line 128 introduces Promise.allSettled over both newly spawned render shards; the prior workflow line invoked only one renderer and had no sibling process to await after failure.",
+      "Title": "Cancel sibling renderers after the first shard failure",
+      "Impact": "If one shard fails early (for example during server/browser startup or from a shard-specific renderer crash), the failed workflow still waits while the other shard renders its entire share of the fixture suite. This delays CI failure feedback by up to the surviving shard's render time and burns runner CPU, memory, and subprocess capacity even though no merged output can be produced.",
+      "Evidence": "fixtureShards contains two complementary patterns; renderShard spawns a component-explorer CLI process for each, and each CLI reaches the configured npm/rspack server plus browser rendering path. Promise.allSettled at line 128 deliberately waits for both renderShard promises, and no child handle, AbortSignal, or process-tree termination is retained to stop the surviving shard after the first rejection.",
+      "Recommendation": "Retain cancellation ownership for both child process trees and, on the first shard rejection, terminate the remaining renderer/server/browser tree, await child cleanup, then throw the collected failure. Preserve the current all-success merge and ensure cancellation does not leave descendants running."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "cleanup-lifecycle",
+      "boundary-fanout",
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Successful component-fixture screenshot capture and downstream comparison/upload",
+        "CriticalPath": "Both renderShard subprocesses must finish; mergeShards then reads both manifests, validates/sorts all fixture entries, recreates the final directory, copies every referenced image, writes the merged manifest, and removes shard storage before downstream checks, artifact upload, screenshot-service upload, and diffing can proceed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/componentFixtures/renderFixtures.mts:44 renderShard",
+            "Operation": "Spawn component-explorer CLI, which invokes the configured npm run serve-out-rspack server and browser rendering lifecycle.",
+            "Cardinality": "Two concurrent top-level CLI processes after the diff, each serving one disjoint fixture shard; previously one CLI process served the full fixture suite.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The workflow directly launched one component-explorer render process and one associated server/browser lifecycle.",
+            "CriticalPathEffect": "Both must close successfully before merging starts. The added startup is concurrent with rendering and is the intentional tradeoff enabling shard parallelism."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "test/componentFixtures/renderFixtures.mts:77 mergeShards",
+            "Operation": "Read two manifests, recursively replace the final output directory, issue mkdir and copyFile for each image, write one merged manifest, and recursively delete shard output.",
+            "Cardinality": "Two manifest reads, O(N) entry processing, up to one mkdir/copy pair per image-bearing fixture, one manifest write, and two recursive directory removals for the complete suite.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The single renderer wrote directly to .screenshots/current, so there was no shard-manifest merge, per-image copy pass, or shard cleanup.",
+            "CriticalPathEffect": "All merge I/O occurs after rendering and before every downstream consumer; image copies are serial. This adds critical-path work but is bounded by the fixture count and supports the required existing output layout."
+          },
+          {
+            "Kind": "network",
+            "Location": ".github/workflows/component-fixtures.yml:198 Upload screenshots to service",
+            "Operation": "Zip and POST the final screenshot directory, then fetch the base manifest and image data used for screenshot diffs.",
+            "Cardinality": "One screenshot archive upload and one base-manifest fetch per eligible workflow; changed-image fetches continue to scale with actual changed fixtures.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single upload/fetch/diff sequence consumed the direct renderer output.",
+            "CriticalPathEffect": "These remain later workflow steps. The merged output preserves one current directory and does not increase request cardinality."
+          }
+        ],
+        "ScalingInput": "The complete fixture suite, partitioned by two complementary regular expressions. Effective render cardinality remains one render per fixture; merge work scales with all manifest entries and image-bearing fixtures.",
+        "EffectiveConcurrency": "Exactly two renderer coordinators run concurrently, each with its own component-explorer CLI and configured maxSlots=1. After both finish, image mkdir/copy operations and cleanup are serialized by the loop. Downstream artifact/network steps remain serialized by workflow step order.",
+        "CacheBehavior": "Each shard starts independently with no coordinator-level cache or coalescing; each reaches a cold server/browser startup. The prebuilt static explorer exists earlier in the workflow, but the configured render server command still starts rspack serve per shard. The merge has no incremental/warm path and recreates current output on every run.",
+        "MechanismConfidence": "High: process count, partitioning, serialization, filesystem operations, workflow ordering, and downstream boundary cardinality are explicit in the changed code and configuration.",
+        "MagnitudeUncertainty": "The exact CPU/memory cost of a second rspack/browser lifecycle and the duration of the serial image-copy pass depend on runner hardware and image sizes. The PR's stated successful-run timing indicates the intended parallelism can outweigh those costs, so they do not independently establish a regression.",
+        "Verdict": "No additional finding for the successful path: the diff intentionally trades one extra cold renderer/server/browser lifecycle and an O(N) merge for two-way fixture parallelism, while preserving effective fixture and downstream network cardinality. Repository evidence does not establish that the added startup or merge outweighs the intended wall-clock reduction."
+      },
+      {
+        "Scenario": "One render shard fails before its sibling completes",
+        "CriticalPath": "The first rejection does not make progress toward failure reporting because Promise.allSettled waits for the other renderShard promise to close; only then does main construct AggregateError. Merge and downstream output consumers do not run.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/componentFixtures/renderFixtures.mts:128 main",
+            "Operation": "Await both component-explorer renderer process trees with Promise.allSettled after one has rejected.",
+            "Cardinality": "One otherwise unnecessary surviving CLI/server/browser tree can continue across all fixtures in its shard per failed workflow.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was only one direct renderer process, so its process failure ended the capture command without an independent sibling render remaining.",
+            "CriticalPathEffect": "The surviving process remains directly on the failure-reporting critical path because allSettled cannot resolve first; this can delay failure by the remainder of a full shard."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "test/componentFixtures/renderFixtures.mts:37 renderShard and CLI target output",
+            "Operation": "The surviving renderer continues writing its shard manifest and screenshot images that will not be merged after any failure.",
+            "Cardinality": "Up to all image-bearing fixtures in the surviving shard.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No sibling shard existed to generate unusable output after the sole renderer had failed.",
+            "CriticalPathEffect": "These writes consume runner I/O while failure reporting waits, but produce no usable final output."
+          }
+        ],
+        "ScalingInput": "The remaining fixtures assigned to the surviving shard. An early failure in one shard leaves nearly its sibling's entire partition as wasted work.",
+        "EffectiveConcurrency": "Two shards start concurrently. After one fails, effective useful concurrency becomes zero, but the sibling subprocess tree continues at one-shard concurrency with no cancellation or backpressure until completion.",
+        "CacheBehavior": "No failed-result cache or cancellation coalescing exists. The surviving shard continues its already-started cold rspack/server/browser lifecycle and fixture rendering even though its output cannot be merged.",
+        "MechanismConfidence": "High: allSettled semantics, two spawned processes, full-shard promises, and absence of any retained cancellation handle are explicit.",
+        "MagnitudeUncertainty": "Early process-level failures are less frequent than successful runs and exact remaining duration depends on when failure occurs. The deterministic worst realistic trigger is server/browser startup failure in one shard while the other proceeds through its partition.",
+        "Verdict": "Reportable cleanup/cancellation regression: failed runs can wait for and pay for a complete surviving shard even though success is already impossible."
+      }
+    ],
+    "Summary": "Reviewed all three changed files and traced successful and failed screenshot-capture workflows through renderer/server/browser subprocesses, manifest/image filesystem work, and downstream artifact/network consumers. Submitted one performance finding for missing sibling cancellation on shard failure; no separate successful-path regression was proven because the added bounded startup/merge work is the explicit parallelization tradeoff and stated workflow goal."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-24T18:35:42.514159931Z",
+    "CompletedAt": "2026-09-24T18:37:43.904135728Z",
+    "WallClockMilliseconds": 121389,
+    "ModelCalls": 10,
+    "InputTokens": 269656,
+    "OutputTokens": 7101,
+    "TotalTokens": 276757,
+    "ReasoningTokens": 3555,
+    "CacheReadTokens": 226632,
+    "CacheWriteTokens": 42994,
+    "APIDurationMilliseconds": 106838,
+    "ToolCalls": 42,
+    "NanoAIUnits": 44776280000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 226632,
+      "cache_write": 42994,
+      "input": 30,
+      "output": 7101
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
