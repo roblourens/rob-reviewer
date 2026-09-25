@@ -1,0 +1,169 @@
+{
+  "PullRequest": {
+    "Number": 337982,
+    "Title": "Keep picker changes made while a new session is starting",
+    "Body": "Fixes #337981\n\nIn the Agents window, if you changed a picker right after sending the first message of a new session, the change was lost once the session finished starting. This affected the permission level, mode, sandbox, model and agent pickers. With this fix, the session keeps what you picked.\n\n## What the fix does\n\nWhile a new session is starting, picker changes only update a local draft. The fix passes the draft's latest picks on to the session once it is ready:\n\n- **Model and agent:** the session now gets the draft's latest model (including its model settings) and agent, instead of the ones from before the first message. Both are sent with every message, so follow-up messages use them. If you switch back to the default agent while waiting, that is kept too.\n- **Permission level, mode, sandbox and other session settings:** the fix compares the draft's settings with the ones sent with the first message. It then sends the agent host one update containing only the settings that changed and that a running session is allowed to change.\n\nThese settings are sent once the session is ready, not right away. Just after the first message goes out, the original settings are sent to the host again, and that would overwrite an earlier update.\n\nThe code that sends a settings update to a running session is now a small shared helper, `_dispatchRunningSessionConfig`, used by both the existing picker path and this one.\n\n## Tests\n\nFour new tests in `localAgentHostSessionsProvider.test.ts` change a picker while a new session is starting, then check that the session and follow-up messages use the new value:\n- the permission level;\n- the model and its settings;\n- the custom agent;\n- switching back to the default agent.\n\nAll four fail without the fix. The local and remote Agent Host provider test suites pass.\n\n## Not included\n\nOther actions taken while a new session is starting (rename, mark unread, delete, archive, stop, Agent Merge, sending a second message) fail for related reasons, but need separate fixes.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337982",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "bda2b9e790a8c5ae641e494fbaefd5a328c86287",
+    "HeadRef": "benibenj/agents/fix-agent-host-picker-bug-session-commit",
+    "HeadSHA": "6130ef4b601b4541b381bebce54439e66d9dfaee",
+    "CreatedAt": "2026-09-25T15:31:39Z",
+    "UpdatedAt": "2026-09-25T15:48:54Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "serialization-allocation",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Change a mutable picker on an already-running Agent Host session",
+        "CriticalPath": "The picker update normalizes one value, updates the local running-config cache, and synchronously queues one action dispatch; resolveSessionConfig is launched without awaiting it and is off the interaction critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_dispatchRunningSessionConfig",
+            "Operation": "Dispatch SessionConfigChanged to the Agent Host.",
+            "Cardinality": "One dispatch per picker mutation after filtering the one supplied property against the session schema.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The prior single-property implementation dispatched the same one action per accepted mutable picker mutation.",
+            "CriticalPathEffect": "The dispatch call is synchronous queueing on the interaction path, but does not await host processing."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_resolveRunningSessionConfig",
+            "Operation": "Request authoritative configuration resolution from the Agent Host/provider.",
+            "Cardinality": "One asynchronous request per accepted picker mutation; stale responses are suppressed by a per-session sequence number.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The prior single-property implementation launched the same asynchronous resolution after each dispatch.",
+            "CriticalPathEffect": "Fire-and-forget and therefore off the picker interaction critical path."
+          }
+        ],
+        "ScalingInput": "The helper receives one property from the existing picker path, so filtering/allocation remains O(1) per user mutation; config-cache cloning scales with the bounded session configuration just as before.",
+        "EffectiveConcurrency": "Resolution requests can overlap, with last-response application guarded per session by _runningSessionConfigResolveSeq; the diff does not increase request cardinality or concurrency on this existing path.",
+        "CacheBehavior": "Requires the existing _runningSessionConfigs and _sessionCache entries; there is no new cache key, miss retry, or retention behavior.",
+        "MechanismConfidence": "High: the pre- and post-diff helper bodies and resolve call path establish identical one-dispatch/one-resolution behavior for this scenario.",
+        "MagnitudeUncertainty": "Exact IPC and provider resolution duration varies by Agent Host provider, but this path has unchanged boundary cardinality.",
+        "Verdict": "No reportable regression; the refactor adds constant-size entry filtering for a one-key input while preserving expensive boundary counts."
+      },
+      {
+        "Scenario": "Change a mutable session setting while the first request is waiting for the new session to commit",
+        "CriticalPath": "The first chat send and session-commit wait are pre-existing critical-path work. Once the committed session is available, the diff compares the draft snapshot with the originally sent snapshot, queues one filtered SessionConfigChanged action, and starts an unawaited configuration re-resolution before returning the committed session.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_sendNewSessionRequest",
+            "Operation": "Existing first chat request and wait for the Agent Host to announce the committed session.",
+            "Cardinality": "One first-request send and one commit wait per new session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same first-request send and commit wait occurred before the diff.",
+            "CriticalPathEffect": "These must complete before the draft can graduate to a running session."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:6112 via _dispatchRunningSessionConfig",
+            "Operation": "Send the mutable settings that changed after the first request snapshot to the newly committed Agent Host session.",
+            "Cardinality": "At most one grouped dispatch per committed new session, only when at least one changed property is sessionMutable; all changed mutable properties share the action.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No post-commit settings action was sent, so picker edits made during commit were not replayed.",
+            "CriticalPathEffect": "Synchronous queueing occurs after commit, while host application is asynchronous; there is no per-property fan-out."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_resolveRunningSessionConfig",
+            "Operation": "Re-resolve the grouped changed configuration against the provider/Agent Host.",
+            "Cardinality": "One fire-and-forget request after the grouped dispatch, not one request per property.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No post-commit re-resolution occurred because there was no replay dispatch.",
+            "CriticalPathEffect": "The promise is not awaited, so provider resolution is off the session-return critical path."
+          }
+        ],
+        "ScalingInput": "Snapshot comparison is O(P) in the number of resolved session configuration properties; expensive boundary cardinality remains one grouped dispatch plus one resolution regardless of how many properties changed.",
+        "EffectiveConcurrency": "One replay can be in flight per newly committed session. Separate simultaneously created sessions can resolve concurrently, but this user workflow normally has low concurrency and introduces no per-property burst.",
+        "CacheBehavior": "The committed running-config cache is seeded from the draft immediately before replay, enabling schema filtering without a cold read. There is no added persistent cache or negative-cache behavior.",
+        "MechanismConfidence": "High: the changed line groups all changed values, the helper emits one action, and _resolveRunningSessionConfig is explicitly invoked without awaiting.",
+        "MagnitudeUncertainty": "Provider resolution cost is implementation-dependent and concurrent multi-session creation is uncommon, but the one-request mechanism and off-critical-path placement are established.",
+        "Verdict": "No reportable performance regression. The added remote work is a single bounded, grouped replay needed for the new behavior, with authoritative resolution off the critical path rather than fan-out by property."
+      },
+      {
+        "Scenario": "Change model or custom/default agent while a new session is committing, then send a follow-up message",
+        "CriticalPath": "After the existing commit wait, the diff reads the latest local draft observables/configuration and updates the committed adapter. The later follow-up chat send remains the external request on that later message's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_sendNewSessionRequest",
+            "Operation": "Existing first chat send and session commit notification.",
+            "Cardinality": "One per new session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The first chat send and commit wait already occurred.",
+            "CriticalPathEffect": "Must complete before latest selections are transferred to the committed adapter."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:subsequent sendRequest path",
+            "Operation": "Send a later user message with the selected model and agent metadata.",
+            "Cardinality": "One request per user follow-up message.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Follow-up messages already crossed the same send boundary; the diff only changes which locally selected metadata they carry.",
+            "CriticalPathEffect": "This is the follow-up message's normal critical path."
+          }
+        ],
+        "ScalingInput": "Constant work per committed session: local observable reads, one model-configuration lookup, and adapter state updates; no loop over sessions, messages, or models is added.",
+        "EffectiveConcurrency": "No new asynchronous operation or limiter behavior is introduced for model/agent preservation; concurrency follows existing session commits and later message sends.",
+        "CacheBehavior": "Language-model metadata and automation model configuration use existing local services/maps; the diff adds no cache, miss path, or retention lifecycle.",
+        "MechanismConfidence": "High: the changed model/agent code contains local reads and adapter setters and does not invoke an external boundary.",
+        "MagnitudeUncertainty": "None material for the mechanism; the changed operations are local and constant-cardinality.",
+        "Verdict": "No reportable performance regression; the change substitutes current draft selections for captured selections without adding expensive work or boundary calls."
+      }
+    ],
+    "Summary": "Completed the performance pass over the complete two-file diff. Traced the running-picker and new-session commit paths through IPC/provider resolution, compared pre/post boundary counts, and checked grouping, cache state, concurrency, allocation, and critical-path placement. No high-confidence actionable performance issue was introduced."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T22:02:08.767759774Z",
+    "CompletedAt": "2026-09-25T22:03:25.951135271Z",
+    "WallClockMilliseconds": 77183,
+    "ModelCalls": 10,
+    "InputTokens": 259043,
+    "OutputTokens": 4877,
+    "TotalTokens": 263920,
+    "ReasoningTokens": 1508,
+    "CacheReadTokens": 217255,
+    "CacheWriteTokens": 41758,
+    "APIDurationMilliseconds": 61940,
+    "ToolCalls": 37,
+    "NanoAIUnits": 39335200000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 217255,
+      "cache_write": 41758,
+      "input": 30,
+      "output": 4877
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

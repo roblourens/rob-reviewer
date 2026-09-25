@@ -1,0 +1,171 @@
+{
+  "PullRequest": {
+    "Number": 337985,
+    "Title": "sessions: Fix Stop and Mark as Done while a new session is being created",
+    "Body": "Fixes #337984\n\n## The problem\n\nWhen you send the first message of a new session, the session isn't ready right away. The agent host sets it up first, which takes a few seconds with worktree isolation. During those seconds:\n\n- **Stop** left the session at \"Working…\" forever, until you reloaded the window.\n- **Mark as Done** did nothing.\n\nThe window only has a draft of the session until the host tells it about the real session. The host did that only after the agent received the first message.\n\n## What this fixes\n\n### Stop\n\nIf the first message is stopped before the agent gets it, the host now tells the window about the session anyway. The session shows up as a normal, idle session with the stopped message, instead of spinning forever.\n\nThe host also includes the worktree it just created, so your next message runs in that worktree, not in your main folder. Without this, the next message would have run in the original folder, because the worktree is no longer marked as pending once it exists.\n\n### Mark as Done\n\nIf you mark a new session as done before the host has told the window about it:\n\n- The draft is marked as done right away, so it moves to Done immediately.\n- The real session is marked as done as soon as it arrives.\n- If that step fails (for example the Dev Container worktree step in the remote provider), the error is logged. Before, a failure there would have thrown away a session that had already been created.\n\nThe remote and cloud sandbox providers get the same handling.\n\n## Tests\n\nNew regression tests:\n\n- `agentSideEffects.test.ts`: a first message stopped during working-directory resolution announces the session, doesn't send the message to the agent, and doesn't mark creation as failed.\n- `agentService.test.ts`: the announced session has the worktree, project and branch, and the next message runs in the worktree.\n- `localAgentHostSessionsProvider.test.ts`:\n  - marking as done before the host announces the session archives the draft, then the real session;\n  - an unarchive after the host announced the session but before commit isn't undone at commit.\n- `remoteAgentHostSessionsProvider.test.ts`: a failing Dev Container archive at commit doesn't break the new session.\n\n## Known limitations\n\n- The session still shows \"Working…\" until the worktree is ready, then it becomes idle.\n- If Stop is clicked before the window has even sent the message to the host, the session can still stay at \"Working…\". This window is usually very short, but it includes the workspace-trust prompt, and declining trust has the same effect.\n- A session whose first message was stopped can disappear after the agent host restarts, just like sessions whose creation failed.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337985",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "cd8ca560b3f1365a93dc1cd488b90cef9083aaa5",
+    "HeadRef": "agents/fix-agent-window-bugs-session-creation",
+    "HeadSHA": "7b2eacf400c23cff5f9c8b7108dad4d9cf5a1f89",
+    "CreatedAt": "2026-09-25T15:36:10Z",
+    "UpdatedAt": "2026-09-25T16:19:45Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-3559067926FD",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts",
+      "Side": "RIGHT",
+      "Line": 6113,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The await is directly added to the foreground commit path; callers await `provider.sendRequest` before firing `onDidStartSession`/`onDidSendRequest`. The remote call path is explicit and performs extension IPC plus filesystem/database and Git subprocess work. The exact duration varies with repository/worktree size and dirtiness, but critical-path placement and the scaling mechanism are certain.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "Extension/agent-host IPC, detached-worktree database writes, filesystem operations, and Git subprocess work (`status`/commit/worktree removal)",
+      "PerformanceScaling": "One archival cleanup is added per new session marked done before commit; its latency grows with remote IPC latency, dirty-file count and commit cost, and worktree/repository size during removal. Different sessions can also perform this cleanup concurrently because sequencing is only per session.",
+      "PerformanceOutcome": "Blocked foreground send completion and delayed draft-to-committed-session replacement",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before the diff, archiving the unannounced draft was a no-op, so once `_waitForNewSession` found the backend session, the send path graduated and replaced the draft without awaiting worktree cleanup.",
+      "ChangedBehavior": "A draft archived while its first request is still materializing now causes the newly discovered backend session to be archived synchronously inside `_sendNewSessionRequest`, delaying session graduation, replacement notification, and the provider's send promise until detached-worktree cleanup completes.",
+      "CausalDiffEvidence": "The added RIGHT-side line 6113 awaits `this.archiveSession(committedSession.sessionId)` before `newSession.graduate()`, `_onDidReplaceSession.fire(...)`, and returning from `_sendNewSessionRequest`. For `RemoteAgentHostSessionsProvider`, that call awaits `_setDetachedWorktreeArchived`, which crosses an extension/agent-host request and reaches `setDetachedWorktreeArchived`; the implementation writes DB metadata, checks/commits worktree changes, and runs Git worktree removal before resolving.",
+      "Title": "Move worktree archival off the send commit path",
+      "Impact": "When a user marks a newly created remote Dev Container session done before the host announces it, the session can remain in the in-flight send lifecycle and keep showing the draft instead of the committed session for the full worktree cleanup duration. Dirty or large repositories can add seconds or more of latency even though the draft was already moved to Done immediately.",
+      "Evidence": "`_sendNewSessionRequest` awaits the added archive call before firing `_onDidReplaceSession` and returning. `RemoteAgentHostSessionsProvider.archiveSession` queues and awaits `_setArchivedWithDetachedWorktree`, which awaits `_setDetachedWorktreeArchived`; that invokes `connection.setDetachedWorktreeArchived`. The worktree implementation persists archive metadata and `cleanupWorktreeOnArchive` may run `hasUncommittedChanges`, `commitAll`, and `removeWorktree`. `SessionsManagementService` in turn awaits `provider.sendRequest` before completing the request activity and publishing send-complete events.",
+      "Recommendation": "Keep the immediate draft archive state, but do not await detached-worktree cleanup before graduating/replacing the session. Apply the committed session's archived state optimistically, fire the replacement and complete the send, then run the existing per-session sequenced archival in the background with the current logging/rollback behavior so archive/unarchive ordering remains intact."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "eager-work",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Stop the first message while a provisional session is resolving or creating its worktree.",
+        "CriticalPath": "Cancellation must still wait for the already-running working-directory resolution before the new announcement can occur. The added summary publication and notification dispatch are synchronous after resolution; the added Git-state refresh is launched without awaiting it and is therefore off the cancellation/announcement critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentSideEffects.ts `_runSendMessage`",
+            "Operation": "Resolve/create the isolated working directory before the first send.",
+            "Cardinality": "One existing worktree-resolution operation for the first turn; only one announcement is reached because either cancellation check returns immediately.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same working-directory resolution already completed before cancellation was observed.",
+            "CriticalPathEffect": "Worktree resolution remains on the pre-existing send/cancel critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts `_announceUnsentProvisionalSession`",
+            "Operation": "Publish the provisional session summary and resolved root to connected clients.",
+            "Cardinality": "One session-added notification plus, when the primary root changes, one working-directory replacement action.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No session-added notification was emitted for this cancellation path.",
+            "CriticalPathEffect": "Synchronous publication occurs after working-directory resolution and makes the canceled session visible to the window."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts `_announceUnsentProvisionalSession` -\u003e AgentHostGitStateService.refreshSessionGitState",
+            "Operation": "Query Git state for the resolved worktree and persist changed metadata.",
+            "Cardinality": "At most one newly launched refresh for the worktree replacement; keyed throttling bounds overlap for the session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The canceled pre-materialization path did not launch this refresh.",
+            "CriticalPathEffect": "Fire-and-forget and off the announcement critical path."
+          }
+        ],
+        "ScalingInput": "One provisional session/turn and its resolved working-directory set; metadata work scales with root/chat count, while the introduced Git refresh is one per changed primary root.",
+        "EffectiveConcurrency": "One first-send pipeline runs per affected turn. Git-state refresh is throttled by session key, so overlapping refreshes coalesce/serialize per session rather than fan out unboundedly.",
+        "CacheBehavior": "No cache controls the cancellation path. Working-directory resolution/worktree creation is the existing first-send operation; `markSessionPersisted` is idempotent after the first announcement, and Git refreshes are throttled per session. A repeated cancellation after announcement performs metadata comparison but does not replace the root or launch the new Git refresh unless the resolved primary root changes.",
+        "MechanismConfidence": "High: the cancellation checks, lifecycle guard, idempotent announcement, and fire-and-forget throttled Git refresh were traced directly.",
+        "MagnitudeUncertainty": "Worktree creation duration is environment-dependent, but it is pre-existing. The newly added background Git refresh has variable cost and a narrow cancellation trigger; it does not block announcement, so it does not independently justify a finding.",
+        "Verdict": "No reportable regression. The required publication adds bounded synchronous metadata work and one off-critical-path, per-session-throttled Git refresh; the dominant worktree creation was already present."
+      },
+      {
+        "Scenario": "Mark a newly sent session Done before the host announces it, then commit it across local, remote Dev Container, and cloud-sandbox providers; optionally unarchive during remote cleanup.",
+        "CriticalPath": "The draft moves to Done immediately. Once `_waitForNewSession` discovers the real session, the added awaited `archiveSession` is now on the foreground `provider.sendRequest` critical path and precedes session graduation, replacement notification, `onDidStartSession`, and `onDidSendRequest`. For remote Dev Container sessions this await includes worktree cleanup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts `_sendNewSessionRequest` -\u003e `_setSessionArchived`",
+            "Operation": "Dispatch `SessionIsArchivedChanged` to the Agent Host.",
+            "Cardinality": "One archive action dispatch for a local Agent Host session after commit.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Archiving an unannounced draft did not dispatch an action and session replacement proceeded without this work.",
+            "CriticalPathEffect": "Awaited by the added commit block, although dispatch itself is synchronous and small for local sessions."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/remoteAgentHost/browser/remoteAgentHostSessionsProvider.ts `_setDetachedWorktreeArchived`",
+            "Operation": "Request archive handling for the detached Dev Container worktree.",
+            "Cardinality": "One extension/agent-host request for a committed remote session with detached-worktree metadata; no call for sessions without that metadata.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This boundary was used for normal archives, but was not on the pending-new-session commit path.",
+            "CriticalPathEffect": "Awaited before the send resolves and before draft replacement."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts `setDetachedWorktreeArchived` / `cleanupWorktreeOnArchive`",
+            "Operation": "Persist archive metadata, inspect/commit dirty changes, and remove the Git worktree.",
+            "Cardinality": "One metadata update and one cleanup sequence per affected archived draft. Cleanup can issue existence/branch/dirty-state checks, an optional commit, and worktree removal.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No worktree archival was performed while committing a draft whose early archive action had previously been ignored.",
+            "CriticalPathEffect": "Transitively awaited by the new commit-path archive call."
+          }
+        ],
+        "ScalingInput": "One operation per draft marked done before commit; cost scales with remote round-trip time, dirty-file/commit work, worktree size, and concurrently archived sessions across distinct keys.",
+        "EffectiveConcurrency": "Archive/unarchive calls are serialized by session ID through `SequencerByKey`, preserving order for one session. Different sessions are not globally limited and can perform worktree operations concurrently, though the realistic trigger is one explicit user action per newly created session.",
+        "CacheBehavior": "The draft archive state is stored in the existing `NewSession` object until discovery. On commit, local and cloud providers update existing cached session adapters; remote Dev Container worktree archival does not use a result cache because it mutates authoritative archive/checkout state. Failed operations are not negatively cached and explicit later actions retry.",
+        "MechanismConfidence": "Very high: the added await, the send lifecycle callers, remote IPC, database mutation, Git calls, and per-key sequencing were traced end to end.",
+        "MagnitudeUncertainty": "Exact latency depends on remote IPC, repository size, dirty files, and Git/filesystem performance. The operation may be fast for clean small worktrees, but the placement on the foreground send path and potentially expensive Git cleanup are certain.",
+        "Verdict": "Reportable medium-severity latency regression for remote Dev Container sessions: expensive cleanup is newly awaited before foreground send completion and draft replacement. Per-session sequencing correctly bounds archive/unarchive ordering and does not leak keys; cloud-sandbox handling is local-only and does not share this expensive boundary."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 10 changed files and their relevant call paths. One introduced critical-path regression was reported: committing an early-archived remote Dev Container session now waits for IPC and Git worktree cleanup. Provisional-session announcement after cancellation is bounded, idempotent, and launches its only new Git boundary off the critical path."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T22:07:47.633785503Z",
+    "CompletedAt": "2026-09-25T22:09:36.344796626Z",
+    "WallClockMilliseconds": 108711,
+    "ModelCalls": 11,
+    "InputTokens": 483349,
+    "OutputTokens": 7673,
+    "TotalTokens": 491022,
+    "ReasoningTokens": 2835,
+    "CacheReadTokens": 416635,
+    "CacheWriteTokens": 66681,
+    "APIDurationMilliseconds": 96056,
+    "ToolCalls": 58,
+    "NanoAIUnits": 65365100000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 416635,
+      "cache_write": 66681,
+      "input": 33,
+      "output": 7673
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
