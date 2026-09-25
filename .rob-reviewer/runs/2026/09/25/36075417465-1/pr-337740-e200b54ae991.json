@@ -1,0 +1,128 @@
+{
+  "PullRequest": {
+    "Number": 337740,
+    "Title": "api: Preserve snippet whitespace in returned code actions",
+    "Body": "Fixes #325990\n\nCode actions retrieved through `vscode.executeCodeActionProvider` now retain `SnippetTextEdit.keepWhitespace` when their workspace edits are applied. Previously, the command round trip dropped the flag, allowing the editor to reindent whitespace the provider had already prepared.\n\nCopy the flag when converting a workspace edit back to the extension API and extend the existing snippet round-trip test with a whitespace assertion. No new test cases are added.\n\n### Manual verification\n\nReproduced in Windows Code OSS 1.140.0 Dev: direct application preserved two spaces, while applying the command's returned edit expanded them to four. Verified the fix in a launched OSS window and repeated the check in a fresh instance after review; the returned edit now preserves the two spaces and snippet placeholder selection.",
+    "URL": "https://github.com/microsoft/vscode/pull/337740",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "amunger",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ab20c7e767dd9ad266dc9b6dbe2936745d738700",
+    "HeadRef": "amunger/fix-snippet-keep-whitespace",
+    "HeadSHA": "e200b54ae9917bef1a4fdbad462e9b9052a53350",
+    "CreatedAt": "2026-09-24T16:15:33Z",
+    "UpdatedAt": "2026-09-24T23:33:09Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "An extension invokes vscode.executeCodeActionProvider, receives code actions containing snippet WorkspaceEdits, and may apply a returned edit.",
+        "CriticalPath": "The existing API command executes the provider and returns its DTO across the command/extension-host boundary; extHostApiCommands then synchronously converts each returned code action and each workspace edit before resolving the extension's command promise. If the extension later calls workspace.applyEdit, that is a separate existing IPC and apply path. The new keepWhitespace assignment is synchronous scalar work inside the already-required per-edit conversion and adds no wait or boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostApiCommands.ts:311-333",
+            "Operation": "Execute the code-action provider command and receive code-action/workspace-edit DTOs in the extension host.",
+            "Cardinality": "One command invocation per extension request; the response can contain multiple code actions and edits, but conversion remains one pass over those existing results.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same command/provider round trip returned the same workspace-edit DTO, including keepWhitespace, and ran the same linear conversion; the converter simply failed to copy that one field into SnippetTextEdit.",
+            "CriticalPathEffect": "The provider response must arrive before the command promise resolves; this boundary and its placement are unchanged."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostBulkEdits.ts:32-33",
+            "Operation": "Serialize and send a WorkspaceEdit to the main thread when the extension explicitly applies the returned edit.",
+            "Cardinality": "At most one IPC per workspace.applyEdit call, containing all edits; no per-edit IPC is created by this change.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Applying a returned edit already used one bulk-edit IPC with the whole DTO; the patch only preserves a primitive option during the earlier round trip.",
+            "CriticalPathEffect": "This later boundary must complete for application, but it is not invoked by WorkspaceEdit.to and is unchanged by the diff."
+          }
+        ],
+        "ScalingInput": "Number of returned code actions and total text edits. WorkspaceEdit.to already performs O(E) object conversion and grouping; the patch adds one primitive property read/write only for the snippet subset, with no extra collection, parsing, serialization pass, or retained object.",
+        "EffectiveConcurrency": "The command is promise-based and result conversion is synchronous after the response. The patch adds no task, Promise, loop, queue, or concurrency burst; optional application remains one bulk IPC.",
+        "CacheBehavior": "No cache exists in this converter, and the patch changes no provider cache, key, coalescing, positive/negative result handling, or cold/warm behavior.",
+        "MechanismConfidence": "High: the changed line and both production callers were traced, and the downstream bulk-apply path confirms no additional boundary or multiplicity.",
+        "MagnitudeUncertainty": "Exact edit counts vary by provider, but the incremental cost is a constant scalar assignment per snippet and does not materially affect the existing linear conversion even for large responses.",
+        "Verdict": "No reportable regression. The diff preserves metadata within existing objects and loops without changing allocation cardinality, IPC count, parsing, concurrency, or retained lifetime."
+      },
+      {
+        "Scenario": "An extension invokes vscode.executeDocumentRenameProvider and receives a WorkspaceEdit that may contain snippet edits.",
+        "CriticalPath": "The existing rename-provider command/IPC must complete, then WorkspaceEdit.to synchronously converts the returned edits before resolving. The added assignment occurs in the existing per-edit branch and does not add a boundary or additional traversal.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostApiCommands.ts:201-214",
+            "Operation": "Execute the rename provider and return one workspace-edit DTO to the extension host.",
+            "Cardinality": "One provider command boundary per rename request; all returned edits are carried together and converted once.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider boundary and O(E) conversion occurred, but SnippetTextEdit.keepWhitespace was omitted from the reconstructed API object.",
+            "CriticalPathEffect": "The existing provider round trip is on the rename command's critical path; the patch does not introduce or move it."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostBulkEdits.ts:32-33",
+            "Operation": "Send the reconstructed WorkspaceEdit as one bulk request if the extension applies it.",
+            "Cardinality": "One IPC per explicit apply call regardless of edit count; no new fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one-request bulk application path existed before the diff.",
+            "CriticalPathEffect": "Required only for a subsequent apply action and unchanged by the converter patch."
+          }
+        ],
+        "ScalingInput": "Total edits in the rename WorkspaceEdit, with one pre-existing conversion iteration per edit and one additional scalar assignment per snippet edit.",
+        "EffectiveConcurrency": "A single asynchronous provider request followed by synchronous conversion; no new parallel work, limiter interaction, or burst.",
+        "CacheBehavior": "No cache or coalescing exists in WorkspaceEdit.to, and the diff does not alter rename-provider caching or reuse.",
+        "MechanismConfidence": "High: this is the converter's other production API-command caller, and its full before/after work differs only by the field copy.",
+        "MagnitudeUncertainty": "Snippet edits in rename responses may be uncommon, but prevalence does not affect the conclusion because there is no scaling or boundary amplification mechanism.",
+        "Verdict": "No reportable regression. Runtime cost and resource lifetime are materially unchanged."
+      }
+    ],
+    "Summary": "Completed the performance pass over the full two-file diff. The sole runtime change copies an optional boolean during an existing O(E) WorkspaceEdit conversion; it adds no meaningful allocation, extra pass, boundary call, cache state, retained lifetime, scheduling change, or concurrency. No findings and no qualifying performance-regression fix were identified."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T00:06:41.41072254Z",
+    "CompletedAt": "2026-09-25T00:07:59.279750972Z",
+    "WallClockMilliseconds": 77869,
+    "ModelCalls": 8,
+    "InputTokens": 150746,
+    "OutputTokens": 3358,
+    "TotalTokens": 154104,
+    "ReasoningTokens": 864,
+    "CacheReadTokens": 122153,
+    "CacheWriteTokens": 28569,
+    "APIDurationMilliseconds": 65630,
+    "ToolCalls": 30,
+    "NanoAIUnits": 25896220000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 122153,
+      "cache_write": 28569,
+      "input": 24,
+      "output": 3358
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "PullRequest": {
+    "Number": 337810,
+    "Title": "chat: Gate Discover separately and default the GitHub Feed on",
+    "Body": "## Summary\n\nProvide the small shared base for the MCP Gallery, Plugin marketplace, and Copilot Connectors PRs.\n\n- Add default-off `chat.customizations.marketplace.enabled` to control whether Agent Customizations shows Discover instead of the original Overview. Toggling it replaces the visible home surface and cancels stale discovery; Marketplace installation is unavailable while it is off.\n- Default `chat.customizations.marketplace.sources.publicFeed.enabled` **on**, independently of Marketplace visibility. The GitHub Feed can still be disabled. With Marketplace visibility off, this change preserves Overview and existing management-page catalogs rather than starting Discover requests.\n- Hard-gate the GitHub Feed itself on **both** switches: when Marketplace or the Feed is disabled, no public-feed query or installation can start, and toggling either cancels in-flight work. Other feeds with existing management-page catalogs can still serve those legacy pages while Marketplace is hidden.\n- Provide an internal adapter-assigned priority for Marketplace entries. Browse shows higher-priority custom entries first and interleaves equal-priority entries round-robin across pages; search keeps global relevance order and uses priority (then round-robin) to break equal scores. Priority never appears as a quality or trust rating.\n\n## Verification\n\n- 141 focused source-gating, ranking, and installation tests passed, including Marketplace-off cancellation and rejection of direct GitHub Feed queries even when its own setting is on.\n- Client typecheck, changed-file ESLint/formatter, layer check, and diff check passed.\n- Overview with the enabled GitHub Feed but Marketplace visibility off, Overview with no source, and Discover with another source only all rendered in dark and light component fixtures without errors.\n\n## Manual test\n\n1. With neither setting explicitly configured, open Agent Customizations: Overview and the existing MCP/Plugin Available sections remain; no Discover catalog is queried.\n2. Enable `chat.customizations.marketplace.enabled`: Discover appears and the default-enabled GitHub Feed can be browsed without signing in.\n3. Disable the GitHub Feed: Discover returns to Overview when no other feed is enabled. Re-enable it and verify the catalog loads afresh.\n4. Turn Marketplace visibility off during a GitHub Feed query or skill import and verify cancellation, no new feed calls (including direct catalog IPC), and the original Overview. Legacy MCP/Plugin management catalogs remain usable.\n5. With independently enabled test feeds, verify higher-priority custom entries precede default entries in browsing and equal-priority feeds round-robin across page boundaries; search still orders by relevance before priority.\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337810",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "pwang347",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "900242820970f0ff3f0d40abd10f34c3d26ddbf6",
+    "HeadRef": "pwang/marketplace-visibility-base",
+    "HeadSHA": "4cc55326cb6be8a928cefb332a46a9c89d9afff7",
+    "CreatedAt": "2026-09-24T21:02:29Z",
+    "UpdatedAt": "2026-09-24T23:51:19Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "eager-work",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "synchronous-ui-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open Agent Customizations with default settings, where Marketplace visibility is off and the GitHub Feed setting now defaults on",
+        "CriticalPath": "The welcome page reads Marketplace/source configuration, chooses the original Overview, and never constructs the Discover page. The lazy marketplace query service/provider is not dereferenced, so catalog work is off the critical path and absent.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Configuration filtering is O(S) in registered marketplace sources; production currently registers one source.",
+        "EffectiveConcurrency": "No catalog request, IPC call, provider initialization, or network operation runs. Configuration checks are synchronous and serial.",
+        "CacheBehavior": "Neither the renderer browse cache nor service continuation cache is populated. There is no cold request, and warm behavior is unchanged because Discover was never entered.",
+        "MechanismConfidence": "High: the welcome page uses getVisibleCustomizationMarketplaceSources, the public source requires visibility, and both desktop IPC and web services call the same gate before dereferencing lazy services.",
+        "MagnitudeUncertainty": "Future source count is unknown, but the current production cardinality is one and no expensive work is reached.",
+        "Verdict": "No regression. The changed default does not introduce startup/open-page network, IPC, or eager provider work while Marketplace is hidden."
+      },
+      {
+        "Scenario": "Enable Marketplace and browse or search Discover, including pagination and multi-source priority merging",
+        "CriticalPath": "After Discover becomes visible, a scheduled load issues one marketplace query; desktop crosses one IPC call while web calls the workbench service directly, then active source pages are fetched, validated, merged, and rendered. The boundary is required before available catalog results appear.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/customizationMarketplace/common/customizationMarketplaceIpc.ts:CustomizationMarketplaceChannelClient.query",
+            "Operation": "Send one combined catalog-page request to the shared-process marketplace channel on desktop",
+            "Cardinality": "One IPC call per combined page load; source IDs are grouped in the request rather than sent per item.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The enabled public feed used the same single IPC request per page before the diff.",
+            "CriticalPathEffect": "Blocks catalog results for the requested page on desktop; web bypasses this IPC boundary."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentFinder/common/agentFinderRestProvider.ts:AgentFinderRestProvider.query",
+            "Operation": "Fetch and parse a bounded GitHub Feed REST page",
+            "Cardinality": "One request per active source whose local buffer is empty; production has one source. Existing mixed-type backfill can request up to eight sequential combined pages.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same REST fetch placement, page bounds, parallel source fan-out, and backfill cap existed before the diff.",
+            "CriticalPathEffect": "Each needed source response is awaited before the combined page can be merged; active sources are fetched concurrently."
+          }
+        ],
+        "ScalingInput": "The UI requests 24 items; the platform caps pages at 100. Merge work is O(pageSize*S), as before. Priority adds constant-time validation/comparison per buffered item and production currently emits no priority metadata.",
+        "EffectiveConcurrency": "CustomizationMarketplaceService uses Promise.all across active sources, so effective concurrency is S source requests per refill; production S=1. Pagination is sequential and no new limiter or burst behavior is introduced.",
+        "CacheBehavior": "Queryless results use the existing renderer cache keyed by selected source. Combined continuations retain at most 32 entries for 30 minutes, with at most one bounded native page buffered per source; priority adds only an optional number to already-retained entries. Configuration changes clear renderer caches and invalidate in-flight work.",
+        "MechanismConfidence": "High: the full renderer-to-IPC/direct-service-to-REST call path, page caps, Promise.all concurrency, and continuation bounds are explicit.",
+        "MagnitudeUncertainty": "Additional future sources and adapters may increase S, but the diff neither increases requests per source nor changes aggregate concurrency from the pre-diff merge.",
+        "Verdict": "No reportable regression. Priority ranking preserves boundary cardinality and asymptotic merge cost, and all added allocation/CPU is bounded by existing page/source limits."
+      },
+      {
+        "Scenario": "Render install state for catalog rows and react to Marketplace/source configuration changes",
+        "CriticalPath": "Each visible/result catalog item synchronously asks the install service for local state. A configuration toggle synchronously disposes/recreates the home surface only when visibility changes, clears disabled-source state, and notifies renderers.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "A normal page has 24 catalog items. The new visibility/source helper scans S sources per state check, currently S=1; existing plugin/MCP installation scans dominate and are unchanged.",
+        "EffectiveConcurrency": "State checks are synchronous. Rendering handles the current bounded catalog collection; configuration toggles are serialized user actions.",
+        "CacheBehavior": "Installed-skill/manual-setup maps are pruned when their source becomes unavailable; enabled listeners are disposed when Marketplace becomes hidden. No new retained cache or listener lifecycle is introduced.",
+        "MechanismConfidence": "High: getInstallState performs configuration/array/map checks only and reaches no IPC, filesystem, or network boundary.",
+        "MagnitudeUncertainty": "Future source counts could increase the small local scan, but realistic current cardinality and the 24-item page bound make user-visible impact unsupported.",
+        "Verdict": "No reportable regression. The added local gate is bounded and configuration-triggered reconstruction is intentional, low-frequency, and cancels rather than adds expensive work."
+      },
+      {
+        "Scenario": "Disable Marketplace or a source while a catalog request or explicit skill/plugin/MCP installation is in flight",
+        "CriticalPath": "The configuration event cancels the current catalog token and pending source-specific install token. Any already-started provider/import operation must observe cancellation before completing; no new operation is started by the toggle.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentFinder/common/agentFinderRestProvider.ts:query and src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMarketplaceInstallService.ts:installSkill",
+            "Operation": "Cancel an in-flight GitHub Feed REST request or repository acquisition for an explicit installation",
+            "Cardinality": "At most the already-running catalog request per active source and one coalesced operation per resource key; only explicit user installations reach repository acquisition.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Source disablement already cancelled these operations; the diff extends the same cleanup to the new Marketplace visibility switch.",
+            "CriticalPathEffect": "Cancellation shortens obsolete work and rejects the pending user operation; it does not add blocking work."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMarketplaceInstallService.ts:installSkill",
+            "Operation": "Validate/copy/move a selected skill package, with cleanup if cancellation occurs",
+            "Cardinality": "One file-tree copy/move sequence per explicit skill install, scaling with the selected package's files; pending operations are coalesced by resource key.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same filesystem install and cancellation cleanup existed for source disablement; Marketplace visibility now invokes that existing lifecycle.",
+            "CriticalPathEffect": "This is on the explicit install critical path, not browse/startup. Hiding Marketplace requests cancellation and may trigger bounded cleanup of the same staging/target paths."
+          }
+        ],
+        "ScalingInput": "Cleanup scales with currently pending catalog requests and explicit installations, not catalog size or history. Typical trigger cardinality is one request/install at the moment of a user setting toggle.",
+        "EffectiveConcurrency": "Requests from active sources run concurrently as before. Install calls for the same resource are coalesced in pending maps; independent explicit installs can overlap as before. The new switch only cancels existing work.",
+        "CacheBehavior": "Catalog requests are cancelled and renderer browse state is cleared. Installed-skill and manual-setup cache entries for unavailable sources are removed, while other legacy sources remain available when allowed; no stale resource is retained by the new gate.",
+        "MechanismConfidence": "High: configuration listeners dispose cancellation tokens and existing cleanup paths own temporary filesystem state.",
+        "MagnitudeUncertainty": "Underlying cancellation latency depends on remote and filesystem services, but the diff reduces obsolete lifetime rather than increasing work.",
+        "Verdict": "No regression. The change extends cleanup/cancellation ownership to the new gate without adding I/O, fan-out, or retained state."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 17 changed files and every diff page. Traced default-hidden startup/open behavior, enabled browse/search ranking and pagination, renderer install-state work, and configuration-driven cancellation through IPC, REST, repository, and filesystem boundaries. The diff preserves existing bounded page sizes, cache limits, request grouping, and concurrency; no actionable performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T00:08:03.320015195Z",
+    "CompletedAt": "2026-09-25T00:09:52.950496941Z",
+    "WallClockMilliseconds": 109630,
+    "ModelCalls": 7,
+    "InputTokens": 265560,
+    "OutputTokens": 6485,
+    "TotalTokens": 272045,
+    "ReasoningTokens": 2181,
+    "CacheReadTokens": 199180,
+    "CacheWriteTokens": 66359,
+    "APIDurationMilliseconds": 96927,
+    "ToolCalls": 55,
+    "NanoAIUnits": 54125100000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 199180,
+      "cache_write": 66359,
+      "input": 21,
+      "output": 6485
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
