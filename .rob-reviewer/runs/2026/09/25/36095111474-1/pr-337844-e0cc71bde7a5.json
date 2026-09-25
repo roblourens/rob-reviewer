@@ -1,0 +1,168 @@
+{
+  "PullRequest": {
+    "Number": 337844,
+    "Title": "mcp: show user-configured servers in the User tab",
+    "Body": "## Summary\n\nFixes the MCP source-tab regression introduced in #337399: servers configured in Copilot's `mcp-config.json` should appear in **User**, not **Built-In**.\n\n- Preserve SDK-reported configuration sources through agent-host publication and the workbench adapter, including host-only servers without a local definition.\n- When `session.rpc.mcp.list` omits a source, resolve user membership through the SDK's `rpc.mcp.config.list`; do not guess based on missing metadata or server names.\n- Retain source metadata across lifecycle updates and restored state, and refresh tab membership when source metadata arrives.\n- Group externally discovered collections by their configuration target while preserving workspace, extension, plugin, and built-in behavior.\n- Add regression coverage across SDK inventory, controller publication, metadata parsing, service mapping, and tab grouping. Move an existing accidentally nested grouping test to suite scope so it actually runs.\n\n## Validation\n\n- `npm run compile` — passed.\n- `npm run typecheck-client` — passed.\n- Targeted ESLint and pre-commit hygiene — passed.\n- `npm run valid-layers-check` — passed.\n- Controller, Copilot session, and Copilot provider tests — 1,135 passed, 1 pre-existing pending.\n- MCP widget, customization service, and metadata reader browser tests — 139 passed.\n\nLive UI verified on macOS with a rebuilt Code OSS Agents window and the real Copilot runtime: two servers loaded only from an isolated `COPILOT_HOME/mcp-config.json` appear in User; the runtime's `github-mcp-server` remains in Built-In. User membership also survives Stop/Start.\n\nScreenshots and reproduction details are in a follow-up comment. The agent host must be rebuilt/restarted to publish the new source metadata.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337844",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "vritant24",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6fe28bfdd92bea9db9da74163dd8c5018e036486",
+    "HeadRef": "agents/fix-mcp-servers-tab-location",
+    "HeadSHA": "e0cc71bde7a5040e02caaa642ce2aafbd5946b50",
+    "CreatedAt": "2026-09-24T23:46:30Z",
+    "UpdatedAt": "2026-09-25T04:14:28Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-4BEA72608931",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts",
+      "Side": "RIGHT",
+      "Line": 6826,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed await, its production callback, the per-turn trigger, and the stdio subprocess boundary are all directly traced in repository code. Exact RPC duration and number of concurrent active sessions are uncertain, which limits severity rather than mechanism confidence.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Copilot CLI subprocess IPC requests and response serialization",
+      "PerformanceScaling": "One extra config-list round trip per affected session seed, per later-turn loaded event, and again for lifecycle-race retries; aggregate work scales with active sessions and turns even though the underlying user configuration is process-global.",
+      "PerformanceOutcome": "Excessive IPC, increased MCP inventory publication latency, and reduced CLI subprocess throughput under multiple active sessions or long conversations",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Each seed or session.mcp_servers_loaded invalidation performed one session-scoped rpc.mcp.list call and then applied the result; it did not make the additional client-level config RPC.",
+      "ChangedBehavior": "After each session-scoped rpc.mcp.list response containing any server without a source, the refresh now awaits a separate client-level rpc.mcp.config.list call before publishing inventory.",
+      "CausalDiffEvidence": "Added lines 6825-6827 conditionally await _getUserMcpServerNames for every source-less inventory response, and added lines 5650-5653 wire that callback to a fresh client.rpc.mcp.config.list call.",
+      "Title": "Cache user MCP membership instead of refetching it every turn",
+      "Impact": "With SDK versions that omit source metadata, every session initialization and every later turn that re-emits session.mcp_servers_loaded incurs another subprocess round trip, delaying MCP inventory/tab refresh and adding contention on the Copilot CLI stdio channel used by other session operations.",
+      "Evidence": "_refreshMcpServersFromRpc is called once when a session subscribes and on every session.mcp_servers_loaded event; the adjacent comment explicitly says that event is re-emitted on later turns. Production wires getUserMcpServerNames to client.rpc.mcp.config.list, and CopilotClient is connected through RuntimeConnection.forStdio. The list is client-level configuration, but there is no cache or in-flight coalescing; concurrent refreshes are only made stale after both RPCs complete.",
+      "Recommendation": "Keep a client-generation-scoped, coalesced cache of user MCP server names shared by sessions, and invalidate it only when MCP configuration actually changes or the Copilot client restarts; inventory refreshes should reuse the cached/in-flight result rather than issuing a per-turn RPC."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "synchronous-ui-work",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Copilot session MCP inventory seeding and later-turn invalidation when SDK inventory omits source metadata",
+        "CriticalPath": "rpc.mcp.list must complete, then the newly added client-level rpc.mcp.config.list must also complete before the refreshed customizations can be applied and published. The refresh is fire-and-forget relative to chat turn progression, but both calls share the Copilot CLI process and the second call is on the MCP inventory publication path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_refreshMcpServersFromRpc",
+            "Operation": "List session MCP inventory without starting servers through rpc.mcp.list",
+            "Cardinality": "One call per session seed and loaded invalidation, plus retries after lifecycle races; unchanged by this diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This was the only inventory RPC on this refresh path.",
+            "CriticalPathEffect": "Must complete before refreshed MCP inventory is published, but is off the chat turn's direct await chain."
+          },
+          {
+            "Kind": "subprocess IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:getUserMcpServerNames / copilotAgentSession.ts:6826",
+            "Operation": "List client-level MCP configuration and serialize all configured server keys through rpc.mcp.config.list",
+            "Cardinality": "One added call for every refresh whose inventory has at least one missing source, independently per session/event/retry.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No client-level config RPC occurred on session inventory refreshes.",
+            "CriticalPathEffect": "Runs sequentially after rpc.mcp.list and must finish before inventory publication; also contends on the shared Copilot CLI stdio connection."
+          }
+        ],
+        "ScalingInput": "Active Copilot sessions multiplied by session initialization, later turns that re-emit session.mcp_servers_loaded, and lifecycle-race retries; one missing source anywhere in the inventory triggers the global config read.",
+        "EffectiveConcurrency": "Each loaded event starts an independent refresh. Request versions prevent stale application only after RPC completion; they do not cancel or coalesce either RPC, so refreshes and different sessions can overlap against the shared CLI process.",
+        "CacheBehavior": "rpc.mcp.config.list results are neither cached nor coalesced. The same process-global user configuration is fetched on every affected refresh; successful, empty, and in-flight results all repeat.",
+        "MechanismConfidence": "High: trigger comments, call graph, production callback, and RuntimeConnection.forStdio establish the repeated subprocess IPC mechanism.",
+        "MagnitudeUncertainty": "The exact SDK RPC duration and number of simultaneous sessions vary, but the per-turn repeated subprocess boundary and lack of coalescing are explicit.",
+        "Verdict": "Reportable repeated-work regression because process-global membership is refetched per session and later turn without caching or coalescing."
+      },
+      {
+        "Scenario": "MCP lifecycle/status updates and source-preserving customization publication",
+        "CriticalPath": "A status event synchronously rebuilds the affected customization and dispatches the existing session update action when state or metadata changes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/shared/mcpCustomizationController.ts:_applyServer/_buildTopLevel",
+            "Operation": "Publish SessionCustomizationUpdated over the existing agent-host session action channel",
+            "Cardinality": "Existing state updates remain one action per changed server; source-only changes can now add one required action for each server whose source actually changes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same action boundary published lifecycle/customization changes but omitted source metadata and did not publish source-only changes.",
+            "CriticalPathEffect": "Required for workbench source grouping; payload growth is one small metadata property and does not materially alter transport cost."
+          }
+        ],
+        "ScalingInput": "MCP status events and actual source changes across configured servers; effective cardinality is one customization per lifecycle event and changed servers during inventory application.",
+        "EffectiveConcurrency": "Lifecycle events are handled synchronously; inventory application batches state transaction bookkeeping but may publish changed customizations individually through the existing action path.",
+        "CacheBehavior": "The previous published customization and source metadata are retained in controller state; no new remote lookup or cache miss is introduced here.",
+        "MechanismConfidence": "High for the action path; low performance risk because call count changes only on real source changes and payload growth is bounded.",
+        "MagnitudeUncertainty": "Source-only changes are expected to be infrequent and MCP inventories modest.",
+        "Verdict": "No additional finding: required source propagation adds bounded metadata and only publishes when equality detects a real change."
+      },
+      {
+        "Scenario": "Workbench adaptation of host-published MCP servers",
+        "CriticalPath": "On customization updates, getMcpServers maps the current in-memory customization collection into workbench server models before notifying consumers.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of host-published MCP customizations in the active session.",
+        "EffectiveConcurrency": "Synchronous in-process mapping; no queue, subprocess, filesystem, network, or database work is reached by readMcpServerSource.",
+        "CacheBehavior": "Reads source directly from the already-retained open metadata bag; no cache or lookup is added.",
+        "MechanismConfidence": "High that this is in-memory only.",
+        "MagnitudeUncertainty": "Inventory size varies, but the added operation is a constant-time property read per server.",
+        "Verdict": "No regression: bounded O(N) mapping already existed and the added metadata read is trivial."
+      },
+      {
+        "Scenario": "MCP customization UI membership comparison and section grouping",
+        "CriticalPath": "Customization changes synchronously compute membership signatures before and after filtering; a changed signature triggers render grouping on the UI thread.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Installed MCP entry count. The new group field is computed twice per agent-host customization event and once more per entry during a resulting tree render.",
+        "EffectiveConcurrency": "Entirely synchronous on the renderer/UI thread; rendering remains serialized. No new async fan-out exists.",
+        "CacheBehavior": "Host source is retained in-memory. External-configuration grouping reads IMcpServer.readDefinitions().get(), whose implementation returns the already-created _fullDefinitions observable; it does not initiate filesystem, IPC, database, or network work.",
+        "MechanismConfidence": "High after tracing readDefinitions to McpServer._fullDefinitions.",
+        "MagnitudeUncertainty": "Users can have varying MCP counts, but realistic counts are small and each added read is cached observable/property work.",
+        "Verdict": "No reportable regression: the added synchronous work is linear, allocation-light, and based on cached definitions; it correctly limits rerenders to actual membership/group changes."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 13 changed files and every diff page. One medium-severity repeated subprocess-IPC regression was submitted; metadata propagation and UI grouping changes are bounded and do not introduce additional expensive boundaries."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T04:47:25.15792111Z",
+    "CompletedAt": "2026-09-25T04:49:15.045347924Z",
+    "WallClockMilliseconds": 109887,
+    "ModelCalls": 10,
+    "InputTokens": 355851,
+    "OutputTokens": 6584,
+    "TotalTokens": 362435,
+    "ReasoningTokens": 2215,
+    "CacheReadTokens": 299983,
+    "CacheWriteTokens": 55838,
+    "APIDurationMilliseconds": 99210,
+    "ToolCalls": 55,
+    "NanoAIUnits": 53098320000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 299983,
+      "cache_write": 55838,
+      "input": 30,
+      "output": 6584
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

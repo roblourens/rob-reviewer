@@ -1,0 +1,149 @@
+{
+  "PullRequest": {
+    "Number": 337850,
+    "Title": "Fix Agent Host sandbox path normalization on Windows",
+    "Body": "## Summary\n\nFixes #337171.\n\n- Resolve sandbox configuration in a shared, provider-neutral Agent Host accessor before SDK or host-terminal policy mapping.\n- Normalize Windows filesystem path separators using the executing Agent Host's OS, independently of whether its client is local or remote.\n- Apply the resolver at session launch/resume, per-turn SDK updates, and host-terminal settings reads.\n- Preserve stored configuration, client forwarding, POSIX paths, and session/managed-policy overrides.\n- Reuse the platform normalization helper in the existing Windows MXC terminal path.\n\n## Validation\n\n- 74 targeted sandbox, session, launcher, and Windows terminal tests passed.\n- `npm run typecheck-client` passed.\n- ESLint passed for all 11 changed files.\n- `npm run compile` completed with zero errors.\n- Pre-commit hygiene passed.\n- Launched Code OSS and attached the Agent Host debugger with a breakpoint after normalization. End-to-end access-denial enforcement has not been verified.\n\n## Compatibility / follow-up\n\nNo persisted schema or wire-format migration is required. Existing sessions receive normalized policy on resume or the next policy application. Windows paths that previously failed to match may now enforce their intended restrictions.\n\nThe runtime filesystem schema still accepts generic objects; this change assumes the documented string-array fields. Malformed persisted configuration is not covered by the new normalization tests and may throw earlier during resolution, including with sandboxing disabled.",
+    "URL": "https://github.com/microsoft/vscode/pull/337850",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dileepyavan",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "13fa61ecce3c4b4c4eefb1e00dbab505dba6a013",
+    "HeadRef": "fix/337171-terminal-deny-read",
+    "HeadSHA": "02e369101f12b19cdc0cb6af47961941b3742a0c",
+    "CreatedAt": "2026-09-25T00:20:06Z",
+    "UpdatedAt": "2026-09-25T01:29:07Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create or resume a Copilot agent session and apply its effective sandbox policy",
+        "CriticalPath": "Session creation/resume completes first, then script-safety and sandbox-policy RPC updates must complete before the session wrapper is returned. The diff adds synchronous normalization of the selected OS filesystem arrays before the existing sandbox update RPC.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:592 applySandboxConfig",
+            "Operation": "session.rpc.options.update forwards the computed sandboxConfig to the Copilot runtime",
+            "Cardinality": "One sandbox-config update per successful create/resume finalization; fallback resume attempts still finalize only the successful session",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one options.update call was made from _finalizeSession using a policy built directly from root settings plus session overrides",
+            "CriticalPathEffect": "The RPC is on the launch critical path, but its count and payload fields are unchanged; local normalization runs immediately before it"
+          }
+        ],
+        "ScalingInput": "Total strings and characters in the four filesystem policy arrays for the executing OS, once per launched session; no cross-platform arrays are traversed.",
+        "EffectiveConcurrency": "One finalization sequence per launched session; separate sessions can launch concurrently as before. The diff adds no limiter, queue, or additional asynchronous operation.",
+        "CacheBehavior": "Root/session configuration is read from the in-memory configuration service. There is no normalized-policy cache, so each launch maps the configured path arrays once; cold and warm launch behavior differ only in surrounding pre-existing runtime/session state.",
+        "MechanismConfidence": "High: the added map/replace work and unchanged single RPC are directly visible in the changed helper and launcher call path.",
+        "MagnitudeUncertainty": "Filesystem policy lists may vary, but realistic configuration cardinality is bounded and the added linear string mapping is small relative to the existing critical-path runtime RPC.",
+        "Verdict": "No finding. The diff adds bounded local O(P) normalization but no new expensive boundary or changed boundary cardinality."
+      },
+      {
+        "Scenario": "Start an SDK-backed agent turn or react to a sandbox/permission configuration change",
+        "CriticalPath": "_prepareSdkTurn waits for the sandbox options update before starting the agent loop. Configuration-change updates and per-turn updates are serialized by _sandboxConfigSequencer. The changed helper normalizes paths before the existing SDK policy construction and RPC.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4725 _updateEffectiveSandboxConfig -\u003e applySandboxConfig",
+            "Operation": "Update the runtime's sandboxConfig through session.rpc.options.update",
+            "Cardinality": "One update per turn preparation and one per relevant configuration synchronization, with an occasional additional existing update when registering a new shell-init-script path",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same updates and sequencing existed; policy construction merged root settings and session overrides without separator normalization",
+            "CriticalPathEffect": "Per-turn update blocks turn start; configuration updates run through the same sequencer. The diff only adds one local normalization pass before each existing RPC."
+          }
+        ],
+        "ScalingInput": "Filesystem rule count P per policy update and active-session count for configuration broadcasts; effective work is O(P) per already-existing update, not per individual tool or path access.",
+        "EffectiveConcurrency": "Per session, sandbox updates are serialized by _sandboxConfigSequencer; different sessions remain independent. The diff does not increase concurrency or remove coalescing.",
+        "CacheBehavior": "Configuration reads are warm in-memory reads. Sandbox policy updates themselves are not value-deduplicated in this code before or after the diff; normalization is likewise recomputed per update. Shell-init script payload/path caching remains unchanged.",
+        "MechanismConfidence": "High for the call path and O(P) allocation; low magnitude risk because there is no boundary amplification and updates are serialized.",
+        "MagnitudeUncertainty": "Large centrally managed path lists could add allocation, but no evidence establishes policy sizes high enough for this single pass to create user-visible latency.",
+        "Verdict": "No finding. Added normalization is bounded and does not materially amplify the existing per-turn IPC or its concurrency."
+      },
+      {
+        "Scenario": "Run a command through the Agent Host custom terminal sandbox",
+        "CriticalPath": "The shell tool checks sandbox settings, wraps the command, may regenerate and write the sandbox settings file, then executes the wrapped command in the terminal/subprocess. getSandboxSetting now resolves and normalizes the selected filesystem arrays each time it is queried.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/sandbox/common/terminalSandboxEngine.ts:398 getSandboxConfigPath / _createSandboxConfig",
+            "Operation": "Create or overwrite the generated sandbox-settings JSON when the cached configuration requires refresh",
+            "Cardinality": "At most one settings-file write for a wrap refresh; Windows refreshes for changed command lines and other platforms refresh on the existing command/config/root conditions",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The engine generated the same policy file under the same refresh rules, reading unnormalized Agent Host settings",
+            "CriticalPathEffect": "Existing file generation is on command wrapping's critical path; separator normalization occurs before the existing generation but does not add writes"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotShellTools.ts:488 handler -\u003e executeCommandInShell",
+            "Operation": "Execute the wrapped user command through the existing terminal/sandbox runtime path",
+            "Cardinality": "One command execution per shell-tool invocation, with an optional second wrap only for the existing unsandboxed-confirmation retry path",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same wrapped command was executed with the same invocation cardinality",
+            "CriticalPathEffect": "Command execution dominates the workflow and is unchanged by the diff"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/agentHostSandboxEngine.ts:111-117 Windows MXC helper methods",
+            "Operation": "Obtain/build Windows MXC filesystem/environment/payload data through the existing sandbox helper service",
+            "Cardinality": "Existing per-config-generation helper calls; the diff changes only the configuration value accessor feeding the engine",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Windows policy generation called the same helper methods",
+            "CriticalPathEffect": "These existing helper calls participate in Windows policy generation; normalization neither adds nor multiplies them"
+          }
+        ],
+        "ScalingInput": "Number P and character length of configured filesystem paths, multiplied by the constant number of sandbox-setting queries in enablement, wrapping, and policy generation; command count determines repetition over time.",
+        "EffectiveConcurrency": "A tool invocation awaits wrapCommand and then terminal execution. Per-shell behavior and command concurrency are unchanged; no new concurrent subprocess or file operation is added.",
+        "CacheBehavior": "TerminalSandboxEngine caches the generated config path and invalidates it on root/session setting or root changes; Windows command-line changes already force refresh. The new accessor does not cache normalized arrays and can map them for multiple setting reads during one command, while the underlying root/session values remain warm. Effective repetition is a small constant number of O(P) passes.",
+        "MechanismConfidence": "High that repeated mapping occurs; low confidence that its bounded cost is material enough to qualify as a performance bug.",
+        "MagnitudeUncertainty": "Very large filesystem policies would increase CPU/allocation, especially on Windows, but typical user/managed lists are modest and existing path resolution, file generation, MXC work, and command execution dominate. No realistic threshold or evidence supports user-visible regression.",
+        "Verdict": "No finding. Although the shared accessor repeats path-array mapping across setting reads, it adds no boundary calls and the bounded local work is not sufficiently material for an actionable regression."
+      }
+    ],
+    "Summary": "Reviewed all 11 changed files and complete diff pages. Traced session launch/resume, per-turn/config policy updates, and custom terminal command execution through IPC, filesystem, MXC helper, and subprocess boundaries. The change adds linear in-memory path normalization, sometimes repeated by the terminal setting accessor, but does not change expensive-boundary cardinality, critical-path concurrency, cache invalidation, or retained lifetime enough to establish a reportable performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T04:49:19.673755229Z",
+    "CompletedAt": "2026-09-25T04:51:08.933096049Z",
+    "WallClockMilliseconds": 109259,
+    "ModelCalls": 8,
+    "InputTokens": 246615,
+    "OutputTokens": 5084,
+    "TotalTokens": 251699,
+    "ReasoningTokens": 1463,
+    "CacheReadTokens": 196444,
+    "CacheWriteTokens": 50147,
+    "APIDurationMilliseconds": 99055,
+    "ToolCalls": 46,
+    "NanoAIUnits": 43108860000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 196444,
+      "cache_write": 50147,
+      "input": 24,
+      "output": 5084
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

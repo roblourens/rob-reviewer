@@ -1,0 +1,175 @@
+{
+  "PullRequest": {
+    "Number": 337348,
+    "Title": "Make deferred title generation the default",
+    "Body": "Defaults new Agent Host sessions to deferred title generation and removes the rollout settings. Existing sessions retain their persisted strategy.\n\nFollow-up to #336704.",
+    "URL": "https://github.com/microsoft/vscode/pull/337348",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6b9f4b2daf34707878aaa19cd2d5bb7abfd81d56",
+    "HeadRef": "bhavyau/agent-host-deferred-titles-default",
+    "HeadSHA": "948d6853af93a1ee39130cee42411252bd5e5bbe",
+    "CreatedAt": "2026-09-22T20:03:55Z",
+    "UpdatedAt": "2026-09-25T04:27:16Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-E17816823C72",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/toolSearchDeferral.ts",
+      "Side": "LEFT",
+      "Line": 17,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed defer policy, default activation, client boundary, and separate provider continuation are all explicit in code and the repository's E2E capture. Exact milliseconds vary by provider and local search duration, but the additional serialized round trip is unconditional when a cold deferred rename is needed.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "one additional model-provider request plus a client tool-search IPC/tool invocation before the rename tool can run",
+      "PerformanceScaling": "Adds one serialized discovery round trip to each cold symbol-rename turn on supported models with the default-enabled tool-search setting; cost grows with the number of such rename turns.",
+      "PerformanceOutcome": "increased end-to-end latency before a requested symbol rename begins",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "With `rename` in the allowlist, its schema was present in the initial model request and the model could invoke the rename tool directly without first discovering it.",
+      "ChangedBehavior": "With tool search enabled by default (threshold 1), `rename` is now deferred. To use it, the model invokes `tool_search_tool`; Agent Host sends candidates across the client action boundary, the renderer invokes VS Code's `toolSearch`, and only the returned tool reference loads `rename` for a subsequent provider continuation.",
+      "CausalDiffEvidence": "The diff deletes `'rename'` from `NON_DEFERRED_CLIENT_TOOL_NAMES` at the deleted line, changing `_createClientSdkTools` from `defer: 'never'` to `defer: 'auto'` for this tool whenever tool search is active.",
+      "Title": "Keep the symbol rename tool on the non-deferred path",
+      "Impact": "On a normal request such as renaming a symbol, supported Copilot models now wait for a search tool IPC/invocation and an extra provider continuation before they can start the actual rename. This is directly visible as added latency on an interactive refactoring path.",
+      "Evidence": "`copilotAgentSession.ts:2356-2358` maps allowlisted tools to `defer: 'never'` and all others to `defer: 'auto'`. Its tool-search handler waits for `_pendingClientToolCalls.registerAndFire`, while `agentHostSessionHandler.ts:2974-2991` invokes the renderer-side search tool. The checked-in tool-search E2E capture shows discovery and the deferred tool execution as separate model-provider requests. `chat.shared.contribution.ts:1729-1739` makes this path the default (`toolSearch.enabled: true`, threshold 1).",
+      "Recommendation": "Restore `rename` to `NON_DEFERRED_CLIENT_TOOL_NAMES`; this preserves direct invocation for the core refactoring operation while leaving less frequently used tools deferred."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A new Agent Host session receives and successfully completes its first user turn, causing default deferred title refinement.",
+        "CriticalPath": "The fallback title is published synchronously, but metadata writes and the utility refinement are fire-and-forget. The foreground agent response completes before `SessionTitleContribution.onTurnEnd` starts refinement, so title network work is off the first-response critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:158-195, 343-404, 904-979 via shared/persistSessionMetadata.ts",
+            "Operation": "Persist the automatic fallback title/source, deferred seed, strategy, seed cleanup, and eventual generated title metadata.",
+            "Cardinality": "A bounded set of single-key writes per newly titled session/chat; each helper call opens and disposes a database handle. Refinement is consumed at most once per title key.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Stable default utility mode performed immediate title generation and fewer seed-lifecycle writes; non-Stable default active-agent mode persisted an automatic fallback and relied on the foreground agent rename flow.",
+            "CriticalPathEffect": "Writes are fire-and-forget and do not block the agent response, though they add background filesystem/database work."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:607-680",
+            "Operation": "Fetch linked GitHub issue/PR context (up to ten references) and request one Copilot utility chat completion for the refined title.",
+            "Cardinality": "At most one utility completion per eligible first successful turn; zero to ten GitHub context requests based on unique links in the first prompt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Stable utility mode already performed the same title boundaries earlier, from the first prompt. Outside Stable, active-agent mode did not make the utility/GitHub title request, but could require an in-turn rename tool continuation.",
+            "CriticalPathEffect": "Starts only after the first successful response and is not awaited; it can overlap later user work but does not delay first-response completion."
+          }
+        ],
+        "ScalingInput": "Number of newly created sessions/independent chats completing their first successful turn, and up to ten unique GitHub references in each first prompt.",
+        "EffectiveConcurrency": "One refinement per session/chat key is enforced by `_deferredRefinementStarted`; cancellation replaces in-flight generation for the same key. Different sessions have no shared limiter and may refine concurrently.",
+        "CacheBehavior": "Title strategy is cached per session and persisted. Deferred eligibility is persisted and restored, then consumed before utility work. No GitHub-context cache is visible; failed or terminal first turns are not retried.",
+        "MechanismConfidence": "High: scheduling, one-shot guards, persistence, network calls, and non-awaited placement are explicit in the controller and contribution.",
+        "MagnitudeUncertainty": "Background request duration and concurrent multi-session usage vary. The work is bounded and intentional, and for Stable users the network cardinality is unchanged while moving off the first-response path.",
+        "Verdict": "No finding. The default activates bounded background work and adds some persistence, but the utility request is one-shot and off the first-response critical path; compared with the prior Stable default it primarily reschedules existing work."
+      },
+      {
+        "Scenario": "A user asks a supported Copilot Agent Host model to rename a code symbol while default tool search is active.",
+        "CriticalPath": "The requested refactoring cannot begin until the model discovers the deferred `rename` tool. Tool search, its provider continuation, actual rename execution, and the final continuation are serialized on the interactive turn.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/toolSearchDeferral.ts:17 and Copilot SDK deferred-tool flow",
+            "Operation": "Model-provider continuation after `tool_search_tool` returns the reference that loads `rename`.",
+            "Cardinality": "One additional provider request for each cold turn that needs the deferred rename tool.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "`rename` was non-deferred and available in the initial model request, so the model could invoke it without a discovery continuation.",
+            "CriticalPathEffect": "Directly delays actual symbol rename execution."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:2338-2477; src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts:2974-3008",
+            "Operation": "Forward tool-search candidates from Agent Host to the renderer, invoke VS Code's `toolSearch`, and return matching tool names.",
+            "Cardinality": "One extra search invocation before the actual rename tool call on each cold rename turn.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No tool-search client invocation was needed for rename because its defer policy was `never`.",
+            "CriticalPathEffect": "Serialized before the provider can load and call `rename`."
+          }
+        ],
+        "ScalingInput": "Number of interactive symbol-rename turns on tool-search-capable models; effective cardinality is one added discovery and provider continuation per cold turn.",
+        "EffectiveConcurrency": "Sequential within one turn: discovery must complete before the model receives the tool reference and can invoke rename. Separate turns/sessions may run independently.",
+        "CacheBehavior": "The returned tool reference loads rename for the current continuation. No application-level cross-turn cache or coalescing is present on this path.",
+        "MechanismConfidence": "Very high: the deleted allowlist entry changes `defer` from `never` to `auto`, the setting is default-on, and the checked-in E2E capture demonstrates separate search and deferred-tool provider exchanges.",
+        "MagnitudeUncertainty": "Provider latency and whether a model chooses rename vary, but every turn that actually needs this newly deferred tool incurs the serialized discovery path.",
+        "Verdict": "Reported: the diff adds an avoidable serialized network and IPC round trip to a core interactive refactoring workflow."
+      },
+      {
+        "Scenario": "An existing or legacy session is restored and its title-generation strategy and deferred seed are hydrated.",
+        "CriticalPath": "Database metadata reads must complete during chat hydration before restored title state is finalized. No utility or GitHub network request is launched merely by hydration.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:928-1038 and sessionTitleContribution.ts:99-133",
+            "Operation": "Read persisted title strategy, deferred seed, title, and title source metadata; persist a normalized strategy when absent.",
+            "Cardinality": "One coalesced strategy restore per session while in flight, plus seed/title reads per hydrated chat. Subsequent strategy lookups hit the in-memory map.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same restore reads and strategy persistence occurred; only the fallback strategy for metadata-less legacy sessions changed from the active-agent setting result to utility.",
+            "CriticalPathEffect": "Hydration awaits these local database reads as before; the changed fallback value does not add another boundary."
+          }
+        ],
+        "ScalingInput": "Number of sessions/chats restored, with effective strategy reads coalesced once per session and seed/title reads per chat.",
+        "EffectiveConcurrency": "Concurrent strategy restores for the same session share `_restoringTitleStrategies`; deferred seed restores are tracked per chat. Different sessions may hydrate concurrently.",
+        "CacheBehavior": "Warm lookups use `_titleGenerationStrategies`; in-flight restores coalesce. Missing legacy strategy is persisted as `utility`, avoiding repeated misses on later restores.",
+        "MechanismConfidence": "High: restore coalescing, cache population, and metadata accesses are explicit.",
+        "MagnitudeUncertainty": "Database implementation latency and catalog restore size vary, but no changed boundary count or new network work is present.",
+        "Verdict": "No finding. The diff changes compatibility semantics but does not increase restore boundary cardinality or move title network generation onto hydration."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 25 changed files. Traced default deferred title generation, persistence/restore lifecycle, utility/GitHub boundaries, server-tool exposure, and client tool deferral. Submitted one medium-confidence-high finding for the added serialized tool-search/provider round trip before symbol rename; no other changed mechanism met the performance reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T04:40:22.531021183Z",
+    "CompletedAt": "2026-09-25T04:42:34.196471411Z",
+    "WallClockMilliseconds": 131665,
+    "ModelCalls": 9,
+    "InputTokens": 458856,
+    "OutputTokens": 9489,
+    "TotalTokens": 468345,
+    "ReasoningTokens": 4127,
+    "CacheReadTokens": 377238,
+    "CacheWriteTokens": 81591,
+    "APIDurationMilliseconds": 116954,
+    "ToolCalls": 74,
+    "NanoAIUnits": 74873820000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 377238,
+      "cache_write": 81591,
+      "input": 27,
+      "output": 9489
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

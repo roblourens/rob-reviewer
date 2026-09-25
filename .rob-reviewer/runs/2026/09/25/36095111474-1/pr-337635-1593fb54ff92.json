@@ -1,0 +1,152 @@
+{
+  "PullRequest": {
+    "Number": 337635,
+    "Title": "agentHost: show live HydraFusion phase work in its phase chat",
+    "Body": "Shows live HydraFusion phase work in each phase's chat. Needs runtime [github/copilot-agent-runtime#21218](https://github.com/github/copilot-agent-runtime/pull/21218), which `main` now has via SDK `1.0.15-preview.3` (#337821).\n\n## Background\n\nWhile a phase runs, #21218 sends a provisional copy (`ephemeral`, no `commitId`) of each `assistant.message`, `tool.execution_start`, and `tool.execution_complete`. The winning phase then replays with a `commitId` and the same ids. A losing phase never replays. Rendering every event naively shows a rejected draft as the response and duplicates the winning phase's text and tool rows.\n\n## Changes\n\n- **Live:** provisional messages and tool calls go to their phase chat as they happen, including the phase's own answer. Review phases still show their critique on completion.\n- **Commit:** routed per model call. A call that ends in tool requests is phase work, and anything already shown is skipped. A call that ends without them is the answer and becomes the response. Only the winning phase commits.\n- **Chunks:** earlier chunks of a model call wait for its last chunk. This also fixes text before a reasoning boundary leaking into the response.\n- **Unchanged:** approvals and client tools are raised inside the phase chat, and accounting still counts committed work only.\n\n## Testing\n\n- Unit tests (1063) and Copilot Agent Host E2E (198) pass. New tests cover live streaming, a rejected phase, chunk routing, review phases, and approvals.\n- Manual, in Code OSS on runtime `1.0.89-3`: Single and Cascade runs with file edits and terminal commands. Phase pills streamed live, approvals appeared inside the phase, each tool row showed once, and only the winning answer reached the response.\n\n## Known limitations\n\n- A losing phase's chat is gone after a reload, because provisional copies aren't saved.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337635",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "392a72b272548317c64fde85b358681d94b440d6",
+    "HeadRef": "dev/bhavyau/hydrafusion-live-phase-events",
+    "HeadSHA": "1593fb54ff928015d24cfc43178d97da67dbf29e",
+    "CreatedAt": "2026-09-24T07:01:43Z",
+    "UpdatedAt": "2026-09-25T04:03:17Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Live HydraFusion phase messages and tool lifecycle events appear in the phase child chat while a phase runs",
+        "CriticalPath": "Each provisional SDK event is synchronously classified by CopilotSessionWrapper, routed by CopilotAgentSession, reduced into child-chat state, and published to subscribed AHP clients before event handling returns. There is no awaited subprocess, filesystem, database, or remote call on this path; transport publication is the only changed expensive boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:5502 renderMessage, transitively protocolServerHandler.ts:_broadcastAction",
+            "Operation": "Publish one chat action envelope to each connected client subscribed to the phase chat",
+            "Cardinality": "One markdown action per non-empty provisional assistant-message chunk and the existing start/ready/complete actions per surfaced tool, per relevant connected client",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Provisional assistant messages were dropped and provisional tool starts were generally held until approval/client handling or committed replay, so losing-phase conversation produced no corresponding live client envelopes.",
+            "CriticalPathEffect": "Synchronous state reduction and transport send invocation happen before the SDK event callback returns, but no response is awaited."
+          }
+        ],
+        "ScalingInput": "Cost scales linearly with provisional assistant-message chunks plus tool start/complete events across the bounded set of Fusion phases, multiplied by the number of connected clients subscribed to the affected chat. There is no collection-wide work nested inside each event.",
+        "EffectiveConcurrency": "SDK events and synchronous emitters are processed serially on the Node event loop. Each envelope is synchronously offered once to each relevant connected client; the diff adds no Promise.all fan-out or concurrent remote work.",
+        "CacheBehavior": "No cache lookup is involved. Message-id deduplication is turn-local; committed chunks for one model call are coalesced until the last chunk, then provisional copies are skipped. State and deduplication sets are cleared at turn reset/completion.",
+        "MechanismConfidence": "High: the event-to-state-to-transport call path and one-action-per-event cardinality are explicit in the changed handler and state publication code.",
+        "MagnitudeUncertainty": "The exact number and size of runtime chunks and connected clients varies, but Fusion phases are bounded and the changed work is the product behavior itself rather than accidental per-item duplication.",
+        "Verdict": "No reportable regression. The added linear publication and retained child-chat content are necessary to show live phase work, are bounded by turn/phase output, and duplicate committed phase work is suppressed."
+      },
+      {
+        "Scenario": "Winning Fusion phase committed replay and answer routing",
+        "CriticalPath": "Committed assistant-message chunks enter the existing SDK event path. Chunks are retained only until the model-call boundary; phase-work chunks already shown provisionally perform in-memory accounting/deduplication, while the no-tool final call emits the root answer as before.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:5530 renderCommittedFusionMessage",
+            "Operation": "Publish the winning final answer to the root chat and any committed phase content not already shown",
+            "Cardinality": "One envelope per final-answer chunk; committed phase-work chunks emit no duplicate envelope when their message ids were shown provisionally",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The committed final answer was already rendered to the root response; this diff changes classification/coalescing and suppresses duplicates for newly shown provisional phase work.",
+            "CriticalPathEffect": "State reduction and transport send invocation are synchronous but do not await a remote response."
+          }
+        ],
+        "ScalingInput": "Temporary work is linear in chunks in the current model call. The shown-message-id set scales with provisional messages in the current turn and is cleared when the turn resets or ends.",
+        "EffectiveConcurrency": "Model calls within a phase are assumed sequential and events are handled serially. There is no new concurrent boundary fan-out.",
+        "CacheBehavior": "The turn-local shown-message-id set acts as a positive deduplication cache. It has explicit reset/completion invalidation; incomplete chunk groups are also cleared on those lifecycle boundaries. No negative cache or cross-turn state is retained.",
+        "MechanismConfidence": "High: buffering, deduplication, and lifecycle clears are explicit in CopilotFusionMessageChunks and _clearProvisionalFusionState.",
+        "MagnitudeUncertainty": "Malformed or abandoned chunk streams could retain several event objects until turn cleanup, but the lifetime is bounded to the active turn and realistic cardinality is the number of incomplete model calls.",
+        "Verdict": "No reportable regression. Buffering is bounded to a model call/turn, committed duplicate rendering is avoided, and no new expensive boundary is added to replayed phase work."
+      },
+      {
+        "Scenario": "Restoring persisted chats containing chunked Fusion phase work",
+        "CriticalPath": "Session restore first pages the SDK event log, then mapSessionEvents scans the already materialized event array to classify complete Fusion model calls before constructing root and phase turns. Existing edit/shell restoration follows afterward.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_computeMappedEvents",
+            "Operation": "Read persisted SDK event-log pages of up to 1000 events",
+            "Cardinality": "One pre-existing RPC per history page, independent of the new Fusion classification",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same complete event log was paged before the diff.",
+            "CriticalPathEffect": "History reconstruction waits for all pages before mapping."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/mapSessionEvents.ts and copilotAgentSession.ts:_restoreStoredShellOutputs",
+            "Operation": "Load stored edit data during mapSessionEvents and stored shell output after mapping",
+            "Cardinality": "Existing grouped/edit-tool and completed-shell cardinality; unchanged by the added Fusion message classification",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same edit and shell restoration ran before the diff.",
+            "CriticalPathEffect": "These existing reads remain on chat restoration's critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostStateManager.ts history loading path",
+            "Operation": "Publish reconstructed turns/chat state to clients after restore",
+            "Cardinality": "Existing bulk history actions; routing more Fusion chunks into phase turns changes payload placement/content but does not add per-event publication during mapping",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Restored turns were already published; some earlier chunks were classified into the root rather than their phase chat.",
+            "CriticalPathEffect": "Occurs after reconstruction and is required to display restored history."
+          }
+        ],
+        "ScalingInput": "CPU and temporary references scale linearly with total persisted events; the new chunk map and phase-work set scale only with committed Fusion assistant messages in the loaded history. Effective cardinality is message chunks after provisional events are excluded.",
+        "EffectiveConcurrency": "Event-log pages are fetched sequentially and mapping is synchronous. Existing stored shell-output restoration is sequential by chat/turn; the diff does not change its concurrency.",
+        "CacheBehavior": "No persistent cache is added. The chunk classifier is function-local and discarded after one restore; pending groups are cleared at top-level user-message boundaries to prevent cross-turn correlation.",
+        "MechanismConfidence": "High: mapSessionEvents already had the relevant passes; the diff adds constant-time classification inside an existing pass and no new I/O call.",
+        "MagnitudeUncertainty": "Persisted histories can be large, but the added scan work is constant per event and temporary memory contains references rather than copies of message content.",
+        "Verdict": "No reportable regression. Restore remains O(number of events), adds no I/O or concurrency burst, and the temporary maps/sets are released after mapping."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and all diff hunks. Traced live provisional routing, committed replay/deduplication, lifecycle cleanup, history reconstruction, state reduction, protocol publication, event-log RPCs, and restore-time database/filesystem work. No high-confidence actionable performance regression was introduced."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T04:45:36.207632403Z",
+    "CompletedAt": "2026-09-25T04:47:21.059897759Z",
+    "WallClockMilliseconds": 104852,
+    "ModelCalls": 14,
+    "InputTokens": 774666,
+    "OutputTokens": 6457,
+    "TotalTokens": 781123,
+    "ReasoningTokens": 1638,
+    "CacheReadTokens": 685722,
+    "CacheWriteTokens": 88902,
+    "APIDurationMilliseconds": 94585,
+    "ToolCalls": 70,
+    "NanoAIUnits": 84810680000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 685722,
+      "cache_write": 88902,
+      "input": 42,
+      "output": 6457
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
