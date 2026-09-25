@@ -1,0 +1,176 @@
+{
+  "PullRequest": {
+    "Number": 337915,
+    "Title": "Fix nested chat archive functionality for issue #336799",
+    "Body": "This pull request implements the necessary changes to enable independent archiving and restoration of nested chats in VS Code, addressing issue #336799. The following updates were made:\n\n- Introduced provider-neutral capabilities for archiving and restoring nested chats.\n- Added primary actions for archiving/restoring chat rows.\n- Implemented a toggle for displaying archived chats in the session view.\n- Ensured that Tool and SideChat chats cannot be archived independently.\n- Updated the persistence layer to maintain accurate state across sessions.\n- Added comprehensive tests covering protocol, persistence, provider behavior, and UI interactions.\n\nAll changes have been validated with passing tests and have been reviewed for design, performance, security, and accessibility. The implementation is now production-ready.",
+    "URL": "https://github.com/microsoft/vscode/pull/337915",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6864c1f5997067bf68bd886ffbaad40c3cd5c239",
+    "HeadRef": "agents/fix-this-https-github-com-microsoft-vscode-issue",
+    "HeadSHA": "b88946e0072f36790dc62faee1b104f43e123abf",
+    "CreatedAt": "2026-09-25T08:38:32Z",
+    "UpdatedAt": "2026-09-25T09:50:09Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-EB59C70D2F79",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/sessions/browser/views/sessionsViewActions.ts",
+      "Side": "RIGHT",
+      "Line": 1208,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The multi-selection argument flow and synchronous update call are explicit in repository code, as is the full-tree work performed by update(). Exact milliseconds depend on list size and selection count, which affects severity but not the repeated-work mechanism.",
+      "PerformanceCategory": "rendering",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "CPU work, tree-model objects, and rendered-row reconciliation",
+      "PerformanceScaling": "For K selected sessions in a list containing N sessions/chats, the loop performs K complete synchronous list rebuilds; each rebuild traverses and filters the full session collection, reconstructs tree children, calls tree.setChildren, and recreates chat-row reconciliation, yielding O(K*N) collection work plus repeated rendering reconciliation.",
+      "PerformanceOutcome": "Multi-selecting many session rows and invoking Show Archived Chats can block the UI thread and cause visible list jank while the same tree is rebuilt once per selected row.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR there was no per-session archived-chat visibility command and therefore no multi-selection path that repeatedly rebuilt the Sessions tree for this operation.",
+      "ChangedBehavior": "The new action accepts the array forwarded by the session context menu for the current multi-selection, then calls setSessionArchivedChatsVisible once per selected session. That setter synchronously calls update() on every effective change.",
+      "CausalDiffEvidence": "The added line `sessionsControl.setSessionArchivedChatsVisible(session, visible);` is inside a loop over all selected sessions, while the newly added setter performs a full synchronous `this.update()` per call.",
+      "Title": "Batch archived-chat visibility updates before rebuilding the tree",
+      "Impact": "Right-clicking one row in a large multi-selection and choosing Show Archived Chats serially rebuilds the entire Sessions list for every selected session instead of applying the selection as one state change.",
+      "Evidence": "SessionsList.onContextMenu forwards selectedSessions as the menu argument, getSessionActionTargets returns that array unchanged, and the added loop at lines 1207-1208 calls setSessionArchivedChatsVisible for each target. The added setter in sessionsList.ts calls update() immediately; update traverses all this.sessions, groups/sorts them, rebuilds child objects, calls tree.setChildren, and runs reconcileChatRowHeights. No batching or transaction surrounds the loop.",
+      "Recommendation": "Add a bulk visibility API (or update the override map for all targets in one method), then call update() once and expand the affected visible sessions after that single rebuild."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "eager-work",
+      "boundary-fanout",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Toggle Show Archived Chats from a session context menu, including a multi-row selection",
+        "CriticalPath": "The context-menu command synchronously updates per-session visibility state and rebuilds the Sessions tree before the command returns; tree filtering/grouping, setChildren, and row-height reconciliation are on the UI critical path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "N sessions and their nested chats in the management service, multiplied by K selected sessions. The context menu forwards the effective selected-session array without deduplication concerns, and each target currently triggers one complete update.",
+        "EffectiveConcurrency": "All K updates execute serially on the UI thread in the action's synchronous loop; there is no transaction, debounce, or bulk setter.",
+        "CacheBehavior": "Visibility overrides are in-memory by session ID. Reads are O(1), but each changed override immediately invalidates/rebuilds the whole tree. No render coalescing applies across the loop.",
+        "MechanismConfidence": "High: selectedSessions is explicitly forwarded by the context menu, returned unchanged by getSessionActionTargets, and every setter call synchronously invokes update(), which performs full collection and tree work.",
+        "MagnitudeUncertainty": "Exact frame loss depends on session/chat count and selected-row count, but multi-selection is directly supported and the repeated full-tree mechanism is deterministic.",
+        "Verdict": "Reportable repeated-work regression: K selected sessions cause K full list rebuilds instead of one batched rebuild."
+      },
+      {
+        "Scenario": "Archive or restore one nested Agent Host chat",
+        "CriticalPath": "The browser validates the cached session/chat and dispatches one protocol action. The host updates state and fans out the accepted action; persistence is scheduled by the contribution without awaiting it, so SQLite and filesystem work is off the immediate browser command critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_setChatArchived",
+            "Operation": "Dispatch ChatIsArchivedChanged to the Agent Host connection",
+            "Cardinality": "One dispatch per archive or restore action",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No independent nested-chat archive protocol dispatch existed.",
+            "CriticalPathEffect": "Initiates the authoritative state change; dispatch itself is synchronous from this code path and does not await persistence."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:setArchived -\u003e _applyWrite; src/vs/platform/agentHost/node/agentHostDatabase.ts:replaceSessionChatCatalog",
+            "Operation": "Read and transactionally replace the session chat catalog, including deleting/reinserting catalog rows",
+            "Cardinality": "One serialized catalog mutation per accepted action in the no-conflict case; insert work is batched in groups of 150 and scales with that session's peer chats.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Other peer-chat mutations already used the same full-catalog replacement path; this PR adds archive/restore as a new user-triggered mutation.",
+            "CriticalPathEffect": "Runs fire-and-forget after the accepted action, so it consumes host I/O but does not block the browser command's state transition."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:_publishCompatibilityState/_writeLegacyMirror",
+            "Operation": "Write compatibility metadata to the changed chat-local database and the session legacy mirror database",
+            "Cardinality": "Normally one changed chat-local metadata operation plus one legacy mirror write per archive action; limiter caps aggregate chat-local writes at four.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The compatibility publication mechanism was pre-existing; archive state now causes it to run for this new mutation.",
+            "CriticalPathEffect": "Off the immediate UI path and serialized behind the per-session write queue."
+          }
+        ],
+        "ScalingInput": "One user action targets one peer chat. The central catalog rewrite and legacy JSON mirror scale with peer-chat count for that session, bounded by the 1,000-child catalog limit; changed local metadata writes are effectively one chat for this mutation.",
+        "EffectiveConcurrency": "Browser dispatch is one action. Host persistence is serialized per session by AgentHostPeerChatStore._writes; local metadata writes use a limiter of four, but only the changed chat is selected in the normal archive path.",
+        "CacheBehavior": "The provider requires an existing cached session and live connection. Central catalog and legacy mirror are read/reconciled on each write; no cache miss fan-out was introduced. Rapid toggles queue separately rather than coalescing, but ordinary cardinality is one user click.",
+        "MechanismConfidence": "High for the call path, I/O cardinality, and per-session serialization.",
+        "MagnitudeUncertainty": "Sessions with hundreds of peer chats make the existing full-catalog replacement more expensive, but archive/restore is a discrete user action and persistence is off the UI critical path; no evidence supports a separate high-confidence regression finding.",
+        "Verdict": "No additional finding: one bounded user action reuses the established serialized persistence mechanism and does not introduce boundary fan-out on a hot path."
+      },
+      {
+        "Scenario": "Open an existing Agent Host database after the schema change",
+        "CriticalPath": "Database initialization checks schema version and runs migrations before normal database use can proceed, so migration I/O is on the cold-open critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostDatabase.ts:normalizePreReleaseCatalogSchema and migration version 12",
+            "Operation": "Inspect session_chats columns and add the archived column with a default when required",
+            "Cardinality": "At most one PRAGMA inspection and one ALTER TABLE for an affected database; zero migration work after version 12 is persisted.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Database initialization stopped at migration version 5 and did not inspect or add the archived column.",
+            "CriticalPathEffect": "Blocks that database's first open after upgrade, but is bounded and one-time."
+          }
+        ],
+        "ScalingInput": "One database, one session_chats table, and existing rows handled by SQLite's ALTER TABLE. The extra PRAGMA inspection is limited to pre-release versions 5-11 with the final catalog schema.",
+        "EffectiveConcurrency": "Migration statements execute sequentially during database initialization; normal database operations wait for initialization.",
+        "CacheBehavior": "After user_version reaches 12, warm/subsequent opens skip the migration and schema inspection branch. Databases already carrying the archived column are detected and only have user_version normalized.",
+        "MechanismConfidence": "High for cold-open placement and warm-version bypass.",
+        "MagnitudeUncertainty": "SQLite ALTER cost depends on platform/version and row count, but the operation is one-time and schema-bounded.",
+        "Verdict": "No finding: the one-time bounded migration is necessary for persisted state and does not repeat after successful upgrade."
+      },
+      {
+        "Scenario": "Render and refresh the Sessions list with nested chats",
+        "CriticalPath": "Observable chat/session changes can synchronously trigger SessionsList.update; virtualized visible chat rows create scoped context keys and a MenuWorkbenchToolBar template for the new archive action.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Tree-model work scales with all known sessions/chats included by grouping and filters. Toolbar instances scale with virtualized rendered templates rather than every catalog chat, while archived-state filtering reads each nested chat during list refresh.",
+        "EffectiveConcurrency": "Rendering and observable reactions execute on the UI thread. Active-session refresh is scheduled at the next animation frame; chat-list changes invoke update synchronously when visible.",
+        "CacheBehavior": "The object tree virtualizes row templates and reuses them as elements scroll. Archived visibility overrides are in-memory; global archive-filter changes clear them. Provider catalog metadata avoids subscribing to each chat merely to obtain archived state.",
+        "MechanismConfidence": "High for UI-thread reachability, observable refresh triggers, and virtualized template ownership.",
+        "MagnitudeUncertainty": "Toolbar construction has nonzero per-visible-row cost, but virtualization bounds simultaneous instances and mirrors the existing session-row toolbar pattern; no concrete jank mechanism was established beyond the separately reported multi-update path.",
+        "Verdict": "No additional finding: archived metadata propagation adds small per-chat state checks, and toolbar creation is bounded by visible templates."
+      }
+    ],
+    "Summary": "Reviewed all 58 changed files and all diff pages for the performance focus. Submitted one medium-severity repeated full-tree rebuild finding for the multi-session archived-chat visibility action. Traced protocol dispatch, per-session serialized persistence, compatibility database writes, one-time migration, catalog propagation, list refreshes, and virtualized toolbar lifecycle; no other changed mechanism met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T09:53:02.305216983Z",
+    "CompletedAt": "2026-09-25T09:55:35.406696116Z",
+    "WallClockMilliseconds": 153101,
+    "ModelCalls": 10,
+    "InputTokens": 845434,
+    "OutputTokens": 9100,
+    "TotalTokens": 854534,
+    "ReasoningTokens": 2685,
+    "CacheReadTokens": 720509,
+    "CacheWriteTokens": 124895,
+    "APIDurationMilliseconds": 139071,
+    "ToolCalls": 99,
+    "NanoAIUnits": 109479860000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 720509,
+      "cache_write": 124895,
+      "input": 30,
+      "output": 9100
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
