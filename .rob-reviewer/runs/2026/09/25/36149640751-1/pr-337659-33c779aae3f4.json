@@ -1,0 +1,193 @@
+{
+  "PullRequest": {
+    "Number": 337659,
+    "Title": "agentHost: Detect Codex writer locks before sending",
+    "Body": "Opening a Codex conversation that another app owns now shows a non-dismissible banner above the composer before the user sends a message. Sending, queueing, and resending are blocked while history, the editable draft, and attachments stay visible.\n\nThe banner uses a lock icon and the title **This chat is open in another app**. Its body explains the restriction, followed by separate recovery instructions:\n\n\u003e The other app has locked this chat. It must release the lock before you can continue here.  \n\u003e Quit the other app (e.g. ChatGPT, Codex CLI), then retry.\n\n**Retry** checks access without submitting the draft or adding transcript entries. Successful recovery enables sending. The banner reuses the existing input notification widget, and the composer uses a consistent background color. Themed Component Explorer fixtures cover locked, narrow, and checking states.\n\nThe host checks readiness on interactive chat subscriptions using Codex's existing `thread/resume` API. Existing read-only interactivity and namespaced session metadata carry the restriction; Retry refreshes the subscription. No new AHP request, capability, generated protocol change, or Codex app-server change is required. Passive history reads remain read-only, fresh chats remain lazy, and archived/read-only chats are skipped.\n\nWriter contention requires both code `-32600` and the exact `thread \u003cbacking-thread-id\u003e already has an active writer` message. Send-time races retain typed guidance. Refresh preserves pending drafts, live updates, and newer reconnect snapshots. Temporary restrictions are not persisted as permanent read-only state. No processes are terminated and no locks are bypassed.\n\nValidation:\n\n- Compilation, hygiene, and layer checks passed. The latest UI refinement passed compilation and hygiene, all 40 affected notification tests, and all six Component Explorer variants; wide/dark and narrow/light screenshots were inspected.\n- The subscription implementation passed 609 provider/protocol tests, 474 host/contribution/telemetry tests, 726 chat UI tests, and 107 chat-group/metadata tests, plus focused lifecycle coverage.\n- Used the launch skill in Code OSS on macOS with Codex 0.153.0. A ChatGPT-held conversation showed the banner immediately; mouse and keyboard Retry kept one banner, disabled Send, and unchanged history.\n- With two real app-server processes sharing an isolated test home, Enter and repeated Retry preserved the draft and attachment without new transcript entries. After the disposable owner exited through stdin EOF, Retry enabled Send without submitting; an explicit subsequent send completed against a local response stub.\n- Windows/Linux and native screen-reader output were not exercised.\n\nPublic lock/release behavior: [Codex thread-resume regression test](https://github.com/openai/codex/blob/rust-v0.153.0/codex-rs/app-server/tests/suite/v2/thread_resume.rs#L372).\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337659",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "Giuspepe",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e5f3c4cdf7975e77ed8bab79aef0facb7463a167",
+    "HeadRef": "agents/codex-sessions-display-issue",
+    "HeadSHA": "33c779aae3f495fa584a6a8a3f43243bae56dbb7",
+    "CreatedAt": "2026-09-24T08:37:57Z",
+    "UpdatedAt": "2026-09-25T14:09:48Z",
+    "MergedAt": null,
+    "Labels": [
+      "on-testplan"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-3A94DBA6DCBF",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentService.ts",
+      "Side": "RIGHT",
+      "Line": 6105,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The awaited call path is explicit: `AgentHostSessionHandler.provideChatSessionContent` waits for the chat subscription to hydrate, the server waits for `AgentService.subscribe`, and the new line waits for provider preparation. Codex restored entries set `needsResume: true`; preparation reaches `_resumeSession`, which performs filesystem/config discovery and `thread/resume`. Exact duration varies with app-server, workspace, and MCP configuration, so severity is medium rather than high.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "Codex child-process `thread/resume` IPC plus workspace filesystem/configuration work",
+      "PerformanceScaling": "One resume is added for each restored chat whose runtime has `needsResume`; fresh restore can initiate this for every active chat subscription, while repeated subscriptions after a successful resume take the warm fast path.",
+      "PerformanceOutcome": "increased latency and a blocked chat-open/reconnect critical path",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "A chat subscription could return its existing snapshot/history without acquiring the Codex writer lock; restored threads were resumed by `_sendMessage` when the user actually sent the next turn.",
+      "ChangedBehavior": "Opening or restoring an existing interactive Codex chat now waits for native writer-lock acquisition and full thread resume before the subscription snapshot is returned.",
+      "CausalDiffEvidence": "The added `await this._chatInputService.prepareChat(resource)` at RIGHT line 6105 inserts provider preparation before `AgentService.subscribe` can return the chat snapshot. `prepareChat` marks the chat checking and awaits Codex `_prepareChat`, which calls `_ensureThreadConnection`; restored Codex entries are created with `needsResume: true`, so this runs `_resumeSession` and its `thread/resume` IPC before subscription hydration completes.",
+      "Title": "Hydrate the chat before awaiting native thread resume",
+      "Impact": "Opening a previously saved Codex conversation can leave the transcript/composer load blocked on child-process IPC and workspace/configuration work, even when the user only wants to read history. On fresh restore, several active chats can amplify reconnect latency and app-server load.",
+      "Evidence": "`AgentHostSessionHandler.provideChatSessionContent` blocks at `_whenSubscriptionHydrated(chatSub)`. The new subscribe await reaches `CodexAgent._prepareChat` -\u003e `_ensureThreadConnection`. For restored sessions, `_createResumedSessionEntry` sets `needsResume: true`; `_resumeSession` refreshes session MCP discovery (reading each workspace `.mcp.json`), resolves launch/model/hook state, and sends `thread/resume` to the Codex child process. The prior send path already performed this resume in `_sendMessage`, so this diff moves that work from first send onto chat-open hydration. Fresh reconnect/host restore processes active chat subscriptions in `Promise.all`, so the same boundary cost can occur once per restored chat, with only per-chat sequencing rather than a global resume limiter.",
+      "Recommendation": "Return/activate the chat subscription after publishing the synchronous `checking` input-block state, then run provider preparation off the transcript-hydration critical path while buffering or snapshotting its completion so sends remain blocked and no update is lost."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "repeated-work",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open an existing Codex conversation",
+        "CriticalPath": "`provideChatSessionContent` waits for chat-subscription hydration; the protocol subscribe waits for `AgentService.subscribe`; the diff now waits for `prepareChat`, which waits for Codex thread readiness. Thus resume completes before the existing transcript and composer can finish opening.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:6105 -\u003e CodexAgent._prepareChat/_resumeSession",
+            "Operation": "Resume the persisted native thread through Codex app-server JSON-RPC to acquire its writer lock.",
+            "Cardinality": "One `thread/resume` per restored chat with `needsResume`; session MCP discovery reads at most one `.mcp.json` per distinct working root and then caches the root snapshot.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Chat subscription/history hydration did not resume the native thread; `_sendMessage` resumed it when the user sent a turn.",
+            "CriticalPathEffect": "Both provider preparation and all of its awaited discovery/resume work block delivery of the chat snapshot."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_refreshSessionMcpDiscovery -\u003e SessionMcpDiscovery.refresh",
+            "Operation": "Read and parse workspace `.mcp.json` definitions used to construct resume configuration.",
+            "Cardinality": "One cached-or-cold read for each distinct workspace root used by the restored chat; shared roots avoid repeated cold reads.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This discovery/resume preparation ran on first send rather than before chat hydration.",
+            "CriticalPathEffect": "`_resumeSession` awaits MCP discovery before issuing `thread/resume`, so cold filesystem reads delay opening."
+          }
+        ],
+        "ScalingInput": "The number of restored chats opened, with effective cardinality one native resume per cold chat after subscription and cache coalescing.",
+        "EffectiveConcurrency": "One open is coalesced per resource within a client, and Codex serializes lifecycle work per chat key. Distinct chats use distinct keys and can prepare concurrently; there is no global resume limiter.",
+        "CacheBehavior": "The workbench and host reuse one managed subscription per resource, and concurrent Retry calls are coalesced by both `AgentSubscriptionManager.refresh` and `AgentHostChatInputService._pending`. After a successful Codex resume, `needsResume` is false and later preparations take a warm fast path. A restored or connection-replaced runtime is cold and must resume again.",
+        "MechanismConfidence": "High: the complete awaited call path and restored `needsResume` invariant are explicit in code.",
+        "MagnitudeUncertainty": "Exact latency depends on app-server responsiveness, workspace filesystem, hook/customization configuration, and whether discovery is warm; the critical-path move itself is deterministic.",
+        "Verdict": "Reportable medium-severity eager-work regression because native resume and filesystem/configuration work moved from first send onto transcript hydration."
+      },
+      {
+        "Scenario": "Retry a writer-locked conversation",
+        "CriticalPath": "Retry intentionally waits for the refreshed subscribe and writer-lock result before enabling Send. Transcript/draft are already visible, so this work is not on transcript hydration but is on the explicit recovery action.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/platform/agentHost/common/state/agentSubscription.ts:refreshSubscription and CodexAgent._prepareChat",
+            "Operation": "Refresh the chat snapshot and retry Codex writer-lock acquisition without sending a turn.",
+            "Cardinality": "One subscribe protocol round trip and, while locked, one Codex `thread/resume` attempt per user Retry.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no pre-send Retry flow; lock contention surfaced only during Send.",
+            "CriticalPathEffect": "The Retry action remains in checking state until the child-process response arrives; this is required for the recovery result."
+          }
+        ],
+        "ScalingInput": "Explicit Retry clicks and number of independently locked chats.",
+        "EffectiveConcurrency": "One in-flight refresh per resource per client and one host preparation per chat marker; separate chats may retry concurrently.",
+        "CacheBehavior": "The refresh promise is coalesced per managed subscription, the host coalesces simultaneous preparation for the same chat marker, and a successful retry clears `needsResume`; a failed writer-lock retry deliberately remains cold/retryable.",
+        "MechanismConfidence": "High: refresh and host pending maps visibly coalesce, and the Codex test confirms exactly one resume attempt per retry.",
+        "MagnitudeUncertainty": "User retry frequency and lock-release timing vary, but same-chat bursts are explicitly coalesced.",
+        "Verdict": "No separate finding: the boundary is user-requested, coalesced, and necessary to determine readiness."
+      },
+      {
+        "Scenario": "Reconnect or restore a window with active chats",
+        "CriticalPath": "Reconnect response waits for `Promise.all` over restored subscriptions. Every chat subscribe now waits for preparation, so all cold chat resumes must settle before reconnect completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:_restoreReconnectSubscriptions -\u003e AgentService.subscribe",
+            "Operation": "Concurrently resume active persisted Codex threads in the shared child app-server.",
+            "Cardinality": "Up to one `thread/resume` per active restored chat subscription after deduplication; session residency normally bounds resident root sessions to ten, though a session may own multiple chat backings.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Chat subscription restoration returned snapshots without native writer-lock acquisition; resumes occurred later on send.",
+            "CriticalPathEffect": "The reconnect handshake waits for every restored chat subscription, so the slowest resume gates reconnection."
+          }
+        ],
+        "ScalingInput": "Effective number of distinct active chat subscriptions requiring cold resume.",
+        "EffectiveConcurrency": "Protocol restoration maps all subscriptions through `Promise.all`; lifecycle sequencing is per chat only. Distinct chat resumes can therefore run concurrently against the shared Codex app-server.",
+        "CacheBehavior": "An ordinary transport reconnect can reuse resident Codex sessions and may take the warm preparation fast path. A fresh host/app-server restore creates runtime entries with `needsResume: true`; cold thread reads are limited to eight, but subsequent native resumes have no global limiter.",
+        "MechanismConfidence": "High for concurrency and handshake reachability; medium for prevalence of many simultaneously cold active chats.",
+        "MagnitudeUncertainty": "The active-chat count and whether the Codex connection was also replaced vary; warm reconnects may avoid native resume entirely.",
+        "Verdict": "Covered by the reported eager-work finding as its collection-scaling form; not duplicated as a second comment."
+      },
+      {
+        "Scenario": "Open a fresh Codex chat",
+        "CriticalPath": "Only local checking-state actions and subscription hydration occur; no provider subprocess or filesystem work is introduced for a genuinely fresh chat.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of fresh chats opened.",
+        "EffectiveConcurrency": "Constant local state work per newly subscribed chat; same-chat concurrent subscriptions coalesce while checking.",
+        "CacheBehavior": "A new Codex chat has no native `threadId`; preparation returns without starting or resuming a thread, preserving lazy materialization until first send.",
+        "MechanismConfidence": "High: `_prepareChat` exits when `session.threadId` is absent, and focused tests assert no backing is created.",
+        "MagnitudeUncertainty": "None material for the reviewed mechanism.",
+        "Verdict": "No reportable regression; native work remains lazy."
+      },
+      {
+        "Scenario": "Render and clear the writer-lock banner",
+        "CriticalPath": "Metadata/interactivity transitions synchronously update context keys and one composer notification. No changed filesystem, subprocess, database, or network boundary is reached.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Writer-state transitions and number of currently open views.",
+        "EffectiveConcurrency": "Constant work per state transition; same notification ID prevents accumulation in a view.",
+        "CacheBehavior": "Input state is held in observable session metadata and rendered as one keyed notification; updates replace/delete the same notification rather than accumulating DOM entries.",
+        "MechanismConfidence": "High for constant cardinality and cleanup on disposal.",
+        "MagnitudeUncertainty": "DOM/layout cost is small and constant; no evidence of forced layout or frame-frequency updates.",
+        "Verdict": "No reportable rendering, retention, or synchronous-UI regression."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 55 changed files. Reported one medium-severity critical-path regression: existing-chat subscription now awaits Codex native resume and workspace/configuration preparation before transcript hydration. Retry coalescing, fresh-chat laziness, bounded residency cleanup, reconnect fan-out, and notification rendering were separately traced; no additional independent performance finding or regression-fix signal met the evidence threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T14:52:04.516209571Z",
+    "CompletedAt": "2026-09-25T14:56:30.613836106Z",
+    "WallClockMilliseconds": 266097,
+    "ModelCalls": 20,
+    "InputTokens": 2337039,
+    "OutputTokens": 15847,
+    "TotalTokens": 2352886,
+    "ReasoningTokens": 5463,
+    "CacheReadTokens": 2170336,
+    "CacheWriteTokens": 166643,
+    "APIDurationMilliseconds": 248565,
+    "ToolCalls": 183,
+    "NanoAIUnits": 201852940000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 2170336,
+      "cache_write": 166643,
+      "input": 60,
+      "output": 15847
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

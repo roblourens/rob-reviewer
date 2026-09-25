@@ -1,0 +1,160 @@
+{
+  "PullRequest": {
+    "Number": 337442,
+    "Title": "sessions: fix: preserve hidden Chat on editor handoff",
+    "Body": "fixes https://github.com/microsoft/vscode/issues/334236\n\n## Summary\n\nPreserve a user's hidden Chat state when **Open in Editor** returns an Agents session to an editor window that is already open.\n\n- Track successful external session handoffs for the lifetime of each editor window.\n- Suppress only a repeated handoff whose existing Chat widget is hidden.\n- Restrict suppression to the Chat view, excluding inactive Chat editor tabs.\n- Coalesce concurrent handoffs for the same session.\n- Preserve the existing first-open, visible-widget, missing-widget, and retry behavior.\n- Add focused regression coverage for the window-local lifecycle.\n\n## Motivation\n\nThe Agents window hands a session to the regular workbench through `vscode:openChatSession`. Opening the same workspace again correctly reuses and focuses its existing editor window, but the IPC listener previously reopened Chat every time. That overrode the user's deliberate choice to hide Chat while continuing to work in the editor.\n\nThe hidden state should be remembered only for that editor window's lifetime. It should not become profile or workspace state, and a newly created or reloaded window must still open the handed-off session.\n\n## Implementation\n\n`ChatSessionHandoffController` records sessions only after their first handoff opens successfully. For later handoffs it checks the current widget:\n\n| Situation | Result |\n|---|---|\n| First handoff in this editor window | Open Chat |\n| Existing widget is hidden after a previous handoff | Keep Chat hidden |\n| Only an inactive Chat editor exists | Open/reveal the session normally |\n| Existing widget is visible | Use the normal open/reveal path |\n| Widget no longer exists | Open the session again |\n| Different session | Open that session |\n| Open fails | Leave it unrecorded so a later handoff retries |\n| Concurrent handoffs for one session | Share one pending open |\n| Chat becomes hidden during a pending open | Keep waiting for the pending result |\n\n`ChatCommandLineHandler` owns one controller per renderer contribution, which naturally scopes this memory to one editor window without adding storage or provider-specific behavior.\n\n## Validation\n\n- Focused `ChatSessionHandoff` unit tests: **5 passing**\n- ESLint on all changed TypeScript files: **passed**\n- Full client type check: no diagnostics in changed files; existing Agent Host SDK dependency mismatches remain outside this change\n- Code OSS Dev UI scenario on Windows x64, VS Code 1.139.0: **5/5 steps passed**\n  - first handoff created an editor window and displayed Chat;\n  - hiding Chat left that editor window open;\n  - the second handoff reused and focused the same window;\n  - the window count stayed unchanged;\n  - Chat remained hidden.\n\n### UI evidence\n\nhttps://github.com/user-attachments/assets/ae0d3a50-fd13-4129-b639-f4648f9dc8ea\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337442",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "ulugbekna",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0a580c422d26090631afd7a4ee6e27cf4018dba8",
+    "HeadRef": "ulugbekna/agents/insiders-chat-persistence-feature",
+    "HeadSHA": "5a13e1bd2c153b906acfc443b46dc73b32dc88d0",
+    "CreatedAt": "2026-09-23T09:18:41Z",
+    "UpdatedAt": "2026-09-25T14:09:04Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "repeated-work",
+      "concurrency-burst",
+      "unbounded-retention"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First or visible-widget handoff from Agents/Open in Editor or a session protocol URL into an editor window",
+        "CriticalPath": "The main process routes/focuses the target window, sends vscode:openChatSession, and the renderer awaits openSession to reveal the Chat view and load the session before the requested UI is ready. The new controller adds one ResourceMap lookup and one linear scan over currently open chat widgets before the unchanged open path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/native/electron-main/nativeHostMainService.ts:306 and src/vs/code/electron-main/app.ts:1130",
+            "Operation": "Send vscode:openChatSession from the main process to the selected renderer window.",
+            "Cardinality": "One IPC message per explicit handoff/protocol invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC message was sent before this PR.",
+            "CriticalPathEffect": "The renderer cannot begin revealing/loading the requested session until this message arrives."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/model/chatSessionStore.ts:635-674 via ChatViewPane.loadSession",
+            "Operation": "Read and deserialize a cold locally persisted chat session, with a fallback read for migrated empty-window storage.",
+            "Cardinality": "Normally one queued read of the log or flat session file per cold local-session load; warm model reuse avoids it.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The prior IPC handler called the same openSession/loadSession path for every handoff.",
+            "CriticalPathEffect": "A cold local session must be read before the Chat model can be displayed."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts:1339-1386 via ChatViewPane.loadSession",
+            "Operation": "Resolve a cold remote session through its registered content provider; the provider's concrete transport is provider-dependent.",
+            "Cardinality": "One coalesced provider resolution per cold remote session key; warm sessions are served from the existing session cache.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The prior IPC handler invoked the same provider-backed path; this PR only skips eligible hidden repeats and coalesces duplicate same-key opens.",
+            "CriticalPathEffect": "Cold remote session content must resolve before the model is shown."
+          }
+        ],
+        "ScalingInput": "One handoff event and one session URI per explicit user action; the added scan scales with live chat widgets/editor tabs, not session history. Session-history size affects the pre-existing load/parse path.",
+        "EffectiveConcurrency": "Same-session handoffs are now coalesced by pendingOpens. Different-session handoffs can proceed concurrently, as they could before; the Chat view's loadSession cancellation token applies last-call-wins behavior.",
+        "CacheBehavior": "openedSessions is cold on the first handoff. The chat model/session services may reuse a warm in-memory model/session; a cold local session reads persisted data and a cold remote session resolves provider content. Failed opens are deliberately not added to openedSessions and therefore retry.",
+        "MechanismConfidence": "High: the renderer call path, widget scan, per-key coalescing, local filesystem read, and remote provider resolution are directly visible in the implementation.",
+        "MagnitudeUncertainty": "The number of open chat widgets and session-history size vary, but the added scan is over live widgets and does not multiply any expensive boundary.",
+        "Verdict": "No reportable regression. The added O(live widgets) lookup is small on an explicit action path, while expensive cold-load behavior is unchanged and duplicate same-session work is reduced."
+      },
+      {
+        "Scenario": "Repeated handoff of a successfully opened session whose Chat view is currently hidden",
+        "CriticalPath": "After the existing main-to-renderer IPC, the controller scans live widgets and returns immediately when the same handed-off session is found in a hidden Chat view. Session reveal, model acquisition, rendering, filesystem reads, and provider resolution are kept off this path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/native/electron-main/nativeHostMainService.ts:306",
+            "Operation": "Deliver the repeated handoff to the renderer.",
+            "Cardinality": "One IPC per user invocation; unchanged by this PR.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC was sent and then always triggered openSession.",
+            "CriticalPathEffect": "The IPC occurs before suppression, but the renderer then completes without loading or revealing Chat."
+          }
+        ],
+        "ScalingInput": "One lookup per repeated explicit handoff; scan cost scales with live widgets. openedSessions membership scales with distinct successful handoffs during the editor-window lifetime.",
+        "EffectiveConcurrency": "If no open is pending, the hidden repeat returns immediately. If an earlier open for the same URI is pending, repeated callers share that promise rather than starting another load.",
+        "CacheBehavior": "openedSessions is a positive window-lifetime marker populated only after a successful open. There is no negative caching: missing/failed opens retry. The set has no per-entry eviction, but each entry is only a URI/string key from an explicit successful handoff, so the evidenced cardinality and retained resource are too small to establish a meaningful performance regression.",
+        "MechanismConfidence": "High: the suppression guard and window-lifetime ResourceSet are explicit in ChatSessionHandoffController.",
+        "MagnitudeUncertainty": "A very long-lived window can accumulate stale URI markers, but growth requires distinct successful explicit handoffs and retains only URI metadata; no realistic high-cardinality or material memory impact is established.",
+        "Verdict": "No reportable regression. This scenario removes pre-existing UI/model work and expensive cold-load boundaries rather than adding them."
+      },
+      {
+        "Scenario": "Concurrent handoffs for the same session",
+        "CriticalPath": "The first renderer event starts the normal openSession path; later same-key events await the promise stored in pendingOpens, so completion still depends on the single underlying session load.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/model/chatSessionStore.ts:635-674",
+            "Operation": "Potential cold local-session read for the one underlying same-session open.",
+            "Cardinality": "At most one controller-initiated load for concurrent events sharing the same URI; lower layers may also reuse an existing model.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Each concurrent IPC handler could call openSession independently; the PR reduces this cardinality.",
+            "CriticalPathEffect": "All coalesced callers await the same cold read when needed."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts:1289-1328 and 1339-1386",
+            "Operation": "Potential provider-backed remote-session resolution, already coalesced at the session service and now also coalesced before view-opening work.",
+            "Cardinality": "One provider resolution per remote session key after service caching/coalescing; the new controller also prevents duplicate view open/load calls for that key.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Provider resolution already coalesced below, but duplicate renderer open/view work could still be initiated; this PR reduces that repeated work.",
+            "CriticalPathEffect": "The first cold resolution remains on the UI-open critical path; duplicate callers share it."
+          }
+        ],
+        "ScalingInput": "Cost is one underlying open per distinct session URI in the concurrent burst, rather than one per event. Aggregate work can still scale with distinct session keys, matching pre-diff event cardinality.",
+        "EffectiveConcurrency": "Per-session concurrency is coalesced. pendingOpens entries are removed in finally on success or failure; distinct keys are not globally limited.",
+        "CacheBehavior": "The pending map is an in-flight cache only and is cleared in finally. A successful open populates openedSessions; failures remain retryable. Lower session services also coalesce/cache same-resource provider resolution.",
+        "MechanismConfidence": "High: the pending map is keyed by ResourceMap URI identity and deletion is guaranteed by finally; the focused test confirms one attempt for concurrent same-session calls.",
+        "MagnitudeUncertainty": "The frequency of duplicate user handoffs is unknown, but uncertainty only affects the size of the improvement, not regression risk.",
+        "Verdict": "No reportable regression. Same-key concurrency and duplicate UI work are reduced; distinct-key concurrency is not increased relative to the prior handler."
+      }
+    ],
+    "Summary": "Reviewed all three changed files and traced the handoff through Electron IPC, widget lookup/reveal, local persisted-session reads, and remote provider resolution. The PR adds only small per-event map/scan bookkeeping, suppresses repeated hidden-session loads, and coalesces concurrent same-session opens. No high-confidence diff-introduced performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T14:50:12.037932639Z",
+    "CompletedAt": "2026-09-25T14:52:00.908779088Z",
+    "WallClockMilliseconds": 108870,
+    "ModelCalls": 16,
+    "InputTokens": 542217,
+    "OutputTokens": 7427,
+    "TotalTokens": 549644,
+    "ReasoningTokens": 2933,
+    "CacheReadTokens": 484656,
+    "CacheWriteTokens": 57513,
+    "APIDurationMilliseconds": 91938,
+    "ToolCalls": 62,
+    "NanoAIUnits": 63015940000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 484656,
+      "cache_write": 57513,
+      "input": 48,
+      "output": 7427
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

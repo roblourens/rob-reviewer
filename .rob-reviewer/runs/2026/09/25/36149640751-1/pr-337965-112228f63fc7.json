@@ -1,0 +1,275 @@
+{
+  "PullRequest": {
+    "Number": 337965,
+    "Title": "Fix worktree creation display for peer chats",
+    "Body": "This pull request addresses the issue of displaying worktree creation notifications for peer chats, aligning their behavior with that of main chats. \n\n### Changes Made\n- Peer-chat worktrees are now correctly associated with their owning chat in `sessionAdditionalWorktrees.ts`.\n- The association is persisted before the peer chat is created, as implemented in `sessionServerTools.ts` and `agentService.ts`.\n- The `WorktreeAnnouncementContribution` now:\n  - Emits the localized \"Created isolated worktree...\" markdown used by main chat.\n  - Displays this message exactly once in the owning peer chat.\n  - Restores the message when chat history is reopened.\n  - Prevents incorrect display in chats that reuse the worktree.\n\n### Validation\n- Focused regression tests were added and successfully passed.\n- Targeted transpilation and type-checks for changed files are clean.\n- Full type-check issues are unrelated to this change, stemming from missing Electron typings.",
+    "URL": "https://github.com/microsoft/vscode/pull/337965",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "be21ce757f1c1e83277c81b18c8aa6846c5cb7cf",
+    "HeadRef": "sandy081/agents/worktree-creation-display-fix",
+    "HeadSHA": "112228f63fc7d4eba9dc99edecc28bf36d6c0e98",
+    "CreatedAt": "2026-09-25T14:02:22Z",
+    "UpdatedAt": "2026-09-25T14:55:33Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-EEBF110D2F20",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/chatContributions/worktreeAnnouncement/worktreeAnnouncementContribution.ts",
+      "Side": "RIGHT",
+      "Line": 59,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The added call is reached for every non-default outgoing turn until an announcement is emitted, and `_findOwnedWorktree` is directly shown to call `tryOpenDatabase` plus `getMetadata`; the contribution dispatcher awaits it serially before `agent.chats.sendMessage`. For the common peer chat that does not own a newly-created additional worktree, the miss is never memoized, so this repeats deterministically. Exact disk latency varies by filesystem and SQLite contention, which affects severity but not the mechanism.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceResource": "filesystem stat calls, SQLite metadata reads, JSON parsing/validation, and array scans",
+      "PerformanceScaling": "For each non-owner peer chat, cost grows with every outgoing turn and every hydration/history-refresh event; each event performs one stat and one SQL query, while CPU/allocation also grows with the number of additional-worktree records in the session.",
+      "PerformanceOutcome": "Repeated critical-path I/O increases prompt-dispatch latency and background history-refresh I/O.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Peer-chat outgoing turns did not execute this contribution or access additional-worktree metadata; peer-chat hydration also returned without storage I/O.",
+      "ChangedBehavior": "Every non-default outgoing turn first checks an in-memory positive-only memento, then performs a durable ownership lookup when it is false; misses do not change the memento and are retried indefinitely.",
+      "CausalDiffEvidence": "Before the diff, non-default chats returned immediately from `onHydrateTurns` and this contribution had no `onOutgoingTurn`, so ordinary peer-chat sends performed no additional-worktree storage lookup. The added RIGHT line 59 now places that lookup on every non-default outgoing-turn path unless the positive announcement state was reached.",
+      "Title": "Cache negative worktree-ownership lookups",
+      "Impact": "Sending messages in any ordinary peer chat now waits for a filesystem stat and SQLite metadata query before the prompt can reach the provider. Subscribed provider-history refreshes also repeat the lookup. On slower or contended storage this adds recurring send latency and unnecessary disk/SQLite activity even though ownership cannot appear after the chat has been created through this flow.",
+      "Evidence": "`onOutgoingTurn` awaits `_findOwnedWorktree` at the added line. That helper calls `readSessionAdditionalWorktrees`, which invokes `ISessionDataService.tryOpenDatabase` (an awaited filesystem `stat` even when the DB is already warm), executes `SELECT value FROM session_metadata WHERE key = ?`, parses and validates the complete JSON array, then scans it. `AgentHostChatContributions.outgoingTurn` awaits contributions sequentially, and `AgentSideEffects` awaits that result immediately before provider dispatch. The same uncached helper is also reached from peer-chat hydration/history refresh. Only successful ownership plus metadata sets `announcementEmittedKey`; a non-owner leaves it false forever.",
+      "Recommendation": "Memoize the ownership resolution, including `undefined`, per chat (or load a session-level chat-to-worktree map once) and clear it with the existing chat/session contribution lifecycle. Association is persisted before chat creation in this PR, so a chat created through this path can safely retain the negative result; preserve an explicit invalidation path if any other flow can associate an already-live chat."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Send a prompt from a peer chat",
+        "CriticalPath": "After model selection and attachment resolution, all chat contributions run serially. The new worktree contribution must finish before `agent.chats.sendMessage`, so its ownership and first-announcement reads directly delay provider dispatch.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionAdditionalWorktrees.ts:20 `readSessionAdditionalWorktrees` via `SessionDataService.tryOpenDatabase`",
+            "Operation": "Stat the parent session database path before acquiring the database.",
+            "Cardinality": "One per non-default send while the positive announcement memento is false; repeated forever for non-owner chats.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This contribution did no work for peer-chat outgoing turns.",
+            "CriticalPathEffect": "Awaited before provider dispatch."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionAdditionalWorktrees.ts:26 `readSessionAdditionalWorktrees`",
+            "Operation": "SQLite SELECT of the additional-worktrees metadata, followed by JSON parse/validation and a chat scan.",
+            "Cardinality": "One query per ownership lookup; the CPU/allocation portion scans all additional-worktree records.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No additional-worktree metadata query occurred on peer-chat sends.",
+            "CriticalPathEffect": "Awaited before provider dispatch."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1471 `_readWorktreeMetadata`",
+            "Operation": "For the owning chat's first announcement, stat/open detached worktree metadata storage and probe worktree-path existence.",
+            "Cardinality": "Once after a successful ownership lookup and announcement; retried on later sends if metadata is absent.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Peer-chat sends did not read detached worktree metadata.",
+            "CriticalPathEffect": "Awaited before provider dispatch."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1471 `_readWorktreeMetadata`",
+            "Operation": "Read four detached worktree metadata keys.",
+            "Cardinality": "Once for a successful first announcement; retried after metadata misses.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Peer-chat sends had no detached metadata reads.",
+            "CriticalPathEffect": "Awaited before provider dispatch."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1499 `_resolvePrimaryWorktreeRoot`",
+            "Operation": "Potential Git worktree-root resolution through the Git service when the resolver's bounded path cache is cold.",
+            "Cardinality": "At most the first successful metadata read for this path while cold; shared resolver caching removes repeat Git probes for known paths.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Peer-chat announcement sends did not reach this metadata normalization path.",
+            "CriticalPathEffect": "Can delay the first owning peer-chat send, but is bounded and required only for the one-time announcement path."
+          }
+        ],
+        "ScalingInput": "Outgoing-turn count per peer chat. For chats that do not own a newly-created additional worktree, effective cardinality is one ownership lookup per send indefinitely; for the owner it is one successful lookup plus one detached-metadata load before the positive memento suppresses later sends.",
+        "EffectiveConcurrency": "Contribution execution is serial within each send. There is no coalescing of ownership misses across sends or chats; concurrent sends in different chats can issue independent storage reads.",
+        "CacheBehavior": "The positive `announcementEmitted` state is cached per chat and cleaned up with chat/session contribution state. Negative ownership results and missing detached metadata are not cached, so warm sends repeat the same I/O. The Git primary-root resolver has its own bounded path cache, but it is reached only after a positive ownership lookup.",
+        "MechanismConfidence": "High: changed call path, awaited ordering, storage implementation, and positive-only cache behavior are explicit.",
+        "MagnitudeUncertainty": "Filesystem and SQLite latency depends on platform, cache warmth, and contention. The repeated critical-path boundary and its exact per-send cardinality are certain; only milliseconds and prevalence of long-lived peer chats vary.",
+        "Verdict": "Reportable: ordinary non-owner peer chats repeat a stat and SQLite query on every send because misses are not memoized."
+      },
+      {
+        "Scenario": "Open or refresh peer-chat history",
+        "CriticalPath": "Initial history restore gets provider messages and workspace transitions, then sequentially hydrates all contributions before returning turns. Subscribed `onDidChangeChatHistory` events likewise await hydration before state refresh; the new ownership lookup is therefore on both restore and refresh paths.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:5081 `_getChatMessages`",
+            "Operation": "Provider `getMessages` request for chat history.",
+            "Cardinality": "One per initial history reconstruction.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider history request occurred before this PR.",
+            "CriticalPathEffect": "Pre-existing prerequisite that runs before contribution hydration."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionAdditionalWorktrees.ts:20 `readSessionAdditionalWorktrees`",
+            "Operation": "Stat parent session database storage.",
+            "Cardinality": "One per peer-chat hydration or subscribed history refresh.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Non-default hydration returned immediately from this contribution.",
+            "CriticalPathEffect": "Adds latency before restored/refreshed turns are published."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionAdditionalWorktrees.ts:26 `readSessionAdditionalWorktrees`",
+            "Operation": "Read, parse, validate, and scan the complete additional-worktree metadata value.",
+            "Cardinality": "One per peer-chat hydration or history refresh.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No ownership metadata read on peer-chat hydration.",
+            "CriticalPathEffect": "Adds local I/O and CPU before history publication."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1515 `_readWorktreeNotice`",
+            "Operation": "For an owning peer chat, stat/open detached worktree storage.",
+            "Cardinality": "One for each owner hydration/history refresh.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Peer chats did not restore worktree announcements.",
+            "CriticalPathEffect": "Required to reconstruct the announcement before publishing turns."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1515 `_readWorktreeNotice`",
+            "Operation": "Read detached branch/failure announcement metadata.",
+            "Cardinality": "Two metadata SELECTs, issued concurrently, for each owner hydration/history refresh.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Peer-chat hydration had no detached announcement reads.",
+            "CriticalPathEffect": "Required to reconstruct the owner announcement."
+          }
+        ],
+        "ScalingInput": "Number of peer chats restored and provider history-change events while subscribed. Effective cardinality is one parent-session ownership lookup per hydration event per peer chat; an owner adds one detached announcement lookup.",
+        "EffectiveConcurrency": "Hydration contributions are serial per chat. External history refreshes are sequenced per chat, but different chat keys can proceed independently; there is no session-level lookup coalescing.",
+        "CacheBehavior": "Neither positive nor negative ownership is reused by `onHydrateTurns`; every hydration re-reads the parent metadata. Database connections may be warm, but `tryOpenDatabase` still performs a filesystem stat. The detached announcement read also runs on every owner hydration to reconstruct synthetic history.",
+        "MechanismConfidence": "High for the new local storage boundaries and sequential hydration placement.",
+        "MagnitudeUncertainty": "Provider event frequency differs by implementation and active subscriptions. The added local lookup per hydration event is explicit; exact wall-clock impact and number of simultaneously open chats vary.",
+        "Verdict": "The same uncached ownership mechanism is covered by the reported finding. Owner-only detached reads are behavior-required and bounded to one owner per worktree, so they do not warrant a separate finding."
+      },
+      {
+        "Scenario": "Create a current-session peer chat with a newly isolated worktree",
+        "CriticalPath": "Worktree preparation performs Git discovery/creation and records the worktree. The PR then serially associates the allocated chat by reading and rewriting session metadata before `createChat`, rename, and initial prompt.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:6724 `_prepareChatWorkingDirectory`",
+            "Operation": "Existing Git repository/worktree discovery, branch selection, and detached worktree creation.",
+            "Cardinality": "Several Git operations once per new isolated worktree.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same Git/worktree preparation already occurred.",
+            "CriticalPathEffect": "Dominates worktree preparation before chat creation."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:6737-6774 `_prepareChatWorkingDirectory`",
+            "Operation": "Existing read and write of additional-worktree records.",
+            "Cardinality": "One read and one write in the successful preparation path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Preparation already persisted the unassociated worktree record.",
+            "CriticalPathEffect": "Pre-existing part of worktree preparation."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:6800 `_associateAdditionalWorktreeWithChat`",
+            "Operation": "New database-path stat via `readSessionAdditionalWorktrees`.",
+            "Cardinality": "Once for the newly created worktree.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No association callback or additional pre-create stat existed.",
+            "CriticalPathEffect": "Now completes before chat allocation is committed."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:6800-6808 `_associateAdditionalWorktreeWithChat`",
+            "Operation": "Read the record array, copy/update one record, and rewrite the serialized array.",
+            "Cardinality": "One SELECT and one metadata write per newly-created worktree chat.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The prepared unassociated record was not rewritten before chat creation.",
+            "CriticalPathEffect": "Awaited before `accessor.createChat` and the initial prompt."
+          }
+        ],
+        "ScalingInput": "One operation per newly-created additional worktree/peer chat; the metadata serialization size grows with the session's additional-worktree record count.",
+        "EffectiveConcurrency": "The existing `_additionalWorktreeSequencer` serializes preparation, association, release, and related record changes per session. Different sessions can proceed independently.",
+        "CacheBehavior": "The association read always uses `tryOpenDatabase`, so even a warm connection incurs a stat; no read cache is used. This is a one-time write path, not a recurring miss.",
+        "MechanismConfidence": "High: the callback is passed only when preparation created a worktree and is awaited before createChat.",
+        "MagnitudeUncertainty": "Record counts and local storage latency vary, but this is one bounded metadata update next to substantially heavier worktree creation.",
+        "Verdict": "No finding: the added association I/O is one-time, per-session serialized, and necessary to persist ownership before the chat can emit its first turn; it is not a realistic independent regression relative to existing Git worktree creation."
+      },
+      {
+        "Scenario": "Use or restore the default chat",
+        "CriticalPath": "Default chats continue directly to the existing worktree announcement restore behavior and skip the new ownership lookup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1515 `_readWorktreeNotice`",
+            "Operation": "Existing default-session worktree notice storage lookup.",
+            "Cardinality": "One per default-chat hydration, as before.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical default-chat restore-announcement read.",
+            "CriticalPathEffect": "Existing restore cost."
+          }
+        ],
+        "ScalingInput": "One existing restore-announcement read per default-chat hydration; unchanged by the diff.",
+        "EffectiveConcurrency": "Existing sequential contribution hydration behavior is unchanged.",
+        "CacheBehavior": "Existing worktree notice storage behavior is unchanged; the new peer-chat memento and ownership lookup are bypassed.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "None material to the diff.",
+        "Verdict": "No regression on the default-chat path."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files and traced worktree association, outgoing-turn, hydration/history-refresh, storage, Git, and lifecycle paths. Submitted one cache-lifecycle finding for repeated negative ownership reads on ordinary peer chats; no separate issue was justified for the bounded association write or required owner announcement restoration."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T14:57:36.598577789Z",
+    "CompletedAt": "2026-09-25T15:00:16.055203078Z",
+    "WallClockMilliseconds": 159456,
+    "ModelCalls": 15,
+    "InputTokens": 737809,
+    "OutputTokens": 9416,
+    "TotalTokens": 747225,
+    "ReasoningTokens": 2983,
+    "CacheReadTokens": 664062,
+    "CacheWriteTokens": 73702,
+    "APIDurationMilliseconds": 146226,
+    "ToolCalls": 74,
+    "NanoAIUnits": 82263480000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 664062,
+      "cache_write": 73702,
+      "input": 45,
+      "output": 9416
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
