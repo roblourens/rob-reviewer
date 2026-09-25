@@ -1,0 +1,142 @@
+{
+  "PullRequest": {
+    "Number": 337829,
+    "Title": "Respect preview entitlement for HydraFusion",
+    "Body": "## Summary\n\n- gate the HydraFusion value forwarded by VS Code to the local Copilot Agent Host on the existing editor-preview entitlement\n- forward `hydraFusion: false` when `chat_preview_features_enabled` is disabled, even if the user setting or experiment is enabled\n- re-evaluate the forwarded value when account policy data changes\n- avoid introducing a standalone HydraFusion enterprise policy or policy-catalog entry\n\n## Scope\n\nThis applies to the existing VS Code AHP configuration bridge. It does not define a new runtime-wide managed setting or enterprise control.\n\n## Validation\n\n- `npm run typecheck-client`\n- `./scripts/test.sh --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostCopilotCliSettingsContribution.test.ts --grep \"forwards the experimentation settings|disables HydraFusion when preview features are disabled\"`\n- `npm run export-policy-data`",
+    "URL": "https://github.com/microsoft/vscode/pull/337829",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "c3cbcba676f18ba2d0281d10d43b7ccd63db9a69",
+    "HeadRef": "bhavya/hydrafusion-preview-policy",
+    "HeadSHA": "fd2340d13d2d86ee085f618bbaac77a319908fe6",
+    "CreatedAt": "2026-09-24T22:08:31Z",
+    "UpdatedAt": "2026-09-25T18:58:19Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "eager-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Workbench restoration or local Agent Host start/hydration forwards Copilot CLI root configuration",
+        "CriticalPath": "After restore, enablement starts the forwarder and synchronously computes each advertised key; any differing values are sent to the local Agent Host. The added policy lookup is an in-memory property read and does not delay restoration or initiate account refresh/network work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostRootConfigForwarder.ts:_push",
+            "Operation": "Dispatches a RootConfigChanged notification through the local Agent Host protocol when the advertised root value differs.",
+            "Cardinality": "At most one HydraFusion notification per enabled workbench window during a reconcile; zero when schema is absent or the cached root value is equal.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "HydraFusion already used the same schema-gated, equality-guarded local-host dispatch during start and hydration; the diff only changes the boolean computation based on cached policy data.",
+            "CriticalPathEffect": "Fire-and-forget notification after the synchronous value computation; it does not await host processing."
+          }
+        ],
+        "ScalingInput": "The fixed table of 11 forwarded keys, with HydraFusion contributing at most one notification for one advertised root-config key per workbench window.",
+        "EffectiveConcurrency": "Reconciliation invokes one async push per fixed key. HydraFusion computation is synchronous; dispatches are independent notifications, while schema and structural-equality guards suppress absent or unchanged values.",
+        "CacheBehavior": "policyData is already cached in DefaultAccountService. A cold/unhydrated host is schema-gated and retried once when the schema appears; a warm host with the same root value emits no notification.",
+        "MechanismConfidence": "High: the constructor, fixed key table, schema/equality guards, and local protocol dispatch were traced directly.",
+        "MagnitudeUncertainty": "The number of concurrently open windows varies, but the changed startup work remains one constant-time cached read per window and does not alter key or IPC cardinality.",
+        "Verdict": "No reportable regression: startup adds only a cached boolean read and preserves the existing bounded forwarding behavior."
+      },
+      {
+        "Scenario": "Default-account policy or entitlement data changes while Agent Host forwarding is enabled",
+        "CriticalPath": "An already-completed account-policy update fires onDidChangePolicyData; the changed listener recomputes HydraFusion and may synchronously enqueue a local-host notification. The network refresh that produced policy data completes before this listener and is not initiated by the diff.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/accounts/browser/defaultAccount.ts:getTokenEntitlements",
+            "Operation": "Fetches token entitlements that can populate chat_preview_features_enabled before the change event fires.",
+            "Cardinality": "Existing account refresh cadence; one entitlement request per eligible refresh, independent of this listener.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same account service fetched and cached entitlement data before this PR; the contribution simply did not react to its completed policy event.",
+            "CriticalPathEffect": "Upstream of the event, but not called or awaited by the changed contribution; the diff adds no network operation and does not move it onto a new critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostRootConfigForwarder.ts:_push",
+            "Operation": "Sends RootConfigChanged for HydraFusion to the local Agent Host when the effective boolean differs from root state.",
+            "Cardinality": "Zero for unrelated policy changes or unchanged effective values; at most one per enabled window for an actual preview-entitlement transition.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Policy changes alone caused no HydraFusion dispatch; only setting changes, startup, restart, or schema hydration could trigger the existing dispatch path.",
+            "CriticalPathEffect": "Fire-and-forget after the policy event; it updates host configuration without blocking the account refresh caller."
+          }
+        ],
+        "ScalingInput": "Policy-change events after provider-level deep-equality deduplication, multiplied by active workbench windows; only transitions that change the effective HydraFusion boolean can pass the root-value equality guard.",
+        "EffectiveConcurrency": "One push is scheduled per policy event per enabled window. Separate windows can notify the shared local host concurrently, but provider equality checks suppress unchanged policy objects and root structural equality suppresses unchanged effective values; there is no collection-sized fan-out.",
+        "CacheBehavior": "The listener reads current in-memory policyData. The subscribed root state acts as the warm-value guard; no negative cache is needed because null policy data intentionally preserves the prior setting behavior.",
+        "MechanismConfidence": "High: event production is deep-equality guarded, the listener targets one key, and the forwarding guard and IPC path were traced.",
+        "MagnitudeUncertainty": "Exact refresh cadence and open-window count vary, but entitlement transitions are infrequent and each event performs constant work with an equality-guarded, tiny notification.",
+        "Verdict": "No reportable regression: the newly reachable IPC is bounded to actual effective-value transitions and does not fan out by sessions, repositories, or policy fields."
+      },
+      {
+        "Scenario": "User or experiment changes the HydraFusion setting",
+        "CriticalPath": "The existing filtered configuration listener recomputes the key; the changed computation adds one cached policy boolean check before the existing configuration read and optional local-host dispatch.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostRootConfigForwarder.ts:_push",
+            "Operation": "Sends the effective HydraFusion value to the local Agent Host.",
+            "Cardinality": "At most one notification per affected setting change per enabled window, unchanged from before the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same setting event already triggered the same one-key dispatch path; only the computed value is now entitlement-gated.",
+            "CriticalPathEffect": "Fire-and-forget and not awaited by configuration change handling."
+          }
+        ],
+        "ScalingInput": "One affected configuration-change event per enabled workbench window; no scaling collection.",
+        "EffectiveConcurrency": "One push per matching setting event. The structural root-value comparison suppresses unchanged values.",
+        "CacheBehavior": "Both policy data and configuration values are in-memory; warm equal root state avoids IPC, while an unhydrated schema defers the push until hydration.",
+        "MechanismConfidence": "High: configuration filtering, value computation, equality guard, and dispatch were inspected directly.",
+        "MagnitudeUncertainty": "No material uncertainty: the path is fixed-cardinality and the only added operation is a cached property read.",
+        "Verdict": "No reportable regression: frequency, concurrency, and expensive-boundary cardinality are unchanged."
+      }
+    ],
+    "Summary": "Completed the performance review of both changed files and all diff pages. The production change adds a disposable policy listener and a constant-time cached entitlement check. It introduces a bounded local IPC only when the effective HydraFusion value actually changes; existing schema and structural-equality guards prevent repeated notifications for unrelated or unchanged policy updates. No actionable performance regression or qualifying regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-25T19:04:50.858356084Z",
+    "CompletedAt": "2026-09-25T19:06:30.773442524Z",
+    "WallClockMilliseconds": 99915,
+    "ModelCalls": 11,
+    "InputTokens": 289876,
+    "OutputTokens": 4908,
+    "TotalTokens": 294784,
+    "ReasoningTokens": 1851,
+    "CacheReadTokens": 249517,
+    "CacheWriteTokens": 40326,
+    "APIDurationMilliseconds": 87653,
+    "ToolCalls": 37,
+    "NanoAIUnits": 39972880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 249517,
+      "cache_write": 40326,
+      "input": 33,
+      "output": 4908
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
