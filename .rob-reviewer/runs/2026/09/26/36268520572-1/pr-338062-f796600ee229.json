@@ -1,0 +1,133 @@
+{
+  "PullRequest": {
+    "Number": 338062,
+    "Title": "Fix client reconnection logic to handle hibernation correctly",
+    "Body": "This pull request addresses an issue with the client reconnection logic in VS Code Server, specifically how it handles reconnections during system hibernation.\n\n### Changes Made\n- Replaced the use of `Date.now()` for the client-side reconnection deadline with `ProcessTimeRunOnceScheduler`, which is suspend-aware. This ensures that hibernation time does not count against the reconnection grace period.\n- The scheduler is now properly disposed of when the reconnection loop finishes.\n- Added a regression test to cover scenarios involving significant wall-clock jumps, such as an eight-hour hibernation.\n\n### Validation\n- The changes have been validated with a dependency-free timing probe, confirming that the new implementation behaves as expected.\n- Full transpilation and tests could not be executed due to authentication issues with Azure Artifacts, but no dependency manifests were altered.",
+    "URL": "https://github.com/microsoft/vscode/pull/338062",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "aeschli",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3b2b948b52d396484f8ba723c24f778365821287",
+    "HeadRef": "aeschli/agents/vscode-server-reconnection-arg",
+    "HeadSHA": "f796600ee22985c54fd73bb1cb892e0b6d61bab0",
+    "CreatedAt": "2026-09-25T21:46:42Z",
+    "UpdatedAt": "2026-09-26T19:09:53Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "cleanup-lifecycle",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Ordinary transient remote-connection loss while the process remains awake",
+        "CriticalPath": "The existing reconnect loop waits 0/5/10/30 seconds, resolves the remote address, and opens/authenticates a socket; those operations must complete before the window or remote extension host reconnects. The added one-second scheduler only decrements its counter and eventually flips a local boolean, so it is not itself on the per-attempt critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/remote/common/remoteAgentConnection.ts: resolveConnectionOptions and PersistentConnection._reconnect",
+            "Operation": "Resolve the remote endpoint and perform the management or extension-host socket reconnection handshake.",
+            "Cardinality": "One address resolution and one socket connection per retry attempt; retries are serialized within each connection and spaced by 0, 5, 10, then 30 seconds. A typical remote window can have one management and one extension-host connection retrying independently.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same serialized address resolution and network connect occurred at the same retry cadence until Date.now() exceeded the grace period.",
+            "CriticalPathEffect": "Each retry's resolution and socket handshake must finish or fail before the next retry and before reconnection succeeds."
+          }
+        ],
+        "ScalingInput": "Elapsed disconnected process time, with one one-second timer callback per active reconnect loop and one network attempt per configured retry interval; default grace is three hours.",
+        "EffectiveConcurrency": "_beginReconnecting guards each PersistentConnection to one loop. Management and extension-host connections are separate and can retry concurrently, but there is no per-item fan-out and tunnel connections do not use this loop.",
+        "CacheBehavior": "Remote-authority resolution and any cache it uses are unchanged. The new scheduler has no cache or retained per-attempt state, and successful reconnection disposes it.",
+        "MechanismConfidence": "High: the changed line creates exactly one interval-backed scheduler per guarded reconnect loop; implementation and call sites establish its one-second cadence and bounded lifetime.",
+        "MagnitudeUncertainty": "Exact timer wake-up energy cost varies by runtime and platform, but at most two typical client timers run only while disconnected, and existing network retries dominate the work.",
+        "Verdict": "No reportable regression. The new timer adds bounded low-cost callbacks only during an already active reconnect loop, without increasing ordinary retry cardinality, concurrency, startup work, or healthy-connection overhead."
+      },
+      {
+        "Scenario": "Resume from hibernation after a large wall-clock jump while the remote remains unavailable",
+        "CriticalPath": "After wake, the next scheduled retry performs endpoint resolution and a socket attempt. With the changed process-time deadline, failures continue through the remaining active-process grace period instead of terminating because wall time advanced during sleep; successful socket reconnection remains the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/remote/common/remoteAgentConnection.ts:694 and the retry body at resolveConnectionOptions/_reconnect",
+            "Operation": "Continue remote address resolution and socket reconnection attempts after resume.",
+            "Cardinality": "One resolution plus one socket attempt per serialized retry, eventually spaced 30 seconds apart, for up to the remaining active-process portion of the default three-hour grace period; management and extension-host connections may each do this independently.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "After the wall clock jumped beyond the grace deadline, the first failed post-resume attempt caused permanent failure, so no later attempts occurred.",
+            "CriticalPathEffect": "These calls are required to restore the remote session and directly determine reconnection latency."
+          }
+        ],
+        "ScalingInput": "Remaining configured grace time after resume and duration of continued remote unavailability, not wall-clock sleep duration.",
+        "EffectiveConcurrency": "One in-flight retry per PersistentConnection; at most the independent management and extension-host loops normally overlap. No burst is created on wake because existing waits and per-loop awaits serialize attempts.",
+        "CacheBehavior": "The address provider's existing resolver/cache behavior is unchanged; every socket attempt necessarily creates a fresh connection. No new negative cache is introduced.",
+        "MechanismConfidence": "High: the deadline change directly preserves retries after hibernation, and the transitive network boundaries are explicit in the loop.",
+        "MagnitudeUncertainty": "A long post-resume outage can produce many more retries than the old incorrect early termination, but frequency is capped by the existing 30-second cadence and configured grace.",
+        "Verdict": "No performance finding. The additional bounded, serialized network attempts are the intended reconnection behavior needed to restore the session, not avoidable duplicate work or an uncontrolled fan-out."
+      },
+      {
+        "Scenario": "Reconnect succeeds, reaches permanent failure, or the connection is disposed during reconnection",
+        "CriticalPath": "A current sleep or socket attempt completes, the loop observes success/failure/disposal, and then disposes the new scheduler. Scheduler disposal is off the network critical path and constant time.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/remote/common/remoteAgentConnection.ts: PersistentConnection._runReconnectingLoop",
+            "Operation": "Finish the current socket reconnection attempt before the loop can exit.",
+            "Cardinality": "At most one in-flight attempt per connection; disposal does not create an additional attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same current wait or connect had to settle before the loop exited; there was no process-time scheduler to clear.",
+            "CriticalPathEffect": "The existing in-flight wait/connect may delay loop exit; the added scheduler does not extend that operation and is cleared immediately afterward."
+          }
+        ],
+        "ScalingInput": "Number of concurrently disconnected persistent connections, normally management plus extension host; scheduler state is constant-sized per loop.",
+        "EffectiveConcurrency": "Per-connection serialization remains enforced; cleanup executes once after the loop exits.",
+        "CacheBehavior": "No cache is involved. The scheduler retains only a callback, counter, and interval handle, all released on normal loop completion; if it reaches the deadline first, it self-clears its interval.",
+        "MechanismConfidence": "High for normal and deadline cleanup paths based on the scheduler implementation and loop structure; no credible exception path was found that makes the added resource unbounded.",
+        "MagnitudeUncertainty": "A pre-existing unresolved address/connect operation could delay final cleanup, but the added interval self-clears at the grace deadline and does not retain an unbounded history.",
+        "Verdict": "No cleanup-lifecycle finding. The new resource is constant-sized, disposed after loop completion, and self-clearing at expiration."
+      }
+    ],
+    "Summary": "Reviewed the complete three-file diff and traced the scheduler through persistent management and extension-host reconnection paths, including hibernation, ordinary retries, success/failure, disposal, timer lifetime, network boundaries, retry cardinality, caching, and concurrency. No high-confidence actionable performance regression was introduced, and the PR does not establish a performance-regression fix suitable for blame-based learning."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-26T20:13:18.654518206Z",
+    "CompletedAt": "2026-09-26T20:15:01.323242867Z",
+    "WallClockMilliseconds": 102668,
+    "ModelCalls": 8,
+    "InputTokens": 168631,
+    "OutputTokens": 5619,
+    "TotalTokens": 174250,
+    "ReasoningTokens": 2778,
+    "CacheReadTokens": 135855,
+    "CacheWriteTokens": 32752,
+    "APIDurationMilliseconds": 87860,
+    "ToolCalls": 35,
+    "NanoAIUnits": 33057800000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 135855,
+      "cache_write": 32752,
+      "input": 24,
+      "output": 5619
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
