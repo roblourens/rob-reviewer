@@ -1,0 +1,144 @@
+{
+  "PullRequest": {
+    "Number": 337895,
+    "Title": "Release inline request edit input and listeners when editing finishes",
+    "Body": "Related to #146841\r\n\r\nWith the default `chat.editRequests: inline`, clicking a request creates an inline `ChatInputPart` through `ChatWidget.createInput`. `createInput` registers about 10 listeners and autoruns on the widget's own store (`onDidLoadInputState`, `onDidFocus`, `onDidAcceptFollowup`, `inputEditor.onDidChangeModelContent`, `chatAgentService.onDidChangeAgents`, `input.onDidChangeCurrentChatMode`, `contextKeyService.onDidChangeContext`, two autoruns, and the scoped instantiation service), and `clickedRequest` adds 3 more listeners. They were only released when the whole widget was disposed, so every edit left them behind:\r\n\r\n- the autoruns read the inline input's `selectedToolsModel.entriesMap` / `selectedLanguageModel`, keeping them subscribed to the global `LanguageModelToolsService.toolSets`, and through them the disposed input part, its `CodeEditorWidget`, `TextModel` and DOM;\r\n- listeners accumulated on global emitters (`chatAgentService.onDidChangeAgents`, `contextKeyService.onDidChangeContext`);\r\n- the edit listeners captured the edited request view model, so the replaced `ChatRequestModel`/`ChatResponseModel` stayed alive too.\r\n\r\nEdit-only disposables now go into a per-edit `DisposableStore` (`_editingDisposables`), which `createInput` receives for the inline input and which is cleared in `finishedEditing`. The main input keeps using the widget's store. `createInput` subscribes to the input part it created rather than the active one (`this.input`), so the main input's autoruns can't switch to the inline input while an edit is open. `finishedEditing` clears the inline input and paste-target holders instead of only disposing the input, and only the main input gets the getting-started tip presenter (the tip only applies to the empty state; previously an edit replaced the main input's presenter and left it bound to the disposed inline input).\r\n\r\nRetainer path (heap snapshot):\r\n`LanguageModelToolsService.toolSets._observers → Derived (ChatSelectedTools.entriesMap) → AutorunObserver (ChatWidget._store)`, and `ObservableValue (owner ChatInputModelSelectionController) → ChatInputPart.container → \u003cdiv class=\"chat-edit-input-container\"\u003e`\r\n\r\n### Measurement\r\n\r\n| Per inline edit (send + edit) | Without this change | With this change |\r\n|---|---|---|\r\n| CodeEditorWidget / TextModel | **+1 / +1** | flat |\r\n| ChatRequestModel / ChatResponseModel | **+2 / +2** (replaced request kept) | +1 / +1 (the new request) |\r\n| Detached DOM | **+36 nodes**, +19 roots | flat |\r\n| Emitter / DisposableStore instances | **~+265 / ~+260** | +4 / +5 (the new request) |\r\n| Heap after GC | ~+1 MB | ~+0.1 MB |\r\n\r\n### How this was measured\r\n\r\nCode OSS (Electron, dev build) with the mock LLM server from `scripts/chat-simulation` (no sign-in), driven over CDP with Playwright. After a warm-up round and after each of 4 rounds: 4× forced GC, live instance counts via `Runtime.queryObjects` on the class prototypes, and `DOM.getDetachedDomNodes` (descendants of every detached root, queried from a throwaway CDP session). \"Without this change\" means only this fix reverted. The retainers were identified from heap snapshot retainer paths.\r\n\r\nAdded a `ChatWidget` test for the inline edit path: it creates the main input, starts and finishes an inline edit, and checks that the inline input, its scoped instantiation service, listeners and autoruns are released, and that the main input keeps its tip presenter (fails without this change).\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/337895",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "5be92d646bd52da623cdaaeab77c6972e7c6bc10",
+    "HeadRef": "agents/leak-chat-inline-edit-input",
+    "HeadSHA": "7f9cdc694776ba05afde58cbf8ebf8eafe2c91d2",
+    "CreatedAt": "2026-09-25T06:10:36Z",
+    "UpdatedAt": "2026-09-25T22:32:32Z",
+    "MergedAt": null,
+    "Labels": [
+      "freeze-slow-crash-leak",
+      "inline-chat"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 2514,
+      "BasePath": "src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts",
+      "BaseLine": 2627,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/browser/chatWidget.ts",
+      "IntroducingCommit": "c6e8ac17784881782a3e0bcdb0728d8a12301b3c",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "memory",
+      "Mechanism": "Every completed inline edit left event registrations, autoruns, the editor/model/DOM graph, and scoped services reachable from widget-lifetime owners, so retained memory and listener work grew linearly with edit count.",
+      "Symptom": "Repeated inline request edits accumulated editor models, detached DOM, listeners, and approximately one megabyte of retained heap per measured edit cycle until the chat widget was disposed.",
+      "FixedBehavior": "All resources specific to an inline edit are now owned by a per-edit store and released by finishedEditing, bounding retained edit resources to the active edit rather than the widget lifetime.",
+      "Evidence": "In the base revision, createInput registered each inline input focus listener at line 2627 and the rest of the inline input listeners and autoruns in ChatWidget._store, so their registrations remained rooted for the widget lifetime after finishedEditing. The inline ChatInputPart holder and child instantiation service were likewise not cleared at edit completion. The changed code passes a per-edit store into createInput, adds those registrations and the child service to it, clears the inline input and paste-target holders, and clears that store at changed line 2514. The PR's heap measurements show per-edit retention of CodeEditorWidget, TextModel, detached DOM, and emitter/disposable graphs before the change and flat edit-only counts after it.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "unbounded-retention",
+      "eager-work",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Start, use, and finish an inline request edit",
+        "CriticalPath": "Clicking Edit synchronously creates and renders one ChatInputPart/CodeEditorWidget and registers its listeners; finishing removes the DOM and disposes the input, paste registration, scoped service, listeners, and autoruns before returning focus to the main input. The diff adds bounded cleanup to the finish path but does not add creation work.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One active edit per widget is enforced by the existing editing guard. Across N sequential edits, construction remains once per edit; retained edit-only resources change from O(N) before the PR to O(1) active-edit state after it.",
+        "EffectiveConcurrency": "At most one inline edit and one per-edit DisposableStore are active in a ChatWidget. There is no parallel creation burst or queue.",
+        "CacheBehavior": "No cache controls this path. Cold and repeated edits both construct one inline input; the change affects ownership and release, not cache keys, coalescing, or negative caching.",
+        "MechanismConfidence": "High: the changed holder clears and per-edit store ownership directly sever the widget-lifetime retainer paths, and the test exercises disposal of the input, scoped service, listeners, autorun, and DOM holder.",
+        "MagnitudeUncertainty": "The exact disposal latency varies with the input's internal resource graph, but it is once per edit and replaces the prior ChatInputPart.dispose call while adding only bounded listener/service/map cleanup. The supplied heap measurements strongly establish the retained-memory improvement.",
+        "Verdict": "No reportable regression. The diff fixes linear retained editor/model/DOM/listener growth and does not increase construction cardinality or concurrency."
+      },
+      {
+        "Scenario": "Edit a request in the persistent bottom input mode",
+        "CriticalPath": "Starting an edit reuses the existing main ChatInputPart, creates one small DisposableStore for edit-only overlay handling, and clearing the edit disposes that store. No extra editor or DOM subtree is constructed.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One edit-only store and listener set per active edit; repeated sequential edits release the prior set at finish rather than accumulating it for the widget lifetime.",
+        "EffectiveConcurrency": "One active edit per widget; no asynchronous fan-out or limiter is involved.",
+        "CacheBehavior": "The persistent input remains warm and reused. The change does not alter model, tool, or tip caches.",
+        "MechanismConfidence": "High: the isInput branch bypasses createInput and the newly created editing store owns only the edit-lifetime registrations.",
+        "MagnitudeUncertainty": "Listener-disposal cost is negligible and bounded; request-history size still controls pre-existing context reconstruction but the diff does not add work to that loop.",
+        "Verdict": "No reportable regression; the change removes accumulated edit listeners while preserving main-input reuse."
+      },
+      {
+        "Scenario": "Submit an edited sent request and return to the main composer",
+        "CriticalPath": "For a sent request, the existing accept path first awaits cancellation through chatService, then calls finishedEditing synchronously, then continues submission. The PR's cleanup occurs after the pre-existing awaited cancellation and before focus returns; it does not move the remote/service operation or add another one.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatWidget.ts:3445, ChatWidget.acceptInput",
+            "Operation": "Cancel the current chat request/session before replacing an already-sent request.",
+            "Cardinality": "Zero for pending edits; at most one awaited cancellation for an edited sent request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cancellation call was awaited before finishedEditing in the base revision.",
+            "CriticalPathEffect": "This existing await blocks edited-request submission before finishedEditing; the new cleanup runs only afterward."
+          }
+        ],
+        "ScalingInput": "At most one cancellation per edited active request and one cleanup per accepted edit, independent of conversation length after the request is selected.",
+        "EffectiveConcurrency": "The cancellation is awaited and serialized before cleanup; the diff does not increase concurrent service calls.",
+        "CacheBehavior": "No changed cache or coalescing behavior. Pending-request edits skip cancellation as before; sent-request edits use the same service path as before.",
+        "MechanismConfidence": "High for ordering and cardinality from the traced acceptInput branch; provider-specific transport details do not affect the regression verdict.",
+        "MagnitudeUncertainty": "Service cancellation latency depends on the provider, but its call count and placement are unchanged. Added synchronous cleanup is bounded to the single active input and registration set.",
+        "Verdict": "No reportable regression; no new boundary call, fan-out, or critical-path await is introduced."
+      },
+      {
+        "Scenario": "Initial ChatWidget render and main input lifetime",
+        "CriticalPath": "Widget render calls createInput once for the main composer. The default store remains ChatWidget._store, the main input still renders and lays out synchronously, and the getting-started tip is still created only for this main input.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One main ChatInputPart and one tip presenter per rendered ChatWidget. The local input variable and optional store parameter do not change cardinality.",
+        "EffectiveConcurrency": "Synchronous single-instance construction; no queue or parallel boundary work is added.",
+        "CacheBehavior": "Main input and tip remain widget-lifetime reused objects. Inline edits no longer replace the main tip presenter, so repeated edits avoid unnecessary presenter churn.",
+        "MechanismConfidence": "High: both existing createInput call sites omit the new parameter and therefore retain the widget-lifetime store; the inline-only branch is gated by viewModel.editing.",
+        "MagnitudeUncertainty": "DOM/editor construction cost is not measured here, but it is unchanged in count and remains on the same initial-render path.",
+        "Verdict": "No reportable regression; main input startup work and lifetime are preserved, while inline-tip eager work is removed."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and traced inline edit, persistent-input edit, edited-request submission, and initial render lifecycles. No diff-introduced performance issue met the reporting threshold. The PR is itself a concrete cleanup-lifecycle regression fix; its introducing commit was identified and recorded via report_regression_fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-26T00:29:36.557674668Z",
+    "CompletedAt": "2026-09-26T00:34:23.937952956Z",
+    "WallClockMilliseconds": 287380,
+    "ModelCalls": 11,
+    "InputTokens": 367654,
+    "OutputTokens": 8450,
+    "TotalTokens": 376104,
+    "ReasoningTokens": 4390,
+    "CacheReadTokens": 315900,
+    "CacheWriteTokens": 51721,
+    "APIDurationMilliseconds": 116335,
+    "ToolCalls": 42,
+    "NanoAIUnits": 55409700000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 315900,
+      "cache_write": 51721,
+      "input": 33,
+      "output": 8450
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
