@@ -1,0 +1,198 @@
+{
+  "PullRequest": {
+    "Number": 338073,
+    "Title": "agentHost: retain sandbox client while waiting for credentials",
+    "Body": "## Summary\n\n- Keep the initial sandbox client identity while waiting for complete sealed credentials during startup.\n- Use the existing reconnect API rather than allocating another client on each credential retry.\n- Preserve the existing retry limit, delay, request scope, cancellation, authentication checks, and ready-credential fast path.\n\nThis is a startup follow-up to #338016, not a replacement for expired-credential recovery. The number and timing of credential requests are unchanged.\n\n## Validation\n\n- Four regression checks reproduced the old behavior before the fix.\n- 70 focused sandbox connection-service and API unit tests pass after rebasing onto current main.\n- Targeted TypeScript compilation, ESLint, hygiene, and whitespace checks pass.\n- No full product build or live sandbox validation was run; no measured production performance improvement is claimed.",
+    "URL": "https://github.com/microsoft/vscode/pull/338073",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "osortega",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "4ce000fb4097aa1a4e4f21c2469851abdb7ef318",
+    "HeadRef": "osortega/agents/sandbox-credential-wait-identity",
+    "HeadSHA": "0a949c7eb5cd585e29d8c2b4ed672383ddff53bb",
+    "CreatedAt": "2026-09-25T23:03:24Z",
+    "UpdatedAt": "2026-09-26T03:03:19Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 367,
+      "BasePath": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts",
+      "BaseLine": 374,
+      "IntroducingPath": "src/vs/sessions/contrib/providers/remoteAgentHost/browser/cloudSandboxAgentHostService.ts",
+      "IntroducingCommit": "15a102b9c45a3e2fa9841ef0814b7251e0bd33ee",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "network",
+      "Mechanism": "The sealed-token wait repeatedly invoked the new-client `/connect` endpoint after an initial client had already been minted, allocating a distinct logical client on every retry while retaining only the last token.",
+      "Symptom": "Fresh sandbox startup with delayed sealed credentials could issue 13 client-mint requests and allocate up to 12 unnecessary remote client identities over the one-minute wait, increasing control-plane work and leaked server-side client state.",
+      "FixedBehavior": "Credential polling retains the initially minted logical sandbox client and refreshes its credentials through `/reconnect`; retry count, 5-second serialization, cancellation, request scope, and ready-token fast path remain unchanged, so delayed startup no longer creates up to 12 surplus remote clients.",
+      "Evidence": "In the base revision, `_awaitSealedToken` called `ICloudSandboxApiService.connect` once every 5 seconds for up to `MAX_SEALED_TOKEN_RETRIES` (12) after `_mintWithWaking` had already obtained an initial token. The API contract states that `connect` mints credentials for a new logical connection, while `reconnect` refreshes credentials for an existing `clientId`; the connection token's `client_id` is the stable identity used for group lanes and reconnect. Thus a startup whose sealed token is delayed could mint the initial client plus 12 additional remote client identities before establishing only the final one. The changed call passes `minted.client_id` to `reconnect`, and the added bounded-retry test asserts one connect followed by 12 reconnects for that same ID.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open a cloud sandbox whose first `/connect` response already includes a valid sealed GitHub token.",
+        "CriticalPath": "The initial Mission Control `/connect` request and then the Web PubSub/protocol handshake must complete before the sandbox session opens. `_awaitSealedToken` performs no retry when the first token is sealed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:_mintWithWaking and CloudSandboxApiService.connect",
+            "Operation": "Resolve authentication and request initial Web PubSub credentials from Mission Control `/agents/environments/{id}/connect`.",
+            "Cardinality": "One request when the environment immediately returns a complete token; zero when an existing live connection is reused.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical: one `/connect` request followed by handshake, with no sealed-token retry.",
+            "CriticalPathEffect": "Blocks connection establishment and session opening."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:_establish",
+            "Operation": "Open the relay transport and wait for the remote agent protocol handshake.",
+            "Cardinality": "One handshake per newly established sandbox connection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical handshake path and cardinality.",
+            "CriticalPathEffect": "Blocks session opening after credentials are ready."
+          }
+        ],
+        "ScalingInput": "One logical sandbox connection; cost does not scale with the sealed-token retry limit when the first token is complete.",
+        "EffectiveConcurrency": "One serialized connect request for this invocation; no retry request is scheduled. An already-live remote-agent connection bypasses minting entirely.",
+        "CacheBehavior": "The service reuses an existing live connection by address, making that warm path request-free. Credential responses themselves are not cached; the ready-token path needs no refresh.",
+        "MechanismConfidence": "High: the connect fast path, sealed-token loop guard, and existing-connection reuse were traced directly.",
+        "MagnitudeUncertainty": "Network and handshake duration depend on service and environment latency, but the diff does not change either boundary or its cardinality.",
+        "Verdict": "No regression. The changed call is unreachable on this fast path."
+      },
+      {
+        "Scenario": "Open a newly provisioned sandbox whose environment is online but whose sealed GitHub token appears only after credential polling.",
+        "CriticalPath": "An initial `/connect`, each 5-second delay and credential refresh, and the eventual protocol handshake are serialized on the session-open critical path. Polling ends at the first valid sealed envelope, a non-token response/error, cancellation, or 12 retries.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:367",
+            "Operation": "Refresh the initially minted client's Web PubSub and sealed-token credentials through Mission Control `/reconnect` using `minted.client_id`.",
+            "Cardinality": "One initial `/connect` plus 1..12 `/reconnect` requests, stopping early when sealed credentials arrive. Requests are separated by 5 seconds.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same number and timing of network requests used `/connect`; each poll minted another logical client rather than refreshing the initial identity.",
+            "CriticalPathEffect": "Each refresh remains on the startup critical path because connection establishment waits for the sealed token or bounded retry exhaustion."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:_establish",
+            "Operation": "Open the relay transport and complete the protocol handshake with the final credentials.",
+            "Cardinality": "One handshake after polling completes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical handshake count and placement, but it used the final newly minted client identity.",
+            "CriticalPathEffect": "Blocks final session readiness."
+          }
+        ],
+        "ScalingInput": "Cost scales with sealed-token readiness delay, capped at 12 serialized refreshes over roughly 60 seconds; network request count is unchanged by the PR, while remote logical-client allocations fall from up to 13 to one.",
+        "EffectiveConcurrency": "One in-flight control-plane request at a time per connect invocation. The loop awaits both the delay and request; it creates no burst or Promise.all fan-out. The service does not coalesce concurrent pre-establishment calls, but that behavior is pre-existing and unchanged.",
+        "CacheBehavior": "There is no cache of incomplete credential responses. The stable `client_id` acts as the identity key for refreshes; successful sealing terminates polling. Existing live connections still bypass this path.",
+        "MechanismConfidence": "Very high: API contracts distinguish new-client mint from existing-client refresh, the changed line reuses the initial client ID, and regression tests assert one connect followed by same-ID reconnects.",
+        "MagnitudeUncertainty": "The prevalence and server-side lifetime/cost of delayed-token client identities are not measured, but endpoint semantics and the bounded multiplicity are explicit.",
+        "Verdict": "No finding. This is a performance fix that removes repeated remote client allocation without increasing request count, startup latency, or concurrency."
+      },
+      {
+        "Scenario": "Open a dormant sandbox that returns one or more `waking` responses before issuing an incomplete token.",
+        "CriticalPath": "The wake polling sequence must complete first because only `/connect` can resume and mint the initial client. Once a token arrives, sealed-token refreshes run serially, followed by the handshake.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:_mintWithWaking",
+            "Operation": "Poll Mission Control `/connect` while the environment wakes.",
+            "Cardinality": "One request per waking response until a token arrives, capped at 20.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical `/connect` wake polling, delay, cap, and serialization.",
+            "CriticalPathEffect": "Blocks startup while compute resumes."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:367",
+            "Operation": "After the first token is minted, refresh that same client's credentials via `/reconnect` until sealing completes.",
+            "Cardinality": "Zero if the awakened token is complete; otherwise 1..12 serialized refreshes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Post-wake polling invoked `/connect` and allocated a new logical client on each retry.",
+            "CriticalPathEffect": "Blocks handshake only during the bounded sealed-token wait."
+          }
+        ],
+        "ScalingInput": "Request count scales with the number of waking responses plus sealed-token polls, each independently bounded; the diff changes only the endpoint used after the initial token.",
+        "EffectiveConcurrency": "All wake and credential requests are sequential. Wake retries remain capped at 20 with server-directed delay capped at 30 seconds; post-mint refresh remains capped at 12 with a 5-second delay.",
+        "CacheBehavior": "A live connection bypasses the entire path. Waking and incomplete responses are deliberately not cached; successful initial mint fixes the client identity used by every later refresh.",
+        "MechanismConfidence": "High: separate wake and post-mint loops and their endpoint selection are directly visible and covered by the added test.",
+        "MagnitudeUncertainty": "Actual wake duration and sealed-token readiness are service-dependent, but the control flow and upper bounds are explicit.",
+        "Verdict": "No regression. The change preserves wake behavior and reduces post-mint client allocation."
+      },
+      {
+        "Scenario": "Cancel sandbox startup while a credential refresh is delayed or in flight.",
+        "CriticalPath": "Cancellation terminates the awaited timeout/request and prevents staging credentials or opening the transport, so no later handshake remains on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:367",
+            "Operation": "Potential in-flight Mission Control `/reconnect` credential request.",
+            "Cardinality": "At most one in-flight request at cancellation and no subsequent retries.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The corresponding in-flight request was `/connect` with the same cancellation token; retry cancellation behavior was unchanged.",
+            "CriticalPathEffect": "Cancellation aborts startup rather than waiting for or staging a late result."
+          }
+        ],
+        "ScalingInput": "Constant per cancelled invocation; no lifetime growth or queued retry chain.",
+        "EffectiveConcurrency": "At most the single current refresh request is in flight; cancellation uses the same token and no follow-up request is scheduled.",
+        "CacheBehavior": "No result is cached or staged after cancellation. Existing live connections are handled before this path.",
+        "MechanismConfidence": "High: cancellation checks, token propagation, awaited serialization, and the added late-result test establish the lifecycle.",
+        "MagnitudeUncertainty": "Transport-level cancellation timing depends on the request service, but no code path launches concurrent retries.",
+        "Verdict": "No performance issue. The changed endpoint preserves cleanup/cancellation and does not retain work after cancellation."
+      }
+    ],
+    "Summary": "Completed the performance review of both changed files and all diff pages. The sole production change replaces bounded sealed-token retry mints with same-identity credential refreshes. It preserves network cardinality, timing, serialization, cancellation, and handshake behavior while eliminating repeated remote logical-client allocation. No actionable performance regression was introduced; one concrete regression fix was recorded from base blame."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-26T05:23:00.694130709Z",
+    "CompletedAt": "2026-09-26T05:24:13.911862077Z",
+    "WallClockMilliseconds": 73217,
+    "ModelCalls": 9,
+    "InputTokens": 246400,
+    "OutputTokens": 5059,
+    "TotalTokens": 251459,
+    "ReasoningTokens": 1240,
+    "CacheReadTokens": 202752,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 59172,
+    "ToolCalls": 30,
+    "NanoAIUnits": 35687280000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 202752,
+      "cache_write": 0,
+      "input": 43648,
+      "output": 5059
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
