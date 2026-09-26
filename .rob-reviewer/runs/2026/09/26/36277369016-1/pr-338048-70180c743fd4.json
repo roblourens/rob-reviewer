@@ -1,0 +1,217 @@
+{
+  "PullRequest": {
+    "Number": 338048,
+    "Title": "browser: reconcile popup state missed before the renderer subscribes",
+    "Body": "## Problem\n\n`Integrated Browser › preserves native page lifecycle across editors, popups, and restart` fails intermittently on Linux and macOS ([run 36120855518, job 108025747044](https://github.com/microsoft/vscode/actions/runs/36120855518/job/108025747044)):\n\n```\nlocator.waitFor: Timeout 30000ms exceeded.\n  - waiting for locator('.tab').filter({ hasText: 'Browser Smoke Popup Child' }) to be visible\n```\n\nIn the failure screenshot the popup page has rendered, but its tab still shows the host name (`127.0.0.1:41045`), which is the fallback label used when the model has no title.\n\n## Root cause\n\nThis is the race described in #335987:\n\n1. When a page opens a popup, the main process creates the child view and starts loading it immediately.\n2. The renderer builds its `BrowserViewModel` from a state snapshot taken when the view was created, and only then subscribes to the view's dynamic IPC events.\n3. Events fired before the subscription reaches main are lost. A fast page can commit and set its title in that gap, so the model keeps an empty title.\n\nIt happened in 4 Electron-Smoke jobs in the last ~15h of PR runs, 2 on Linux and 2 on macOS: 108025747044, 107951348615, 107885059240 and 108087350213.\n\n## Fix\n\nThis PR takes the popup-reconciliation part of #335987, without its favicon-loader changes (those are in #336077) and without its per-event version numbers.\n\n- **Platform:** a new `getNavigationState(id)` returns a lightweight `IBrowserViewNavigationState`: URL, title, back/forward, loading, favicon and errors. `IBrowserViewState` extends it. No screenshots or session data go over IPC.\n- **Renderer model:** navigation, loading, title and favicon events are relayed through the model's own emitters, so the model's state is updated before consumers see an event. After subscribing, the model reads the navigation state once and applies only what changed. A snapshot that changes only the title fires a title event, not a navigation.\n- **Seeded state:** URL, title and favicon from the snapshot are applied only once a navigation has committed. Until then the model keeps what it was seeded with: the requested URL, or a restored editor's title and favicon.\n\n**Why no versions are needed:** the events and `getNavigationState` use the same ordered main-process channel. `ChannelServer` subscribes as soon as each `listen` request arrives and forwards events as they fire. It builds the snapshot synchronously and sends the reply on the microtask queue, so no Electron event can run in between. Any event the model received was therefore fired before the snapshot, and is already reflected in it. Anything fired later arrives after the reply.\n\n#336077 is stacked on this PR. It scopes main's favicon state to the current page, so the favicon replayed here is the current page's too.\n\n## Validation\n\n- **Unit test:** a new test covers a popup that loaded before subscribing, a restored page that hasn't navigated yet, and a live event that arrived before the snapshot and isn't repeated. All 180 tests under `**/browserView/**` pass.\n- **Smoke test:** the `Integrated Browser` suite passes 7/7, three times in a row.\n- **Delay experiment:** I added a temporary 2s delay before the renderer creates the model for a new view. Without the fix, the test fails with the CI error. With the fix, the whole suite passes.\n- **Static checks:** `npm run typecheck-client`, eslint and `build/hygiene.ts` pass on the changed files.\n\nWhen this test runs alone (`-g \"preserves native page lifecycle\"`), its `afterEach` times out waiting for the restored page to close. That also happens on `origin/main`, so it isn't related to this change. The full suite, as CI runs it, passes.\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/338048",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "f8db09b62a370126d8c74c3457481b5ed0c2e395",
+    "HeadRef": "agents/fix-smoke-browser-popup-title",
+    "HeadSHA": "70180c743fd40f8cc203e55197986d4145216e33",
+    "CreatedAt": "2026-09-25T20:37:29Z",
+    "UpdatedAt": "2026-09-26T21:01:39Z",
+    "MergedAt": null,
+    "Labels": [
+      "vscode-build",
+      "engineering",
+      "browser-integration"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-772A4A1CAAE4",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/browserView/common/browserView.ts",
+      "Side": "RIGHT",
+      "Line": 673,
+      "Severity": "low",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The production call path, one-call-per-constructor multiplicity, synchronous restoration loop, IPC proxy boundary, and duplicate state fields are directly established in repository code. Exact user-visible delay depends on the number of restored views and favicon sizes, so severity is low rather than the mechanism being speculative.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "main-process IPC calls, synchronous Electron WebContents state reads, and serialized navigation-state bytes including favicon data URLs",
+      "PerformanceScaling": "On renderer startup `_initializeExistingViews` creates one model for each of N existing views in a synchronous loop; every constructor reaches this line without awaiting the previous call, so the change produces N concurrent IPC requests and serializes the sum of all favicon payloads. There is no cache, grouping, or coalescing.",
+      "PerformanceOutcome": "A burst of main-process IPC handling and renderer serialization/deserialization competes with window-reload startup, increasing CPU/GC pressure and reducing startup responsiveness as the number of restored browser tabs and favicon bytes grows.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The restoration path called `getBrowserViews(windowId)` once and used the returned state to construct every model. It did not issue a second per-view command after model construction.",
+      "ChangedBehavior": "Every `BrowserViewModel` now unconditionally calls `getNavigationState(id)`. During restoration, `_initializeExistingViews` loops over all returned views and constructs their models synchronously, causing all per-view calls to be queued together after the existing aggregate `getBrowserViews` call.",
+      "CausalDiffEvidence": "Added line 673 unconditionally invokes `this.browserViewService.getNavigationState(this.id)` from each model constructor; no equivalent per-model IPC existed before the PR because models used the state from the aggregate `getBrowserViews`/creation response.",
+      "Title": "Batch reconciliation for restored browser views",
+      "Impact": "Reloading a window with many integrated-browser tabs adds one IPC round trip per tab in a concurrent burst; large favicon data URLs are also copied over IPC for a second time. The reconciliation is not awaited by model creation, but its main/renderer work runs during startup and scales linearly with restored views.",
+      "Evidence": "`BrowserViewWorkbenchService._initializeExistingViews` first performs one `getBrowserViews` IPC and then loops synchronously over all views calling `_createModel`; `_createModel` constructs `BrowserViewModel`, whose new line 673 immediately starts `getNavigationState`. The main implementation synchronously reads URL/title/history/loading state and returns `lastFavicon`; the initial `getBrowserViews` response already obtained the same fields through `view.getState()`. Favicon fetching accepts data URLs and buffers fetched images without a size cap, so the duplicate snapshot can carry nontrivial bytes.",
+      "Recommendation": "Coalesce reconciliation requests created in the same turn into one batched `getNavigationStates(ids)` IPC after all per-view listeners have been registered, then dispatch the returned states to their models. Keep a single-view path for isolated popup creation so the subscription-before-snapshot ordering remains intact."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Renderer/window reload restores browser views that remain alive in the main process",
+        "CriticalPath": "`BrowserViewWorkbenchService` asynchronously calls `getBrowserViews(windowId)` to discover all existing views. Model construction then completes without awaiting reconciliation, so the new snapshots are off the model-availability critical path but execute during startup and contend for main/renderer IPC and CPU.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/browserView/electron-browser/browserViewWorkbenchService.ts:_initializeExistingViews",
+            "Operation": "Fetch all existing browser-view info and full state in one response",
+            "Cardinality": "One call for the window, returning N view states",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single aggregate call supplied model state before the diff.",
+            "CriticalPathEffect": "Must complete before existing models can be constructed"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/browserView/common/browserView.ts:BrowserViewModel._reconcileNavigationState",
+            "Operation": "Fetch current navigation state for one view, including favicon data URL",
+            "Cardinality": "N calls for N restored views; constructors launch them without awaiting, so effective concurrency is N",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No second per-view command followed the aggregate state response.",
+            "CriticalPathEffect": "Not awaited for model construction, but all requests execute during renderer startup and consume main/renderer IPC, serialization, CPU, and GC capacity"
+          }
+        ],
+        "ScalingInput": "Number N of integrated-browser views owned by the reloading window after grouping by view ID; payload cost also scales with the summed lengths of their favicon data URLs.",
+        "EffectiveConcurrency": "The restoration loop constructs models synchronously and each constructor starts a promise without awaiting it, producing an unbounded burst up to N in-flight reconciliation calls. There is no batcher, limiter, cache, or coalescer.",
+        "CacheBehavior": "Every model reconciles unconditionally. Warm main-process state and an immediately preceding `getBrowserViews` response do not suppress or coalesce the call; unchanged favicon strings are still serialized before renderer equality checks.",
+        "MechanismConfidence": "High: the synchronous N-model loop, constructor call, ProxyChannel IPC boundary, and duplicate fields are directly visible.",
+        "MagnitudeUncertainty": "Typical users may have only a few browser tabs and normal favicons are small; users with many retained tabs or unusually large favicon data see proportionally more work. This uncertainty supports low severity.",
+        "Verdict": "Reportable low-severity boundary fan-out because the diff changes one aggregate startup fetch into one aggregate fetch plus N concurrent per-view fetches."
+      },
+      {
+        "Scenario": "A page opens one popup or a caller creates one new integrated-browser view",
+        "CriticalPath": "The main process creates/loads the view and sends its initial state. The renderer constructs a model, registers dynamic listeners, and starts one reconciliation snapshot. The snapshot is not awaited by model construction or editor opening; it is required only to recover events missed before subscription.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/browserView/electron-browser/browserViewWorkbenchService.ts:_getOrCreateLazy / main onDidCreateBrowserView",
+            "Operation": "Create or discover the browser view and return initial full state",
+            "Cardinality": "One response per newly created view",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Initial state was already returned once per created view.",
+            "CriticalPathEffect": "The create/discover response is required before model construction"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/browserView/common/browserView.ts:BrowserViewModel._reconcileNavigationState",
+            "Operation": "Read lightweight navigation state after listeners subscribe",
+            "Cardinality": "One additional call per created view; multiple simultaneous popups can produce one call each",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No post-subscription state read existed, so pre-subscription events could be missed.",
+            "CriticalPathEffect": "Fire-and-forget and off editor/model creation's awaited critical path, though state reconciliation awaits it"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/browserView/electron-main/browserView.ts:page-favicon-updated handler",
+            "Operation": "Fetch and base64-encode a page favicon",
+            "Cardinality": "At most one attempt per favicon candidate URL until success, cached per view by URL",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same favicon fetch occurred before this PR.",
+            "CriticalPathEffect": "Asynchronous and not required for popup model creation; its retained result may later be included in reconciliation IPC"
+          }
+        ],
+        "ScalingInput": "Number of concurrently created views/popups after deduplication by browser view ID, plus favicon byte size.",
+        "EffectiveConcurrency": "One reconciliation per model; isolated creation is one call, while many simultaneous creations are not globally limited. Favicon requests use a per-view URL promise cache but no cross-view limiter.",
+        "CacheBehavior": "Navigation reconciliation has no cache and always runs once per model. Favicon fetches are cached per view URL; successful current favicon strings are returned in both initial and reconciliation state.",
+        "MechanismConfidence": "High for the extra IPC and ordering; low concern for a standalone single view because it is off the critical path and bounded.",
+        "MagnitudeUncertainty": "Normal popup creation is isolated, making one lightweight extra IPC inexpensive; burst creation is less common and overlaps the restoration issue.",
+        "Verdict": "No separate finding: one post-subscription snapshot is a bounded intentional cost for the race fix; the actionable scaling problem is the uncoalesced restoration burst already reported."
+      },
+      {
+        "Scenario": "Live page navigation, title/loading/favicon updates, and model consumers",
+        "CriticalPath": "Electron emits a per-view event in main, the renderer model updates authoritative local state, then synchronously notifies local consumers such as editor labels and navigation UI. Cross-origin navigation may issue the existing forced zoom IPC before local event notification, but it is fire-and-forget.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/browserView/common/browserView.ts:BrowserViewModel constructor relay registrations",
+            "Operation": "Forward dynamic navigation/title/loading/favicon events from main to renderer",
+            "Cardinality": "One cross-process subscription and one delivered event per event type per model, followed by local emitter fan-out",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The model and each consumer subscribed through dynamic proxy events independently; the PR consolidates these into one IPC subscription per type and local fan-out.",
+            "CriticalPathEffect": "Required for consumers to observe live state; local listeners run synchronously after model state updates"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/browserView/common/browserView.ts:BrowserViewModel._updateNavigation",
+            "Operation": "Apply browser zoom after navigation",
+            "Cardinality": "One fire-and-forget IPC per navigation event or reconciled navigation mismatch",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The prior navigation-state listener performed the same forced zoom call for each navigation.",
+            "CriticalPathEffect": "Not awaited before local navigation listeners; Chromium zoom application occurs asynchronously"
+          }
+        ],
+        "ScalingInput": "Live browser event frequency and number of local model consumers.",
+        "EffectiveConcurrency": "Cross-process delivery is consolidated to one subscription per model/event type; consumers fan out synchronously in-process. Zoom calls remain one per navigation and are not coalesced, unchanged from before.",
+        "CacheBehavior": "Model fields suppress reconciliation events when snapshot state equals current state. Live events are not cached; zoom index lookup uses existing zoom-service state.",
+        "MechanismConfidence": "High based on the replaced proxy getters and added local emitters.",
+        "MagnitudeUncertainty": "Consumer work varies by enabled browser features, but the PR reduces duplicate cross-process subscriptions rather than increasing them.",
+        "Verdict": "No regression: the changed relay architecture reduces IPC event fan-out and preserves the existing per-navigation zoom cost."
+      },
+      {
+        "Scenario": "Callers request the full state of one browser view",
+        "CriticalPath": "A caller crosses IPC once to `getState`; main synchronously reads Electron view properties and serializes state.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/browserView/electron-main/browserViewMainService.ts:getState",
+            "Operation": "Read and serialize full browser-view state",
+            "Cardinality": "One call per caller request",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One IPC and one set of WebContents/session reads; the PR only factors navigation fields into `getNavigationState()` within the same synchronous call.",
+            "CriticalPathEffect": "The caller awaits the returned state"
+          }
+        ],
+        "ScalingInput": "Number of explicit `getState` requests and state payload size.",
+        "EffectiveConcurrency": "Unchanged caller-controlled concurrency; no new loop or fan-out in this path.",
+        "CacheBehavior": "No cache before or after the diff; the refactor performs the same reads once per full-state request.",
+        "MechanismConfidence": "High from the direct method refactor.",
+        "MagnitudeUncertainty": "None material for causality; cost is behaviorally unchanged.",
+        "Verdict": "No regression: object spread and helper extraction do not add another boundary or repeat the state read across IPC."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and relevant callers/lifecycle paths. Submitted one low-severity finding for N-way startup reconciliation IPC after an already aggregated state fetch. Live-event relays reduce prior IPC subscription fan-out, isolated popup reconciliation is bounded and off creation's awaited critical path, and full-state reads retain their previous boundary cost."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-26T22:50:44.216797713Z",
+    "CompletedAt": "2026-09-26T22:52:35.814154803Z",
+    "WallClockMilliseconds": 111597,
+    "ModelCalls": 9,
+    "InputTokens": 264112,
+    "OutputTokens": 7518,
+    "TotalTokens": 271630,
+    "ReasoningTokens": 3021,
+    "CacheReadTokens": 213504,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 95749,
+    "ToolCalls": 44,
+    "NanoAIUnits": 43819360000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 213504,
+      "cache_write": 0,
+      "input": 50608,
+      "output": 7518
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
