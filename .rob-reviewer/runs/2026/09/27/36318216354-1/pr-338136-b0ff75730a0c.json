@@ -1,0 +1,241 @@
+{
+  "PullRequest": {
+    "Number": 338136,
+    "Title": "Add symlink setting for Git extension and Agent Host",
+    "Body": "This pull request introduces a new symlink setup phase and conflict handling for the Git extension and expands this capability to the Agent Host. Key changes include:\n\n- **Symlink Setup**: Implemented a new phase for setting up symlinks, ensuring that only fully ignored folders are symlinked, adhering to `.gitignore` semantics.\n- **Conflict Handling**: Improved handling of nested settings to prevent order-dependent behavior and false warnings.\n- **Error Handling**: Added logging for unexpected setup failures to ensure they are properly managed.\n- **Performance Improvements**: Optimized the folder-selection algorithm to avoid quadratic complexity in filtering redundant descendants.\n- **Testing Enhancements**: Added regression tests to cover new functionality and edge cases, ensuring robust validation of symlink behavior.\n\n### Validation\n- All relevant tests have passed, including type-checks and integration tests, confirming the correctness of the implementation.",
+    "URL": "https://github.com/microsoft/vscode/pull/338136",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ca1020a2710357004a97608f712a937968a3c433",
+    "HeadRef": "lszomoru/agents/add-git-extension-symlink-setting",
+    "HeadSHA": "b0ff75730a0c0cddc542b47dd9b1647885ac2b33",
+    "CreatedAt": "2026-09-26T19:44:31Z",
+    "UpdatedAt": "2026-09-27T06:42:16Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-54171E11A6B3",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostGitService.ts",
+      "Side": "RIGHT",
+      "Line": 756,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The changed commands, complete buffering, awaited call path, absence of caching/coalescing, and test configuration targeting `node_modules/**` are explicit. Only the exact wall-clock impact varies with repository size and storage speed.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Repository-wide Git subprocesses, filesystem traversal, and buffered stdout/JS path strings",
+      "PerformanceScaling": "For each worktree, the first two new `ls-files` commands emit and buffer one record per ignored or pattern-matched file, so cost grows with the total ignored-file population (not the usually small number of folders eventually symlinked). Concurrent sessions multiply this into three repository scans per session because setup runs after the repository-keyed creation sequencer.",
+      "PerformanceOutcome": "Increased first-turn/worktree materialization latency, filesystem I/O, and memory/GC pressure on repositories with large ignored dependency trees",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, worktree creation performed no symlink-discovery scans. Existing include-file setup, when configured, performed its own scans once; there was no additional symlink phase repeating the standard ignored-file and directory traversals.",
+      "ChangedBehavior": "With `git.worktreeSymlinkFolders` enabled, Agent Host now awaits a discovery phase that launches three repository-wide `git ls-files` scans, two without `--directory`, then buffers and splits their complete per-file outputs before it can materialize the worktree. If include files are also configured, its existing standard ignored-file and directory scans run immediately afterward as a separate pass.",
+      "CausalDiffEvidence": "The added RIGHT-side `Promise.all` at lines 755-759 invokes `git ls-files --others --ignored -z` twice without directory collapsing and once with it; these subprocesses and their full outputs did not exist on worktree creation before this diff.",
+      "Title": "Avoid full ignored-file scans when selecting symlink folders",
+      "Impact": "A realistic `node_modules/**` setting (used by the added tests) makes session creation enumerate potentially hundreds of thousands of ignored dependency files even though the result is commonly one symlink. The awaited phase delays the agent's first turn; multiple sessions against the same repository can run these scans concurrently.",
+      "Evidence": "`WorktreeIsolation.resolveWorkingDirectory` awaits `symlinkWorktreeFolders` at `src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:984` before recording the materialized worktree. The added code at lines 754-759 launches three `ls-files` subprocesses; the first two omit `--directory`, while the existing include implementation documents that directory mode collapses a wholly ignored tree into one entry. `_runGit` buffers up to 32 MiB of stdout, and `getWorktreeSymlinkFolderCandidates` then splits both full outputs into arrays/sets. The repository creation sequencer ends before this call, so the added concurrent-session test's same-repository sessions can overlap setup scans. The Git extension mirrors the same full-file discovery at `extensions/git/src/repository.ts:2087`.",
+      "Recommendation": "Discover candidates with directory-collapsing Git queries (preserving nested/partial-ignore semantics), and share the standard ignored-directory result with include-file setup when both settings are present. Coalesce in-flight discovery by repository plus pattern set so concurrent sessions do not repeat the same scans."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Agent Host first-send creation of a worktree-isolated session with `git.worktreeSymlinkFolders` configured, including the common combination with `git.worktreeIncludeFiles`",
+        "CriticalPath": "`resolveOnFirstSend` awaits `resolveWorkingDirectory`; after `git worktree add`, the changed path awaits symlink discovery and creation before marking the worktree materialized and allowing the first turn to proceed. Include-file copying then runs serially after symlink setup when configured.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:958",
+            "Operation": "`git worktree add`",
+            "Cardinality": "One per newly materialized session worktree",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One awaited worktree-add operation was already required.",
+            "CriticalPathEffect": "Awaited before all setup; this boundary was already present."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:755",
+            "Operation": "Three `git ls-files` scans, one `git init`, and two `git check-ignore` calls for symlink discovery",
+            "Cardinality": "Six Git subprocesses per session with nonempty symlink patterns; the three repository scans run concurrently, and two emit every matching file. With both symlink and include settings, four existing include-resolution Git calls follow, for ten setup subprocesses total.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No symlink-discovery subprocesses. Optional include setup ran only its own four Git queries.",
+            "CriticalPathEffect": "Newly awaited before the worktree is materialized and before first-turn progress."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:745",
+            "Operation": "Create/write/delete a temporary matcher repository and patterns file",
+            "Cardinality": "One temporary tree per session setup",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No symlink matcher temporary tree; include setup has its separate pre-existing temporary tree.",
+            "CriticalPathEffect": "Awaited within symlink discovery."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/worktreeSymlink.ts:11",
+            "Operation": "Resolve paths, inspect target parents/targets, create parent directories, and create directory symlinks",
+            "Cardinality": "Several filesystem calls per effective topmost matched wholly-ignored folder; up to 15 folders are processed concurrently per session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No worktree symlink filesystem operations.",
+            "CriticalPathEffect": "All selected-folder operations settle before session materialization."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:714",
+            "Operation": "Resolve and copy configured include files with four Git calls",
+            "Cardinality": "Four calls per session when include patterns are configured; two repository-wide standard-ignore scans repeat scans now made by the preceding symlink phase.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "These calls existed, but there was no preceding symlink phase duplicating standard-ignore traversal.",
+            "CriticalPathEffect": "Awaited after symlink setup."
+          }
+        ],
+        "ScalingInput": "Total ignored and pattern-matched file count/bytes controls the two uncollapsed scan outputs; ancestor candidate count controls check-ignore input; effective topmost wholly-ignored folder count controls symlink operations. Concurrent sessions multiply scans because setup is outside the repository-keyed creation sequencer.",
+        "EffectiveConcurrency": "Three discovery scans run in parallel, then two check-ignore calls run in parallel, then symlinks use a limiter of 15. Worktree add is serialized per repository, but setup is not, so separate sessions can overlap all discovery work without coalescing.",
+        "CacheBehavior": "No positive, negative, or in-flight cache exists. Every new session, and configured recovery, repeats discovery. Empty results are not retained. Include and symlink phases do not share overlapping scan output.",
+        "MechanismConfidence": "High: the awaited call path, subprocess cardinality, full-output buffering, and concurrency are explicit in changed code.",
+        "MagnitudeUncertainty": "Exact latency and memory depend on ignored-tree size, path lengths, storage speed, and concurrent session count; repositories with a large `node_modules` tree are explicitly realistic in the added tests.",
+        "Verdict": "Reportable regression: the new opt-in setting puts uncollapsed repository-wide ignored-file enumeration and duplicated scans on the first-turn critical path."
+      },
+      {
+        "Scenario": "Manual Git extension worktree creation with symlink patterns",
+        "CriticalPath": "The worktree-add command itself returns after scheduling `_setupWorktree`, so new discovery is off the immediate create-command critical path. It remains on the ordered setup path before include copying and `runOn: worktreeCreated` tasks.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/repository.ts:2087",
+            "Operation": "Three `git ls-files` scans, one temporary `git init`, and two `git check-ignore` calls",
+            "Cardinality": "Six Git subprocesses per configured worktree; two scans buffer every matching ignored file.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No symlink discovery; include setup and worktree-created tasks began immediately after worktree add.",
+            "CriticalPathEffect": "Does not delay `createWorktree` return, but delays symlink availability, include copying, and worktree-created tasks while consuming repository I/O."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/git/src/worktreeSymlink.ts:62",
+            "Operation": "Temporary matcher file/tree operations and per-folder realpath/lstat/mkdir/symlink",
+            "Cardinality": "One temporary matcher per worktree; filesystem calls scale with effective topmost matched folders and are processed serially in the extension implementation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No symlink setup operations.",
+            "CriticalPathEffect": "Awaited by background setup before subsequent setup phases."
+          }
+        ],
+        "ScalingInput": "Ignored-file population controls scan/output cost; effective topmost folder count controls serial symlink filesystem operations.",
+        "EffectiveConcurrency": "The three initial scans and two checks are parallel within their stages; selected symlinks are created serially. Separate worktree setups are not visibly coalesced.",
+        "CacheBehavior": "No discovery cache or in-flight coalescing; every configured worktree repeats all scans.",
+        "MechanismConfidence": "High for the mirrored full-scan mechanism; lower impact certainty because setup is intentionally detached.",
+        "MagnitudeUncertainty": "Immediate worktree creation is not blocked, so user-visible impact is mainly I/O contention and delayed setup/tasks; exact observability depends on repository size and configured tasks.",
+        "Verdict": "The same mechanism is covered by the submitted finding's evidence and fix direction; no separate duplicate finding was submitted."
+      },
+      {
+        "Scenario": "Resume or unarchive when a persisted Agent Host worktree is missing",
+        "CriticalPath": "Metadata is read, `git worktree add` recreates the checkout, and persisted symlink discovery/creation is newly awaited before the repaired working directory is returned.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1551",
+            "Operation": "Read two additional symlink metadata values",
+            "Cardinality": "Two extra metadata reads per worktree metadata load, parallel with existing reads.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only branch, path, repository root, and legacy working-directory metadata were read.",
+            "CriticalPathEffect": "Awaited on resume metadata lookup; constant-cardinality local metadata work."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1345",
+            "Operation": "Recreate worktree and rerun six-call symlink discovery",
+            "Cardinality": "One worktree-add plus six discovery Git subprocesses for a missing configured worktree.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Recreation only added the existing worktree; it did not rediscover or recreate symlinks.",
+            "CriticalPathEffect": "Awaited before resume/unarchive recreation completes."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1522",
+            "Operation": "Persist or delete symlink pattern/source metadata",
+            "Cardinality": "Two metadata writes when configured, or one deletion request when empty, parallel with existing metadata writes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No symlink metadata was persisted.",
+            "CriticalPathEffect": "Awaited near the end of initial creation; constant cardinality."
+          }
+        ],
+        "ScalingInput": "Recovery discovery has the same ignored-file and candidate-folder scaling as initial creation; metadata work is constant.",
+        "EffectiveConcurrency": "Per-session resume is sequenced, but discovery across different sessions/repositories is not globally limited; each symlink batch is limited to 15 filesystem operations.",
+        "CacheBehavior": "Persisted patterns avoid configuration loss but do not cache resolved folders or discovery output, so recovery reruns all scans. Normal resumes with an existing worktree do not rerun discovery.",
+        "MechanismConfidence": "High for the changed awaited recovery path and repeated scans; prevalence is lower.",
+        "MagnitudeUncertainty": "Missing-worktree recovery and unarchive are less frequent than initial creation; scan cost remains potentially large when triggered.",
+        "Verdict": "No separate finding: this is an additional trigger for the same reported full-scan mechanism. Constant metadata fan-out alone is not material enough to report."
+      },
+      {
+        "Scenario": "Worktree creation with the new setting absent or empty",
+        "CriticalPath": "Configuration propagation occurs, but both implementations return before symlink discovery and issue no new Git or symlink filesystem operations.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1526",
+            "Operation": "Delete empty persisted symlink metadata during Agent Host worktree metadata write",
+            "Cardinality": "One constant-cardinality metadata deletion request per new Agent Host worktree, parallel with existing metadata writes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No symlink metadata deletion call.",
+            "CriticalPathEffect": "Awaited with existing metadata persistence but does not scale with repository contents."
+          }
+        ],
+        "ScalingInput": "No repository-size-dependent new work when patterns are empty; only constant configuration and metadata handling.",
+        "EffectiveConcurrency": "No symlink discovery or creation is scheduled.",
+        "CacheBehavior": "Empty configuration is checked directly; no negative cache is needed because no expensive discovery follows.",
+        "MechanismConfidence": "High that expensive symlink boundaries are skipped.",
+        "MagnitudeUncertainty": "The added metadata delete's local cost is not measured, but it is constant and parallelized.",
+        "Verdict": "No reportable regression for default users; the constant metadata operation is insufficiently material."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 28 changed files. One medium-severity boundary-fanout finding was submitted for full ignored-file Git scans and buffering on configured worktree creation; mirrored extension and recovery triggers were included without duplicate findings. No concrete regression fix attributable to a base commit was identified."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-27T12:16:23.993735516Z",
+    "CompletedAt": "2026-09-27T12:19:03.826234356Z",
+    "WallClockMilliseconds": 159832,
+    "ModelCalls": 7,
+    "InputTokens": 347030,
+    "OutputTokens": 10813,
+    "TotalTokens": 357843,
+    "ReasoningTokens": 5765,
+    "CacheReadTokens": 276480,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 123961,
+    "ToolCalls": 50,
+    "NanoAIUnits": 60905200000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 276480,
+      "cache_write": 0,
+      "input": 70550,
+      "output": 10813
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
