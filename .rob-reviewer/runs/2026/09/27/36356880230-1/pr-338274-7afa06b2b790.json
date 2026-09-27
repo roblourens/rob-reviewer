@@ -1,0 +1,254 @@
+{
+  "PullRequest": {
+    "Number": 338274,
+    "Title": "Continue sessions with last applied sandbox config after managed policy conflicts",
+    "Body": "## Summary\nWhen a sandbox configuration update conflicts with managed policy, log the error details and continue the session with the runtime's last applied sandbox configuration instead of failing the session.\n\nFollow-up to #338172.\n\n## Problem\nVS Code applies sandbox configuration after SDK session creation/resume and during running-session configuration updates. Previously, `applySandboxConfig` logged update errors and rethrew them, including `managed_sandbox_policy_conflict`. A rejected update could therefore fail session initialization or interrupt a request even though the runtime retained its existing sandbox configuration.\n\n## Changes\n- Catch `managed_sandbox_policy_conflict` specifically within the sandbox configuration update helper. Recognize the structured error code and the runtime's full policy-conflict message, including RPC-wrapped messages.\n- Log the session context and original error details, then return without propagating that conflict.\n- Continue using the runtime's existing, last applied sandbox configuration; do not retry with weaker restrictions or apply the rejected candidate.\n- Return whether the update was applied, so callers preserve the last confirmed sandbox state and existing session-bypass bookkeeping when it was rejected.\n- Keep existing error behavior for unrelated failures and other SDK operations.\n- Document this behavior in the Agent Host guide.\n\n## Scope\nThis only suppresses managed-policy conflicts from `session.options.update({ sandboxConfig })`. It does not suppress SDK resume failures, transport errors, generic unsuccessful update responses, or conflicts from other SDK operations. It does not rewrite client settings or compose managed/local filesystem policies.\n\n## Validation\n- **136 targeted tests passed** across the sandbox launcher and session permission-handling suites.\n- Regression coverage includes create/resume, structured and message-based conflicts, idle and active sessions, continuing requests, preserving confirmed state, successful subsequent retries, and unrelated errors remaining failures.\n- Changed-file ESLint, editor diagnostics, and `git diff --check` passed.\n- Commit hygiene checks passed.\n\n```powershell\n.\\scripts\\test.bat --run src\\vs\\platform\\agentHost\\test\\node\\copilotSessionLauncher.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\copilotAgentSession.test.ts --grep \"CopilotSessionLauncher sandbox policy|CopilotAgentSession permission handling\" --reporter dot\n```",
+    "URL": "https://github.com/microsoft/vscode/pull/338274",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dileepyavan",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6ed05a17ea68d096e122f0866e8ee3aec612f2c5",
+    "HeadRef": "DileepY/sandbox_existing_sessions",
+    "HeadSHA": "7afa06b2b79073cf6d118d9f326b0d8c805f8893",
+    "CreatedAt": "2026-09-27T21:59:25Z",
+    "UpdatedAt": "2026-09-27T22:03:37Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "missing-coalescing",
+      "boundary-fanout",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create or resume a Copilot session when the sandbox update conflicts with managed policy",
+        "CriticalPath": "SDK create/resume, script-safety options update, sandbox options update, and optional connector reconciliation must finish before the session wrapper is returned. The diff changes only the sandbox-update error outcome: a recognized conflict no longer enters disconnect-and-fail cleanup, so later initialization remains on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:738 and :673",
+            "Operation": "SDK createSession or resumeSession",
+            "Cardinality": "One create or resume attempt per ordinary launch, aside from unchanged documented resume fallbacks.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same SDK launch boundary ran before the diff.",
+            "CriticalPathEffect": "Produces the raw runtime session before sandbox application can run."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:821",
+            "Operation": "session.options.update for script safety",
+            "Cardinality": "One per finalized session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged.",
+            "CriticalPathEffect": "Awaited before the sandbox update."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:611",
+            "Operation": "session.options.update for sandboxConfig",
+            "Cardinality": "Exactly one per finalized launch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The identical boundary ran and a conflict propagated, triggering disconnect and launch failure.",
+            "CriticalPathEffect": "Awaited before the wrapper is returned. The call existed before; only a recognized conflict is now converted to false."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:779",
+            "Operation": "Connector capabilities/auth/account/reconcile RPCs when connector MCP is enabled",
+            "Cardinality": "At most one fixed reconciliation sequence per launch, independent of repository size.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A conflicted launch stopped before connector reconciliation, while every successful launch already performed it.",
+            "CriticalPathEffect": "These calls become reachable after a sandbox conflict because the session now continues; they were already on every successful launch path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:760",
+            "Operation": "raw session disconnect on failed finalization",
+            "Cardinality": "Previously one after each propagated sandbox conflict; now none for recognized conflicts.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A conflict entered cleanup and disconnected the raw session before surfacing failure.",
+            "CriticalPathEffect": "Removed from the recognized-conflict path."
+          }
+        ],
+        "ScalingInput": "One launch per session. Sandbox application is one RPC per launch; connector reconciliation is a fixed sequence per launch rather than per workspace item.",
+        "EffectiveConcurrency": "Launch steps are awaited serially within a session. Separate session launches may run independently; this diff adds no burst or fan-out.",
+        "CacheBehavior": "The computed candidate is not cached, while the last confirmed sandbox state is intentionally retained. There is no negative conflict cache, but launch invokes this helper only once.",
+        "MechanismConfidence": "High: the changed catch and boolean result directly establish the new continuation path and unchanged RPC count.",
+        "MagnitudeUncertainty": "Runtime RPC latency and frequency of enterprise policy conflicts are not measured, but launch cardinality is fixed and small.",
+        "Verdict": "No reportable regression. Continuing through later initialization adds work only because the launch now succeeds; it neither multiplies the sandbox boundary nor introduces unbounded retention."
+      },
+      {
+        "Scenario": "Apply a live sandbox configuration change while the session is idle or has an active turn",
+        "CriticalPath": "The configuration event queues permission synchronization when needed and one sandbox options.update. A recognized conflict now resolves normally, preserves confirmed state, and avoids the prior error/rollback/active-turn abort path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4773",
+            "Operation": "permissions.setMode and experimental options update when active permission settings require changes",
+            "Cardinality": "At most one of each changed permission setting per relevant event, with state checks avoiding unchanged mode writes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged.",
+            "CriticalPathEffect": "Precedes sandbox application for active turns."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4831",
+            "Operation": "session.options.update for sandboxConfig",
+            "Cardinality": "One per matching sandbox/approval configuration event.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same RPC propagated conflicts to the outer handler.",
+            "CriticalPathEffect": "Awaited by the per-session sequencer; the changed helper turns only managed conflicts into a normal false result."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4768",
+            "Operation": "Session abort after active-turn synchronization failure",
+            "Cardinality": "Previously one after a managed conflict during an active turn; now zero.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The outer catch aborted an active turn after the conflict propagated.",
+            "CriticalPathEffect": "Removed from the recognized-conflict path."
+          }
+        ],
+        "ScalingInput": "One sandbox RPC per relevant configuration event. Event handling is scoped to the owning session.",
+        "EffectiveConcurrency": "Sandbox updates are serialized by _sandboxConfigSequencer per session; active sessions remain independent. No new parallel fan-out is introduced.",
+        "CacheBehavior": "The last confirmed state is retained because false suppresses publication of the rejected candidate. The rejected candidate is not negatively cached, allowing a later event or turn to retry.",
+        "MechanismConfidence": "High: the event filter, sequencers, and tests demonstrate exactly one immediate rejected update and removal of abort behavior.",
+        "MagnitudeUncertainty": "Configuration-event frequency is user/policy driven, but each event has bounded cardinality.",
+        "Verdict": "No reportable performance regression. The diff removes failure cleanup and preserves state without adding per-item work, concurrency, or retention."
+      },
+      {
+        "Scenario": "Send or resume turns after a managed-policy conflict remains active",
+        "CriticalPath": "Every normal send/resume runs _prepareSdkTurn serially before the provider call. Its sandbox step retries one options.update; the new false result allows shell/MCP reconciliation and the actual send to proceed instead of failing the turn.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4831",
+            "Operation": "session.options.update for sandboxConfig during _prepareSdkTurn",
+            "Cardinality": "One per send/resume/fleet turn; tests explicitly show a second attempt on the first turn after an event conflict.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Successful sessions already issued one sandbox update per turn; a managed conflict instead rejected the turn.",
+            "CriticalPathEffect": "Awaited before the provider send. The boundary and per-turn frequency predate the diff; the conflict branch now continues afterward."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4910",
+            "Operation": "Materialize a configured shell init script",
+            "Cardinality": "One write when configured script content is synchronized; not per sandbox conflict once registered.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Existing shell synchronization ran on successful preparation; a propagated sandbox conflict prevented reaching it.",
+            "CriticalPathEffect": "May be awaited after the sandbox step during turn preparation."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4058",
+            "Operation": "MCP list and per-server enable/disable reconciliation",
+            "Cardinality": "One list only when desired MCP enablement is nonempty, then at most one operation per server whose observed state differs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Existing on successful turns; a propagated sandbox conflict prevented reaching it.",
+            "CriticalPathEffect": "Awaited after sandbox and shell synchronization before the provider send."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:3299",
+            "Operation": "SDK provider send/sendMessages",
+            "Cardinality": "One provider request per accepted turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A conflict blocked this request; successful turns already used it.",
+            "CriticalPathEffect": "The user-visible agent turn starts after preparation; the diff makes this reachable after recognized conflicts."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:621",
+            "Operation": "Warning log including the conflict Error object",
+            "Cardinality": "One warning per rejected attempt, therefore one per turn while conflict persists.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The generic failure path also logged the same error once, but the failed session could not accumulate later per-turn warnings.",
+            "CriticalPathEffect": "Synchronous log invocation occurs in the rejected RPC path; downstream sink behavior is not established as blocking."
+          }
+        ],
+        "ScalingInput": "One sandbox RPC and warning per turn while the same conflict persists; typical multiplicity follows conversation turn count, not files, tools, or repository size.",
+        "EffectiveConcurrency": "Per-session sandbox, shell, and MCP work is sequenced; preparation steps are awaited serially. Different sessions can prepare independently, as before.",
+        "CacheBehavior": "There is no negative cache for a rejected sandbox candidate, so a persistent conflict is retried on each turn. Successful sandbox configs were already re-applied on every turn before this diff, and retry preserves the ability to recover when runtime policy changes.",
+        "MechanismConfidence": "High that one retry and warning occur per turn; low that this bounded work constitutes a material regression rather than the necessary cost of newly continued functionality.",
+        "MagnitudeUncertainty": "The actual cost of a local SDK RPC and log sink is unknown. A persistent conflict can repeat across turns, but the fixed one-call cardinality matches the pre-existing successful-turn contract and no evidence shows material latency or log-volume impact.",
+        "Verdict": "No finding. Although the conflict is not negatively cached, the retry is a single serialized RPC per turn, successful sessions already paid the same per-turn RPC, and retry is required to recover from runtime-side policy changes without a proven invalidation signal."
+      },
+      {
+        "Scenario": "Register or refresh a shell init script while sandbox application conflicts",
+        "CriticalPath": "Script materialization writes the file, then sandbox application is awaited before registering the path. A recognized conflict now allows the existing shell registration RPC to proceed while retaining runtime policy.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4910",
+            "Operation": "Write the materialized init script",
+            "Cardinality": "One write per changed script synchronization.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged and already occurred before a propagated sandbox conflict.",
+            "CriticalPathEffect": "Occurs before sandbox validation and registration."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4894",
+            "Operation": "Sandbox options update followed by shell initScripts options update",
+            "Cardinality": "One sandbox update and, for a new path, one shell registration RPC.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The shell registration was reached after successful sandbox application but not after a propagated conflict.",
+            "CriticalPathEffect": "Both are awaited during synchronization; the shell registration becomes reachable after a recognized conflict."
+          }
+        ],
+        "ScalingInput": "One filesystem write per script content synchronization and one registration RPC per new path; content changes rewrite in place without another registration.",
+        "EffectiveConcurrency": "Shell synchronization is serialized by _shellInitScriptSequencer, and sandbox application is independently serialized by _sandboxConfigSequencer.",
+        "CacheBehavior": "Serialized script content and registered path suppress repeated registration. A conflict does not alter these caches; the runtime's existing sandbox state remains authoritative.",
+        "MechanismConfidence": "High: path caching and sequencer ownership are explicit in the implementation.",
+        "MagnitudeUncertainty": "Shell init scripts are optional and registration frequency is path-bounded.",
+        "Verdict": "No reportable regression. The newly reachable registration is bounded and represents completion of requested initialization, not repeated or fan-out work."
+      }
+    ],
+    "Summary": "Completed the performance pass over all five changed files and traced launch, live configuration, per-turn preparation, and shell synchronization. The PR changes recognized managed-policy conflicts from fatal to non-fatal while retaining existing serialized RPC cardinality. No high-confidence actionable performance regression or qualifying regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-27T23:00:25.424053939Z",
+    "CompletedAt": "2026-09-27T23:02:01.0352979Z",
+    "WallClockMilliseconds": 95611,
+    "ModelCalls": 11,
+    "InputTokens": 354735,
+    "OutputTokens": 6757,
+    "TotalTokens": 361492,
+    "ReasoningTokens": 2281,
+    "CacheReadTokens": 297472,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 83122,
+    "ToolCalls": 42,
+    "NanoAIUnits": 48318080000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 297472,
+      "cache_write": 0,
+      "input": 57263,
+      "output": 6757
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

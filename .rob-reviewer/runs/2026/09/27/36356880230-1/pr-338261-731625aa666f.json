@@ -1,0 +1,165 @@
+{
+  "PullRequest": {
+    "Number": 338261,
+    "Title": "agentHost: Show Linux SDK sandbox diagnostics in chat",
+    "Body": "## Summary\r\n\r\nAddresses the missing-diagnostics portion of #335755.\r\n\r\n- On Linux hosts, query the Copilot SDK's sandbox host support when an SDK session initializes, before turns, and when its sandbox configuration changes.\r\n- Publish unsupported backend/capability reasons through optional, validated `vscode.sandboxDiagnostics` session metadata for local and remote clients.\r\n- Reuse the existing chat-input warning UI: plain-text SDK diagnostics, a standard dismiss button, and no settings action. Dismissing the warning does not change sandboxing, and unchanged diagnostics do not immediately reopen it.\r\n- Clear the warning when sandboxing is disabled or support becomes available. Leave sandbox enforcement, permission handling, and sending behavior unchanged.\r\n- Cover diagnostic publication, capability filtering, stale async results, disposal, session initialization, notification lifecycle, and dismissal in regression tests. Update chat accessibility help.\r\n\r\n## Scope and timing\r\n\r\nThis is limited to Linux hosts for now, pending testing on macOS and Windows. It is not Dev Container-specific: local and remote Linux Copilot SDK hosts are covered, regardless of the client's platform. The custom terminal override uses a different sandbox implementation and is excluded.\r\n\r\nFor lazy sessions, the SDK initializes on the first send, so the warning is not guaranteed before the user sends their first prompt. Remote hosts must run this change as well as the client.\r\n\r\n## Validation\r\n\r\n- 84 targeted sandbox and notification regression tests, including macOS/Windows exclusion, passed.\r\n- Changed-file ESLint and whitespace checks passed.\r\n- TypeScript checked successfully against the repository-pinned SDK before dependency restoration.\r\n- Deployed the locally compiled host into an isolated Linux Dev Container installation with matching Linux-native dependencies. Verified authenticated AHP connectivity and confirmed the real SDK reports missing Bubblewrap via `sandbox.getHostSupport()`.\r\n- Dependency installation and namespace-restriction recovery have not been validated end to end.\r\n- The latest `npm run compile` attempt was blocked by `EPERM` while the Copilot extension postinstall tried to replace a loaded Windows `runtime.node` in the running Code OSS instance. An earlier core compile also reported two unrelated `SinonFakeTimersConfig` test-typing errors in `mcpSamplingLog.test.ts` and `terminalStickyScrollOverlay.test.ts`. These are not changed by this PR.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/338261",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "chrmarti",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "2322fa7df206eee50696c8fb58fafb075340c930",
+    "HeadRef": "chrmarti/agent-host-sandbox-diagnostics",
+    "HeadSHA": "731625aa666f7dccea41273a6060fbc116a32749",
+    "CreatedAt": "2026-09-27T20:02:53Z",
+    "UpdatedAt": "2026-09-27T21:53:02Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-8D6EF137664B",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts",
+      "Side": "RIGHT",
+      "Line": 4783,
+      "Severity": "high",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed await is directly on the traced `_prepareSdkTurn` critical path, `CopilotSandboxDiagnostics.update` unconditionally starts the RPC whenever `config.enabled`, and the SDK client is explicitly connected to its runtime subprocess through `RuntimeConnection.forStdio`. The added test itself establishes two probes for initialization plus one first send and a 5,000 ms elapsed timeout. Exact normal RPC duration and user prevalence are uncertain, but the per-turn call and worst-case delay are explicit.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "One additional SDK-runtime stdio IPC request per initialization and per turn, plus an uncancelled pending RPC on each timeout.",
+      "PerformanceScaling": "Cost grows linearly with the number of turns (one uncached probe for every normal send, resume, or fleet start); a session with N turns issues N+1 probes, and each slow probe serially blocks that turn for as long as five seconds.",
+      "PerformanceOutcome": "Increased turn-start latency and blocked initialization, up to five seconds per probe when the runtime does not answer.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff, turn preparation applied the sandbox configuration and proceeded to the model send without querying host-support diagnostics; session initialization likewise did not await this diagnostic RPC.",
+      "ChangedBehavior": "Every Linux turn with SDK sandboxing enabled now invokes `client.rpc.sandbox.getHostSupport()` and waits for the result (or a 5,000 ms timeout) after applying the sandbox config and before starting the provider request.",
+      "CausalDiffEvidence": "The added RIGHT-side line `await this._sandboxDiagnostics.update(...sandboxConfig)` at `copilotAgentSession.ts:4783` inserts the diagnostics probe into `_updateEffectiveSandboxConfig`; `_prepareSdkTurn` awaits `_applyEffectiveSandboxConfig` before `session.send` for normal sends, resumes, and fleet starts.",
+      "Title": "Keep the sandbox diagnostic probe off every turn's critical path",
+      "Impact": "On Linux with sandboxing enabled, a slow or wedged SDK runtime delays session readiness and each prompt before model work begins; in the explicit timeout case users wait an extra five seconds on every turn. Repeated timeouts also leave each underlying RPC unresolved because the timeout wrapper does not cancel it.",
+      "Evidence": "`_send` and `resume` await `_prepareSdkTurn` before calling `session.send`/`rpc.sendMessages`; `_prepareSdkTurn` awaits `_applyEffectiveSandboxConfig`; the changed line awaits `CopilotSandboxDiagnostics.update`; that method calls `raceTimeout(this._getHostSupport(), 5_000)` without caching, and `raceTimeout` does not cancel the losing promise. `CopilotAgent` creates the SDK client with `RuntimeConnection.forStdio`, proving this is a subprocess IPC round trip rather than local metadata access. The new timeout test expects `queries: 2` for initialization followed by one send and separately measures a hung query at exactly 5,000 ms.",
+      "Recommendation": "Keep diagnostics off the turn critical path: probe asynchronously at initialization/config changes, cache/coalesce the latest host-support result, and refresh on an explicit bounded cadence or invalidation event. If polling before turns is required, reuse an in-flight/cached result and do not await it before `session.send`; also cancel or otherwise bound timed-out RPC requests."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create or resume a Copilot agent session",
+        "CriticalPath": "`_initializeAndRegisterSession` awaits `initializeSession`, which now awaits `_sandboxDiagnostics.update` before registration and availability. The diagnostic IPC is therefore on the cold session creation/resume critical path, bounded only by the 5,000 ms timeout.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:2661 and CopilotSandboxDiagnostics.update",
+            "Operation": "Request sandbox host support from the Copilot runtime connected through stdio.",
+            "Cardinality": "One added host-support request per new or resumed sandbox-enabled Linux session; zero on disabled, non-Linux, or custom-terminal paths.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Session initialization performed existing launch/session RPCs but did not query or await sandbox host-support diagnostics.",
+            "CriticalPathEffect": "The session cannot finish initialization/register until the response or the five-second timeout."
+          }
+        ],
+        "ScalingInput": "Number of simultaneously initialized Linux sandbox-enabled sessions.",
+        "EffectiveConcurrency": "One probe is awaited per initializing session. Different sessions can initialize concurrently and issue independent probes to the shared SDK runtime; there is no shared coalescing or limiter.",
+        "CacheBehavior": "There is no positive, negative, or in-flight cache for host support. A newly created or resumed Linux sandbox-enabled session always probes once during initialization; disabled sandboxing and non-Linux/custom-terminal paths skip the probe.",
+        "MechanismConfidence": "High: the await chain, stdio runtime connection, unconditional enabled-path probe, and timeout are all explicit.",
+        "MagnitudeUncertainty": "Normal host-support response latency and the number of concurrently initialized sessions are not measured; the five-second hung-response bound is explicit in code and tests.",
+        "Verdict": "Reportable as part of the submitted critical-path regression: the new optional diagnostic blocks session readiness and has no cache/coalescing."
+      },
+      {
+        "Scenario": "Send, resume, or start a fleet turn",
+        "CriticalPath": "Normal sends and resumes await `_prepareSdkTurn`, which awaits `_applyEffectiveSandboxConfig`, which now awaits the diagnostic probe before `session.send`/`rpc.sendMessages`. Fleet starts use the same preparation path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4783",
+            "Operation": "Call SDK runtime `sandbox.getHostSupport` after the existing sandbox options update.",
+            "Cardinality": "One newly added stdio IPC request per normal send, resumed turn, or fleet start while sandboxing is enabled; effective count is N for N turns, in addition to initialization.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Turn preparation already sent one sandbox-options update, then proceeded without a host-support query; the diff adds a second sequential RPC.",
+            "CriticalPathEffect": "The provider request cannot start until this IPC returns or reaches the five-second timeout."
+          }
+        ],
+        "ScalingInput": "Number of turns across active sandbox-enabled Linux sessions; timed-out pending RPCs also grow with repeated hung turns because timeout does not cancel them.",
+        "EffectiveConcurrency": "Chat turns are queued and `_sandboxConfigSequencer` serializes sandbox updates within a session, so this is one blocking probe at a time per session rather than a burst. Separate sessions can issue probes concurrently to the shared runtime.",
+        "CacheBehavior": "No support result is reused, even immediately after initialization or when sandbox configuration is unchanged. Every enabled turn probes afresh; `raceTimeout` resolves after five seconds but does not cancel the underlying RPC promise.",
+        "MechanismConfidence": "Very high: all normal/resume/fleet paths and their ordering before the model call are directly traced.",
+        "MagnitudeUncertainty": "The common-case IPC duration and prevalence of wedged runtimes are uncertain. The code and tests establish that a hung request adds exactly five seconds per turn and that initialization plus the first send produce two requests.",
+        "Verdict": "Reportable high-severity latency regression; submitted as one repeated-work finding."
+      },
+      {
+        "Scenario": "Change sandbox settings and display/dismiss the warning",
+        "CriticalPath": "Configuration changes asynchronously queue permission/sandbox synchronization. Notification rendering is event-driven and off the model request path except when the same update is reached through turn preparation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:4783",
+            "Operation": "Refresh sandbox host support after applying changed sandbox/permission configuration.",
+            "Cardinality": "At most one added host-support IPC per relevant queued configuration synchronization; root changes can affect each live session, while session changes affect the owning session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Config changes applied sandbox settings without the additional support query.",
+            "CriticalPathEffect": "A config-change task waits for the probe, but callers launch this synchronization asynchronously; it can still occupy each session's sequencer and delay a following turn behind it."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSandboxNotification.ts",
+            "Operation": "Receive session metadata over the existing agent-host subscription channel.",
+            "Cardinality": "Existing session-state subscription traffic; diagnostic metadata changes add only a small reasons array and unchanged values are suppressed.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The subscription already carried session state; this diff adds optional diagnostic metadata but no new subscription boundary.",
+            "CriticalPathEffect": "Off the turn critical path on the workbench side; it updates or removes a chat-input notification."
+          }
+        ],
+        "ScalingInput": "Number of live sessions affected by a root configuration event and number of actual diagnostic changes.",
+        "EffectiveConcurrency": "Sandbox config applications are serialized per session by `_sandboxConfigSequencer`. UI notification ownership uses a `MutableDisposable`, replacing and disposing the prior listener when subscriptions change.",
+        "CacheBehavior": "Diagnostics metadata is deduplicated by array equality before publication, and the UI notification similarly suppresses unchanged reasons. There is no host-support cache, but disabled/non-Linux configurations clear metadata without probing.",
+        "MechanismConfidence": "High for update scheduling, deduplication, and disposal; no separate UI retention or rendering regression is evidenced.",
+        "MagnitudeUncertainty": "Root-config event fan-out depends on the number of live sessions; diagnostic arrays are expected to be small SDK capability lists.",
+        "Verdict": "No additional reportable issue beyond the critical-path probe. Metadata publication is deduplicated, notifications are session-scoped, and listeners/notifications are removed on replacement or disposal."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 13 changed files. One high-confidence regression was submitted: an uncached SDK-runtime host-support probe is newly awaited during initialization and on every sandbox-enabled turn, adding a sequential stdio IPC and up to five seconds of latency per occurrence. Notification lifecycle, deduplication, disabled-platform behavior, config-event serialization, and disposal were also checked; no other concrete performance regressions met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-27T22:58:48.38086884Z",
+    "CompletedAt": "2026-09-27T23:00:20.473774144Z",
+    "WallClockMilliseconds": 92092,
+    "ModelCalls": 12,
+    "InputTokens": 482779,
+    "OutputTokens": 7333,
+    "TotalTokens": 490112,
+    "ReasoningTokens": 1694,
+    "CacheReadTokens": 422287,
+    "CacheWriteTokens": 60456,
+    "APIDurationMilliseconds": 74873,
+    "ToolCalls": 77,
+    "NanoAIUnits": 61799880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 422287,
+      "cache_write": 60456,
+      "input": 36,
+      "output": 7333
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
