@@ -1,0 +1,173 @@
+{
+  "PullRequest": {
+    "Number": 338388,
+    "Title": "Sync MCP runtime enablement with Customizations",
+    "Body": "Fixes #338387\n\n## Summary\n\n- observe Copilot SDK MCP enablement transitions regardless of whether they originate from Chat, the CLI, or another runtime entry point\n- publish scoped customization toggle actions and synchronize client-owned global MCP state with the workbench enablement model\n- distinguish Agent Host reconciliation RPCs from external changes and prevent in-flight reconciliation from reversing an external toggle\n- notify Agent Customizations listeners immediately when a toggle action arrives\n\n## Validation\n\n- `npm run typecheck-client`\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --grep \"MCP server inventory\"` (74 passing)\n- `./scripts/test.sh --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostCustomizationService.test.ts --grep \"notifies when customization enablement changes\"`",
+    "URL": "https://github.com/microsoft/vscode/pull/338388",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "aeschli",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "acfc00a9e482b98f6383b4e69ba3dd771cce02b1",
+    "HeadRef": "aeschli/fix-mcp-runtime-enablement-sync",
+    "HeadSHA": "1fa804ab288f96f6544def110caf0821545972fb",
+    "CreatedAt": "2026-09-28T13:39:14Z",
+    "UpdatedAt": "2026-09-28T15:20:09Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "An MCP server is enabled or disabled outside the Agent Host session (for example by another SDK/CLI runtime entry point).",
+        "CriticalPath": "The SDK status event synchronously updates the live customization, compares the prior and current enablement, resolves the desired state, and emits one customization-toggle action only for a real enablement transition. Client notification and local enablement synchronization are on this event path; cross-session reconciliation is scheduled asynchronously and does not block the originating runtime toggle.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_syncObservedMcpServerEnablement",
+            "Operation": "Emits a SessionCustomizationToggled action through the Agent Host action stream to connected clients.",
+            "Cardinality": "One action per actual enabled/disabled transition after the previous-enabled and desired-enabled guards; repeated status updates with unchanged enablement emit none.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "External runtime enablement transitions updated lifecycle state but did not publish a scoped toggle action.",
+            "CriticalPathEffect": "Synchronous event publication occurs on the status-event path, while downstream client handling is event-driven."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentSideEffects.ts:_recordCustomizationEnablement -\u003e agentHostCustomizationEnablementService.ts:replaceEnablement",
+            "Operation": "Persists the changed global customization decision and session metadata through the existing enablement service.",
+            "Cardinality": "One replacement per emitted transition; global changes can notify all active sessions, but identical repeated statuses are suppressed before emission.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No enablement decision was persisted from an externally observed runtime transition.",
+            "CriticalPathEffect": "The in-memory replacement is synchronous; host storage/database persistence is queued and is not awaited by the SDK status callback."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_doReconcileMcpServerEnablement",
+            "Operation": "Calls rpc.mcp.list for each affected active session, then enable/disable only where that session differs from the new global decision.",
+            "Cardinality": "At most one queued reconciliation per enablement-change notification per active affected session; server mutations are sequential within each session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same reconciliation boundary already ran for customization enablement changes; the diff makes externally observed global changes enter that existing path.",
+            "CriticalPathEffect": "Fire-and-forget from the enablement event and off the originating toggle's critical path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostCustomizationService.ts:_syncClientMcpEnablement",
+            "Operation": "Updates the client-owned MCP profile enablement memento for the uniquely matched local server.",
+            "Cardinality": "One no-op-aware setEnabled call for the single matched local server; ambiguous or absent matches perform no write.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Agent Host toggle actions did not synchronize the client-owned local MCP enablement model.",
+            "CriticalPathEffect": "Synchronous model update can notify UI observers; persistence uses the existing storage service and is not a network/process boundary."
+          }
+        ],
+        "ScalingInput": "Number of active Agent Host sessions affected by a global decision, plus MCP/customization counts used by bounded linear lookups. Typical status chatter that does not change the enabled bit is filtered out.",
+        "EffectiveConcurrency": "Unexpected transitions are handled once per server status stream. Reconciliation is serialized by the existing per-session MCP enablement sequencer; separate affected sessions may reconcile concurrently. Local enablement writes are transactionally coalesced by the existing observable/storage model.",
+        "CacheBehavior": "Live prior enablement is retained per server and suppresses duplicate status emissions. Desired state is recomputed from current authoritative customization data; no new cache miss loop is introduced. Local enablement storage avoids rewriting unchanged map entries.",
+        "MechanismConfidence": "High: the event guards, action emission, persistence side effect, per-session reconciliation listener, sequencer, and RPC calls are directly traced.",
+        "MagnitudeUncertainty": "The number of simultaneously active sessions and configured MCP servers varies, but the new work occurs only on actual enablement transitions rather than every lifecycle event.",
+        "Verdict": "No reportable regression. The new boundary work is the required synchronization behavior, is transition-deduplicated, and uses existing per-session serialization; there is no high-confidence avoidable fan-out or critical-path amplification."
+      },
+      {
+        "Scenario": "Agent Host reconciles desired MCP enablement after a user customization change or session send/resume.",
+        "CriticalPath": "The existing reconciliation lists MCP servers and sequentially applies required mutations. The diff only records the expected result before each enable/disable RPC and clears it when the matching SDK status arrives, preventing that host-requested transition from being reclassified as external.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_enableMcpServer/_disableMcpServer",
+            "Operation": "Invokes SDK rpc.mcp.enable or rpc.mcp.disable for servers whose observed state differs from desired state.",
+            "Cardinality": "Unchanged from before the diff: one mutation per mismatched server after a single mcp.list for the reconciliation; calls remain sequential.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same RPCs were called directly without expected-transition bookkeeping.",
+            "CriticalPathEffect": "When reconciliation is awaited by send/resume it remains on that existing critical path; the added map operations do not add an awaited boundary."
+          }
+        ],
+        "ScalingInput": "Number of configured MCP servers with desired state and number actually mismatched after the list result.",
+        "EffectiveConcurrency": "A single existing sequencer serializes reconciliation per session, and enable/disable calls remain sequential across servers. The two new maps are keyed by server name and do not create additional tasks or parallel RPCs.",
+        "CacheBehavior": "Launch projection and desired-state resolution remain unchanged. Expected-transition entries are deleted on matching status or RPC failure; retained entries are bounded by server names in a session.",
+        "MechanismConfidence": "High: before/after RPC placement and sequencer behavior are explicit in the changed and surrounding code.",
+        "MagnitudeUncertainty": "SDK status delivery timing varies, but bookkeeping cost is constant per mutation and does not change boundary cardinality.",
+        "Verdict": "No performance regression. RPC count, serialization, and critical-path placement are unchanged; the added work is constant-time bookkeeping."
+      },
+      {
+        "Scenario": "Workbench receives a customization-toggle action while MCP/customization UI is active.",
+        "CriticalPath": "The action handler synchronously locates the matching session customization and local MCP server, updates profile enablement, then emits the existing customization and custom-agent change notifications. Visible MCP rows may synchronously refresh from those notifications.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostCustomizationService.ts:_syncClientMcpEnablement",
+            "Operation": "Scans subscribed sessions, flattens one session's customizations, scans local MCP servers, and updates the persisted enablement map.",
+            "Cardinality": "One pass over subscribed sessions, one pass over that session's customizations, and one pass over local servers per global toggle action; only one uniquely matched server is updated.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Toggle actions relied on eventual session-state notification and did not synchronize the local MCP profile model in this handler.",
+            "CriticalPathEffect": "Runs synchronously before listeners are notified, but actions are user/runtime enablement transitions rather than render-, input-, scroll-, or frame-frequency events."
+          }
+        ],
+        "ScalingInput": "Subscribed Agent Host chat sessions, customizations in the matching session, configured local MCP servers, and currently rendered listeners. These are not multiplied by normal server lifecycle statuses because unchanged enablement is filtered at the producer.",
+        "EffectiveConcurrency": "Handling is synchronous per action. Session, customization, and local-server lookups are linear scans; there is no spawned concurrency or boundary burst. The local enablement model coalesces unchanged values.",
+        "CacheBehavior": "Authoritative current or verified session snapshots are reused. No new cache is introduced; local storage updates are skipped when the stored value already matches.",
+        "MechanismConfidence": "High for the synchronous scans and notifications; low evidence of a realistic hot frequency or material latency impact.",
+        "MagnitudeUncertainty": "Large customization management views can have many listeners, but enablement toggles are low-frequency discrete events and the diff does not place this work on scrolling/render loops.",
+        "Verdict": "No reportable regression. The work scales linearly on a low-frequency transition and is bounded by active subscriptions/configured servers; evidence does not establish jank or excessive I/O."
+      },
+      {
+        "Scenario": "Workbench service construction and ordinary MCP lifecycle updates that do not change runtime enablement.",
+        "CriticalPath": "The customization service receives a delayed IMcpService dependency. Ordinary pending/connected/failed/stopped updates perform only map lookups and return before desired-state resolution when the enabled bit is unchanged.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Frequency of normal MCP lifecycle status events and number of live server names stored in the session maps.",
+        "EffectiveConcurrency": "No work is scheduled by unchanged enablement statuses. Both the customization service and MCP service are registered as delayed services, so constructor injection does not itself eagerly discover or start servers.",
+        "CacheBehavior": "The controller's live map supplies the previous enabled bit, allowing unchanged lifecycle updates to avoid action emission and synchronization. Expected and observed maps are per session and keyed by server name.",
+        "MechanismConfidence": "High based on delayed singleton registrations and early-return guards.",
+        "MagnitudeUncertainty": "Sessions can observe many lifecycle statuses, but the changed path adds constant-time map reads for unchanged enablement and no boundary call.",
+        "Verdict": "No eager-startup or hot-status-path regression. The new dependency remains lazy, and unchanged lifecycle updates do not cross persistence, IPC mutation, or UI fan-out boundaries."
+      }
+    ],
+    "Summary": "Completed the performance pass over all seven changed files and traced runtime-toggle propagation, host reconciliation, client enablement persistence, UI notification fan-out, startup laziness, map lifecycle, and all transitive IPC/filesystem boundaries. No high-confidence actionable performance regression was introduced, and the PR does not provide sufficient evidence of a shipped performance-regression fix requiring blame attribution."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-28T15:30:46.622800333Z",
+    "CompletedAt": "2026-09-28T15:33:00.494363157Z",
+    "WallClockMilliseconds": 133871,
+    "ModelCalls": 13,
+    "InputTokens": 739789,
+    "OutputTokens": 8695,
+    "TotalTokens": 748484,
+    "ReasoningTokens": 3553,
+    "CacheReadTokens": 648689,
+    "CacheWriteTokens": 91061,
+    "APIDurationMilliseconds": 121870,
+    "ToolCalls": 71,
+    "NanoAIUnits": 88883660000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 648689,
+      "cache_write": 91061,
+      "input": 39,
+      "output": 8695
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

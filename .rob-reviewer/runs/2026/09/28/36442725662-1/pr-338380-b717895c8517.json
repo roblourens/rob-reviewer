@@ -1,0 +1,167 @@
+{
+  "PullRequest": {
+    "Number": 338380,
+    "Title": "Support continuous reads and improve session management",
+    "Body": "Enhance the read file tool with line adjustment settings and improve session eviction logic to emit events only when sessions are removed. Add telemetry for better monitoring.\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/338380",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dbaeumer",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "12dc71b304d560398c1c991e9ebad13e917dcc38",
+    "HeadRef": "dbaeumer/casual-moth-teal",
+    "HeadSHA": "b717895c85178e5ff3e2292f2b2b9119127f77f3",
+    "CreatedAt": "2026-09-28T13:16:34Z",
+    "UpdatedAt": "2026-09-28T13:47:46Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-5599895E715C",
+      "Focus": "performance-review",
+      "Path": "extensions/copilot/src/extension/tools/node/readFileTool.tsx",
+      "Side": "RIGHT",
+      "Line": 178,
+      "Severity": "low",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The added completion path definitively retains one ReadAdjustment plus nested Map entries per distinct successful (session, file, end, start) tuple. The only successful-entry cleanup is whole-session deletion driven by the grep cache's 16-session LRU eviction; there is no per-session/per-file limit or chat-disposal cleanup. The exact real-world duration and number of distinct reads vary, which limits severity rather than mechanism confidence.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceResource": "Nested Map keys and ReadAdjustment objects retained by the extension-host singleton ReadFileTool",
+      "PerformanceScaling": "Retained state grows O(U) with the number of unique successful (file, startLine, endLine) reads in each of up to 16 grep sessions; the 16-result grep cap does not bound U.",
+      "PerformanceOutcome": "Unbounded retained memory and increasing GC pressure during long agent sessions",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, region results were used transiently for telemetry and no per-range adjustment metadata survived an invocation.",
+      "ChangedBehavior": "Eligible reads now persist successful adjustment metadata in a nested singleton cache, including when the line-adjustment experiment is disabled.",
+      "CausalDiffEvidence": "RIGHT line 178 newly stores every successful adjustment in adjustmentsByStartLine; the surrounding newly added cache has no tuple-level capacity or expiration, and its only successful-entry cleanup is session-wide eviction.",
+      "Title": "Bound the per-session read-adjustment cache",
+      "Impact": "A long-running agent/chat session that searches and then reads many distinct TypeScript/JavaScript ranges steadily grows the extension host's retained Maps and adjustment objects, causing increasing memory use and eventual GC pressure; closed sessions can also remain retained until enough later grep sessions force LRU eviction.",
+      "Evidence": "ReadAdjustmentCache.reserve creates nested maps keyed by session, file, end line, and start line, and this added line replaces each successful reservation with a permanently retained adjustment. cancel removes only failed reservations. clearSession is the sole removal path for successful entries, and ReadFileTool invokes it only from GrepResultService.onDidRemoveSession; that event fires only when a 17th grep-result session evicts an entire session, while the grep service's 16-result per-session cap no longer emits cleanup. The cache path executes before doRealLineAdjustment is checked, so the default-false experiment setting does not prevent retention.",
+      "Recommendation": "Bound adjustment history per session/file (for example with an LRU sized to the repeated/continuation window), evict obsolete start/end tuples, and clear the session on the existing chat-session disposal lifecycle; also avoid populating this cache when neither real adjustment nor its continuity telemetry is required."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "unbounded-retention",
+      "cleanup-lifecycle",
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A chat agent searches, then reads a matching TypeScript/JavaScript range",
+        "CriticalPath": "The read invocation checks for binary content, opens/snapshots the document, looks up in-memory grep matches, and on a cold adjustment tuple awaits region analysis before rendering the requested lines. The filesystem/document and region-analysis work is on the tool-response critical path; telemetry enqueueing is not awaited.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/extension/tools/node/readFileTool.tsx:256 and ReadFileTool.getSnapshot",
+            "Operation": "Probe for binary content and open/snapshot the requested file",
+            "Cardinality": "Once per read invocation; open-document state may make the snapshot warm, while cold files require filesystem access.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same binary probe and document open/snapshot occurred before the diff.",
+            "CriticalPathEffect": "Must complete before any line adjustment or tool result can be returned."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/copilot/src/extension/typescriptContext/vscode-node/ts6/regionContextProvider.ts:45 and ts7/regionContextProvider.ts:51",
+            "Operation": "Request TypeScript region context through typescript.tsserverRequest on TS6, or perform native TS7 snapshot/project analysis",
+            "Cardinality": "After the diff, one call per cold unique tuple with applicable grep matches, zero for exact repeats/recognized continuations; before the diff, every applicable matching read called the provider.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This boundary already existed and was reached more often; the new exact-range reservation/cache reduces repeated calls.",
+            "CriticalPathEffect": "Awaited on cold tuples and therefore directly delays the read response."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/tools/node/readFileTool.tsx:570",
+            "Operation": "Enqueue read/adjustment telemetry",
+            "Cardinality": "A constant number of events per invocation; the new continuation event replaces the adjustment/failure event that the old matching-read path would have emitted rather than adding collection-scaled fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Adjustment and read telemetry were already emitted per invocation.",
+            "CriticalPathEffect": "Not awaited and therefore off the response critical path."
+          }
+        ],
+        "ScalingInput": "One invocation per model read request; region-analysis input is deduplicated grep ranges from at most the last 16 grep results in the session, each search capped by configured results. Adjustment-cache cardinality is the number of unique successful (file,start,end) tuples, not the grep-result count.",
+        "EffectiveConcurrency": "The new reservation coalesces simultaneous calls only for the exact same session/file/start/end tuple. Different ranges and files can still reach region analysis concurrently with no new shared limiter; this is unchanged or reduced relative to the pre-diff path.",
+        "CacheBehavior": "Cold unique tuples call the provider and successful results become positive cache entries. Exact warm repeats and adjacent continuations skip provider work. Failures cancel the reservation and are retried rather than negatively cached. Grep results are capped at 16 per session and 16 sessions, but successful adjustment tuples have no per-session/per-file cap.",
+        "MechanismConfidence": "High: the call path, exact-tuple coalescing, provider boundary, and successful-entry retention are directly visible in the changed code and tests.",
+        "MagnitudeUncertainty": "Provider latency and the prevalence of repeated versus unique ranges vary by TypeScript runtime and model behavior. The cache's retained-entry count in typical chats is not measured, but its unbounded tuple growth and cleanup lifecycle are explicit.",
+        "Verdict": "The new coalescing lowers expensive region-provider calls, but its positive entries are unbounded and persist even when real line adjustment is disabled; the cache-lifecycle regression was reported."
+      },
+      {
+        "Scenario": "Grep searches populate and evict session results",
+        "CriticalPath": "Workspace search (including the existing fallback search on empty valid-regex results) completes before grouped matches are stored. The changed eviction notification is synchronous in-memory work after search completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/extension/tools/node/findTextInFilesTool.tsx:108",
+            "Operation": "Workspace text search, with an optional opposite-regex-mode retry after an empty result",
+            "Cardinality": "One search normally, at most two for an empty valid-regex query; result grouping and caps are unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical search count and placement before the diff.",
+            "CriticalPathEffect": "Search must complete before grep output and cache insertion."
+          }
+        ],
+        "ScalingInput": "Search output is capped by maxResults and grouped by file; each session retains at most 16 grep results and the service retains 16 sessions. Evicting a session now emits one event regardless of its retained request count.",
+        "EffectiveConcurrency": "Search behavior and timeout/cancellation remain unchanged. Cache insertion is synchronous; no new parallel boundary burst is introduced.",
+        "CacheBehavior": "The grep cache has positive LRU bounds of 16 results per session and 16 sessions. Adding a 17th result in one session drops the oldest result without notification; adding a 17th session evicts one whole session and clears that session's adjustment cache.",
+        "MechanismConfidence": "High: the changed code only replaces per-request eviction events with a single whole-session event and leaves the search boundary untouched.",
+        "MagnitudeUncertainty": "Actual workspace search duration depends on repository size, ignore rules, and cache warmth, but the diff does not change its cardinality.",
+        "Verdict": "No regression: session eviction fan-out is reduced from up to 16 notifications to one, and no expensive boundary was added or moved."
+      },
+      {
+        "Scenario": "Long-running or disposed chat sessions accumulate successful read adjustments",
+        "CriticalPath": "Each successful cold read performs an O(1) synchronous insertion after awaited region analysis; later reads are not blocked by scanning the history. Cleanup is off the individual read critical path and occurs only if the grep-session LRU later evicts the session.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Retained entries grow linearly with unique successful (file,start,end) reads within each retained session. The 16-session bound does not bound entries inside a session, and an active session remains LRU-hot.",
+        "EffectiveConcurrency": "Concurrent exact duplicates share a reservation, while distinct tuples insert independently. Completion uses reservation identity to avoid stale completions overwriting replacements.",
+        "CacheBehavior": "Successful entries have no TTL, tuple capacity, or chat-disposal invalidation. Failed reservations are removed. Whole-session cleanup depends solely on a later 17th grep session, so an active long session can grow indefinitely and a disposed session can remain until unrelated future churn.",
+        "MechanismConfidence": "High: successful completion writes persistent nested Map entries, and exhaustive repository tracing found only grep-LRU session eviction as their cleanup trigger despite an existing chat-session disposal event used by other session-owned caches.",
+        "MagnitudeUncertainty": "Each individual entry is small, and typical unique-read counts are unknown; therefore the finding is low severity. Very long autonomous sessions or many retained closed sessions increase the observable memory/GC effect.",
+        "Verdict": "Reportable low-severity memory regression: the diff introduces unbounded retained per-range state in the extension-host singleton."
+      }
+    ],
+    "Summary": "Reviewed all seven changed files and all diff pages. The new exact-range reservation reduces repeated TypeScript region-analysis work and the grep eviction event reduces notification fan-out. One diff-introduced cache-lifecycle issue was reported: successful adjustment tuples are retained without a per-session bound or chat-disposal cleanup, including under the default-disabled line-adjustment setting."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-28T15:27:58.354013696Z",
+    "CompletedAt": "2026-09-28T15:30:41.152957321Z",
+    "WallClockMilliseconds": 162798,
+    "ModelCalls": 12,
+    "InputTokens": 580102,
+    "OutputTokens": 8624,
+    "TotalTokens": 588726,
+    "ReasoningTokens": 4056,
+    "CacheReadTokens": 505201,
+    "CacheWriteTokens": 74865,
+    "APIDurationMilliseconds": 150174,
+    "ToolCalls": 59,
+    "NanoAIUnits": 74902940000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 505201,
+      "cache_write": 74865,
+      "input": 36,
+      "output": 8624
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
