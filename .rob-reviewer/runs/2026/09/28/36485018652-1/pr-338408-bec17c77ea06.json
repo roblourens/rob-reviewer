@@ -1,0 +1,136 @@
+{
+  "PullRequest": {
+    "Number": 338408,
+    "Title": "[cherry-pick] sessions: fix workspace reselection and onboarding spotlights",
+    "Body": "Cherry-pick of #338335 from `main`.\n\n## Summary\n\n- Preserve the new-session draft when the selected workspace, provider, and Dev Container mode are unchanged. Reselecting Chat or its current host is also a no-op, while explicit workspace selections still notify onboarding.\n- Revalidate spotlight targets after rendering settles. If a shown picker disappears during a workspace change, hide the spotlight and wait for its replacement using the step's existing timeout policy; skip the step if the target does not return.\n- Track position-only layout shifts so the highlight and callout stay aligned with the picker, including during onboarding V2.\n\n## Validation\n\n- Cherry-pick applied cleanly to `release/1.140`.\n- `git diff --check origin/release/1.140...HEAD` passed.\n- The original PR passed `npm run compile`, 267 focused Electron unit tests, TypeScript, targeted ESLint, and whitespace checks.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/338408",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "release/1.140",
+    "BaseSHA": "60ef479b4e0450f06ae97de29a73cd7d78ec6b1f",
+    "HeadRef": "benibenj/agents/onboarding-tour-fixes-cherry-pick",
+    "HeadSHA": "bec17c77ea0653fc14d0c65d11ac31d1cea465a6",
+    "CreatedAt": "2026-09-28T15:00:56Z",
+    "UpdatedAt": "2026-09-28T16:23:16Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-280220A8D08B",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/onboarding/browser/spotlight/spotlightOverlay.ts",
+      "Side": "RIGHT",
+      "Line": 197,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The perpetual RAF semantics, synchronous geometry call, disposal lifetime, and user-paced production call path are all directly visible in repository code. Exact milliseconds vary by DOM complexity and refresh rate, which affects severity rather than the mechanism.",
+      "PerformanceCategory": "layout",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceResource": "requestAnimationFrame callbacks and synchronous DOM geometry/layout reads",
+      "PerformanceScaling": "One callback and getBoundingClientRect() run per display frame for the full user-controlled lifetime of every shown spotlight (about 60-144 reads/second); while the target moves, each frame also calls layout(), repeats geometry measurement, reads callout offsets, and rewrites overlay geometry.",
+      "PerformanceOutcome": "continuous renderer CPU/layout pressure, with increased frame time and potential UI jank/battery usage while onboarding remains open",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The overlay measured on show and only re-laid out after resize, scroll, ResizeObserver, or workbench layout events, so a stationary user-paced step did no frame-by-frame geometry work.",
+      "ChangedBehavior": "The added animate() registration creates an unconditional recursive requestAnimationFrame loop for each shown step and synchronously samples the target rectangle every frame until the step is hidden.",
+      "CausalDiffEvidence": "RIGHT lines 197-203 newly register animate(targetWindow, ...) in show(); before this hunk, only event/observer-driven listeners scheduled layout.",
+      "Title": "Stop polling spotlight geometry on every animation frame",
+      "Impact": "Opening any spotlight tour or model-picker tryout now keeps the renderer sampling layout at the monitor refresh rate for as long as the user reads or interacts with the step; a one-minute pause produces roughly 3,600-8,640 geometry reads, and active picker/workbench animation additionally invokes the full overlay layout each frame.",
+      "Evidence": "animate() is an unbounded recursive requestAnimationFrame helper (src/vs/base/browser/dom.ts:1766-1774). The changed callback calls target.getBoundingClientRect() every iteration; on movement it calls layout(), which reads getBoundingClientRect() again and then offsetWidth/offsetHeight after geometry writes (spotlightOverlay.ts:270-333). _showStep awaits user action with no duration bound, and production tours contain interactive workspace/model-picker steps, so the loop remains live on a realistic user-paced path.",
+      "Recommendation": "Replace the perpetual poll with bounded tracking: start RAF sampling only while a relevant target/ancestor animation or a recent mutation/layout signal can move the target, stop after geometry is stable, and retain the existing resize/scroll/ResizeObserver/workbench-layout triggers for steady state."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "repeated-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A user views an interactive onboarding spotlight or model-picker tryout, possibly leaving the step open while reading or interacting.",
+        "CriticalPath": "Target resolution and one readiness frame complete before overlay.show(); thereafter the new animation-frame callback is on every rendering frame for the entire user-paced step, although it does not gate button/target input completion.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Visible-step lifetime multiplied by display refresh rate; movement additionally scales full overlay relayout work with each animated frame.",
+        "EffectiveConcurrency": "Exactly one recursive requestAnimationFrame loop per visible SpotlightOverlay step; presentation runs one step at a time, so loops do not fan out, but execute at the display refresh rate until hide/disposal.",
+        "CacheBehavior": "No cache participates. Every frame re-reads live DOM geometry even when the rectangle is unchanged; stable values are compared but the expensive synchronous read is not avoided.",
+        "MechanismConfidence": "High: animate() is a recursive RAF helper, the callback unconditionally calls getBoundingClientRect(), and step listeners remain registered until hide or step replacement.",
+        "MagnitudeUncertainty": "The exact layout cost depends on refresh rate, pending DOM invalidations, and workbench complexity. Production steps are user-paced and can remain visible indefinitely, so the sustained 60-144 Hz mechanism is certain even though measured frame-time impact is not available.",
+        "Verdict": "Reportable regression: the diff replaces event-driven steady-state positioning with continuous synchronous geometry polling and full per-frame relayout while moving."
+      },
+      {
+        "Scenario": "A spotlight target disappears or is replaced while rendering, animation, or an opened picker settles.",
+        "CriticalPath": "The step hides immediately, then serially resolves the replacement every 50 ms and waits for finite animations/one RAF before re-showing; replacement resolution must finish before the step can continue or skip.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "At most one resolution attempt per 50 ms during the configured 2-10 second target timeout, plus readiness waits only when a visible target is found.",
+        "EffectiveConcurrency": "One serial polling loop for the active step, bounded by the step's existing timeout policy; no parallel target probes or boundary requests.",
+        "CacheBehavior": "No cache; each poll resolves from an in-process provider or DOM query. The second resolution intentionally revalidates element identity after settling.",
+        "MechanismConfidence": "High for the serial polling and readiness path; target replacement frequency in production is uncertain.",
+        "MagnitudeUncertainty": "A target with a long finite animation can make a single readiness wait approach 600 ms, but this wait existed for the selected target before the diff and replacement retries are bounded and uncommon.",
+        "Verdict": "No additional finding: the new work is bounded, serial, and required to avoid showing a stale replacement; it adds no subprocess, IPC, filesystem, database, or network fan-out."
+      },
+      {
+        "Scenario": "A user reselects the current workspace, Chat option, or current quick-chat host; or selects a genuinely different workspace/provider/mode.",
+        "CriticalPath": "For a current selection, synchronous URI/provider/session-state checks now stop before async session creation and focus returns immediately. A changed selection still enters _onWorkspaceSelected -\u003e _createNewSession -\u003e sessionsService.openNewSession as before.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/sessions/contrib/chat/browser/newChatWidget.ts:_createSessionNow",
+            "Operation": "Asynchronous workspace-backed session creation, including the existing provider/trust/session setup behind sessionsService.openNewSession.",
+            "Cardinality": "Before the diff, one call occurred even when the current workspace was reselected; after the diff, identical folder/provider/container-mode selections make zero calls, while changed selections still make one.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every onDidSelectWorkspace event called _onWorkspaceSelected and could recreate the draft via openNewSession, including no-op reselections.",
+            "CriticalPathEffect": "For actual changed selections it remains on the selection critical path; current reselections now bypass it."
+          }
+        ],
+        "ScalingInput": "One equality check per explicit picker selection; expensive creation remains one per genuinely changed selection rather than one per all selections.",
+        "EffectiveConcurrency": "One handler per user selection. Existing pending workspace creation prevents reuse; the diff adds no parallelism and suppresses duplicate creation for identical selections.",
+        "CacheBehavior": "No remote cache is added. Current draft/provider/container-mode state serves as the equality guard; isDevContainerEnabled is an in-memory Set lookup in the concrete provider.",
+        "MechanismConfidence": "High: the event handler guard and downstream openNewSession call path are explicit, and the dev-container check is synchronous in-memory state.",
+        "MagnitudeUncertainty": "Provider-specific session creation cost varies, but the changed behavior only removes duplicate calls and does not increase cold or warm work.",
+        "Verdict": "No regression: this path reduces expensive duplicate session creation and adds only constant-time in-process checks."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and all diff pages. One medium-severity synchronous UI regression was submitted for perpetual per-frame spotlight geometry polling; target replacement and session reselection changes are bounded or reduce prior work."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-28T21:25:01.038773854Z",
+    "CompletedAt": "2026-09-28T21:26:42.578461462Z",
+    "WallClockMilliseconds": 101539,
+    "ModelCalls": 9,
+    "InputTokens": 344015,
+    "OutputTokens": 5592,
+    "TotalTokens": 349607,
+    "ReasoningTokens": 2187,
+    "CacheReadTokens": 285628,
+    "CacheWriteTokens": 58360,
+    "APIDurationMilliseconds": 86638,
+    "ToolCalls": 41,
+    "NanoAIUnits": 51799920000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 285628,
+      "cache_write": 58360,
+      "input": 27,
+      "output": 5592
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

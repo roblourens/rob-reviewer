@@ -1,0 +1,244 @@
+{
+  "PullRequest": {
+    "Number": 338392,
+    "Title": "agentHost: Keep remote hosts alive while agents are running",
+    "Body": "Remote agent hosts started with `--idle-timeout` (managed SSH, WSL, and dedicated tunnel hosts) shut down 300 seconds after the last client disconnected, even while an agent was still running, which killed the in-progress turn.\n\nThe CLI supervisor now counts the agent host server process as activity. The server already stays up while a turn is running and exits on its own once idle, so running agents no longer count as idle. Server exit is now detected from the process itself instead of its output closing, so a leftover child process can't keep the supervisor alive.\n\nNotes for reviewers:\n- An idle host frees the server on the same schedule as before. Only the small supervisor process stays up about 5 minutes longer.\n- A turn waiting for approval also keeps the host alive, with no upper limit.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/338392",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "9c965cd4f1c63f449a810d515ad47d276dc177aa",
+    "HeadRef": "lramos15/agents/ssh-agent-session-timeout-issue",
+    "HeadSHA": "d0d9c0ce4f34645a9341b2a21c46920e62bfcd56",
+    "CreatedAt": "2026-09-28T13:55:36Z",
+    "UpdatedAt": "2026-09-28T15:20:07Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-A419CB4D7797",
+      "Focus": "performance-review",
+      "Path": "cli/src/tunnels/agent_host.rs",
+      "Side": "RIGHT",
+      "Line": 440,
+      "Severity": "low",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The guard lifetime, event semantics, and both default five-minute durations are explicit in the traced code. The exact per-process RSS varies, but the additional process lifetime is deterministic.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "the detached supervisor process, its Tokio runtime/tasks, listener, and registry state",
+      "PerformanceScaling": "The retained resources grow with the number of dedicated remote hosts launched; each idle host now remains for one additional configured idle-timeout interval.",
+      "PerformanceOutcome": "retained remote memory and process slots for an extra five minutes with the default configuration",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "After the last client disconnected, the supervisor's 300-second timer and the backend's 5-minute auto-shutdown timer ran concurrently, so both processes ended at roughly the same deadline.",
+      "ChangedBehavior": "The new server-lifetime guard keeps the activity count nonzero until the backend exits; dropping it emits a Disconnected event that starts a fresh full supervisor timeout only after the backend's own 5-minute shutdown period has elapsed.",
+      "CausalDiffEvidence": "Added line 440 releases the newly added process-wide activity guard only after the backend process has exited, which queues the event that re-arms the supervisor's full idle timer.",
+      "Title": "Preserve the original idle deadline when the server exits",
+      "Impact": "Every default SSH/WSL dedicated host that has served a client remains as an otherwise-idle supervisor for about 10 minutes after disconnect instead of about 5 minutes. Repeated or parallel dedicated-host use leaves extra remote processes and memory resident.",
+      "Evidence": "`activity_guard` is held across `child.wait()` and dropped here. `ClientGuard::drop` sends `ActivityEvent::Disconnected`, and `wait_for_idle_timeout` starts a new full timeout when the active count reaches zero. The backend independently uses `SHUTDOWN_TIMEOUT = 5 * 60 * 1000`, while `buildAgentHostSpawnCommand` defaults `--idle-timeout` to 300 seconds, proving the two periods are now serialized rather than concurrent.",
+      "Recommendation": "Track the client-idle deadline separately from the backend veto: suppress shutdown while the backend is running, but when it exits, honor the already-elapsed client deadline instead of treating backend exit as a new client disconnect."
+    },
+    {
+      "ID": "PERF-FF58A71FD622",
+      "Focus": "performance-review",
+      "Path": "cli/src/tunnels/agent_host.rs",
+      "Side": "RIGHT",
+      "Line": 379,
+      "Severity": "low",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The task and pipe ownership plus restart path are explicit, and the added test proves the trigger; only production frequency is uncertain.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "unbounded-retention",
+      "PerformanceResource": "pending Tokio tasks and inherited stdout/stderr pipe handles",
+      "PerformanceScaling": "Each backend restart can add one reader task and two pipe readers that survive as long as an old descendant keeps the pipes open.",
+      "PerformanceOutcome": "retained memory and file descriptors that grow across restart generations",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "Output reading and process-state cleanup shared one task, so descendant-held pipes could strand one reader but also kept `running` populated and blocked additional backend generations.",
+      "ChangedBehavior": "The changed reader now owns only an output prefix and the pipes, with no cancellation, while a separate waiter clears `running` on parent-process exit and permits another backend and reader to start.",
+      "CausalDiffEvidence": "Added line 379 replaces the reader's prior manager/process-cleanup ownership with an output-only prefix; together with the added independent child waiter, this leaves the pipe reader alive after `running` is cleared.",
+      "Title": "Cancel output readers when the server exits",
+      "Impact": "A long-lived supervisor whose sessions leave descendants holding inherited output pipes accumulates a task and pipe handles on each idle-shutdown/reconnect cycle, eventually creating FD and memory pressure.",
+      "Evidence": "The changed reader loops until both pipes close without a join handle or cancellation signal. The adjacent comment says descendants can keep the pipes open after server exit, and the added test creates such a lingering child. The separate waiter clears `running`, making repeated generations reachable.",
+      "Recommendation": "Signal or abort the reader when the owning child exits, optionally after a bounded drain period, so pipe readers from an old generation cannot survive into the next."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "unbounded-retention"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A dedicated SSH/WSL agent host becomes idle after its last client disconnects and no turn is running.",
+        "CriticalPath": "The backend's auto-shutdown timer must expire, then the supervisor idle timer expires, then sidecar shutdown kills any remaining backend and removes the registry entry. The diff serializes two default five-minute timers, extending cleanup from about five to about ten minutes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "cli/src/tunnels/agent_host.rs:AgentHostManager::run_server",
+            "Operation": "Launch and later reap the VS Code agent-host server process.",
+            "Cardinality": "At most one current backend per supervisor; one launch on the first proxied connection after a backend has exited.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same backend was launched, while backend and supervisor shutdown timers ran concurrently after disconnect.",
+            "CriticalPathEffect": "Backend startup is critical to the first connection; natural backend exit starts the changed second supervisor idle period."
+          },
+          {
+            "Kind": "network",
+            "Location": "cli/src/commands/agent_host.rs:run_supervisor",
+            "Operation": "Resolve and, on cache miss, download the latest server release.",
+            "Cardinality": "One release resolution per supervisor startup and at most one initial download on a cold cache, followed by the existing update loop.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical eager resolution and cache behavior.",
+            "CriticalPathEffect": "Initial resolution/download happens before the sidecar is ready; unchanged by the diff."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "cli/src/tunnels/agent_host.rs:AgentHostSidecar::shutdown",
+            "Operation": "Remove the supervisor's endpoint from the shared registry during sidecar shutdown.",
+            "Cardinality": "One registry cleanup per supervisor.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Registry cleanup followed the first 300-second supervisor deadline rather than a fresh deadline after backend exit.",
+            "CriticalPathEffect": "Not required for an active session, but cleanup is delayed by the newly serialized idle interval."
+          }
+        ],
+        "ScalingInput": "Number of dedicated hosts launched across remote machines or parallel selections; each `--new-instance` command creates a distinct supervisor.",
+        "EffectiveConcurrency": "One backend process per supervisor, but multiple dedicated supervisors can coexist without a shared limiter.",
+        "CacheBehavior": "Cold supervisor startup resolves the latest release over the network and downloads it if absent; a warm server cache avoids the download. This diff does not change those cache keys or requests, but retains the warmed supervisor for an additional timeout interval.",
+        "MechanismConfidence": "High: the process guard, Disconnected event semantics, backend five-minute timeout, and CLI 300-second default are explicit.",
+        "MagnitudeUncertainty": "Exact supervisor RSS and the number of simultaneously idle dedicated hosts vary, but the extra 300-second process lifetime is deterministic under defaults.",
+        "Verdict": "Reportable low-severity retained-process regression; submitted as a cleanup-lifecycle finding."
+      },
+      {
+        "Scenario": "The last client disconnects while an agent turn remains in progress.",
+        "CriticalPath": "The running turn remains critical until completion. The backend lifetime service holds the server alive during the active turn; afterward its five-minute grace period expires, followed by the changed supervisor idle interval.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "cli/src/tunnels/agent_host.rs:AgentHostManager::run_server",
+            "Operation": "Keep the existing agent-host server process alive until active sessions finish, then reap it.",
+            "Cardinality": "One process per supervisor regardless of session count.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The supervisor could invoke one process-tree kill when its client-only timeout elapsed, cutting off a long turn.",
+            "CriticalPathEffect": "The process is required for the in-flight turn; the subsequent additional supervisor-only interval is off the turn's critical path."
+          },
+          {
+            "Kind": "other",
+            "Location": "cli/src/tunnels/agent_host.rs:307,440",
+            "Operation": "Queue process-lifetime Connected/Disconnected events through the unbounded activity channel.",
+            "Cardinality": "Exactly two events per backend generation, independent of session count.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only accepted client connections generated activity events.",
+            "CriticalPathEffect": "Events do not block the turn, but the final event starts a fresh cleanup timer."
+          }
+        ],
+        "ScalingInput": "Turn duration plus number of concurrently active sessions within the single backend; host retention also scales across dedicated supervisors.",
+        "EffectiveConcurrency": "Concurrent chats/sessions are aggregated into backend active-session state; one backend process and one process-wide activity guard serve the whole supervisor, not one guard per session.",
+        "CacheBehavior": "No additional release fetch or cache lookup is introduced while the turn continues. A later reconnect reuses the warm backend until it exits.",
+        "MechanismConfidence": "High: active-turn state gates backend auto-shutdown and the process guard gates supervisor shutdown.",
+        "MagnitudeUncertainty": "Turn lengths and remote-host memory vary; the correctness benefit is intentional, while the post-backend extra timeout has the bounded cost reported separately.",
+        "Verdict": "Keeping the backend during active work is an intentional scheduling tradeoff and not itself a performance bug; only the avoidable full timer reset after backend exit was reported."
+      },
+      {
+        "Scenario": "Supervisor shutdown or server upgrade kills and restarts the backend.",
+        "CriticalPath": "Shutdown waits for the process-owner task to signal the process tree, wait up to five seconds, force-kill if needed, and reap. Upgrade then starts one replacement backend, whose startup is critical to subsequent dials.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "cli/src/tunnels/agent_host.rs:AgentHostManager::kill_running_server_within",
+            "Operation": "Signal the backend process tree, wait up to five seconds, and force-kill/reap if necessary.",
+            "Cardinality": "One kill sequence per running backend shutdown or upgrade.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The caller directly owned the Child and performed the same kill-tree, bounded wait, and forced-kill sequence.",
+            "CriticalPathEffect": "Shutdown and upgrade restart wait for reaping; the timeout remains bounded at five seconds as before."
+          },
+          {
+            "Kind": "network",
+            "Location": "cli/src/tunnels/agent_host.rs:upgrade handler",
+            "Operation": "Download an upgrade release when the update loop has not already prefetched it.",
+            "Cardinality": "At most one serialized download per accepted upgrade request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical synchronous-on-miss upgrade behavior.",
+            "CriticalPathEffect": "The download completes before the upgrade response; unchanged by this diff."
+          }
+        ],
+        "ScalingInput": "One backend per supervisor and one kill/restart per requested upgrade or supervisor shutdown.",
+        "EffectiveConcurrency": "`upgrade_in_progress` serializes upgrades; `running` and the one-shot kill channel serialize process ownership. No aggregate kill burst is introduced.",
+        "CacheBehavior": "The upgrade path normally uses a prefetched release; on a miss it performs the existing synchronous download before scheduling restart. The diff does not alter this cache behavior.",
+        "MechanismConfidence": "High: the one-shot owner task changes ownership without increasing boundary count or timeout.",
+        "MagnitudeUncertainty": "Platform-specific process termination latency remains uncertain, but cardinality and the five-second bound are unchanged.",
+        "Verdict": "No reportable regression on shutdown/upgrade; process signaling cardinality and bounded wait are preserved."
+      },
+      {
+        "Scenario": "The backend parent exits while a descendant keeps inherited stdout/stderr open, then a client reconnects.",
+        "CriticalPath": "The new child waiter observes parent exit and clears `running`, allowing a reconnect to launch a replacement backend. The output-only task remains blocked on old pipes and is off the reconnect critical path but retains resources.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "cli/src/tunnels/agent_host.rs:AgentHostManager::ensure_server/start_server",
+            "Operation": "Launch a replacement backend after the previous parent exits.",
+            "Cardinality": "One launch per reconnect generation; the changed clearing behavior makes repeated generations reachable even while old pipe holders remain.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A descendant-held pipe kept the old combined task from clearing `running`, preventing another backend generation.",
+            "CriticalPathEffect": "Replacement startup is critical to reconnect and usually uses a warm release cache."
+          },
+          {
+            "Kind": "other",
+            "Location": "cli/src/tunnels/agent_host.rs:379",
+            "Operation": "Read inherited stdout/stderr pipes until every writer closes.",
+            "Cardinality": "One uncancelled reader task with two pipe readers per generation whose descendants retain the handles.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The read loop existed, but its blocked cleanup prevented repeated generations and bounded retained readers to one.",
+            "CriticalPathEffect": "Off the reconnect critical path, but retains task memory and file descriptors indefinitely relative to the parent process."
+          }
+        ],
+        "ScalingInput": "Number of backend exit/reconnect generations completed while old descendants continue holding inherited pipes.",
+        "EffectiveConcurrency": "Only one current parent backend is tracked, but old descendants and their uncancelled pipe-reader tasks can overlap without a limiter or cleanup bound.",
+        "CacheBehavior": "Replacement starts normally hit the already-downloaded server cache, so repeated generations can be cheap and are not coalesced with cleanup of old readers.",
+        "MechanismConfidence": "High: changed ownership, missing cancellation, the restart path, and a test with a lingering pipe holder directly establish the mechanism.",
+        "MagnitudeUncertainty": "How often production descendants inherit and retain these pipes is uncertain; the added test proves the mechanism, while long-term FD impact depends on restart frequency and descendant lifetime.",
+        "Verdict": "Reportable low-severity unbounded retention across generations; submitted as an output-reader cleanup finding."
+      }
+    ],
+    "Summary": "Completed the performance pass over all five changed files and every diff hunk. Reported two lifecycle regressions: a deterministic extra idle-timeout interval per dedicated supervisor and uncancelled output readers that can accumulate across backend generations. Process-kill ownership, startup/download boundaries, upgrade serialization, and active-turn preservation otherwise remain bounded or unchanged."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-28T21:21:37.125778376Z",
+    "CompletedAt": "2026-09-28T21:24:55.845351193Z",
+    "WallClockMilliseconds": 198719,
+    "ModelCalls": 12,
+    "InputTokens": 445509,
+    "OutputTokens": 11870,
+    "TotalTokens": 457379,
+    "ReasoningTokens": 5731,
+    "CacheReadTokens": 388312,
+    "CacheWriteTokens": 57161,
+    "APIDurationMilliseconds": 181985,
+    "ToolCalls": 52,
+    "NanoAIUnits": 67867380000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 388312,
+      "cache_write": 57161,
+      "input": 36,
+      "output": 11870
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
