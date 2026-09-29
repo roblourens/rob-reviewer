@@ -1,0 +1,179 @@
+{
+  "PullRequest": {
+    "Number": 338721,
+    "Title": "Fix timeout issue for remote agent host connection",
+    "Body": "Fix #338665",
+    "URL": "https://github.com/microsoft/vscode/pull/338721",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b37356b172afe6f146ec0061ec46a18b475c5655",
+    "HeadRef": "lramos15/agents/fix-vscode-issue-338665",
+    "HeadSHA": "1a53ef8d2b51bc3a69a94fc704ccacd7f2938626",
+    "CreatedAt": "2026-09-29T17:01:46Z",
+    "UpdatedAt": "2026-09-29T18:25:10Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 1975,
+      "BasePath": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts",
+      "BaseLine": 1972,
+      "IntroducingPath": "src/vs/platform/agentHost/browser/remoteAgentHostProtocolClient.ts",
+      "IntroducingCommit": "f91a396d242c451b0e316ad5ccbc3dc19fbf96d0",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "network",
+      "Mechanism": "The watchdog observed only complete protocol messages, so a live connection carrying a slowly arriving large response appeared silent for 25 seconds and was force-closed, causing reconnect and potentially repeating the transfer.",
+      "Symptom": "Slow large agent-host responses could be interrupted by a false liveness timeout, adding reconnect latency and retransmission instead of completing.",
+      "FixedBehavior": "The change propagates partial inbound-data activity through Web PubSub, SSH, dev-tunnel, relay, and reconnecting transports into `_recordInboundTraffic`; SSH/tunnel relay reports are throttled to once per second. Live slow downloads now refresh the existing watchdog without waiting for full message reassembly, avoiding false close/reconnect and repeated transfer.",
+      "Evidence": "The base client updated `_lastReadTime` and reset both liveness timers only in `_handleMessage`, after a complete ProtocolMessage reached the renderer. Web PubSub reassembles up to 32 MiB from ~900 KiB segments, while SSH and dev-tunnel WebSockets can receive arbitrary stream chunks before emitting one complete message. During a response taking over the 5 s ping plus 20 s close budget, the watchdog therefore force-closed a live transport, discarded the in-progress response, and entered reconnect. Added tests exercise a one-minute response with bytes arriving every second and show that the old complete-message-only signal would cross the close budget.",
+      "Confidence": 0.96
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "missing-coalescing",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cloud sandbox/Web PubSub receives a large or slowly delivered agent-host response",
+        "CriticalPath": "Existing WebSocket frames must be parsed, acknowledged, deduplicated, and reassembled before the protocol response can complete. The added partial-data event only refreshes watchdog timers and does not add an awaited step to response delivery.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/webPubSubRelayTransport.ts::_startObserving/_handleInboundFrame",
+            "Operation": "Receive Web PubSub WebSocket frames and send sequence acknowledgements while reassembling an AHP message.",
+            "Cardinality": "One receive callback and existing acknowledgement per WPS frame; default segments are about 900 KiB, with an individual reassembly capped at 32 MiB (roughly 36 segments maximum).",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same WebSocket frames, acknowledgements, parsing, and reassembly occurred, but liveness was refreshed only when the complete protocol message was emitted.",
+            "CriticalPathEffect": "Frame receipt and reassembly are pre-existing critical-path work; the new activity event adds only local timer refresh work for pending segments."
+          }
+        ],
+        "ScalingInput": "Serialized response size and delivery duration; segment cardinality is bounded by the 32 MiB payload ceiling and ~900 KiB default segment size.",
+        "EffectiveConcurrency": "One browser WebSocket callback stream processes frames serially. Reassembly groups may coexist, but activity handling is synchronous per accepted host chunk and creates no parallel work.",
+        "CacheBehavior": "No cache is involved. Reassembly state is bounded and swept as before; cold and warm connection behavior differ only in connection setup, not activity signaling.",
+        "MechanismConfidence": "High: changed call flow and chunk ceilings are explicit in the transport, reassembler, and watchdog code.",
+        "MagnitudeUncertainty": "Actual response sizes and slow-link prevalence vary, but the added work is bounded to one local event and two timer reschedules per pending segment.",
+        "Verdict": "No regression. Added work is bounded and prevents false timeout/reconnect on a live slow download."
+      },
+      {
+        "Scenario": "Desktop SSH agent-host relay receives a large response or reconnect handshake over a slow forwarded channel",
+        "CriticalPath": "SSH forwarding and WebSocket message assembly remain the response critical path. Raw channel activity is observed after the WebSocket parser and is forwarded asynchronously to the renderer only to reset liveness; it is not awaited by message delivery.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts::createWebSocketOverChannel",
+            "Operation": "Receive WebSocket bytes over the existing SSH forward channel.",
+            "Cardinality": "One raw callback per channel chunk; unchanged network traffic. Activity reporting examines each callback but emits at most once per second until a complete message arrives.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The SSH channel and WebSocket received the same bytes, but only complete messages were forwarded as liveness evidence.",
+            "CriticalPathEffect": "Pre-existing network transfer remains critical; activity observation is synchronous but constant-time and does not delay an awaited boundary."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:onDidRelayActivity -\u003e src/vs/platform/agentHost/common/relayTransport.ts",
+            "Operation": "Forward a connection-id activity event from shared/main service to the protocol client.",
+            "Cardinality": "At most one added event per second per actively downloading SSH connection; complete messages already crossed this service boundary.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No partial-progress IPC event existed; the renderer learned of activity only when a complete relayed message crossed IPC.",
+            "CriticalPathEffect": "The event is fire-and-forget and only resets local watchdog timers; it does not block response completion."
+          }
+        ],
+        "ScalingInput": "Number of simultaneous SSH relay connections and duration of unfinished inbound messages; effective added IPC cardinality is one per second per active connection.",
+        "EffectiveConcurrency": "One active relay per SSH connection key; reconnect disposes and replaces the old relay. Raw data callbacks are serial on the channel, and RelayActivityReporter coalesces renderer-facing activity to at most once per second per connection.",
+        "CacheBehavior": "Native require remains positively cached as before. No new cache, miss path, or invalidation behavior is introduced.",
+        "MechanismConfidence": "High: reporter throttling, connection ownership, replacement disposal, and renderer forwarding are directly traced.",
+        "MagnitudeUncertainty": "The number of concurrent remote sessions varies, but per-connection reporting is explicitly time-bounded and typical usage has few active relays.",
+        "Verdict": "No regression. The small bounded IPC rate avoids force-closing and retransferring a live large response; listeners are removed on close/disposal."
+      },
+      {
+        "Scenario": "Dev-tunnel agent-host response arrives through browser or Node relay stream",
+        "CriticalPath": "The existing tunnel network stream and WebSocket framing must deliver a complete protocol message. Added raw-data observation feeds a per-connection reporter and watchdog reset without adding an awaited operation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/tunnelAgentHostService.ts::NodeTunnelMessageSocket and src/vs/platform/agentHost/common/webSocketOverDuplex.ts::TunnelMessageSocket",
+            "Operation": "Receive existing forwarded-port stream chunks and parse WebSocket frames.",
+            "Cardinality": "One constant-time activity callback per incoming stream chunk; underlying network calls and bytes are unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same tunnel bytes were consumed and parsed, but partial frame progress was not exposed.",
+            "CriticalPathEffect": "The pre-existing network transfer is critical; added observation is not awaited and final-chunk activity is suppressed after message delivery."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/common/tunnelAgentHostConnector.ts:onDidRelayActivity -\u003e src/vs/platform/agentHost/common/relayTransport.ts",
+            "Operation": "Forward throttled connection activity for Node/shared-process tunnel relays.",
+            "Cardinality": "At most one event per second per unfinished active relay message; browser-hosted tunnels use direct in-process events instead.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only complete relay messages crossed to the protocol transport as liveness evidence.",
+            "CriticalPathEffect": "Fire-and-forget event only refreshes timers and does not delay protocol delivery."
+          }
+        ],
+        "ScalingInput": "Raw chunk count, slow-response duration, and active tunnel count; expensive cross-process activity is time-coalesced per connection.",
+        "EffectiveConcurrency": "Each TunnelConnection owns one socket and relay client. Stream callbacks are serialized; activity is coalesced to at most once per second per connection before service/IPC forwarding. Browser tunnel use stays in-process.",
+        "CacheBehavior": "No cache changes. Tunnel lookup and connection setup retain existing cold/warm behavior; activity starts only after a socket is established.",
+        "MechanismConfidence": "High: socket listener order, reporter coalescing, connection filtering, and disposal are explicit and tested.",
+        "MagnitudeUncertainty": "Raw chunk sizes depend on stream implementations, but raw handling is constant-time and cross-process fan-out is bounded to one event per second.",
+        "Verdict": "No regression. Added work is bounded, final-message duplication is suppressed, and stream listeners are cleaned up with socket/connection disposal."
+      },
+      {
+        "Scenario": "Dev container and WSL relay connections",
+        "CriticalPath": "Whole messages continue to traverse their existing local relay mechanisms before protocol handling. These transports cannot attribute partial parent-stream progress to an individual connection.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Message count and active local relay connections, unchanged by this diff.",
+        "EffectiveConcurrency": "Unchanged from before; no partial-activity work is scheduled.",
+        "CacheBehavior": "No cache behavior changes.",
+        "MechanismConfidence": "High: both implementations explicitly use Event.None for relay activity.",
+        "MagnitudeUncertainty": "None material for the changed performance behavior because these implementations expose Event.None.",
+        "Verdict": "No regression. Interfaces are wired without adding runtime work on these paths."
+      }
+    ],
+    "Summary": "Reviewed all 31 changed files and traced partial-data activity through Web PubSub, SSH, dev-tunnel, reconnecting transport, protocol watchdog, and disposal paths. No diff-introduced performance regression met the reporting threshold. The PR instead fixes the complete-message-only watchdog regression introduced by f91a396d242c451b0e316ad5ccbc3dc19fbf96d0; the fix was recorded separately."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-29T18:56:38.546426265Z",
+    "CompletedAt": "2026-09-29T18:59:40.711794718Z",
+    "WallClockMilliseconds": 182165,
+    "ModelCalls": 8,
+    "InputTokens": 347396,
+    "OutputTokens": 6526,
+    "TotalTokens": 353922,
+    "ReasoningTokens": 1911,
+    "CacheReadTokens": 283419,
+    "CacheWriteTokens": 63953,
+    "APIDurationMilliseconds": 90311,
+    "ToolCalls": 59,
+    "NanoAIUnits": 56374860000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 283419,
+      "cache_write": 63953,
+      "input": 24,
+      "output": 6526
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

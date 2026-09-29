@@ -1,0 +1,211 @@
+{
+  "PullRequest": {
+    "Number": 338151,
+    "Title": "[3/4] authentication: canonicalize enterprise credential storage",
+    "Body": "## Review stack\n\n**#338149 (merged) -\u003e #338150 (merged) -\u003e #338151 (canonical credential storage) -\u003e #338080 (multi-host enablement)**\n\nThis PR targets `main`; #338080 remains stacked on this branch. The provider lifecycle and core registration buffering are already on main through #338150.\n\n## Stack 3/4: Canonical credential storage\n\nDerive enterprise credential keys from normalized instance URIs instead of maintaining a persistent canonical-to-storage registry.\n\n- Remove `github-enterprise.storageKeys`, namespace claims, and the host/storage planning layer. No migration marker or replacement bookkeeping key is added.\n- Normalize hostname casing and trailing slashes while preserving scheme, deployment path case, and ports.\n- Locate existing legacy token and Microsoft account-link stores through their existing storage keys, then move the selected data to the canonical credential keys before creating the engine.\n- Preserve native session/account fields and token payloads. Canonical credentials, including signed-out state, remain authoritative.\n- Keep legacy data until destination writes succeed; propagate write/cleanup failures and retry without a completion marker.\n- Recheck canonical credentials around asynchronous legacy reads/copies so a newer sign-in is not overwritten.\n- Keep public GitHub available if enterprise migration fails. Token-only migration does not add a dependency on global-state writes.\n\nThis remains a working **single-host** provider. It adds no plural setting, host picker, host-qualified identities, or workbench changes. Ambiguous legacy aliases require selecting the original URI rather than silently choosing a store.\n\n## Validation\n\nFull-suite baseline: `f3150bec6a5`.\n\n- **128 GitHub authentication extension tests passed** independently on this layer.\n- Coverage includes alias changes, restarts, Microsoft-only consent, canonical sign-out, read-only state for token-only migration, escaped paths, every migration write/cleanup failure, and newer canonical credentials appearing during migration.\n- The stale-canonical-read regression was verified to fail before the fix and pass afterward.\n- Extension compilation, browser-target type checks, scoped lint, hygiene, and diff checks passed.\n\nTests use fake storage and isolated test profiles; no actual user credentials or settings were modified. The follow-on #338080 uses the same deterministic keys and handles ambiguous legacy HTTP/HTTPS ownership without a persistent registry.\n## URI helper consolidation\n\nURI-consolidation checkpoint: `8bb82878fe5`.\n\nRemoved the tiny single-host `enterpriseConfiguration.ts` module: its URI identity helper and legacy setting constant now live in `enterpriseStorage.ts`. Hostname lowercasing is left to `Uri.toString()`; explicit scheme and trailing-slash normalization remain. Added coverage for uppercase schemes, explicit default ports, root paths, repeated trailing slashes, and escaped deployment paths.\n\nFresh validation for this behavior-preserving follow-up: **51 targeted GitHub Enterprise tests passed**, plus extension compilation, browser-target type checking, scoped lint, hygiene, and diff checks. The 128-test full-suite result above is the prior baseline.\n## Selected canonical-precedence feedback\n\nCurrent head: `4ee145bdaef`.\n\nCanonical tokens and Microsoft account links are authoritative independently. Alias selection is required only for a component still missing from the canonical destination; already-authoritative components can clean up their redundant aliases. Signed-out empty values remain authoritative. Unresolved ambiguity for missing data still fails before mutation.\n\nAdded explicit user-info casing coverage for the already-simplified URI helper. Seven migration regression cases were verified failing before the fix and passing afterward. **58 targeted GitHub Enterprise tests passed**, with fresh extension compilation, browser-target type checks, scoped lint, hygiene, and diff checks. Earlier full-suite counts above are historical baselines. The migration-only region remains scheduled for removal in 1.144.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/338151",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "TylerLeonhardt",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "27e4110d90c60dd3c82724a7768cc2a77fb804c1",
+    "HeadRef": "tyleonha/ghe-stack-3-credential-storage",
+    "HeadSHA": "4ee145bdaefb4ca4135eb2e2ec4ed747075a21aa",
+    "CreatedAt": "2026-09-26T21:52:04Z",
+    "UpdatedAt": "2026-09-29T17:45:39Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-597321858122",
+      "Focus": "performance-review",
+      "Path": "extensions/github-authentication/src/common/enterpriseStorage.ts",
+      "Side": "RIGHT",
+      "Line": 88,
+      "Severity": "low",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed call path and boundary cardinality are explicit: warm/no-legacy initialization changes from one engine secret read to one all-keys RPC plus a migration target read plus the engine read, all serialized by the main-thread per-extension sequencer. Exact milliseconds vary with profile size and platform, so severity is low, but recurrence and critical-path placement are certain.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Cross-process SecretStorage calls, full machine-secret key enumeration/JSON parsing, and encrypted-secret reads",
+      "PerformanceScaling": "Every activation with a configured Enterprise URI repeats an O(S) scan over all machine secret keys, where S is the number of secrets stored by all extensions; a warm post-migration activation also adds two serialized SecretStorage RPCs before provider initialization, and cold migration adds one read per matching legacy alias.",
+      "PerformanceOutcome": "Increased authentication-provider activation latency, with the delay growing with the machine secret store and recurring on every window/extension activation during the migration releases.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The provider constructed the Enterprise engine directly, so initialization performed only the engine's single read of its configured credential key and did not enumerate all extension secrets first.",
+      "ChangedBehavior": "applyConfiguration now awaits migrateEnterpriseStorage before creating/registering the host; migrateEnterpriseStorage always calls secrets.keys(), scans global-state keys, and reads the canonical target even when no legacy source remains, after which GitHubSessionEngine reads that same target again.",
+      "CausalDiffEvidence": "Added line 88 introduces `await context.secrets.keys()` on every configured-provider initialization; this path did not exist before the diff and is awaited before host creation.",
+      "Title": "Avoid rescanning all secrets after migration has completed",
+      "Impact": "Once credentials have already been migrated—or for a new profile with no legacy entry—any GitHub authentication activation still waits for a full SecretStorage key enumeration and an extra canonical secret read. MainThreadSecretState serializes these operations per extension, so they sit directly ahead of enterprise registration and the normal engine read.",
+      "Evidence": "extension.ts awaits provider.update during activate. githubEnterprise.ts:80 awaits migration before createHost/registerProvider. extHostSecretState routes keys/get over RPC; MainThreadSecretState.$getKeys enumerates every machine secret key and serializes operations by extension. enterpriseStorage.ts:88 performs that enumeration unconditionally and line 101 reads the canonical target before the no-sources return; GitHubSessionEngine construction then calls Keychain.getToken, which reads the same canonical secret again.",
+      "Recommendation": "Make the temporary migration one-shot across successful activations (while retaining retry on failure), or move legacy discovery off the activation path once completion is known; also reuse or defer the canonical read so the no-source path does not read the same secret twice."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "missing-coalescing",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Extension activation for a GitHub/Public GitHub authentication request when github-enterprise.uri is configured and legacy migration has already completed",
+        "CriticalPath": "extension.activate awaits updateEnterpriseConfiguration, which awaits provider.update and migrateEnterpriseStorage before activation completes and before the Enterprise host is created/registered. The migration key scan and canonical read are therefore on the authentication activation critical path; the engine's subsequent getSessions also awaits its own canonical credential read.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/github-authentication/src/common/enterpriseStorage.ts:88 -\u003e src/vs/workbench/api/browser/mainThreadSecretState.ts:$getKeys",
+            "Operation": "Enumerate SecretStorage keys; the main thread enumerates and parses all machine secret keys before filtering to this extension",
+            "Cardinality": "One new RPC per activation, with O(S) main-thread work over all machine secrets",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No key enumeration; Enterprise initialization proceeded directly to the engine credential read.",
+            "CriticalPathEffect": "Awaited before Enterprise host construction and extension activation completion"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/github-authentication/src/common/enterpriseStorage.ts:101 -\u003e SecretStorage.get",
+            "Operation": "Read/decrypt the canonical Enterprise credential in migration",
+            "Cardinality": "One new read per activation even when no legacy sources exist",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only GitHubSessionEngine/Keychain performed one credential read.",
+            "CriticalPathEffect": "Awaited before the no-sources return and before engine construction"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/github-authentication/src/common/keychain.ts:27",
+            "Operation": "Read/decrypt the canonical Enterprise credential in GitHubSessionEngine",
+            "Cardinality": "One read per host construction",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This was the sole Enterprise credential read on this path.",
+            "CriticalPathEffect": "Awaited by applyConfiguration via engine.getSessions"
+          }
+        ],
+        "ScalingInput": "S machine-scoped secrets across all extensions (the main-thread keys implementation enumerates all of them), plus activation frequency across windows/reloads. Effective legacy-source cardinality is zero on the warm path.",
+        "EffectiveConcurrency": "SecretStorage calls cross the extension-host/main-thread boundary and MainThreadSecretState serializes all calls for this extension with SequencerByKey(extensionId). The new keys call and target read therefore execute ahead of the engine read rather than overlapping it.",
+        "CacheBehavior": "There is no persistent completion state or warm negative cache. Even after sources have been removed, every later activation repeats keys(), the global-state key scan, and the target read; the engine then reads the same target again.",
+        "MechanismConfidence": "High: the awaited call chain, RPC implementation, all-secret enumeration, duplicate target read, and per-extension serialization are explicit in repository code.",
+        "MagnitudeUncertainty": "The exact delay depends on stored-secret count, process placement, encryption backend, and how often authentication activates the extension. The added serialized calls and O(S) scan are certain, but typical absolute latency may be small, so the finding is low severity.",
+        "Verdict": "Reportable low-severity repeated startup work: the diff adds an uncached all-secrets scan and redundant credential read to every warm activation."
+      },
+      {
+        "Scenario": "First activation that migrates one or more legacy Enterprise aliases",
+        "CriticalPath": "Migration enumerates keys, serially reads each matching legacy source, reads the target, copies missing links/tokens, removes selected/redundant aliases, then constructs the engine and awaits getSessions. All migration storage work blocks provider replacement/registration. Existing session restoration may then perform network exchanges for linked accounts.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/github-authentication/src/common/enterpriseStorage.ts:88-96",
+            "Operation": "Enumerate all secret keys and read matching legacy token stores",
+            "Cardinality": "One keys RPC plus K serialized secret reads",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No discovery scan or legacy-source reads.",
+            "CriticalPathEffect": "Blocks migration and host creation"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/github-authentication/src/common/enterpriseStorage.ts:69-76",
+            "Operation": "Read/recheck/write canonical tokens and delete migrated legacy token stores",
+            "Cardinality": "One target read, up to one target re-read and write, then up to T deletes; secret-change notifications can also make the already-created public engine reread github.auth once per secret mutation",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No canonical copy or legacy cleanup occurred.",
+            "CriticalPathEffect": "Migration writes/deletes are awaited; notification-triggered public reads are asynchronous but contend on the same per-extension sequencer"
+          },
+          {
+            "Kind": "database",
+            "Location": "extensions/github-authentication/src/common/enterpriseStorage.ts:89,66,78",
+            "Operation": "Read all extension global-state keys, copy canonical account links, and delete migrated legacy link entries",
+            "Cardinality": "One in-memory/global-state key scan, up to one canonical link write, and up to K cleanup updates",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The engine read account links directly from the old configured key without migration.",
+            "CriticalPathEffect": "Writes and cleanup are awaited before host creation"
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/github-authentication/src/github.ts:313-378 via GitHubServer.renewWithMicrosoft",
+            "Operation": "Silently restore missing Microsoft-brokered sessions through account lookup/token exchange and GitHub user lookup",
+            "Cardinality": "Up to L concurrent restore operations, deduplicated by account/scope restore key",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same getSessions restoration path ran for account links stored under the previous engine key; migration relocates those links but does not add per-link network work.",
+            "CriticalPathEffect": "Already awaited by next.engine.getSessions during provider setup"
+          }
+        ],
+        "ScalingInput": "K distinct legacy spellings that normalize to the configured URI, T token-bearing aliases, and L remembered Microsoft account links. Realistically K is small, but the implementation has no bound beyond stored aliases; restoration cardinality is one logical exchange per missing linked account after deduplication by restore key.",
+        "EffectiveConcurrency": "Legacy SecretStorage reads and cleanup are sequential in source order; all secret operations are additionally serialized per extension by MainThreadSecretState. Account-link restoration uses Promise.all across distinct links and coalesces only duplicate concurrent requests for the same account/scope restore key.",
+        "CacheBehavior": "Successful cleanup removes migrated aliases, so copy/delete work is normally cold-only and failures retry. There is no completion/negative marker, so discovery and target reads remain on every warm activation. Engine restore attempts are cached per engine lifetime in _restoresTried and in-flight restores are coalesced by key.",
+        "MechanismConfidence": "High for storage cardinality and ordering; network duration and the prevalence of multiple aliases/links vary by user.",
+        "MagnitudeUncertainty": "K is usually one and migration writes are intended to occur only once, so cold migration fan-out alone does not warrant a separate finding. Profiles with many historical casing/trailing-slash aliases incur proportionally more serialized work.",
+        "Verdict": "The cold migration necessarily adds bounded storage work and preserves existing restore-network cardinality. Apart from the uncached warm scan covered by the finding, no separate high-confidence regression is warranted."
+      },
+      {
+        "Scenario": "Editing github-enterprise.uri while an Enterprise host is already active",
+        "CriticalPath": "Updates are globally serialized by _pendingUpdate. An equivalent normalized URI returns before migration. A genuinely different URI awaits migration, engine credential loading, existing linked-account restoration, and then swaps registrations/hosts.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/github-authentication/src/githubEnterprise.ts:80 -\u003e common/enterpriseStorage.ts",
+            "Operation": "Legacy discovery and canonical SecretStorage reads for a genuinely different URI",
+            "Cardinality": "One scan plus K source reads and target reads per distinct applied URI",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A changed URI constructed the new engine directly and performed its one credential read.",
+            "CriticalPathEffect": "Blocks the serialized configuration update"
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/github-authentication/src/githubEnterprise.ts:86 -\u003e github.ts:getSessions/restore",
+            "Operation": "Restore missing linked sessions for the new host",
+            "Cardinality": "Up to L concurrent, restore-key-deduplicated exchanges",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same getSessions call was already awaited when changing hosts.",
+            "CriticalPathEffect": "Blocks host swap"
+          }
+        ],
+        "ScalingInput": "One configured URI per update; K aliases for the newly selected URI and L linked accounts control work. Rapid edits queue rather than execute concurrently.",
+        "EffectiveConcurrency": "Provider updates are strictly serialized. Secret operations are also serialized per extension; distinct linked-account network restores can run concurrently as in the pre-diff engine path.",
+        "CacheBehavior": "Equivalent URI edits hit the currentKey/key fast path and perform no storage or network work after registration. Switching away and back within one provider lifetime rebuilds the host and repeats migration discovery because only the active normalized key is remembered.",
+        "MechanismConfidence": "High: normalization guard and update sequencer are explicit.",
+        "MagnitudeUncertainty": "URI changes are infrequent and equivalent edits are suppressed, limiting practical impact beyond activation.",
+        "Verdict": "No additional finding: equivalent updates are coalesced by identity, and expensive work for genuine host changes is infrequent; the recurring activation scan is the actionable issue."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and traced activation, migration, SecretStorage/global-state boundaries, engine credential loading, and linked-session restoration. Submitted one low-severity repeated-work finding for the uncached all-secret scan and duplicate canonical read on every post-migration activation; no regression-fix record was justified."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-29T18:50:43.802780201Z",
+    "CompletedAt": "2026-09-29T18:52:50.129918906Z",
+    "WallClockMilliseconds": 126327,
+    "ModelCalls": 11,
+    "InputTokens": 363777,
+    "OutputTokens": 9115,
+    "TotalTokens": 372892,
+    "ReasoningTokens": 4668,
+    "CacheReadTokens": 313868,
+    "CacheWriteTokens": 49876,
+    "APIDurationMilliseconds": 107967,
+    "ToolCalls": 45,
+    "NanoAIUnits": 55735920000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 313868,
+      "cache_write": 49876,
+      "input": 33,
+      "output": 9115
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

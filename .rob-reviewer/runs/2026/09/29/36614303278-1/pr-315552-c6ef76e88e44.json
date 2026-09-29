@@ -1,0 +1,222 @@
+{
+  "PullRequest": {
+    "Number": 315552,
+    "Title": "Fix remote agent host reconnect hang for SSH and tunnel paths",
+    "Body": "## Problem\n\nWhen a remote Agent Host SSH or dev-tunnel connection silently dies (TCP half-open before ssh2 / dev-tunnels keepalives detect it), the SDK calls used to (re)create the relay can hang forever:\n\n- **SSH**: `client.forwardOut(...)` inside `_createWebSocketRelay` has no timeout and the callback never fires when the SSH client is unresponsive.\n- **Tunnel**: `relayClient.connect()`, `waitForForwardedPort()`, `connectToForwardedPort()`, and the WebSocket `'open'` event have no timeouts.\n\nBecause `connect(replaceRelay=true)` reuses the existing dead `sshClient` and the renderer's `_reconnectSSHEntries` was single-shot, the per-host pending flag stayed set and auto-reconnect was effectively disabled for the lifetime of the shared process. **Reloading the window didn't help** — the dead client lives in the shared-process `_connections` map. Only quitting and restarting the app recovered.\n\n## Fix\n\n| Layer | Change |\n|---|---|\n| `sshRemoteAgentHostService` | Wrap `_createWebSocketRelay` in `connect(replaceRelay=true)` with `raceTimeout` (60s, slightly above ssh2's keepalive failure window). On timeout the existing catch ends the dead `sshClient` and purges it from `_connections`, so the next attempt starts fresh. |\n| `tunnelAgentHostService` | Wrap the four hangable dev-tunnels SDK calls with per-step timeouts (30s each); dispose `relayClient` on any timeout/failure so we don't leak it. |\n| `remoteAgentHost.contribution` | Rewrite `_reconnectSSHEntries` with exponential-backoff retry mirroring the proven tunnel pattern (1s → 30s, max 10 attempts then pause). Resumes on config / connection-change events. Per-host state lives in a single `SSHReconnectState` with a `MutableDisposable` timer (`disposableTimeout`), owned by a `DisposableMap` so disposing the contribution (or removing a host) cancels pending timers automatically. |\n\n## Validation\n\n- ✅ TypeScript: `npm run compile-check-ts-native` clean.\n- ✅ All 46 SSH main service tests pass, including a new test (`reconnect rejects with timeout when relay creation hangs`) that simulates a stuck relay via a `hangRelayCreationOnCall` hook and verifies the timeout fires + `sshClient.end()` is called.\n- ✅ All 167 RemoteAgentHost (renderer) tests pass.\n- ⚠️ No live repro included — the synthetic-network setup needed to deterministically reproduce the silent-death scenario is non-trivial. The unit test exercises the exact main-process code path that hangs in production.\n\n## How to verify by hand\n\nThe most deterministic synthetic repro for SSH:\n\n```bash\n# 1. Connect an SSH agent host (e.g. to a localhost SSH alias).\n# 2. Find the per-connection sshd child:\nlsof -i tcp:22 -sTCP:ESTABLISHED -P -n\n# 3. Freeze it (simulates a dead network without closing the socket):\nsudo kill -STOP \u003csshd-child-pid\u003e\n# 4. Trigger any host activity. Watch the agents output channel for:\n#      \"SSH relay creation timed out after 60000ms\"\n#      \"Scheduling SSH reconnect ... in 1000ms (attempt 2/10)\"\n# 5. Restore:\nsudo kill -CONT \u003csshd-child-pid\u003e\n# Within the next backoff window the host should reconnect.\n```\n\nRealistic real-world repro: close laptop lid for \u003e10 min, wake, and confirm the host recovers without restarting the app.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/315552",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "37ad80f8e55f22ba618e1c8ffe530314a920b456",
+    "HeadRef": "agents/vsckb-implement-i-m-having-some-kind-of-2a7030e7",
+    "HeadSHA": "c6ef76e88e44a85e8a20faad1d3f4cb56d150cb5",
+    "CreatedAt": "2026-05-10T17:28:02Z",
+    "UpdatedAt": "2026-06-25T23:49:38Z",
+    "MergedAt": "2026-05-11T02:26:02Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-79A9959918B4",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/remoteAgentHost/browser/remoteAgentHost.contribution.ts",
+      "Side": "RIGHT",
+      "Line": 365,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The cleanup and retry paths are explicit: reconciliation disposes state for hosts absent from configuration, but this changed catch handler unconditionally recreates that state and schedules another attempt. The transitive reconnect path unconditionally runs `ssh -G` and then SSH/network setup. The only magnitude uncertainty is how often users remove a host while an attempt is pending.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "`ssh -G` subprocesses plus SSH network connections and remote setup commands",
+      "PerformanceScaling": "One removal race can cause up to nine additional sequential attempts with 1s-to-30s backoff; independent removed hosts retry concurrently, so aggregate work scales with the number of affected hosts.",
+      "PerformanceOutcome": "Excessive background subprocess and network I/O after the owning configuration entry has been removed.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff, a reconnect rejection logged/unpublished cached sessions and stopped; removing a host while that one attempt was in flight could not start an autonomous follow-up chain.",
+      "ChangedBehavior": "A failed in-flight reconnect now recreates retry ownership even when configuration removal already disposed it, allowing the new exponential retry chain to continue against a host that no longer exists in configuration.",
+      "CausalDiffEvidence": "The added line `const liveState = this._getOrCreateSSHReconnectState(sshConfigHost);` recreates per-host retry state after reconciliation may have deleted it, and the added call at line 372 schedules the next reconnect from that recreated state.",
+      "Title": "Stop retries when the host's state was removed",
+      "Impact": "If a user removes an unreachable SSH host while reconnect is pending, VS Code can continue launching `ssh -G` and SSH/network attempts for that removed host for minutes, consuming subprocess/network resources and potentially multiplying across several removed hosts.",
+      "Evidence": "`_reconnectSSHEntries` calls `deleteAndDispose(host)` for no-longer-configured hosts, but `_attemptSSHReconnect`'s catch uses `_getOrCreateSSHReconnectState` and then `_scheduleSSHReconnect` without rechecking configuration. Each timer calls `_sshService.reconnect`; that reaches `SSHRemoteAgentHostMainService.reconnect`, which calls `resolveSSHConfig`, spawning `ssh -G`, and then may perform a fresh SSH connection plus remote commands. With no further reconciliation event, failed attempts keep rescheduling until the 10-attempt cap.",
+      "Recommendation": "Treat absence of retry state as cancellation: use `_sshReconnectStates.get(sshConfigHost)` in the catch and return when it is missing, and revalidate that the host is still configured (and auto-connect enabled) before scheduling another attempt."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 493,
+      "BasePath": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts",
+      "BaseLine": 461,
+      "IntroducingPath": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts",
+      "IntroducingCommit": "2bfd243feb70068823a0db14790ae152545a9af7",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "latency",
+      "Mechanism": "Relay replacement reused an unresponsive SSH client and awaited relay creation without a deadline, so one half-open connection could permanently block reconnect and retain the dead shared-process connection.",
+      "Symptom": "After a silent network loss, remote agent host reconnect could hang indefinitely and require restarting the application.",
+      "FixedBehavior": "Relay creation on the replace path now times out after 60 seconds; the existing catch ends the dead SSH client, emits closure, and lets subsequent retries establish a fresh connection.",
+      "Evidence": "The base reconnect path awaited `_createWebSocketRelay`, whose SSH `forwardOut` callback can remain pending when a reused TCP connection is half-open. That leaves the renderer reconnect promise and per-host pending state unresolved indefinitely. The changed line wraps that same operation in `raceTimeout`; the added unit test forces relay creation never to settle and verifies timeout rejection and `sshClient.end()`.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "repeated-work",
+      "concurrency-burst",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A request is sent over an SSH or tunnel protocol transport that became silently half-open after sleep or a network change.",
+        "CriticalPath": "The user request sends one JSON-RPC message and waits. The new per-client watchdog checks every 5 seconds and closes the logical client once both the oldest pending request and last inbound traffic exceed 20 seconds, allowing reconnect; before the diff this request could remain blocked indefinitely.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/remoteAgentHostProtocolClient.ts:_sendRequest",
+            "Operation": "Send a JSON-RPC request over the existing WebSocket/SSH/tunnel transport.",
+            "Cardinality": "One send per application request; pending requests are coalesced only by their own response IDs, not by the watchdog.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same transport send occurred, but a silent transport could leave its promise pending indefinitely.",
+            "CriticalPathEffect": "The request is on the critical path; the watchdog adds timestamp/map bookkeeping but no extra network call and bounds silent-failure latency."
+          }
+        ],
+        "ScalingInput": "One 5-second timer per live protocol client; on ticks with pending work, CPU scales linearly with the number of pending requests for that client, normally a few dozen.",
+        "EffectiveConcurrency": "Each client owns one interval; only one watchdog callback per client runs at a time. Reconnect is initiated through existing connection-change handling.",
+        "CacheBehavior": "No cache is involved. Pending request entries are deleted on response and cleared on close; the watchdog timer is cancelled on close/disposal.",
+        "MechanismConfidence": "High: timer ownership, scan conditions, and close path are explicit in the changed code.",
+        "MagnitudeUncertainty": "The number of simultaneous clients and pending RPCs varies, but the interval and scan are bounded by live clients and pending requests.",
+        "Verdict": "No reportable regression: small periodic CPU work is bounded and replaces potentially infinite request latency."
+      },
+      {
+        "Scenario": "An SSH-configured remote is disconnected, retried with exponential backoff, or removed while a retry is in flight.",
+        "CriticalPath": "Automatic recovery awaits renderer-to-shared-process IPC, `ssh -G`, SSH connection/setup, relay creation, protocol handshake, and registration. This is off the renderer UI critical path but controls when remote sessions become usable. The reused-relay step is now bounded at 60 seconds.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:resolveSSHConfig",
+            "Operation": "Resolve the SSH alias with `ssh -G`.",
+            "Cardinality": "Once per reconnect attempt; up to 10 attempts per host in a normal failed retry series, with independent hosts not globally limited.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The subprocess existed, but automatic reconciliation issued only one attempt per trigger; the diff adds autonomous follow-up attempts.",
+            "CriticalPathEffect": "Must finish before each SSH connection attempt can proceed."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/sshRemoteAgentHostService.ts:reconnect/connect",
+            "Operation": "Establish/reuse SSH, run remote detection/setup commands, and create the forwarded WebSocket relay.",
+            "Cardinality": "Once per attempt; reused connections take the relay-replacement branch, while a purged/dead connection causes the fuller SSH and remote-command path.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The operations existed, but did not repeat autonomously after a failed reconciliation attempt and relay replacement had no timeout.",
+            "CriticalPathEffect": "Serial critical path for making that host usable; a stuck reused relay is now capped at 60 seconds."
+          },
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/platform/agentHost/electron-browser/sshRemoteAgentHostServiceImpl.ts:reconnect",
+            "Operation": "Call the shared-process SSH reconnect service and receive relay/close events.",
+            "Cardinality": "One reconnect IPC call per scheduled attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One call was made per reconciliation trigger rather than up to 10 calls in a self-scheduled series.",
+            "CriticalPathEffect": "Bridges each renderer retry to the expensive shared-process work."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is configured SSH hosts. Attempts are serialized per host by `_pendingSSHReconnects`, but different hosts retry concurrently. A removed host can incorrectly retain the remaining retry budget because the catch recreates deleted state.",
+        "EffectiveConcurrency": "At most one reconnect per SSH host; no global limiter across hosts. Backoff is 1, 2, 4, 8, 16, then 30 seconds, capped at 10 attempts.",
+        "CacheBehavior": "The first attempt may reuse the shared-process SSH connection map entry. A timed-out relay ends and purges that client, so later attempts are cold. SSH config resolution is not cached and spawns `ssh -G` each time. Retry state is intended to be removed with configuration, but the changed catch recreates it.",
+        "MechanismConfidence": "Very high: state deletion, unconditional recreation, timer scheduling, and transitive subprocess/network calls are directly traced.",
+        "MagnitudeUncertainty": "Removal during an in-flight attempt is timing-dependent and users commonly configure only a few hosts, but the extra attempts and boundary calls are deterministic once that race occurs.",
+        "Verdict": "Reportable cleanup-lifecycle regression: removing a host can still lead to up to nine further expensive attempts."
+      },
+      {
+        "Scenario": "A dev-tunnel connection is established while a relay SDK step or WebSocket open hangs.",
+        "CriticalPath": "Tunnel management lookup and four serial relay-opening stages must complete before the remote is usable. The diff bounds each formerly unbounded relay stage at 30 seconds and disposes the relay client on timeout/failure.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/tunnelAgentHostService.ts:connect",
+            "Operation": "Fetch tunnel metadata with `getTunnel`.",
+            "Cardinality": "One management API call per connect invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same one call per connect.",
+            "CriticalPathEffect": "Runs before relay setup and remains unbounded by this diff."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/tunnelAgentHostService.ts:connect",
+            "Operation": "Connect relay, wait for the forwarded port, connect to the port, and open the WebSocket.",
+            "Cardinality": "Four sequential stages per cold connect; no duplicate boundary calls are added by the timeout wrappers.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same four stages ran without deadlines and could block indefinitely.",
+            "CriticalPathEffect": "All four are serial critical-path stages; each is now capped at 30 seconds instead of potentially hanging forever."
+          }
+        ],
+        "ScalingInput": "One sequence per tunnel connect; cost scales with connection attempts, not tunnel-list size.",
+        "EffectiveConcurrency": "Stages are serialized within one connect. Concurrency across separate tunnel connects is controlled by existing caller pending-connect state, not changed here.",
+        "CacheBehavior": "Each connect creates a fresh relay client and connection ID; dynamic imports may be module-cached. Timeout/failure disposes the fresh relay client, with no new result cache.",
+        "MechanismConfidence": "High that the critical path is bounded and no additional boundary call is introduced.",
+        "MagnitudeUncertainty": "SDK cancellation latency after `dispose()` is implementation-dependent, but no evidence shows retained clients after the changed cleanup.",
+        "Verdict": "No reportable regression; this is a latency and cleanup improvement."
+      },
+      {
+        "Scenario": "A managed SSH/tunnel protocol entry is replaced during reconnect, then explicitly removed or the service is disposed.",
+        "CriticalPath": "Replacement disposes the old protocol-client store but transfers responsibility for the same connection ID to the new entry. Full removal/disposal invokes the current transport disposable and its disconnect IPC.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/platform/agentHost/browser/remoteAgentHostServiceImpl.ts:disposeEntry",
+            "Operation": "Disconnect the shared-process SSH or tunnel transport.",
+            "Cardinality": "Zero on same-address replacement; one on explicit removal or service disposal for each current managed entry.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Replacement disposed the old wrapper and issued disconnect against the same connection ID, while removal/disposal also disconnected.",
+            "CriticalPathEffect": "Not on replacement critical path anymore; explicit removal waits only on local disposal because the disposable initiates disconnect asynchronously."
+          }
+        ],
+        "ScalingInput": "Work scales linearly with the number of currently managed entries only during service shutdown; normal replacement is constant time.",
+        "EffectiveConcurrency": "Entry disposal is synchronous locally; any transport disconnects are independently initiated by each disposable.",
+        "CacheBehavior": "The entries map retains only the latest entry. The superseded transport-disposable closure becomes unreachable; the underlying shared connection remains owned by the replacement.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "None material for performance; connection-ID ownership is explicit.",
+        "Verdict": "No reportable performance regression; replacement avoids an unnecessary disconnect and current ownership remains bounded."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 10 changed files. Reported one cleanup-lifecycle regression in SSH retry cancellation and recorded the verified SSH relay-timeout regression fix. Watchdog overhead, tunnel timeouts, and managed-entry ownership changes are bounded and not independently reportable."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-29T18:59:45.153843252Z",
+    "CompletedAt": "2026-09-29T19:01:58.554733972Z",
+    "WallClockMilliseconds": 133400,
+    "ModelCalls": 10,
+    "InputTokens": 459429,
+    "OutputTokens": 10000,
+    "TotalTokens": 469429,
+    "ReasoningTokens": 4960,
+    "CacheReadTokens": 391692,
+    "CacheWriteTokens": 67707,
+    "APIDurationMilliseconds": 118910,
+    "ToolCalls": 50,
+    "NanoAIUnits": 69533180000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 391692,
+      "cache_write": 67707,
+      "input": 30,
+      "output": 10000
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
