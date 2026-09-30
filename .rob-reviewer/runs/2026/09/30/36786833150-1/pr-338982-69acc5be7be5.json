@@ -1,0 +1,266 @@
+{
+  "PullRequest": {
+    "Number": 338982,
+    "Title": "Add Copilot plugin slash commands to Agent Host",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Summary\n\nAdds host-side support for Copilot CLI `/plugin` commands in Agent Host, using the session-scoped Copilot SDK plugin APIs.\n\n- Supports plugin list, install, uninstall, update, enable, and disable operations\n- Supports marketplace add, remove, list, browse, and update operations\n- Adds SDK-backed completions for marketplace plugins, installed plugin specs, and marketplace names\n- Formats plugin and marketplace results and errors for chat\n- Shows activity while plugin mutations are running\n- Prevents implicit file suggestions and speculative Auto-routing progress from interfering with host-handled slash commands\n\nThe Chat Customizations UI and Copilot SDK currently have separate plugin inventories. Unifying those inventories is intentionally deferred to #338975.\n\n## Validation\n\n- `npm run transpile-client` — passed\n- Targeted ESLint for changed files — passed\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/copilotSlashCommand.test.ts` — 33 passing\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/copilotSlashCommandCompletionProvider.test.ts` — 76 passing\n- Plugin progress lifecycle selection in `copilotAgentSession.test.ts` — 3 passing\n- Sessions/plugin completion regression selection — passed\n- Auto-routing regression selection — passed\n- `npm run typecheck-client` — blocked by a pre-existing `ITestCodeEditor`/`CodeEditorWidget` type error in `src/vs/sessions/contrib/chat/test/browser/slashCommands.test.ts:127`\n",
+    "URL": "https://github.com/microsoft/vscode/pull/338982",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "aeschli",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "a2f8ae87352b331acf15b158be871bd2011f49b6",
+    "HeadRef": "aeschli/agents/copilot-cli-commands-integration",
+    "HeadSHA": "69acc5be7be517e9e6dae9982901d62be90f9933",
+    "CreatedAt": "2026-09-30T20:35:58Z",
+    "UpdatedAt": "2026-09-30T22:19:43Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-67F4D76DEBC0",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotSlashCommandCompletionProvider.ts",
+      "Side": "RIGHT",
+      "Line": 181,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed call path, incomplete-list re-evaluation, missing cross-IPC cancellation, and test-observed repeated lookup cardinality are all explicit in the repository. Only the exact SDK RPC duration and user typing rate are uncertain.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Workbench-to-agent-host completion requests plus Copilot SDK `plugins.list` RPC calls and their returned plugin arrays",
+      "PerformanceScaling": "After `/plugin enable|disable|uninstall|remove|update `, cost grows by one uncached SDK list RPC for every typed character; when typing outruns RPC latency, canceled completion requests remain in flight and overlap.",
+      "PerformanceOutcome": "Excessive IPC/subprocess work and delayed completion updates while users type plugin names",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff, plugin argument completion had no branch that called the SDK plugin inventory, so typing these command arguments caused no `plugins.list` RPCs.",
+      "ChangedBehavior": "The added plugin completion branch awaits `getInstalledPlugins(sessionId)` on every completion evaluation before locally filtering the returned inventory.",
+      "CausalDiffEvidence": "RIGHT line 181 adds `await this._sessionInfo.getInstalledPlugins?.(sessionId)` directly to the completion path; the diff also newly wires that hook through `CopilotAgent._listInstalledPlugins` to the SDK RPC.",
+      "Title": "Coalesce plugin-list RPCs while typing completions",
+      "Impact": "Typing a normal plugin spec such as `/plugin uninstall elasticsearch@awesome-copilot` can issue dozens of full inventory RPCs. The Monaco bridge returns these host lists as `incomplete`, so it re-evaluates on each character, while `AgentHostSessionHandler.provideChatInputCompletions` explicitly cannot forward cancellation across IPC; stale calls therefore still consume the agent-host/SDK path and can overlap, making suggestions lag and increasing subprocess load.",
+      "Evidence": "`AgentHostInputCompletionsBase._provide` returns `{ incomplete: true }`, establishing per-character re-evaluation. `AgentHostSessionHandler.provideChatInputCompletions` documents that cancellation is not forwarded across IPC. This changed line awaits an uncached inventory lookup, which reaches `CopilotAgentSession.listInstalledPlugins()` and `session.rpc.plugins.list()`. The added test also expects four separate session lookups for four completion calls, confirming there is no coalescing.",
+      "Recommendation": "Keep a per-session in-flight/short-lived inventory promise (or reuse a session-owned inventory snapshot) and invalidate it after plugin mutations; at minimum coalesce concurrent completion requests so canceled keystrokes do not each start another SDK RPC."
+    },
+    {
+      "ID": "PERF-DB2C8B5C77D1",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotSlashCommandCompletionProvider.ts",
+      "Side": "RIGHT",
+      "Line": 252,
+      "Severity": "low",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "Retention and lifecycle ownership are explicit: successful entries have no removal path and the provider outlives individual sessions. The uncertain factor is only how many sessions/catalog entries a given user accumulates, reflected in low severity.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceResource": "Resolved marketplace catalog arrays and promises retained by the completion provider's session-keyed Map",
+      "PerformanceScaling": "Retained memory grows with the number of distinct sessions in which install completion is opened, multiplied by each session's flattened marketplace plugin catalog; elapsed TTL does not reduce the Map or release values.",
+      "PerformanceOutcome": "Unbounded retained memory and increasing GC footprint in long-lived agent-host processes",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff there was no marketplace catalog completion cache and therefore no session-keyed catalog state retained by this long-lived provider.",
+      "ChangedBehavior": "Each cold `/plugin install` completion inserts a promise for the full flattened catalog into a Map keyed by session ID, but entries are deleted only on rejection; expiration merely causes replacement if that same session is queried again.",
+      "CausalDiffEvidence": "RIGHT line 252 adds a persistent Map entry for every session that requests marketplace plugin completion; no added code removes successfully resolved entries after the 30-second expiry.",
+      "Title": "Evict expired per-session marketplace catalogs",
+      "Impact": "A user opening install completion across many chats leaves every resolved catalog reachable for the lifetime of the Copilot agent, even after `_destroyLiveSession` disposes the corresponding session. The advertised 30-second TTL therefore bounds freshness but not memory, and large catalogs compound retention across historical session IDs.",
+      "Evidence": "The provider is instantiated once and registered from `CopilotAgent`, while live sessions are independently removed by `_destroyLiveSession`. The cache declaration is an unrestricted `Map\u003cstring, ...\u003e`; the hit path checks `expiresAt`, this changed line inserts by session ID, and the only `delete` is the rejection cleanup. There is no session-disposal or provider-disposal eviction path.",
+      "Recommendation": "Delete entries when their TTL elapses and clear them when sessions end/provider disposal occurs, or use a bounded TTL/LRU cache that prunes expired entries on every insertion."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/sessions/contrib/chat/browser/variableCompletions.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 159,
+      "BasePath": "src/vs/sessions/contrib/chat/browser/variableCompletions.ts",
+      "BaseLine": 159,
+      "IntroducingPath": "src/vs/sessions/contrib/chat/browser/variableCompletions.ts",
+      "IntroducingCommit": "910529e09d027eb0060acd84edc36888e90af673",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceCategory": "io",
+      "Mechanism": "The generic implicit file completion provider treated slash-command argument text with no `#` variable as a file query, walking editor history and invoking workspace search (or recursively resolving virtual filesystem directories) whenever slash-command suggestions were retriggered.",
+      "Symptom": "Slash-command argument completion could launch unrelated workspace file searches and delay/compete with the intended command suggestions on each incomplete completion refresh.",
+      "FixedBehavior": "The added slash-prefix guard returns before `_addFileAndFolderEntries`, preventing history traversal and the search/filesystem boundary unless the token is an explicit variable word.",
+      "Evidence": "The fixed line now rejects implicit completion when text before the cursor begins with `/` and `range.varWord` is absent. The transitive old path immediately called `_addFileAndFolderEntries`, which always invokes `searchFilesAndFolders` for file/remote workspaces or recursively calls `fileService.resolve` for virtual workspaces. Agent-host command completion lists are marked incomplete and plugin choices explicitly retrigger suggestions, making this provider reachable repeatedly while typing slash arguments; the added regression test confirms this exact provider previously needed suppression for `/plugin `.",
+      "Confidence": 0.94
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "cache-lifecycle",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Typing targets for `/plugin enable`, `disable`, `uninstall`, `remove`, `update`, or marketplace browse/update/remove",
+        "CriticalPath": "Each Monaco incomplete-list refresh crosses the workbench/agent-host completion boundary and then awaits the plugin inventory RPC before updated suggestions can appear.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts:1366",
+            "Operation": "Request host completion items for the current input",
+            "Cardinality": "One per incomplete-list refresh/typed character while suggestions are active",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The completion IPC already existed, but plugin argument text did not cause plugin inventory work behind it.",
+            "CriticalPathEffect": "The current request waits for the agent host; stale requests continue in the background because cancellation is not forwarded."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:895",
+            "Operation": "List installed plugins through `session.rpc.plugins.list()`",
+            "Cardinality": "One per typed-character completion refresh for installed-plugin subcommands",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No plugin inventory RPC was performed for these completion inputs.",
+            "CriticalPathEffect": "Suggestions wait for the full list before local filtering; prior stale calls may overlap."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:891",
+            "Operation": "List plugin marketplaces through `session.rpc.plugins.marketplaces.list()`",
+            "Cardinality": "One per typed-character completion refresh for marketplace browse/update/remove targets",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No marketplace RPC was performed for these completion inputs.",
+            "CriticalPathEffect": "Marketplace-name suggestions wait for each uncached list call."
+          }
+        ],
+        "ScalingInput": "Number of characters typed after the subcommand; effective SDK-call cardinality is one full inventory/marketplace-list call per completion refresh, with no cache or coalescing.",
+        "EffectiveConcurrency": "Monaco re-requests incomplete lists while typing. Workbench cancellation drops stale results only after await and is not forwarded across IPC, so requests can overlap when RPC latency exceeds the inter-keystroke interval.",
+        "CacheBehavior": "No cold/warm distinction was added for installed plugin or marketplace-name lookups; every request is cold. There is no negative cache or in-flight coalescing.",
+        "MechanismConfidence": "High: repository control flow and added tests directly establish repeated uncached lookups.",
+        "MagnitudeUncertainty": "Exact SDK latency and typing cadence vary, but the per-character call count and inability to cancel in-flight IPC are explicit.",
+        "Verdict": "Reportable repeated-work/concurrency regression; submitted a finding for the dominant installed-plugin inventory path."
+      },
+      {
+        "Scenario": "Opening `/plugin install` marketplace-plugin completions across chat sessions",
+        "CriticalPath": "On a cold cache, suggestions wait for marketplace listing and every available catalog browse; within 30 seconds the resolved promise serves the session off the SDK critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:900",
+            "Operation": "List available plugin marketplaces",
+            "Cardinality": "One on a cold per-session 30-second cache fill",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Install completions did not enumerate marketplaces.",
+            "CriticalPathEffect": "Must complete before browse fan-out can begin."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:906",
+            "Operation": "Browse each available marketplace catalog",
+            "Cardinality": "M concurrent calls per cold fill, grouped by marketplace; zero on a warm cache hit",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Install completions did not browse catalogs.",
+            "CriticalPathEffect": "Cold suggestions wait for the slowest catalog, while individual browse failures are converted to empty catalogs."
+          }
+        ],
+        "ScalingInput": "Cold boundary count is 1 + M SDK RPCs where M is the number of available marketplaces; retained data scales with the sum of catalog sizes across every distinct queried session.",
+        "EffectiveConcurrency": "The M browse RPCs launch together via `Promise.all` with no shared limiter. Same-session requests within the TTL coalesce on one promise; different sessions do not.",
+        "CacheBehavior": "Positive and in-flight results are cached per session for 30 seconds and failures remove the entry. Expired successful entries are never evicted unless the same key is overwritten, and session disposal does not clear them.",
+        "MechanismConfidence": "High for cold fan-out and retention; only deployed cardinalities are uncertain.",
+        "MagnitudeUncertainty": "Typical marketplace count and catalog size are not established; fan-out is cached, but long-lived retention across session IDs is unbounded.",
+        "Verdict": "Cold fan-out is intentional and coalesced, so no separate latency finding. Successful cache entries outlive TTL and sessions, so a cache-lifecycle memory finding was submitted."
+      },
+      {
+        "Scenario": "Executing host-handled plugin and marketplace slash commands",
+        "CriticalPath": "The turn resolves the runtime command, applies mode, then awaits direct session-scoped plugin RPCs and any required reload before emitting output and completing the turn.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotCustomizationCommandDisplay.ts:71",
+            "Operation": "Install, uninstall, update, enable, disable, reload, or list plugins via the session plugin API",
+            "Cardinality": "Two sequential RPCs for most mutations; three for enable/disable due to validation list; fixed per command",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The host made one generic `commands.invoke` call; its internal runtime plugin-operation cardinality is not visible, so total backend work cannot be shown to have increased.",
+            "CriticalPathEffect": "All required calls complete before the command turn produces its final result."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotCustomizationCommandDisplay.ts:150",
+            "Operation": "Add/remove/list/browse/refresh plugin marketplaces",
+            "Cardinality": "Normally one RPC; forced removal may be followed by one reload",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Handled behind generic `commands.invoke`; equivalent internal work is unknown.",
+            "CriticalPathEffect": "Sequential and directly on command completion path."
+          }
+        ],
+        "ScalingInput": "Most operations have fixed cardinality: one mutation plus one reload; enable/disable adds one list lookup; marketplace list/browse/refresh are one RPC, and forced marketplace removal may add one reload. Output formatting is linear in returned plugins/marketplaces/results.",
+        "EffectiveConcurrency": "Operations within a command are sequential to preserve mutation/reload ordering. The session operation wrapper governs the turn; no collection-wide mutation burst was added.",
+        "CacheBehavior": "Slash-command metadata cache is cleared when `runtimeSettingsChanged` is returned. No data cache participates in command execution.",
+        "MechanismConfidence": "High for the changed direct RPC sequence; low for any net regression versus runtime invocation.",
+        "MagnitudeUncertainty": "The generic runtime command's prior internal operations are opaque, preventing a supported before/after cost increase claim.",
+        "Verdict": "No reportable regression: cardinality is bounded and ordering is required, while prior backend work cannot be compared."
+      },
+      {
+        "Scenario": "Slash-command typing with the generic file/folder completion provider active",
+        "CriticalPath": "Before the guard, implicit file completion proceeded into editor-history scanning and workspace search or recursive filesystem resolution; the changed slash-prefix check now returns before those boundaries.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/contrib/chat/browser/variableCompletions.ts:259",
+            "Operation": "Search workspace files/folders or recursively resolve virtual filesystem directories",
+            "Cardinality": "Previously one search per implicit slash-command completion invocation, or many directory resolves for virtual workspaces; now zero for slash text without an explicit variable word",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The generic provider ran implicit file discovery for `/plugin ` text.",
+            "CriticalPathEffect": "Previously competed with intended slash suggestions; now skipped before the search path."
+          }
+        ],
+        "ScalingInput": "Old cost scaled with each suggestion refresh, workspace search size, or up to 100 virtual-filesystem results and depth 10. New cost is only a prefix read/regex for slash text.",
+        "EffectiveConcurrency": "Suggestion refreshes could overlap subject to search cancellation; the new guard prevents starting the unrelated boundary work.",
+        "CacheBehavior": "No cache is involved; suppression removes the work on every slash-command refresh for both cold and warm workspace state.",
+        "MechanismConfidence": "High; the guard and transitive search paths are explicit and covered by the added regression test.",
+        "MagnitudeUncertainty": "Workspace size and provider scheduling determine saved duration, but the removed search/filesystem mechanism is direct.",
+        "Verdict": "This PR fixes a concrete boundary-fanout regression; recorded internally with blame attribution, not as a finding."
+      },
+      {
+        "Scenario": "Showing plugin mutation activity and suppressing unresolved Auto-routing UI for host-handled commands",
+        "CriticalPath": "Activity publication emits at most an immediate event or a one-second delayed event around command execution; Auto-routing suppression is an in-memory observable check.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Constant work per command/observable update; no collection or history scaling.",
+        "EffectiveConcurrency": "One disposable timer per pending command, canceled in `finally`; activity precedence coalesces duplicate values.",
+        "CacheBehavior": "No caches participate.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "None material for performance; operations are constant and bounded.",
+        "Verdict": "No performance regression."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 12 changed files. Submitted two diff-introduced findings: uncached per-keystroke plugin inventory RPCs and non-evicting per-session marketplace catalog retention. Recorded the slash-command file-search suppression as a regression fix. Other direct plugin RPC sequencing, formatting, activity, and Auto-routing changes are bounded or lack evidence of increased backend work."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-30T22:47:11.318414221Z",
+    "CompletedAt": "2026-09-30T22:50:04.991743687Z",
+    "WallClockMilliseconds": 173673,
+    "ModelCalls": 13,
+    "InputTokens": 840393,
+    "OutputTokens": 10748,
+    "TotalTokens": 851141,
+    "ReasoningTokens": 4011,
+    "CacheReadTokens": 745274,
+    "CacheWriteTokens": 95080,
+    "APIDurationMilliseconds": 160051,
+    "ToolCalls": 77,
+    "NanoAIUnits": 98862560000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 745274,
+      "cache_write": 95080,
+      "input": 39,
+      "output": 10748
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
