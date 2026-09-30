@@ -1,0 +1,206 @@
+{
+  "PullRequest": {
+    "Number": 338831,
+    "Title": "github: harden request execution and add client attribution",
+    "Body": "Part of microsoft/vscode-internalbacklog#9678.\r\n\r\nHarden the existing reusable GitHub engine ahead of the broader request-consolidation work:\r\n\r\n- Bound retained requests, coalesced waiters, response sizes, and end-to-end request lifetimes; add caller fairness and reserved admission capacity for interactive/mutation work.\r\n- Preserve rate-limit cooldowns across invalidation and identity-bootstrap failures, classify bounded download diagnostics, and recheck cooldowns before authenticated redirect hops. Keep writes non-retrying except for existing operation-specific reconciliation.\r\n- Add privacy-safe request health summaries and sampled timings using product telemetry, with bounded categories and no request/account/repository content.\r\n- Add binding-supplied product/component identification and per-attempt retry headers. Node egress sends all four headers; browser fetch (including desktop renderers) sends only the CORS-allowed `X-Client-Application` to `api.github.com`. Enterprise browser identification remains disabled until its header contracts are confirmed. Storage redirects receive no identification or retry headers.\r\n- Add deterministic regression coverage and source-adjacent architecture/behavior documentation.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/338831",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "2be8d96dfdb69510f2e595c5721333318e22b8ac",
+    "HeadRef": "agents/consolidate-github-api-calls",
+    "HeadSHA": "53048f1a20380a9cf42340575b3ca1f12c942ac7",
+    "CreatedAt": "2026-09-30T03:07:31Z",
+    "UpdatedAt": "2026-09-30T07:15:01Z",
+    "MergedAt": null,
+    "Labels": [
+      "network"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "serialization-allocation",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "boundary-fanout",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Workbench and Agent Host repository/issue/PR hydration, polling, refresh, and pagination",
+        "CriticalPath": "A cold request waits for credential identity resolution, admission/cooldown, the GitHub REST or GraphQL response, bounded body decoding, and parsing. Warm credential, ETag, and in-flight-coalesced paths skip identity or duplicate wire work. Telemetry aggregation is not a blocking boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubCredentialService.ts:_resolveIdentity",
+            "Operation": "GET the authenticated /user identity",
+            "Cardinality": "One shared request per credential generation; concurrent credential callers await the same identity promise.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same identity lookup was already required; the diff adds a deadline, caller attribution, cooldown preservation, and cleanup.",
+            "CriticalPathEffect": "Required on a cold or replaced credential before repository requests can proceed."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubTransport.ts:_executeRest/_executeGraphQL",
+            "Operation": "Issue GitHub REST or GraphQL reads and consume bounded responses",
+            "Cardinality": "One wire operation per distinct effective REST/GraphQL key after in-flight coalescing, with pagination remaining one request per page up to existing page caps; reads can make one existing bounded retry on transient failure.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same REST/GraphQL boundaries, ETag revalidation, coalescing, pagination, and read retry existed; the diff bounds retained work and response bytes and changes scheduling/metadata.",
+            "CriticalPathEffect": "Each required fragment/page is on that fragment's refresh path; independent fragment requests are governed by the shared queue."
+          }
+        ],
+        "ScalingInput": "Number of active resource subscriptions, requested PR fragments, and bounded pagination pages; equivalent reads collapse to one wire request with at most 64 waiters.",
+        "EffectiveConcurrency": "The changed queue caps four active requests globally, two per host, two per caller, and one per account; cooldown-waiting work consumes no active slot. Same-key reads coalesce, while account-level serialization limits the common single-account case to one active network request.",
+        "CacheBehavior": "Credentials and host capabilities share in-flight work; REST uses a 500-entry ETag LRU; identical REST/GraphQL reads coalesce. Cold cache performs network work, warm ETag reads still revalidate, and failures do not remain in the coalescing maps.",
+        "MechanismConfidence": "High confidence in the call path and bounds from transport, queue, resource-service cancellation, and lifecycle tests.",
+        "MagnitudeUncertainty": "Actual fragment counts and response sizes vary by PR and subscription visibility, but all changed retention, waiter, response, and concurrency dimensions are explicitly bounded.",
+        "Verdict": "No reportable regression: the diff does not add per-item network fan-out, and its extra scheduling, response-bound, metadata, and telemetry work is bounded relative to existing network requests."
+      },
+      {
+        "Scenario": "Interactive PR mutations, reconciliation, workflow reruns, and workflow-log downloads",
+        "CriticalPath": "Mutations wait for credential resolution, per-repository serialization, queue admission, and one write attempt. Only ambiguous dispatched failures enter existing operation-specific reconciliation. Downloads wait for queue/cooldown, redirect hops, and bounded body consumption.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/pullRequestMutationService.ts mutation methods",
+            "Operation": "Send REST or GraphQL mutation writes and, for ambiguous outcomes, refresh authoritative state",
+            "Cardinality": "One transport attempt per write; no automatic transport retry. Reconciliation is failure-only and bounded by the operation-specific workflow.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Writes and operation-specific reconciliation already crossed the network; the diff extends ambiguity classification to newly bounded timeout/oversize outcomes without blindly replaying transport mutations.",
+            "CriticalPathEffect": "The write is on the user action's critical path; reconciliation runs only after an ambiguous dispatched result."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubTransport.ts:_download",
+            "Operation": "Fetch a workflow log through at most five redirects and read a bounded body",
+            "Cardinality": "One initial request plus at most five redirect hops per explicit download; no retry. Authenticated 403 diagnostics consume at most 8 KiB.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Downloads and redirect hops already existed; the diff moves them under common admission/deadlines, strips metadata cross-origin, and bounds diagnostic and successful response reads.",
+            "CriticalPathEffect": "All hops and body reading are on the explicit download path."
+          }
+        ],
+        "ScalingInput": "User-triggered mutation count, bounded reconciliation attempts after ambiguous failures, redirect count capped at five, and requested download bytes capped by both the operation and 16 MiB transport maximum.",
+        "EffectiveConcurrency": "Mutations retain high-priority/reserved admission and are serialized by existing repository operation logic; transport still permits one active request per account. Downloads share the same global/host/account queue and are not retried.",
+        "CacheBehavior": "Writes bypass read coalescing and ETags. Workflow status reads may use the existing REST cache; downloads are no-store. Cooldowns are preserved across credential invalidation.",
+        "MechanismConfidence": "High confidence from mutation service branches, transport retry policy, and lifecycle tests.",
+        "MagnitudeUncertainty": "Ambiguous failures and long redirect chains are uncommon and environment-dependent, but their new work is bounded and failure-only.",
+        "Verdict": "No reportable regression: no new unbounded replay or fan-out is introduced, and the small 403 diagnostic read is capped at 8 KiB."
+      },
+      {
+        "Scenario": "Credential replacement, identity bootstrap failures, and rate-limit cooldown recovery",
+        "CriticalPath": "Token acquisition and a cold /user lookup are critical. Server cooldown waits are parked before active admission, and each credential caller has a five-minute end-to-end deadline.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubCredentialService.ts:_resolveIdentity",
+            "Operation": "Resolve the GitHub account identity after token acquisition or replacement",
+            "Cardinality": "At most one shared /user request per credential generation; failed subsequent generations wait for preserved Retry-After/backoff rather than burst.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identity resolution already performed /user; the diff prevents repeated attempts during server cooldowns and bounds stalled token/identity waits.",
+            "CriticalPathEffect": "Blocks authenticated GitHub work until identity is known; cooldown waits occur before the next network attempt."
+          }
+        ],
+        "ScalingInput": "Credential generations and concurrent callers; callers share generation work while token rotation invalidates the old generation.",
+        "EffectiveConcurrency": "One identity promise per generation; callers have independent deadlines. Cooldown-waiting requests occupy retained admission but no active network slot.",
+        "CacheBehavior": "Successful identity is cached for the current generation. Failures back off; server cooldown is transferred out of the transient bootstrap account and inactive quota state is removed after expiry.",
+        "MechanismConfidence": "High confidence from credential, backoff, coordinator, and deterministic scheduler tests.",
+        "MagnitudeUncertainty": "Token churn and rate-limit prevalence vary, but the changed behavior reduces rather than increases retry cardinality.",
+        "Verdict": "No reportable regression: the diff coalesces and delays boundary work and adds bounded cleanup rather than increasing network attempts."
+      },
+      {
+        "Scenario": "Request-health telemetry and client-attribution headers",
+        "CriticalPath": "Header construction and counter/sample updates run synchronously per admitted logical request or wire attempt. A five-minute flush or service disposal emits one summary and at most ten timing events; emission is not awaited by GitHub requests.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/github/common/githubRequestTelemetry.ts:flush",
+            "Operation": "Submit aggregated product telemetry events through ITelemetryService.publicLog2",
+            "Cardinality": "Only for active windows: one summary plus at most ten reservoir samples every five minutes or on disposal; idle engines emit nothing.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No GitHub request-health summary or timing events were emitted.",
+            "CriticalPathEffect": "Flush is timer/disposal-driven and off the GitHub request critical path; per-request work is fixed-size counters and a reservoir update."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubTransport.ts:_fetchWithRetry/_download",
+            "Operation": "Send existing GitHub requests with bounded attribution headers",
+            "Cardinality": "No additional calls; fixed headers are added to each existing eligible wire attempt, with browser egress limited to one header.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The network calls already occurred without these attribution headers.",
+            "CriticalPathEffect": "Header construction precedes the existing fetch but adds no round trip or serialization proportional to request content."
+          }
+        ],
+        "ScalingInput": "Logical request and wire-attempt frequency within each five-minute window; retained timing samples stay capped at ten regardless of traffic volume.",
+        "EffectiveConcurrency": "Telemetry does not create concurrent GitHub requests. Flush emits a bounded sequence through the telemetry service, while GitHub request concurrency remains queue-controlled.",
+        "CacheBehavior": "Aggregation is window-local, reset after flush, discarded immediately when telemetry is disabled, and does not cache request/account/repository content.",
+        "MechanismConfidence": "High confidence from the collector implementation and flood/opt-out tests.",
+        "MagnitudeUncertainty": "Telemetry service internals may buffer or transmit later, but this diff invokes it at a fixed maximum of eleven events per active window.",
+        "Verdict": "No reportable regression: the introduced work is fixed per request, retained state is bounded, and emission cardinality is capped independently of request volume."
+      },
+      {
+        "Scenario": "Cancellation, resource dormancy, timeout, and service shutdown",
+        "CriticalPath": "Resource disposal/dormancy, waiter cancellation, credential replacement, and deadlines abort the propagated signal; callers reject immediately and replacement work can be admitted. Underlying browser and Agent Host fetch adapters receive the abort signal.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubRequestQueue.ts:enqueue cancel/finish and src/vs/platform/github/common/githubTransport.ts:_fetchWithRetry",
+            "Operation": "Abort active fetches and admit replacement GitHub requests",
+            "Cardinality": "Active queue occupancy is capped at four, with one per account. Cancelled logical work is removed immediately; production fetch implementations receive the abort signal.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old queue retained active occupancy until the task promise settled; the changed queue rejects and releases capacity synchronously after signaling abort.",
+            "CriticalPathEffect": "Cancellation is off the abandoned request's success path and permits current user-visible work to proceed without waiting for an obsolete request."
+          }
+        ],
+        "ScalingInput": "Frequency of resource interest changes, credential invalidations, and deadlines while requests are active.",
+        "EffectiveConcurrency": "The queue admits replacements immediately after abort. Browser fetch and the Agent Host proxy-patched global fetch receive the queue controller signal, so no concrete sustained concurrency beyond abort settlement was established.",
+        "CacheBehavior": "Cancelled waiters detach immediately; when the last waiter leaves, the shared map entry is removed and its controller is aborted. Rejected unique reads do not retain coalescing entries or waiter timers.",
+        "MechanismConfidence": "High confidence in immediate logical release and signal propagation; insufficient evidence that production adapters ignore abort long enough to create a material burst.",
+        "MagnitudeUncertainty": "Physical socket teardown may lag JavaScript abort settlement, but repository adapters are abort-aware and there is no evidence of realistic accumulated live requests or retained tasks.",
+        "Verdict": "No finding: although release moved earlier, the diff propagates abort through both production egress paths and no concrete user-visible concurrency or retention regression is established."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 34 changed files and full paginated diffs. Traced request admission, coalescing, retries, rate-limit parking, response buffering, cancellation, credential lifecycle, downloads, mutations, and telemetry. No high-confidence actionable performance regression introduced by the diff was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-30T07:30:47.614483047Z",
+    "CompletedAt": "2026-09-30T07:33:32.923629885Z",
+    "WallClockMilliseconds": 165309,
+    "ModelCalls": 9,
+    "InputTokens": 881556,
+    "OutputTokens": 11321,
+    "TotalTokens": 892877,
+    "ReasoningTokens": 6010,
+    "CacheReadTokens": 736767,
+    "CacheWriteTokens": 144762,
+    "APIDurationMilliseconds": 153284,
+    "ToolCalls": 73,
+    "NanoAIUnits": 124504480000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 736767,
+      "cache_write": 144762,
+      "input": 27,
+      "output": 11321
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
