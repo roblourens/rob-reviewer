@@ -1,0 +1,210 @@
+{
+  "PullRequest": {
+    "Number": 338900,
+    "Title": "agentHost: Retract orphaned provisional sessions",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Summary\n\n- batch provisional session markers discovered during Agent Host catalog reconciliation\n- refresh the published session list once per affected readable provider\n- notify connected clients when empty orphaned sessions are removed\n- cover the startup race with a regression test that verifies `root/sessionRemoved`\n\nThis closes the gap where startup could publish stale catalog entries before background reconciliation classified them as provisional. The existing safeguards remain unchanged: sessions are suppressed only after their provider catalog is readable, provider metadata is absent, and the conversation has no turns.\n\nFixes #338872\n\n## Validation\n\n- Passed: `npm run transpile-client`\n- Passed: `npm run hygiene`\n- Passed: `./scripts/test.sh --run src/vs/platform/agentHost/test/node/agentService.test.ts --grep \"retroactively marks an empty orphan after an already-backfilled import with incomplete candidates\"` (1 passing)\n- `npm run compile` reached built-in extension compilation but could not complete because the available dependency tree lacks `@vscode/markdown-editor`; dependency restoration was blocked by npm authentication (`E401`). No changed-file compile error was reported.",
+    "URL": "https://github.com/microsoft/vscode/pull/338900",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "9666ca8ea7a0ac0d0ce4e661c19f8a05d5d7ad79",
+    "HeadRef": "sandy081/agents/investigate-sessions-bogus-entries",
+    "HeadSHA": "7df39a918fdd5d1d79fc74d913ef257b2527bcbe",
+    "CreatedAt": "2026-09-30T13:51:43Z",
+    "UpdatedAt": "2026-09-30T13:59:51Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-1FFBD56365E5",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentService.ts",
+      "Side": "RIGHT",
+      "Line": 1045,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed loop, serial queue, unconditional invalidation, and full-list storage/provider call path are explicit in the code. The exact duration and prevalence of multi-provider orphan batches vary, but the multiplicative boundary work is deterministic whenever at least two readable providers are affected.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "SQLite operations, provider metadata calls, session-database accesses, decoded catalog objects, and CPU for full-catalog processing",
+      "PerformanceScaling": "For A affected readable providers and N registered sessions, the callback performs A serialized full-catalog computations rather than one; catalog read/decoding grows as O(A*N), and provider checks for Q provisional rows can grow as O(A*Q), with additional per-session fallback opens on catalog misses.",
+      "PerformanceOutcome": "Excessive I/O and increased latency for publishing removals and other work serialized behind session-list reconciliation",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Retroactive provisional marking only mirrored each marker and invalidated the next session-list computation; it did not force a session-list recomputation for each provider after the run.",
+      "ChangedBehavior": "After one reconciliation run batches all newly provisional session keys, the added loop queues a separate published-list refresh for every affected readable provider.",
+      "CausalDiffEvidence": "The added `for (const provider of readableProviders) { this._queuePublishedSessionListRefresh(provider); }` at RIGHT line 1045 introduces one forced refresh per provider after the batch; no corresponding forced refresh existed in this callback before the diff.",
+      "Title": "Collapse affected providers into one catalog refresh",
+      "Impact": "When one pass discovers orphaned sessions for multiple providers, removal publication for later providers is delayed behind repeated whole-catalog scans, while the agent host repeats SQLite and provider/session-storage work and can contend with normal session listing.",
+      "Evidence": "`readableProviders` already deduplicates sessions by provider, but line 1045 invokes `_queuePublishedSessionListRefresh` once for each provider. Each queued task is serialized through `_sessionListReconciliation`; `_refreshPublishedSessionList` invalidates the list and calls `listSessions()`. That starts `_computeSessions`, which calls `_listRegisteredSessions()` (SQLite registration scan), `_catalogListReader.readMany(catalogCandidates)` (bulk SQLite catalog read over all registered candidates), and `_withoutUnmaterializedProvisionalSessions`, which invokes provider `getChatMetadata` for provisional rows and may use per-session fallback storage. Because each task invalidates before listing and settled list computations are not cached, work from the first provider cannot serve the next.",
+      "Recommendation": "Queue one batched refresh with the full affected-provider set: await marker loading once, collect the exposed affected sessions, invalidate and compute `listSessions()` once, then retract hidden sessions across all affected providers from that single visible-key set."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Post-startup catalog reconciliation discovers empty source-unresolvable sessions for one or more already-readable providers and retracts rows previously published to connected clients.",
+        "CriticalPath": "Reconciliation itself starts only after host startup and the first session listing settle, so it is off initial startup. Client removal progress then depends on the queued published-list refresh; affected providers are processed serially, and each provider waits for a fresh full `listSessions()` computation before its hidden rows are retracted.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts `_listDirtySessions`, `_reconcileSession`, `_markEmptySourceUnresolvableAsProvisional`",
+            "Operation": "List registered sessions and dirty catalog receipts, then read/update tombstone, dirty, and provisional state during reconciliation.",
+            "Cardinality": "One registration list and one receipt list per pass, followed by several central-database operations per selected dirty session, with at most 50 selected in a normal pass and concurrency 4.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same reconciliation database work and durable provisional write occurred before the diff.",
+            "CriticalPathEffect": "Background reconciliation must complete before the batched marker callback runs; it is off startup but precedes publication refresh."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts `_reconcileSession`; src/vs/platform/agentHost/node/agentService.ts `_resolveCatalogReconciliationSource`",
+            "Operation": "Resolve provider/session metadata and inspect local conversation storage while deciding that a source-unresolvable session is empty.",
+            "Cardinality": "Per selected dirty session, bounded by reconciliation concurrency; storage can be skipped when unavailable as documented by the pre-check.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical source resolution and local-storage inspection already occurred.",
+            "CriticalPathEffect": "Part of background reconciliation before a marker can be published."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts `_queuePublishedSessionListRefresh`, `_refreshPublishedSessionList`, `_computeSessions`; src/vs/platform/agentHost/node/agentHostCatalogListReader.ts `readMany`",
+            "Operation": "For each affected provider, query all registrations and bulk-read/decode central catalog rows through a forced `listSessions()` computation.",
+            "Cardinality": "A complete registry query and bulk catalog read over N candidates for each of A affected readable providers, i.e. A full scans instead of one scan for the batch.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The retroactive-marker callback only updated the in-memory set and invalidated future listings; it did not force these per-provider computations.",
+            "CriticalPathEffect": "Each provider's removal publication waits for all earlier provider scans; work also occupies the shared session-list reconciliation queue."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts `_withoutUnmaterializedProvisionalSessions`, `_registeredSessionMetadata`, `_legacyRegisteredSessionMetadata`",
+            "Operation": "Call provider `getChatMetadata` (and read default-chat provider data) for provisional rows during suppression, with possible per-session fallback storage accesses for ineligible catalog rows.",
+            "Cardinality": "Up to Q provisional rows per forced full listing, repeated for each of A queued providers; catalog misses can additionally open per-session storage with fallback concurrency 4.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These calls existed for explicit listings and the one-shot readable-provider transition, but this diff newly invokes the full listing path once per provider after retroactive marking.",
+            "CriticalPathEffect": "These calls must settle before the listing returns and removals for that provider are emitted."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostStateManager.ts `retractSurfacedSession`",
+            "Operation": "Emit `root/sessionRemoved` notifications for surfaced sessions that disappear from the recomputed visible set.",
+            "Cardinality": "One notification per previously exposed marked session that is absent from the refreshed list; no notification for already-unexposed rows.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Retroactively marked sessions could be hidden from later listings but connected clients were not proactively notified on this path.",
+            "CriticalPathEffect": "This is the intended terminal action after each provider refresh and is lightweight relative to the preceding scans."
+          }
+        ],
+        "ScalingInput": "Up to the reconciliation batch size (50 for a normal pass, all dirty sessions across batches for a full pass), deduplicated to A affected readable providers; each refresh traverses N registered sessions and rechecks Q provisional rows. Exposed removals scale with the subset M that was previously published and is now hidden.",
+        "EffectiveConcurrency": "Reconciliation sessions are limited by the service's configured limiter (default 4). The new provider refreshes are appended serially to `_sessionListReconciliation`; each full listing uses a limiter of 4 for catalog fallbacks, while provisional provider metadata checks use `Promise.all`. The serial provider queue does not coalesce refreshes into one catalog computation.",
+        "CacheBehavior": "Durable provisional keys are loaded once and then updated in memory. `listSessions()` coalesces only an active computation at the same epoch; every provider refresh increments the epoch and runs after the preceding refresh, so no settled result is reused across providers. Warm SQLite pages may reduce physical reads, but registration queries, bulk catalog reads/decoding, provisional checks, and provider calls repeat. Provider metadata misses are not negatively cached here.",
+        "MechanismConfidence": "High: the changed provider loop, serial promise queue, per-refresh invalidation, full-list call path, database reads, and provider metadata calls are all explicit.",
+        "MagnitudeUncertainty": "The number of simultaneously affected readable providers is deployment-dependent and commonly small, and SQLite warmth changes absolute duration. Large catalogs and provider metadata latency determine milliseconds, but the A-fold serialized scans and calls are certain whenever multiple providers are affected.",
+        "Verdict": "Reportable medium-severity boundary fan-out: all markers are batched together, but their publication refresh is unnecessarily split into one uncached whole-catalog computation per provider."
+      },
+      {
+        "Scenario": "A reconciliation run marks sessions only for providers whose catalogs are not yet readable, or marks no sessions.",
+        "CriticalPath": "No published-list refresh is queued by the changed callback. Reconciliation remains background work; any later explicit list follows the ordinary list path, and an unreadable provider continues to fail open until its existing readable-transition refresh.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts reconciliation pass",
+            "Operation": "Existing reconciliation reads and provisional marker writes.",
+            "Cardinality": "Per dirty session selected by the existing batch and limiter.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same database operations occurred before.",
+            "CriticalPathEffect": "Background only; no new publication boundary follows in this scenario."
+          }
+        ],
+        "ScalingInput": "Zero newly marked sessions, or any number of marked sessions whose provider is absent from `_readableProviderCatalogs`.",
+        "EffectiveConcurrency": "Existing reconciliation limiter and scheduling apply. The callback performs an in-memory loop and one epoch increment only; no new queued refresh concurrency occurs.",
+        "CacheBehavior": "The session-list epoch is invalidated once per reconciliation run with markers, rather than once per marked session as before. Provisional marker loading remains one-shot. No immediate list cache is populated.",
+        "MechanismConfidence": "High: the readable-provider guard prevents queueing and the empty-set guard skips the callback entirely.",
+        "MagnitudeUncertainty": "None material for causality; the number of in-memory marker additions only affects small CPU/allocation cost.",
+        "Verdict": "No regression in this scenario; batching reduces repeated epoch invalidation and adds no expensive boundary."
+      },
+      {
+        "Scenario": "A single readable provider has retroactively marked orphan sessions and one or more of those rows were published by an earlier listing.",
+        "CriticalPath": "After background reconciliation, one serialized refresh waits for marker loading, computes one fresh session list, and emits removals. This delays removal notification but does not block initial startup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts `_refreshPublishedSessionList` and `_computeSessions`",
+            "Operation": "One registry list and one bulk central-catalog read for the fresh listing.",
+            "Cardinality": "One full-catalog computation for the sole affected provider.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No proactive refresh occurred after retroactive marking.",
+            "CriticalPathEffect": "Required before determining which exposed rows should be retracted."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts listing suppression/fallback helpers",
+            "Operation": "Provider metadata confirmation for provisional sessions and fallback storage for catalog misses.",
+            "Cardinality": "Up to Q provider checks plus fallback work for ineligible rows in one listing.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This work occurred only on the next explicit listing, not proactively on this callback.",
+            "CriticalPathEffect": "Must settle before the visible-key set and removal notifications are available."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostStateManager.ts `retractSurfacedSession`",
+            "Operation": "Deliver removal notifications to connected clients.",
+            "Cardinality": "M notifications.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No proactive notification occurred.",
+            "CriticalPathEffect": "Terminal intended effect; each notification follows the one list computation."
+          }
+        ],
+        "ScalingInput": "One affected provider, N registered sessions, Q provisional rows, and M exposed newly hidden rows.",
+        "EffectiveConcurrency": "Exactly one new refresh is queued for the provider. Catalog fallback work is limited to 4; provisional metadata checks retain the existing listing concurrency behavior.",
+        "CacheBehavior": "The refresh deliberately invalidates and recomputes once. A concurrent in-flight list can hand off to a trailing computation at the new epoch, so callers coalesce around that work. Cold storage/provider reads cost more; warm catalog data still requires the query and decode.",
+        "MechanismConfidence": "High: the test and call path establish the published-row race and one refresh.",
+        "MagnitudeUncertainty": "Absolute latency depends on catalog size, catalog eligibility, and provider speed. With one provider, one proactive recomputation is necessary to preserve the intended notification semantics and is not independently reported.",
+        "Verdict": "No separate performance finding for the single-provider case; one recomputation is bounded and directly serves the requested client notification behavior."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and traced startup/background reconciliation, marker mirroring, session-list computation, provider/storage fallbacks, and client notification. Submitted one medium-confidence-high finding for per-provider full-catalog refresh fan-out; no regression-fix learning record was warranted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-30T14:10:44.06032161Z",
+    "CompletedAt": "2026-09-30T14:13:15.267402702Z",
+    "WallClockMilliseconds": 151207,
+    "ModelCalls": 10,
+    "InputTokens": 349126,
+    "OutputTokens": 8751,
+    "TotalTokens": 357877,
+    "ReasoningTokens": 3672,
+    "CacheReadTokens": 286631,
+    "CacheWriteTokens": 62465,
+    "APIDurationMilliseconds": 140065,
+    "ToolCalls": 50,
+    "NanoAIUnits": 60211740000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 286631,
+      "cache_write": 62465,
+      "input": 30,
+      "output": 8751
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

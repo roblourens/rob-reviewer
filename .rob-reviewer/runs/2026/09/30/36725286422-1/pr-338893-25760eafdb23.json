@@ -1,0 +1,130 @@
+{
+  "PullRequest": {
+    "Number": 338893,
+    "Title": "Don't cache prompt discovery results from a cancelled scan",
+    "Body": "Follow-up to #338883, addressing the Copilot review comment on that PR.\n\n### Problem\n\n#338883 made the filesystem branches of `computeListPromptFiles` report cancellation as an error so a cancelled scan could not be cached as a permanent \"no prompt files\" answer.\n\nThat left one branch uncovered. `ExtensionPromptFileService._listFromProviders` bails out of its provider loop **without** throwing:\n\n```ts\nfor (const providerEntry of providers) {\n    if (token.isCancellationRequested) {\n        break;              // returns a partial result, no throw\n    }\n```\n\nSo if cancellation lands while the extension-provider branch is running and the filesystem branches either already finished or are policy-blocked (`allowStandalone === false` makes them literal `[]`), the combined `Promise.all` resolves normally. The partial list is then stored in `cachedFileLocations[type]` and never evicted — the exact state #338883 set out to fix.\n\nThis is reachable in practice, not theoretical: extension activation (`activateByEvent`) is slow relative to the file scans, so the provider branch is often the last one outstanding.\n\n### Change\n\nRe-check the token after the combined computation, so no branch that swallows cancellation can have its result accepted and cached:\n\n```ts\n// A branch may stop early on cancellation without throwing (extension\n// providers do), so re-check before this result is accepted and cached.\nif (token.isCancellationRequested) {\n    throw new CancellationError();\n}\n```\n\nThe guard is placed at the combined result rather than in `_listFromProviders`, because that loop's tolerance is intentional (it stops calling further providers without erroring), and a single choke point also covers any future branch that swallows cancellation.\n\n### Testing\n\nAdded `does not cache a partial result when a provider swallows cancellation`. It enables the strict-plugin-only lockdown so the filesystem branches are literal `[]`, making the provider the only possible cancellation source — the test is therefore deterministic and specifically covers this gap rather than the path already fixed in #338883.\n\n| Command | Result |\n| --- | --- |\n| `./scripts/test.sh --runGlob \"**/contrib/chat/test/**/promptSyntax/**/*.test.js\"` | passed (802 passing) |\n| `./scripts/test.sh --runGlob \"**/contrib/chat/test/**/*.test.js\"` | 11032 passing, 2 pre-existing failures |\n| `npm run typecheck-client` | passed |\n\nThe new test was verified to fail without the guard (`AssertionError: Missing expected rejection (CancellationError)`) and pass with it.\n\nThe 2 remaining failures are pre-existing and unrelated — `agentHostChatContribution.test.ts` hardcodes `/home/test-user` as the home directory and fails identically on a clean checkout of `main`.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/338893",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "aeschli",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "73d5322bb28c1a3c449fcee6c3869af33fad5027",
+    "HeadRef": "aeschli/no-cache-cancelled-prompt-discovery",
+    "HeadSHA": "25760eafdb2305e4ecf8c7815bb75254db14d94f",
+    "CreatedAt": "2026-09-30T12:07:56Z",
+    "UpdatedAt": "2026-09-30T13:21:56Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold prompt-file discovery for one prompt type, including cancellation during an extension provider",
+        "CriticalPath": "listPromptFiles awaits computeListPromptFiles, which awaits all five source branches; extension discovery waits for extension registration, activation, and sequential provider callbacks, while standalone discovery waits for local/user filesystem search. The new token check runs only after all branches settle and is therefore on the critical path, but it is a constant-time read.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/utils/promptFilesLocator.ts:listFilesWithSource",
+            "Operation": "Resolve or search configured local and user prompt locations and enumerate matching files.",
+            "Cardinality": "Two top-level branches per uncached prompt type (local and user), with configured locations processed sequentially inside each branch; effective calls scale with deduplicated configured source locations and workspace roots.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same local and user scans ran with the same cardinality and parallel placement before the diff.",
+            "CriticalPathEffect": "Both branches must finish before the combined discovery result can be returned. Cancellation is already surfaced from these branches after each location."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/service/extensionPromptFileService.ts:getExtensionPromptFiles/_listFromProviders",
+            "Operation": "Wait for extension registration, activate extensions for the prompt-type activation event, and invoke each registered prompt-file provider.",
+            "Cardinality": "One activation event per uncached type discovery, then one callback per provider of that type, sequentially; in the strict-plugin-only test there is one provider and zero standalone filesystem branches.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The identical activation and provider calls ran before the diff, but a normally resolved partial provider result could pass through to cache admission.",
+            "CriticalPathEffect": "Provider activation/callbacks are awaited by the extension branch and the combined Promise.all. A provider may observe cancellation and return normally, which is the condition handled by the added guard."
+          }
+        ],
+        "ScalingInput": "Configured prompt source locations, workspace roots, and registered providers for one prompt type. Cancellation does not add a boundary call; a later explicit request starts one fresh discovery after the canceled result is rejected.",
+        "EffectiveConcurrency": "The five source branches run under one Promise.all. Local and user scans can overlap; providers remain sequential after one activation. The per-type promise cache coalesces concurrent callers when a file-locator event has initialized caching; rejection clears only that same promise.",
+        "CacheBehavior": "Warm successful results remain unchanged. On a cold canceled scan, the added guard rejects instead of admitting a partial positive/empty result; the existing catch evicts that rejected promise. The next request performs a fresh scan and can then become the warm cached result. No negative cache or retry loop is introduced.",
+        "MechanismConfidence": "High: the changed guard, surrounding Promise.all, cache assignment, identity-checked eviction, provider loop, and filesystem cancellation behavior were directly traced.",
+        "MagnitudeUncertainty": "Filesystem and activation duration vary with workspace layout and extensions, but the added work itself is one token-state read and one exception only when the initiating scan was canceled.",
+        "Verdict": "No reportable regression. The diff adds no expensive boundary or fan-out and prevents a canceled partial result from entering the cache. Re-execution occurs only after cancellation and a subsequent request, preserving intentional cancellation semantics."
+      },
+      {
+        "Scenario": "Warm or concurrent prompt discovery consumers, including all-type commands and customization migration",
+        "CriticalPath": "A warm per-type call returns the cached promise before computeListPromptFiles, so it never reaches the new check. Cold calls for different types can run concurrently in all-type consumers; same-type callers share the existing promise when caching is active.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/service/promptsServiceImpl.ts:computeListPromptFiles",
+            "Operation": "Discover local/user files for each cold prompt type requested by the consumer.",
+            "Cardinality": "At most two top-level standalone discovery branches per cold type; all-type consumers may request five distinct types concurrently, exactly as before. Warm per-type calls add no scans.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same per-type branch count and cross-type concurrency existed before the diff.",
+            "CriticalPathEffect": "Cold consumers await discovery; warm consumers await or receive the cached promise. The token check does not affect uncanceled completion."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/service/extensionPromptFileService.ts:_listFromProviders",
+            "Operation": "Activate and query prompt-file providers for agent, instructions, prompt, and skill types; hooks have no provider activation event.",
+            "Cardinality": "One activation event per cold supported type and sequential calls to providers registered for that type; warm results avoid these calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical provider cardinality, ordering, and cache coalescing.",
+            "CriticalPathEffect": "Cold discovery waits for activation/providers. The diff neither adds nor reorders these operations."
+          }
+        ],
+        "ScalingInput": "Number of distinct prompt types requested concurrently, configured locations, and providers. Same-type concurrency is coalesced by the existing cache; cross-type work remains independent.",
+        "EffectiveConcurrency": "All-type consumers use Promise.all across up to five types. Within each type, source branches overlap and providers serialize. The diff does not create an aggregate concurrency burst.",
+        "CacheBehavior": "Warm cache hits return before the new line. Successful cold cache population is unchanged. If the token owning a shared cold computation is canceled, all sharers already observe that shared computation's outcome; the new behavior rejects and evicts rather than preserving a partial result, after which a later call may retry once.",
+        "MechanismConfidence": "High: callers using Promise.all, the early cache return, per-type cache key, and changed post-computation guard were inspected directly.",
+        "MagnitudeUncertainty": "The frequency of concurrent canceled and uncanceled consumers is unknown, but no automatic retry or newly introduced boundary exists.",
+        "Verdict": "No reportable regression. The change does not alter warm-path work, normal cold-path cardinality, or concurrency; only canceled incomplete computations are denied cache admission."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and the surrounding cache, provider, filesystem, built-in, and caller paths. The added post-computation cancellation check is constant-time and routes canceled partial discovery through the existing identity-checked cache eviction. It introduces no boundary work, retention, fan-out, or hot-path repetition. No performance findings and no qualifying performance regression fix were identified."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-09-30T14:09:27.059646299Z",
+    "CompletedAt": "2026-09-30T14:10:40.204919504Z",
+    "WallClockMilliseconds": 73145,
+    "ModelCalls": 8,
+    "InputTokens": 229202,
+    "OutputTokens": 4042,
+    "TotalTokens": 233244,
+    "ReasoningTokens": 834,
+    "CacheReadTokens": 181694,
+    "CacheWriteTokens": 47484,
+    "APIDurationMilliseconds": 62381,
+    "ToolCalls": 37,
+    "NanoAIUnits": 39103360000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 181694,
+      "cache_write": 47484,
+      "input": 24,
+      "output": 4042
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
