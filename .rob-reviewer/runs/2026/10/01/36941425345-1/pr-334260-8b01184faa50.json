@@ -1,0 +1,190 @@
+{
+  "PullRequest": {
+    "Number": 334260,
+    "Title": "Implement queueing for busy target chats in send_message tool",
+    "Body": "This pull request implements queueing behavior for the `send_message` tool when the target chat is busy. \n\n### Changes made:\n- Updated the `send_message` functionality to queue messages if the target chat is currently busy, preserving the active turn and allowing multiple messages to be queued in FIFO order.\n- Modified the dispatch logic in `sessionServerTools.ts` to handle the new queueing mechanism.\n- Regenerated prompt snapshots to reflect the updated tool description.\n- Added focused unit tests to ensure the new queueing behavior is validated.\n\n### Testing:\n- Automated tests were run to confirm that the original active turn remains intact, messages are queued correctly, and the expected results are returned.\n- Manual end-to-end tests were outlined to verify the functionality in a real-world scenario, ensuring that queued messages are processed correctly after the target chat becomes idle. \n\nThis enhancement improves the usability of the `send_message` tool by allowing users to send messages even when the target chat is busy, ensuring that important communications are not lost.",
+    "URL": "https://github.com/microsoft/vscode/pull/334260",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0c3231b3f5a473fbc59ea1d3161c75f95083e9b9",
+    "HeadRef": "sandy081/agents/send-message-tool-overview-limitations-200967e2",
+    "HeadSHA": "8b01184faa5031a85e3736b228ab318f290013ec",
+    "CreatedAt": "2026-09-03T14:28:26Z",
+    "UpdatedAt": "2026-09-04T09:34:10Z",
+    "MergedAt": "2026-09-04T09:30:10Z",
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "unbounded-retention",
+      "serialization-allocation",
+      "concurrency-burst",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "send_message targets an idle chat",
+        "CriticalPath": "The tool awaits one existing listSessions computation and then startPrompt's synchronous turn admission. Provider execution is launched by the existing side-effects path and is asynchronous relative to the tool result, so remote model completion is off the tool critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:2080-2190 listSessions/_computeSessions",
+            "Operation": "Enumerate registered sessions, read provider metadata, and overlay per-session database metadata.",
+            "Cardinality": "One logical listSessions call per send_message invocation; cold computation groups bulk prewarming once per involved provider and limits per-session metadata/database work to concurrency 4. Concurrent listings use the existing in-flight computation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same applySendMessageTool path called accessor.listSessions before this PR.",
+            "CriticalPathEffect": "Must complete before target validation and turn admission."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:1257 _startSessionPrompt and agentSideEffects.ts:1707 _sendTurnMessage",
+            "Operation": "Admit one turn and eventually send one message to the selected agent provider.",
+            "Cardinality": "Exactly one provider send for the idle target message.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Idle targets already called startPrompt once and followed the same provider path.",
+            "CriticalPathEffect": "Turn admission occurs before the tool result; provider completion remains asynchronous and off the tool-result critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostStateManager.ts:1602 dispatchServerAction and protocolServerHandler.ts:2040 _broadcastAction",
+            "Operation": "Broadcast the ChatTurnStarted action to relevant connected clients.",
+            "Cardinality": "One action per admitted message, fanned out only to relevant active clients.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The prior startPrompt path emitted the same turn-start action.",
+            "CriticalPathEffect": "Synchronous action emission occurs during admission; transport processing is not awaited by the tool."
+          }
+        ],
+        "ScalingInput": "Registered-session count controls existing target-resolution work; one target message controls admission. The diff adds only a local chat-state read on this path.",
+        "EffectiveConcurrency": "Existing list metadata reads are limited to 4 and in-flight listings are coalesced; one provider turn is admitted for this idle message.",
+        "CacheBehavior": "Cold listings may prewarm provider metadata and open per-session databases; warm/concurrent calls use existing provider caches and in-flight coalescing. The new local getChatState check has no separate cache lifecycle.",
+        "MechanismConfidence": "High: the unchanged list/startPrompt call path and new local idle-state branch are explicit.",
+        "MagnitudeUncertainty": "Provider metadata duration varies with catalogue size and provider implementation, but that boundary and its cardinality are unchanged by the diff.",
+        "Verdict": "No reportable regression: idle-target behavior retains the previous expensive boundaries and cardinality."
+      },
+      {
+        "Scenario": "send_message targets a chat with an active turn or pending messages",
+        "CriticalPath": "The tool still awaits the existing listSessions computation, then synchronously appends a pending message and returns. Provider work is deferred until queue admission after a successful/local-command turn end and is therefore off the send_message tool critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:2080-2190 listSessions/_computeSessions",
+            "Operation": "Resolve the known target through the existing session catalogue and metadata pipeline.",
+            "Cardinality": "One logical listing per invocation with existing provider grouping, concurrency-4 metadata limiting, and in-flight coalescing.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same listing ran before every send_message call.",
+            "CriticalPathEffect": "Blocks target validation before enqueue."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionServerTools.ts:1094-1100 and protocolServerHandler.ts:2040",
+            "Operation": "Emit and broadcast one ChatPendingMessageSet action carrying the queued message.",
+            "Cardinality": "One action per busy-target send, fanned out to relevant connected clients; process-wide server-tool sends are capped at 50.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The message instead entered startPrompt immediately and emitted a ChatTurnStarted action; there was no pending-message action.",
+            "CriticalPathEffect": "Synchronous state reduction and emission occur before the queued result; client transport completion is not awaited."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts:89-151 and agentSideEffects.ts:1707",
+            "Operation": "When admitted, send the queued message to the provider as its own turn.",
+            "Cardinality": "One provider send per queued message, serial per chat because only the queue head is admitted after the preceding turn ends successfully; no aggregate burst is introduced.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The provider path was scheduled immediately by startPrompt even while the target was busy.",
+            "CriticalPathEffect": "Deferred from the tool call and placed behind prior chat work by design."
+          }
+        ],
+        "ScalingInput": "Queue length and message size control retained bytes, reducer copying, and IPC bytes. Queue cardinality from this server-tool group is bounded by the singleton process-wide 50-send cap; completed entries are removed and session/chat disposal releases state.",
+        "EffectiveConcurrency": "Per-chat effective provider concurrency is one queued turn at a time. Different chats can progress independently, while the global server-tool send count remains capped at 50.",
+        "CacheBehavior": "The queue is authoritative state rather than a cache. There are no cache misses or retries; state is removed on consumption and all chat state is removed on chat/session disposal. Existing listSessions cold/warm behavior is unchanged.",
+        "MechanismConfidence": "High: reducer append behavior, IPC emission, queue-drain serialization, process cap, and cleanup ownership are all directly traced.",
+        "MagnitudeUncertainty": "Exact message bytes and connected-client count vary, but the extra action count and queue cap are explicit. At this bound, O(q) append copies and one additional broadcast per item do not establish a significant user-visible regression.",
+        "Verdict": "No reportable performance regression. The added retention and action broadcast are bounded, and serial provider admission is the intended busy-chat scheduling behavior rather than an accidental fan-out or burst."
+      },
+      {
+        "Scenario": "send_message targets an idle chat that already retains queued or steering state",
+        "CriticalPath": "After the unchanged listSessions call, the new branch appends another pending message and returns. Because QueueDrainContribution reacts to client-action hooks and turn-end events, this server-originated enqueue does not itself force an idle stale queue to drain.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionServerTools.ts:1088-1100",
+            "Operation": "Broadcast each additional pending-message action containing the message text.",
+            "Cardinality": "One per invocation, bounded by the 50 process-wide successful send_message calls and relevant-client fan-out.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Before the diff, startPrompt admitted a turn immediately instead of appending to pending state.",
+            "CriticalPathEffect": "Action reduction/emission precedes the tool result; no provider boundary is entered on this path."
+          }
+        ],
+        "ScalingInput": "Number and size of later send_message calls while stale pending state remains; at most 50 successful calls from the singleton tool group before process restart, with state also bounded by chat/session lifetime.",
+        "EffectiveConcurrency": "No provider work is launched by these server-originated pending actions; local enqueues are synchronous.",
+        "CacheBehavior": "No cache is involved. Pending messages remain authoritative state until manual removal/admission or chat/session cleanup.",
+        "MechanismConfidence": "High for the hook mismatch and bounded retention; low that the bounded retained bytes create a material performance symptom independent of the correctness issue.",
+        "MagnitudeUncertainty": "Messages have no schema maxLength, but realistic payloads are constrained by model/tool-call context and the number of retained entries is process-bounded.",
+        "Verdict": "No performance finding. The dominant defect risk is correctness (messages may remain queued), which this focus must not report; the associated memory and IPC work are bounded and cleaned up with the owning state."
+      },
+      {
+        "Scenario": "agent prompt/tool-definition construction after the description update",
+        "CriticalPath": "The send_message description is included in provider tool definitions when prompts are assembled; the generated snapshots demonstrate the constant text increase. It travels with otherwise existing model requests.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionServerTools.ts:164 and generated provider prompt snapshots",
+            "Operation": "Transmit the slightly longer send_message tool description as part of provider request metadata/prompts.",
+            "Cardinality": "A constant description-size increase per request that advertises server tools; independent of session count or queue length.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The prior description omitted one sentence about queueing.",
+            "CriticalPathEffect": "Adds a small constant number of request bytes/tokens to the existing model request."
+          }
+        ],
+        "ScalingInput": "Number of model requests; per-request added bytes are constant.",
+        "EffectiveConcurrency": "No scheduling or concurrency behavior changes from the text update.",
+        "CacheBehavior": "Generated snapshots are test artifacts; provider-side prompt caching, if any, is unchanged in keying and lifecycle by this diff.",
+        "MechanismConfidence": "High for a constant payload increase, high that it is below the threshold for an actionable performance regression.",
+        "MagnitudeUncertainty": "Provider tokenization differs, but the literal increase is small and constant.",
+        "Verdict": "No reportable regression; this is a necessary constant-size documentation update, not scaling serialization or allocation."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 21 changed files and every diff page. Traced idle and busy send paths through session enumeration, state reduction, IPC broadcast, queue drain, provider dispatch, concurrency, and cleanup. No high-confidence actionable performance regression was introduced; no regression-fix learning signal was established."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-01T23:40:31.071312632Z",
+    "CompletedAt": "2026-10-01T23:42:52.260172328Z",
+    "WallClockMilliseconds": 141188,
+    "ModelCalls": 14,
+    "InputTokens": 931169,
+    "OutputTokens": 9845,
+    "TotalTokens": 941014,
+    "ReasoningTokens": 2645,
+    "CacheReadTokens": 827037,
+    "CacheWriteTokens": 104090,
+    "APIDurationMilliseconds": 131160,
+    "ToolCalls": 109,
+    "NanoAIUnits": 104833280000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 827037,
+      "cache_write": 104090,
+      "input": 42,
+      "output": 9845
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
