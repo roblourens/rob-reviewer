@@ -1,0 +1,166 @@
+{
+  "PullRequest": {
+    "Number": 339008,
+    "Title": "Avoid unnecessary --numstat diff for incoming changes decorations",
+    "Body": "## Problem and Context\r\n\r\n`GitIncomingChangesFileDecorationProvider.getIncomingChanges()` (in\r\n`extensions/git/src/decorationProvider.ts`) computes the \"Incoming Changes\"\r\nfile badges by calling `repository.diffBetweenWithStats()`. That method runs:\r\n\r\n```\r\ngit diff --raw --numstat --diff-filter=ADMR -z --find-renames=\u003cthreshold\u003e% \u003cref1\u003e...\u003cref2\u003e --\r\n```\r\n\r\nThe only consumer of the result, `collectIncomingChangesFileDecorations()`,\r\nreads only `change.status`, `change.uri`, and `change.originalUri` to pick a\r\nbadge glyph (added/deleted/renamed/modified). It never reads the\r\n`insertions`/`deletions` stats that `--numstat` computes, so that work is\r\nalways discarded.\r\n\r\nThis code path runs automatically and without debounce whenever\r\n`historyProvider.onDidChangeCurrentHistoryItemRefs` fires, which happens on\r\nevery git write operation and on every VS Code built-in auto-fetch tick\r\n(`git.autofetch`, default every 180s) for any repository whose checked-out\r\nbranch has an upstream.\r\n\r\nOn a large repository backed by a partial-clone or virtualized-filesystem\r\nremote (e.g. GVFS/VFS for Git), `--numstat` forces git to read full blob\r\ncontent for every added/modified/deleted path in the diff range, and each of\r\nthose reads is a lazy network fetch rather than a local disk read. We\r\nmeasured this directly: on such a repository, incoming ranges touching\r\nseveral thousand files took 60-200+ seconds and pulled thousands of objects\r\nover the network, purely to compute stats that are then thrown away. Because\r\nthe handler isn't debounced, repeated ref-change events can also stack up\r\nmultiple concurrent invocations of this work.\r\n\r\n## Changes\r\n\r\n- `getIncomingChanges()` now calls `repository.diffBetween()` instead of\r\n  `repository.diffBetweenWithStats()`. `diffBetween()` already exists as a\r\n  sibling method, already returns exactly the `Change[]` shape this caller\r\n  needs (status + uri + originalUri), and builds a cheaper diff with no\r\n  `--numstat` and no explicit `--find-renames` flag.\r\n- No other call sites, types, or configuration (e.g. `git.similarityThreshold`,\r\n  rename detection) are touched; `diffBetweenWithStats()` remains available\r\n  and unchanged for its other callers.\r\n\r\n## Known gaps and deliberate decisions\r\n\r\n- **Rename badge may show as added+deleted instead of renamed, for non-default\r\n  git config** — `diffBetween()` does not pass\r\n  `--find-renames=\u003cgit.similarityThreshold\u003e%` the way `diffBetweenWithStats()`\r\n  did, so incoming-change rename detection now falls back to git's own\r\n  `diff.renames` default instead of the user's configured threshold. With\r\n  default git and VS Code settings (`diff.renames` on, 50% threshold on both\r\n  sides) the output is identical either way. Only a repository with\r\n  `diff.renames` explicitly disabled, or a `git.similarityThreshold` far from\r\n  50%, would see a renamed file decorated as separate added (`↓A`) and deleted\r\n  (`↓D`) badges instead of a single renamed (`↓R`) badge. The set of files\r\n  decorated as \"incoming changes\" is unaffected either way; only the glyph\r\n  choice for renames can differ, and only for non-default configs. This\r\n  tradeoff was evaluated and accepted to avoid reintroducing the\r\n  `--numstat`/blob-hydration cost this PR removes. No follow-up is planned; a\r\n  full fix would mean plumbing `similarityThreshold` into `diffBetween()`,\r\n  which is a separate, larger change.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339008",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "tyrielv",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "f5f73df304d9c5eeab64d4d07eed57e007742a92",
+    "HeadRef": "fix/incoming-changes-decoration-numstat",
+    "HeadSHA": "3d4d603da0f851903e39e213c33652739deb43a4",
+    "CreatedAt": "2026-09-30T22:46:07Z",
+    "UpdatedAt": "2026-10-01T01:04:56Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "extensions/git/src/decorationProvider.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 261,
+      "BasePath": "extensions/git/src/decorationProvider.ts",
+      "BaseLine": 261,
+      "IntroducingPath": "extensions/git/src/decorationProvider.ts",
+      "IntroducingCommit": "c95739960ff4c35dd0bf89ef8a8812eb377d7dfc",
+      "MechanismFamily": "eager-work",
+      "PerformanceCategory": "io",
+      "Mechanism": "The automatic incoming-decoration refresh eagerly requested insertion/deletion statistics for every changed path even though the only consumer discarded those fields. --numstat requires content comparison and can hydrate missing blobs in partial or virtualized repositories, so the cost scales with the incoming changed-file/content set and can overlap across refreshes.",
+      "Symptom": "Incoming-decoration refreshes on large partial-clone or virtualized repositories could spend 60-200+ seconds and fetch thousands of objects solely for unused numstat data, delaying decoration updates and consuming network/disk I/O.",
+      "FixedBehavior": "Changed line 261 calls diffBetween, whose no-path implementation executes git diff --name-status -z --diff-filter=ADMR for the same triple-dot range. This preserves the Change[] metadata needed by decorations while removing --numstat output, its parser allocations, and eager per-file content/stat work.",
+      "Evidence": "Base line 261 called Repository.diffBetweenWithStats from GitIncomingChangesFileDecorationProvider.getIncomingChanges. That wrapper invokes git diff with --raw --numstat and parses insertion/deletion maps, while collectIncomingChangesFileDecorations consumes only status, uri, and originalUri. The provider runs initially when enabled and on current-history-ref changes after write operations; reported measurements for large partial-clone/VFS ranges are 60-200+ seconds and thousands of hydrated objects. Blame attributes the base line to c95739960ff4c35dd0bf89ef8a8812eb377d7dfc.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "concurrency-burst",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Initial incoming-change decorations when Git decorations are enabled",
+        "CriticalPath": "Provider construction invokes the refresh immediately. Publishing the initial incoming-change decoration map waits for merge-base resolution and the diff subprocess; repository opening itself does not await the handler, so this is critical to badge availability but off the repository-open completion path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/historyProvider.ts:resolveHistoryItemRefsCommonAncestor",
+            "Operation": "Resolve the common ancestor of the checked-out and upstream refs with git merge-base.",
+            "Cardinality": "One git merge-base subprocess per repository with both local and upstream refs; independent providers can run one each concurrently.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Exactly the same merge-base subprocess ran before the diff.",
+            "CriticalPathEffect": "Must finish before the diff range and initial decoration map can be computed."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/decorationProvider.ts:261 via extensions/git/src/git.ts:diffBetween",
+            "Operation": "Run git diff --name-status -z --diff-filter=ADMR for the triple-dot incoming range.",
+            "Cardinality": "One git diff subprocess per effective provider initialization; output and CPU scale with the N paths in the incoming range.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One subprocess also ran, but it used --raw --numstat plus explicit rename detection, computed line statistics for all changed paths, emitted more bytes, and allocated a numStats map that the decoration consumer never used.",
+            "CriticalPathEffect": "Must finish before initial incoming-change badges are published."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/git/src/git.ts:diffBetween / Git object access",
+            "Operation": "Git obtains missing objects required to evaluate the diff.",
+            "Cardinality": "On a cold partial clone or virtualized repository, the prior numstat command could fetch missing objects for many of the N changed paths; after the change, name/status generally needs tree metadata, with possible blob reads limited to rename detection behavior.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old --numstat path could force full content access and per-path object hydration; the changed command removes that stats-driven fan-out.",
+            "CriticalPathEffect": "Any lazy object hydration occurs inside the awaited diff and delays badge availability while consuming network and object-store I/O."
+          }
+        ],
+        "ScalingInput": "R open repositories with upstream branches, each with N changed paths between merge base and upstream; effective cardinality is one merge-base plus one diff command per repository initialization, with output/decoration objects proportional to N.",
+        "EffectiveConcurrency": "Within one refresh, merge-base and diff are serialized. Repository.run tracks these read-only operations but does not limit them. Providers for multiple repositories initialize independently, and async event listeners are not awaited, so initial/nearby refreshes can overlap; the diff shortens rather than creates that exposure.",
+        "CacheBehavior": "There is no result cache or in-flight coalescing. Completed ref identities suppress later unchanged events. Previously, warm local object caches still paid numstat content scanning and larger output parsing; cold partial-clone/VFS object caches could additionally hydrate missing blobs. The changed name/status diff avoids numstat work, although configured rename detection can still inspect rename candidates.",
+        "MechanismConfidence": "High: the call path, command arguments, consumer fields, initial invocation, and absence of a read-operation limiter are explicit in repository code. The diff only removes work from this path.",
+        "MagnitudeUncertainty": "Exact startup delay depends on repository count, incoming range size, object locality, rename configuration, and whether decorations are enabled (default true). The removed mechanism is largest on cold partial clones; locally complete repositories still benefit from less content work and smaller parsing allocations.",
+        "Verdict": "No reportable regression. The PR preserves boundary-call cardinality and replaces unused numstat/content work with cheaper name/status metadata, reducing subprocess CPU, I/O, output bytes, parsing allocations, and cold-object hydration."
+      },
+      {
+        "Scenario": "Incoming-decoration refresh after commits, fetches, pulls, and enabled periodic autofetch",
+        "CriticalPath": "Write-operation completion fires the history-ref event without awaiting decoration listeners, so decoration work is off the originating commit/fetch/pull critical path. The merge-base and diff remain on the critical path for updated badges and can compete for Git, disk, CPU, and network resources with later work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/historyProvider.ts:resolveHistoryItemRefsCommonAncestor",
+            "Operation": "Compute the local/upstream common ancestor.",
+            "Cardinality": "Zero when completed cached ref identities are unchanged; otherwise one git merge-base subprocess per effective changed-ref event per repository.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same subprocess and cardinality.",
+            "CriticalPathEffect": "Blocks recomputation and publication of updated incoming badges, not completion of the originating write operation."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/decorationProvider.ts:261 via extensions/git/src/git.ts:diffBetween",
+            "Operation": "Read status and paths for incoming changes.",
+            "Cardinality": "Zero for unchanged completed refs; otherwise one git diff subprocess per effective changed-ref event, with work/output proportional to N incoming paths. Enabled autofetch can trigger write events every configured period (180 seconds by default when autofetch is enabled; autofetch itself defaults off).",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same event issued one diff command with --numstat, eagerly calculating unused insertion/deletion counts and parsing a larger response.",
+            "CriticalPathEffect": "Blocks updated badge publication and consumes shared system resources off the originating write critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/git/src/git.ts diff subprocess / partial-clone object provider",
+            "Operation": "Fetch missing Git objects needed by the diff command.",
+            "Cardinality": "Previously up to the missing objects needed for N changed paths on cold partial-clone/VFS storage; now stats-driven per-path hydration is removed, subject only to Git's rename detection needs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Old numstat content comparison could fetch thousands of objects for large incoming ranges; the changed metadata-only command removes that cause.",
+            "CriticalPathEffect": "Lazy fetches inside Git delay badge refresh and may create network bursts when multiple uncoalesced refreshes overlap."
+          }
+        ],
+        "ScalingInput": "E effective changed-ref events across R repositories, each covering N incoming paths after equality suppression; subprocess count is up to 2*E*R and overlapping work is unbounded by the repository operation tracker, while per-diff data scales with N.",
+        "EffectiveConcurrency": "GitHistoryProvider throttles its own write-operation handler to a current call plus one queued call, but the decoration event callback is async and not awaited. Its cached refs are committed only after computation, and Repository.run has no read-only limiter, so slow refreshes can overlap across events and repositories. This missing coalescing is pre-existing; replacing numstat makes each overlapping operation materially cheaper.",
+        "CacheBehavior": "After a refresh completes, equal local/remote ref identities skip subsequent unchanged events. There is no cache by range and no negative cache; a changed range is recomputed. Cold versus warm object behavior matches the initialization scenario, and the new command removes numstat-driven content hydration.",
+        "MechanismConfidence": "High: all write operations feed the throttled history update, changed refs fire the subscribed provider, the callback awaits merge-base then diff, and only status/URI fields are consumed. No added boundary or hotter placement is introduced.",
+        "MagnitudeUncertainty": "Autofetch is opt-in, write frequency varies, and exact overlap depends on diff duration and event timing. Large incoming ranges and remote-backed object stores maximize the difference; the changed mechanism is still definitively cheaper for the data this consumer uses.",
+        "Verdict": "No reportable regression. Event frequency, command count, scheduling, and lack of coalescing are unchanged; the PR removes discarded per-path stat computation and therefore reduces latency/resource contention on every effective refresh."
+      }
+    ],
+    "Summary": "Completed the performance pass over the full one-file diff and traced initialization and write/autofetch refresh scenarios through merge-base, Git diff, parsing, decoration publication, cold/warm object access, and concurrency. No diff-introduced performance issue was found. The change is a verified eager-work regression fix, recorded against introducing commit c95739960ff4c35dd0bf89ef8a8812eb377d7dfc."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-01T19:58:01.146194753Z",
+    "CompletedAt": "2026-10-01T19:59:37.035707126Z",
+    "WallClockMilliseconds": 95889,
+    "ModelCalls": 11,
+    "InputTokens": 282884,
+    "OutputTokens": 13818,
+    "TotalTokens": 296702,
+    "ReasoningTokens": 2625,
+    "CacheReadTokens": 239591,
+    "CacheWriteTokens": 43260,
+    "APIDurationMilliseconds": 77841,
+    "ToolCalls": 59,
+    "NanoAIUnits": 58862840000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 239591,
+      "cache_write": 43260,
+      "input": 33,
+      "output": 13818
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
