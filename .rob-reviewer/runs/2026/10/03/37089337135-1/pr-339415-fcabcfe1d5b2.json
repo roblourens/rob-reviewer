@@ -1,0 +1,191 @@
+{
+  "PullRequest": {
+    "Number": 339415,
+    "Title": "Scope content exclusion path rules to their repository",
+    "Body": "Path globs from every cached repository were flattened into a single list, so a nested repo with `paths: [\"*\"]` caused Copilot to exclude every file in a multi-repo workspace.\r\n\r\n- Store compiled globs per repository fetch URL and only test a file against globs from its own repositories plus org-wide (non-git) rules.\r\n- `asMinimatchPatterns` now returns only org-wide patterns; repo-scoped rules are enforced per result.\r\n- `SearchServiceImpl.findFiles` searches with the requested limit first and only re-searches unbounded when a full page lost results to filtering.\r\n\r\nFixes #338368 \r\n\r\nI performed a before/after test and confirm this fix works\r\n\r\n\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339415",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sw23",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "de2aa1584c60d5250038e93362e71f5c4105e961",
+    "HeadRef": "sw23/content-exclusion-repo-scoping",
+    "HeadSHA": "fcabcfe1d5b21fd82053b9953df4f3b210ebaa9d",
+    "CreatedAt": "2026-10-02T23:00:16Z",
+    "UpdatedAt": "2026-10-03T00:51:00Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-08994F2426EA",
+      "Focus": "performance-review",
+      "Path": "extensions/copilot/src/platform/search/vscode-node/searchServiceImpl.ts",
+      "Side": "RIGHT",
+      "Line": 37,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The exact boundary call, trigger, caller limits, materialization, and N exclusion checks are directly traced in repository code and tests. Only the absolute duration varies with provider and workspace size; the change in cardinality is certain.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "workspace search-provider/filesystem enumeration, URI result allocations, and per-result ignore checks",
+      "PerformanceScaling": "When a full first page contains any excluded URI, cost jumps from the caller's maxResults M to all N workspace matches: the provider materializes N URIs and filterIngoredResources runs up to N exclusion checks (20 concurrently) before slice keeps only M.",
+      "PerformanceOutcome": "increased latency, blocked feature initialization or tool response, and avoidable CPU/allocation pressure",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The same scenario issued one workspace.findFiles2 call capped at maxResults and checked at most that bounded result page. It could return fewer allowed results, but it did not enumerate the rest of the workspace.",
+      "ChangedBehavior": "After filtering a full limited page, the added retry clears maxResults, waits for workspace.findFiles2 to return every match, filters every returned URI, and only then slices back to the caller's small limit.",
+      "CausalDiffEvidence": "RIGHT line 37 adds a second super.findFiles call with maxResults explicitly set to undefined only when the limited page was full and filtering removed at least one result; before this diff there was no second search.",
+      "Title": "Keep the retry bounded instead of enumerating every match",
+      "Impact": "A repository-scoped exclusion in the first page now makes bounded workflows such as maxResults: 1 test-file discovery, maxResults: 1000 dev-container discovery, or the 100,000-file workspace index scan traverse every matching file. In a large monorepo this can turn a quick lookup into a multi-second search or timeout, even when the second result would satisfy the request.",
+      "Evidence": "BaseSearchServiceImpl delegates each call to vscode.workspace.findFiles2, which returns a materialized URI array. The added line invokes it with maxResults: undefined; the next line passes the entire array to filterIngoredResources, whose workers explicitly visit every resource before returning. Real callers use limits of 1 in extension/prompt/node/testFiles.ts, 1000 in devContainerConfigurationServiceImpl.ts, and 100,000 by default in workspaceFileIndex.ts. The new test also pins the [1, undefined] call sequence when the first hit is excluded.",
+      "Recommendation": "Retry with a progressively larger finite maxResults and stop as soon as M allowed results are found or the provider returns fewer than requested; reuse already checked results. This preserves the quota semantics without immediately expanding a one-result lookup into an unbounded workspace scan."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Bounded file discovery used by test/source lookup, dev-container generation, and workspace indexing",
+        "CriticalPath": "The caller waits for ignore-pattern initialization, one capped workspace.findFiles2 call, and filtering of that page. With an excluded URI in a full page, the diff adds a serial second workspace.findFiles2 call for all matches and waits for every exclusion check before slicing to the requested quota.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/search/vscode-node/searchServiceImpl.ts:29",
+            "Operation": "VS Code workspace.findFiles2 provider search with the caller's finite maxResults",
+            "Cardinality": "One capped provider call returning at most M URIs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This was the only file-search boundary and remained capped at M.",
+            "CriticalPathEffect": "Must complete before the bounded lookup can return."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/search/vscode-node/searchServiceImpl.ts:37",
+            "Operation": "Second VS Code workspace.findFiles2 provider search with maxResults removed",
+            "Cardinality": "One additional provider call that enumerates and materializes all N matches whenever the first M results are full and at least one is excluded.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No retry occurred, so files beyond the initial M were not enumerated or checked.",
+            "CriticalPathEffect": "Fully blocks the lookup; all returned URIs are filtered before any M-result slice is returned."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/ignore/node/remoteContentExclusion.ts:259",
+            "Operation": "Read up to 1 KiB for content-regex exclusion checks",
+            "Cardinality": "Zero when no regex rules apply; otherwise up to one read per uncached returned file, bounded to 10 concurrent reads. The retry can expand this from M to N files.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "At most the capped first-page URIs reached these checks.",
+            "CriticalPathEffect": "Each applicable read blocks that URI's ignore verdict; the filter waits for all verdicts."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/copilot/src/platform/ignore/node/remoteContentExclusion.ts:190",
+            "Operation": "Resolve repository fetch URLs through the git service on a repository-metadata miss",
+            "Cardinality": "Normally avoided for discovered repository files by the populated root cache; misses can occur per unmatched URI.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Only URIs in the original capped result page could encounter misses.",
+            "CriticalPathEffect": "A miss blocks that URI's exclusion verdict."
+          }
+        ],
+        "ScalingInput": "Caller quota M versus total matching files N. Real M values are 1 for test/source lookup, 1,000 for dev-container scans, and 100,000 by default for workspace indexing; the regression changes fallback work from O(M) to O(N).",
+        "EffectiveConcurrency": "The two provider searches and their filtering phases are serial. filterIngoredResources uses 20 workers; content-regex file reads are further limited to 10. Repository-rule network batches contain 10 repos with at most 5 batches concurrently.",
+        "CacheBehavior": "Cold ignore initialization discovers repositories, fetches their rules, and populates repository metadata. Rules remain warm for 30 minutes and concurrent misses are coalesced. Warm rules avoid CAPI calls, and verdict memoization can reduce repeated rule evaluation, but the unbounded fallback still materializes all N URIs and dispatches an ignore check for each.",
+        "MechanismConfidence": "Very high: the added undefined limit, materialized result array, all-result filtering, real finite-limit callers, and trigger are directly visible in code and tests.",
+        "MagnitudeUncertainty": "Absolute time depends on provider indexing, match selectivity, regex-rule presence, and workspace size, but monorepos with thousands to hundreds of thousands of matches are explicitly supported and tested in this subsystem.",
+        "Verdict": "Reportable medium-severity eager-work regression: one excluded first-page hit can convert a bounded request into an unbounded critical-path scan and N exclusion checks."
+      },
+      {
+        "Scenario": "Workspace-wide searches after repository glob rules become correctly repository-scoped",
+        "CriticalPath": "Ignore initialization supplies only organization-wide globs to the provider; repository globs are evaluated per returned URI by isIgnored. Broad callers therefore wait for provider enumeration and post-filtering of files that repository rules may exclude.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/ignore/node/ignoreServiceImpl.ts:131",
+            "Operation": "Discover .git/HEAD files before building search excludes",
+            "Cardinality": "One workspace search per asMinimatchPattern invocation; results are repository roots.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same repository discovery occurred before returning the flattened glob set.",
+            "CriticalPathEffect": "Completes before the requested file search starts."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/copilot/src/platform/ignore/node/remoteContentExclusion.ts:322",
+            "Operation": "Resolve fetch URLs for discovered repositories",
+            "Cardinality": "One git-service lookup per discovered repository during loadRepos.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same preload path populated repository rules.",
+            "CriticalPathEffect": "Blocks rule preloading and therefore search-pattern construction."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/ignore/node/remoteContentExclusion.ts:462",
+            "Operation": "Fetch content-exclusion rules from CAPI",
+            "Cardinality": "Cold or expired repositories only, grouped 10 per request and coalesced; at most 5 batches concurrently.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same CAPI requests loaded the flattened rules.",
+            "CriticalPathEffect": "Cold rule loads complete before the search receives its exclusion pattern; warm cache removes this boundary."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/search/vscode-node/searchServiceImpl.ts:29",
+            "Operation": "Enumerate broad search matches that are later rejected by repository-scoped rules",
+            "Cardinality": "Proportional to matches not removable by organization-wide excludes; repository-excluded files are now returned for correct per-repository evaluation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Flattened repository globs narrowed the provider search globally, but incorrectly removed matching files from unrelated repositories.",
+            "CriticalPathEffect": "Provider enumeration and per-result filtering are on the search critical path."
+          }
+        ],
+        "ScalingInput": "Number of files matching the include pattern across all workspace repositories, number of repositories, and applicable per-repository patterns.",
+        "EffectiveConcurrency": "One provider search per call; post-filtering has 20 workers. Rule fetches are coalesced and batched 10 repositories per request with at most 5 network batches active.",
+        "CacheBehavior": "Compiled globs are rebuilt per fetch URL. Repository metadata, rules, and file verdicts are cached; organization and repository rules expire after 30 minutes. Warm caches avoid network and usually git IPC, while every returned URI still incurs cache lookup and scoped matcher evaluation.",
+        "MechanismConfidence": "High that provider-side filtering is reduced and per-result work increases; uncertain how common large repository-rule match sets are.",
+        "MagnitudeUncertainty": "The extra post-filter cardinality depends on how many repository-scoped rules exist and how many files they match. No separate finding was submitted because this cost is inherent to correcting the prior cross-repository over-exclusion with the current global exclude API, and no independently bounded replacement path was established in the diff.",
+        "Verdict": "No additional finding: the scoped-rule change fixes correctness and uses compiled matchers plus warm metadata/rule caches; the separately reported unbounded retry is the avoidable amplification."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and traced search-provider, git IPC, CAPI, and conditional file-read boundaries. Submitted one medium-severity finding for the newly unbounded retry; no regression-fix learning record was warranted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-03T02:23:49.564342451Z",
+    "CompletedAt": "2026-10-03T02:25:23.022497004Z",
+    "WallClockMilliseconds": 93458,
+    "ModelCalls": 9,
+    "InputTokens": 258510,
+    "OutputTokens": 7010,
+    "TotalTokens": 265520,
+    "ReasoningTokens": 3066,
+    "CacheReadTokens": 213691,
+    "CacheWriteTokens": 44792,
+    "APIDurationMilliseconds": 80025,
+    "ToolCalls": 38,
+    "NanoAIUnits": 44974440000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 213691,
+      "cache_write": 44792,
+      "input": 27,
+      "output": 7010
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

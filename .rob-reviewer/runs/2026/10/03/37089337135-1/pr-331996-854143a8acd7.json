@@ -1,0 +1,233 @@
+{
+  "PullRequest": {
+    "Number": 331996,
+    "Title": "Refactor agentic browser opening lifecycle",
+    "Body": "",
+    "URL": "https://github.com/microsoft/vscode/pull/331996",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "kycutler",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "1be2c3cf898d351d081002673c3c55e12f824ad9",
+    "HeadRef": "kycutler/browserlifecycle",
+    "HeadSHA": "854143a8acd7c939f640390baf0ceeb734cd0ef6",
+    "CreatedAt": "2026-08-21T16:33:25Z",
+    "UpdatedAt": "2026-08-21T18:27:42Z",
+    "MergedAt": "2026-08-21T18:26:01Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-C16E79A62B5D",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/browserView/electron-browser/browserViewWorkbenchService.ts",
+      "Side": "RIGHT",
+      "Line": 345,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed await, complete call path to Electron's network load, and sequencing before `waitForPageAndGetSummary` are explicit. The exact added duration varies by site, but slow load-blocking resources are a realistic trigger and the previous DOMContentLoaded boundary is visible in the deleted code.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "network navigation and the IPC promise waiting on Electron WebContents.loadURL",
+      "PerformanceScaling": "The added wait lasts until every load-blocking subresource completes and can consume the full 30-second timeout for each newly opened agent page; concurrent tool calls each incur their own navigation wait.",
+      "PerformanceOutcome": "increased latency and a blocked tool critical path",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The prior OpenBrowserTool path delegated to PlaywrightSession.openPage, whose page.goto awaited only DOMContentLoaded before producing the page summary.",
+      "ChangedBehavior": "The new workbench creation path awaits BrowserViewModel.loadURL before returning the input, and only afterward invokes Playwright's DOMContentLoaded readiness and summary path.",
+      "CausalDiffEvidence": "The added `await model.loadURL(initialUrl)` at RIGHT line 345 is now awaited by `_openNewPage`; the deleted `page.goto(url, { waitUntil: 'domcontentloaded', ... })` in `PlaywrightSession.openPage` was the previous readiness boundary.",
+      "Title": "Do not wait for the full load event before starting Playwright readiness",
+      "Impact": "Opening an agent browser page can stall for many seconds on sites with slow or hanging subresources even though the DOM is already usable, delaying the chat tool result and subsequent agent actions.",
+      "Evidence": "`BrowserViewModel.loadURL` crosses to `BrowserViewMainService.loadURL`, which awaits `BrowserView.loadURL`; that in turn awaits `webContents.loadURL(url)` (browserView.ts:742), whose promise completes at Electron's finished-load boundary. `OpenBrowserTool._openNewPage` awaits `createBrowserView` before calling `waitForPageAndGetSummary`, so Playwright cannot begin discovery or return its DOMContentLoaded summary until this stricter full-page load finishes. A page whose DOM is ready but whose images/scripts are slow therefore used to progress after DOMContentLoaded and now blocks until full load or 30 seconds.",
+      "Recommendation": "Start `model.loadURL(initialUrl)` without making full-load completion the return condition, then let `waitForPageAndGetSummary` remain the authoritative DOMContentLoaded/timeout gate; preserve explicit rejection logging or propagate immediate navigation failures without awaiting the later load event."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Agent invokes open_browser_page with forceNew, creating and summarizing a new integrated browser page",
+        "CriticalPath": "The workbench creates/resolves a BrowserEditorInput through main-process IPC, then now waits for Electron WebContents.loadURL to finish, then initializes or reuses the Playwright session/group, discovers the page over CDP, waits for DOMContentLoaded, and builds the summary. The new full-load wait is on the critical path and produced the reported regression.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/browserView/electron-browser/browserViewWorkbenchService.ts:createBrowserView",
+            "Operation": "Resolve/create the browser view from the workbench in the Electron main process",
+            "Cardinality": "One getOrCreate call per new page",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Page creation was requested through Playwright/CDP rather than this workbench getOrCreate call.",
+            "CriticalPathEffect": "Must complete before navigation and the tool result can progress"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/browserView/electron-main/browserView.ts:BrowserView.loadURL",
+            "Operation": "Navigate the WebContents to the requested URL",
+            "Cardinality": "One navigation per new page, subject to the page's subresource count",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same logical navigation used Playwright page.goto with `waitUntil: 'domcontentloaded'`; its stricter full-load completion was not on this critical path.",
+            "CriticalPathEffect": "The diff now waits for Electron's finished-load promise before Playwright readiness, whereas the old path progressed at DOMContentLoaded"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/browserView/node/playwrightService.ts:_initSession",
+            "Operation": "Create/reuse the browser-view group and transport CDP messages between the Node service and main process",
+            "Cardinality": "One group/connection per cold agent session; reused on warm calls",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The prior openPage path also initialized and reused this per-session Playwright connection, but did so before creating the page.",
+            "CriticalPathEffect": "Cold initialization must finish before page discovery; warm calls skip it"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/browserView/node/playwrightService.ts:waitForPageAndGetSummary",
+            "Operation": "Identify the page target and collect its initial Playwright summary over CDP",
+            "Cardinality": "One target identity resolution and one summary per new page after session/group reuse",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old path performed page identity resolution and summary after page.goto reached DOMContentLoaded.",
+            "CriticalPathEffect": "Required after page discovery; the DOMContentLoaded wait is redundant when the preceding full-load wait succeeds but remains normally immediate"
+          }
+        ],
+        "ScalingInput": "One native view and one network navigation per newly opened page. Repeated or concurrent tool calls scale linearly with page count; same-session group initialization is deduplicated, but page navigations are independent.",
+        "EffectiveConcurrency": "`_pendingInits` coalesces concurrent Playwright initialization for one session. There is no global page-navigation limiter; concurrent forceNew calls can load concurrently. The reported latency applies independently to each call rather than arising from a fan-out burst.",
+        "CacheBehavior": "Cold sessions create an affinity-backed Electron BrowserSession plus a Playwright group/connection. Warm calls reuse the affinity partition and cached Playwright session; concurrent cold initialization is coalesced. There is no negative-cache behavior involved in the finding.",
+        "MechanismConfidence": "High: the added await, IPC call chain, Electron load promise, and sequencing before Playwright readiness are explicit.",
+        "MagnitudeUncertainty": "The extra delay depends on whether a site has slow load-blocking subresources; exact prevalence and milliseconds are unknown, but the path can consume the explicit 30-second timeout.",
+        "Verdict": "Reportable medium-severity latency regression: the diff replaces the prior DOMContentLoaded readiness boundary with an earlier critical-path wait for full page load."
+      },
+      {
+        "Scenario": "User opens a new browser tab, a file-backed browser editor, or restores a serialized browser editor",
+        "CriticalPath": "BrowserEditorInput remains lazy; opening or explicitly resolving it performs one main-process getOrCreate, creates/reuses the selected BrowserSession, creates a WebContentsView, and starts the stored URL when present. Editor presentation/layout follows. No newly added full-collection or repeated boundary work was found.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/browserView/electron-browser/browserViewWorkbenchService.ts:_getOrCreateLazy",
+            "Operation": "Get or create a native browser view",
+            "Cardinality": "One call per resolved unique editor ID",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The previous getOrCreateLazy resolver used the same main-process service and one call per resolved ID.",
+            "CriticalPathEffect": "Required when the editor is opened/resolved; unresolved lazy inputs do not cross the boundary"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/browserView/electron-main/browserViewMainService.ts:_createBrowserView",
+            "Operation": "Load the restored or file-resource URL in WebContents",
+            "Cardinality": "At most one initial navigation per newly created resolved view",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old getOrCreateBrowserView path also started `initialState.url` without awaiting it.",
+            "CriticalPathEffect": "Started during native creation but not newly awaited by ordinary lazy editor restoration"
+          }
+        ],
+        "ScalingInput": "Scales with the number of browser editors actually resolved during use or restoration, not all known serialized inputs. Each resolved input maps to one native view.",
+        "EffectiveConcurrency": "Multiple restored editors may resolve concurrently according to the editor framework; this diff adds no new limiter or aggregate fan-out and preserves one creation per ID through `_known`.",
+        "CacheBehavior": "`_known` deduplicates BrowserEditorInput/model creation by ID. Global and workspace BrowserSessions are reused; ordinary ephemeral user views remain per-view. Restored title/favicon state is retained only until navigation and is bounded per input.",
+        "MechanismConfidence": "High for unchanged one-per-resolved-editor boundary behavior.",
+        "MagnitudeUncertainty": "Large editor-restoration sets can still create many views when resolved, but the diff does not establish a higher effective cardinality than before.",
+        "Verdict": "No reportable regression; the API reshaping preserves laziness, deduplication, session reuse, and boundary cardinality for user/restored editors."
+      },
+      {
+        "Scenario": "Playwright session/group initialization, page discovery, and CDP-created targets",
+        "CriticalPath": "A cold agent session creates one group over IPC, activates it, reconciles matching host-window views, connects Playwright, and resolves each page identity through CDP. New CDP targets inherit the target creation context and create one BrowserView.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/browserView/node/browserViewGroupRemoteService.ts:createGroup",
+            "Operation": "Create a browser-view group in the main process",
+            "Cardinality": "One per cold Playwright agent session",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same group-service IPC existed before; arguments and target context changed.",
+            "CriticalPathEffect": "Blocks cold Playwright readiness; warm cached sessions avoid it"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/browserView/node/playwrightService.ts:_getPageViewId",
+            "Operation": "Send CDP target/context traffic and request Target.getTargetInfo for each discovered page",
+            "Cardinality": "One identity request per newly discovered matching page, with session setup traffic per cold connection",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old page-add path used the same identity resolution and CDP transport.",
+            "CriticalPathEffect": "Required to bind a new page ID; cached bindings avoid repeats"
+          }
+        ],
+        "ScalingInput": "Activation scans the host window's existing views once per cold group and only adds views matching the audience/browser-ID filter. Page identity work scales with matching pages, not all repository or workspace items.",
+        "EffectiveConcurrency": "Cold initialization for the same session is coalesced. Existing view reconciliation uses Promise.all, while per-page identity sessions can run concurrently; no new repeated polling boundary was proven under successful discovery.",
+        "CacheBehavior": "The Playwright session is reused until the existing inactivity timer disposes it. Page-to-view maps cache successful discovery; failed/missing lookup is retried at 50 ms only during the bounded wait, but normal target events and reconciliation populate it.",
+        "MechanismConfidence": "High for group/session coalescing and per-page CDP cardinality.",
+        "MagnitudeUncertainty": "The number of simultaneously existing agent pages varies, but filtering and cached bindings establish effective cardinality and no diff-caused fan-out beyond matching pages.",
+        "Verdict": "No additional reportable regression; polling is bounded and successful discovery is cached, while group initialization remains once per cold session."
+      },
+      {
+        "Scenario": "Agent affinity session reuse and popup/context-menu child browser creation",
+        "CriticalPath": "An affinity is SHA-256 hashed to select an Electron partition on cold BrowserSession resolution. Child targets and context-menu opens create one child view, reuse the parent's session ID where specified, start one URL, and announce one editor request.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/browserView/electron-main/browserSession.ts:getOrCreateEphemeralForAffinity",
+            "Operation": "Create or retrieve an Electron session partition for an agent affinity",
+            "Cardinality": "One effective Electron session per distinct live affinity, reused across that agent's views",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Agent page creation used a Playwright browser context per session rather than selecting a workbench-created affinity partition.",
+            "CriticalPathEffect": "Part of cold native view creation; warm affinity views reuse it"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/browserView/electron-main/browserViewMainService.ts:openNew",
+            "Operation": "Load a popup, context-menu link, or image URL",
+            "Cardinality": "One navigation per explicit child/open action",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The prior child/context-menu paths also created one view and started one URL using the parent/session context.",
+            "CriticalPathEffect": "Runs for the created child view; editor opening does not await it in these paths"
+          }
+        ],
+        "ScalingInput": "Affinity sessions scale with distinct agent session IDs; child views scale with explicit popup/link/image opens. Each operation creates one view rather than a collection fan-out.",
+        "EffectiveConcurrency": "Distinct agent sessions and child opens may proceed concurrently; same-affinity BrowserSession lookup reuses Electron's partition. No changed shared limiter exists.",
+        "CacheBehavior": "Warm affinity lookups reuse the Electron session through `_bySession`; `_byId` and `_bySession` use weak references, while live views retain their BrowserSession. Children explicitly reuse the parent session. No missing negative cache was identified.",
+        "MechanismConfidence": "High for one-affinity reuse and one-view-per-child behavior; insufficient evidence for unbounded retained native sessions.",
+        "MagnitudeUncertainty": "Electron's internal partition lifetime beyond live BrowserSession references is not established by the diff, so no retention finding is warranted.",
+        "Verdict": "No reportable performance regression; affinity reuse may reduce duplicated session resources, and child boundary cardinality remains one per action."
+      }
+    ],
+    "Summary": "Completed the performance pass across all 24 changed files. One medium-confidence-independent, high-mechanism-confidence latency issue was submitted: agent page creation now awaits Electron's full-load promise before Playwright's DOMContentLoaded readiness. Other creation, session, group, discovery, restoration, popup, IPC, CDP, cache, concurrency, and cleanup paths did not show an additional actionable diff-caused regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-03T02:28:24.134580929Z",
+    "CompletedAt": "2026-10-03T02:30:14.987070211Z",
+    "WallClockMilliseconds": 110852,
+    "ModelCalls": 8,
+    "InputTokens": 345253,
+    "OutputTokens": 9322,
+    "TotalTokens": 354575,
+    "ReasoningTokens": 4345,
+    "CacheReadTokens": 282175,
+    "CacheWriteTokens": 63054,
+    "APIDurationMilliseconds": 99569,
+    "ToolCalls": 51,
+    "NanoAIUnits": 61467600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 282175,
+      "cache_write": 63054,
+      "input": 24,
+      "output": 9322
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
