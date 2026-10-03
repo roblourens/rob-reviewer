@@ -1,0 +1,167 @@
+{
+  "PullRequest": {
+    "Number": 339458,
+    "Title": "chat: preserve transcript order when refreshing history",
+    "Body": "## Summary\n\nRefreshing an older response could move it below a newer locally sent message. The history merger removed and rebuilt the changed suffix, kept local requests in place, and appended the rebuilt turns at the end. Even an elapsed-time or usage update could change the visible conversation order.\n\n- Match history turns by request ID and replace changed restored turns in their existing model/view position.\n- Insert newly loaded history before its next known turn, preserving unchanged and locally created request/response objects.\n- Keep drafts and the existing deferral while a response is streaming; repeated snapshots do not duplicate requests.\n- Dispose superseded response listeners and refresh last-request state and session cost after history removals.\n- Add regressions using the real chat service, model, and view model for metadata/content updates, older history, local echoes, missing IDs, streaming, and removals.\n\nThis is independent of the authentication-recovery changes in #339454. It does not change the protocol client, authentication, or host-side persistence.\n\n## Validation\n\n- Confirmed the ordering regressions fail before the fix: `[README, hi]` becomes `[hi, README]` despite correctly ordered incoming history.\n- Reproduced and fixed both review-found removal edge cases; follow-up review found no remaining blocking issues.\n- 319 related tests pass in Electron.\n- 318 browser-applicable tests pass in each of Chromium, Firefox, and WebKit.\n- Targeted TypeScript diagnostics, ESLint, whitespace checks, and pre-commit hygiene pass.\n- The maintainer reported that the earlier combined history/authentication test snapshot no longer reproduced the issue. The final removal-only corrections have automated validation, not a second manual retest.\n\n## Manual verification\n\nOpen a restored remote chat, send and complete a new message, then trigger a history refresh (for example, return after switching apps). Confirm earlier turns remain above the newer message, response text stays visible, and the unsent draft is preserved. Also load older history and verify it is inserted before the existing turns without duplication.\n\nA turn also missing from another client's history is not proof of a display-order bug; this PR does not claim to repair missing host-side history.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339458",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "osortega",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "253b7648aa69de1a651a327370098f3814b8922f",
+    "HeadRef": "osortega/agents/preserve-chat-history-order",
+    "HeadSHA": "99835eb159d6198ffcd656ae01dca18047b4e730",
+    "CreatedAt": "2026-10-03T07:09:21Z",
+    "UpdatedAt": "2026-10-03T08:24:46Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-820CA721DCFC",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts",
+      "Side": "RIGHT",
+      "Line": 1023,
+      "Severity": "low",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "Both comparisons and their synchronous call path from AgentHostChatSession.updateHistory are explicit. Agent-host refreshes rebuild history objects, so object identity cannot short-circuit objects.equals; the only uncertainty is the transcript size at which the extra traversal becomes noticeable.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "CPU work traversing and sorting keys across nested history objects",
+      "PerformanceScaling": "The duplicated work grows with the total serialized size of all unchanged turns before the late change, not merely with the changed turn; each such payload is recursively compared twice.",
+      "PerformanceOutcome": "increased synchronous refresh latency and CPU pressure",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The old common-prefix loop deep-compared each history item once until the first difference, then rebuilt the changed suffix; a last-response metadata update therefore traversed the unchanged prefix once.",
+      "ChangedBehavior": "A history update whose change is near the end first traverses all preceding turn payloads in turns.every, then traverses those same payloads again in the per-turn reconciliation loop.",
+      "CausalDiffEvidence": "Added line 993 deep-compares turns against lastTurns to detect a no-op, then added line 1023 deep-compares each unchanged turn against the same prior turn again during reconciliation; the pre-PR common-prefix loop compared each history item only once before rebuilding the changed suffix.",
+      "Title": "Reuse the initial per-turn equality results",
+      "Impact": "Completing or passively refreshing a long agent chat can spend roughly twice the prior deep-comparison CPU on the UI thread, increasing refresh latency and risking a visible pause for transcripts with many large response/tool parts.",
+      "Evidence": "refreshHistory runs synchronously from onDidChangeHistory. objects.equals recursively visits arrays/objects and sorts every object's keys. For the common case where context-usage/elapsed metadata or the newest response changes, line 993 reaches the late change after walking the unchanged transcript; line 1023 then repeats deep equality for every unchanged turn before reaching that same changed turn. AgentHostSessionHandler triggers this after persisted-history/context-usage updates and turnsToHistory supplies full response parts, including nested tool data.",
+      "Recommendation": "Cache/reuse the first pass's equality result when the same turn ID remains at the same position, or perform a single reconciliation pass that both detects no-ops and records changed turns, so each payload is deep-compared at most once while preserving reorder handling."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Passive refresh or context-usage update changes a late turn in a long open agent chat.",
+        "CriticalPath": "The full history is converted upstream, emitted through AgentHostChatSession.updateHistory, and refreshHistory synchronously reconciles it before model/view observers finish updating. The duplicated deep comparisons are therefore on the visible refresh critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts:updateHistory/refreshHistory",
+            "Operation": "Receive an agent-host state update and convert all persisted turns to IChatSessionHistoryItem objects.",
+            "Cardinality": "One protocol/state update can carry one full transcript snapshot; reconciliation itself performs no additional boundary calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same full state/history notification and conversion existed before this diff.",
+            "CriticalPathEffect": "The state notification must arrive before reconciliation, but the added regression is CPU after arrival rather than boundary latency."
+          }
+        ],
+        "ScalingInput": "Total serialized size of unchanged turns before a late response/usage/elapsed-time change, after one full transcript snapshot per event.",
+        "EffectiveConcurrency": "History events are handled synchronously and serially. Active-response updates are latest-value coalesced until streaming ends; inactive updates have no scheduler or limiter and each event runs to completion.",
+        "CacheBehavior": "lastTurns retains the prior grouped snapshot; identical snapshots return after one full deep comparison. While a local response is active, pendingHistory keeps only the latest snapshot, but inactive updates are processed immediately and equality results are not reused between the no-op check and reconciliation.",
+        "MechanismConfidence": "High: added lines 993 and 1023 synchronously deep-compare the same unchanged turn payloads for a late change, and objects.equals recursively sorts/traverses nested objects.",
+        "MagnitudeUncertainty": "Exact pause duration depends on transcript depth and nested tool payload size; this lowers the finding to low severity, while the duplicated full traversal itself is certain.",
+        "Verdict": "Reportable repeated CPU work: the diff duplicates deep traversal of the unchanged transcript on the synchronous UI refresh path."
+      },
+      {
+        "Scenario": "Load an older page before already visible chat turns.",
+        "CriticalPath": "After the host returns an older page and emits ChatTurnsLoaded, the page must be reconciled and inserted into model/view arrays before the transcript reflects it.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:fetchTurns",
+            "Operation": "Fetch and publish an older turn page through ChatTurnsLoaded.",
+            "Cardinality": "One fetchTurns protocol request per requested page; page size is host-defined. The current in-repository host publishes an empty page.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The boundary and full history event existed independently of this diff; this diff changes only in-memory reconciliation.",
+            "CriticalPathEffect": "The protocol response precedes insertion and is on the load-older-history critical path."
+          }
+        ],
+        "ScalingInput": "Number of newly prepended turns before the next already-known turn and number of currently materialized model/view items.",
+        "EffectiveConcurrency": "Pages and model events are applied serially on the workbench thread; each inserted request emits synchronous model/view notifications.",
+        "CacheBehavior": "Known request IDs are indexed in requestsById. The algorithm searches forward for the next known turn for every newly loaded turn; there is no cached next anchor. Existing IDs deduplicate turns.",
+        "MechanismConfidence": "Medium for quadratic forward scans in a hypothetical nonempty prepend batch, low for current product impact because the current host has no backing pager.",
+        "MagnitudeUncertainty": "The protocol supports nonempty older pages, but the current host implementation emits an empty page and no production batch cardinality is established. The pre-diff suffix removal also had array-shifting costs, so a net regression is not proven for current inputs.",
+        "Verdict": "No additional finding: the forward suffix search can scale quadratically, but current production cardinality and a net regression over the prior rebuild path are not established."
+      },
+      {
+        "Scenario": "Replace or remove restored turns while preserving local request/view objects and context-usage listeners.",
+        "CriticalPath": "Each changed history turn synchronously replaces or removes model and view-model entries, then notifies render observers and updates context cost. No remote operation must complete in this section.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number and positions of replaced/removed turns and total model/view item count.",
+        "EffectiveConcurrency": "Model and view events are synchronous and serialized. Multiple changed turns are emitted individually with no render-event batching, as before for rebuilt suffixes.",
+        "CacheBehavior": "Response listener ownership is keyed by request/response ID in DisposableMaps; replaced and removed responses are disposed immediately, and the maps are disposed with their owning widget/view model.",
+        "MechanismConfidence": "High that listener cleanup is bounded and replacement work is synchronous; high that no subprocess, filesystem, database, network, or IPC boundary was added in these hunks.",
+        "MagnitudeUncertainty": "Array scans/splices scale with visible transcript size, but the prior suffix rebuild performed at least comparable repeated model/view mutation for changed suffixes; no material amplification is proven.",
+        "Verdict": "No separate regression: cleanup lifecycle is improved and changed-turn replacement avoids the prior broad suffix rebuild; remaining scans are not shown to be worse on a realistic current path."
+      },
+      {
+        "Scenario": "Cold-load a remote session that supports passive history updates.",
+        "CriticalPath": "Provider session resolution and initial history application must finish before the remote chat opens. The diff adds one linear grouping pass and an array of applied request references after history application.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts:loadRemoteSession",
+            "Operation": "Resolve remote/contributed session content and receive its history.",
+            "Cardinality": "One provider content resolution per cold session load, subject to existing model-reference reuse on warm reopen.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Cold session loading already awaited the same provider boundary and applied every history item.",
+            "CriticalPathEffect": "Provider resolution is on cold-load critical path; the new grouping happens afterward in memory."
+          }
+        ],
+        "ScalingInput": "Number of history items in the initial session snapshot.",
+        "EffectiveConcurrency": "Initial model construction is synchronous after the asynchronous provider resolution and processes history serially.",
+        "CacheBehavior": "Initial history is applied once, then grouped into lastTurns only for sessions exposing onDidChangeHistory. The grouped snapshot is retained for future comparisons; no cold/warm external cache behavior changes.",
+        "MechanismConfidence": "High: changed code adds only in-memory arrays/turn wrappers on this path and no new boundary.",
+        "MagnitudeUncertainty": "The added grouping allocation is linear and modest relative to constructing model/response objects; no evidence supports user-visible startup degradation.",
+        "Verdict": "No finding: the added O(n) grouping/snapshot state is bounded by the already retained transcript and does not materially change the cold-load boundary or concurrency."
+      }
+    ],
+    "Summary": "Completed the performance pass over all five changed files. One low-severity repeated-work regression was submitted for duplicate deep equality traversal on late-turn history updates; cleanup, initial loading, model/view replacement, and older-page insertion were traced without another high-confidence current regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-03T08:31:33.022752907Z",
+    "CompletedAt": "2026-10-03T08:34:23.467920714Z",
+    "WallClockMilliseconds": 170445,
+    "ModelCalls": 16,
+    "InputTokens": 889425,
+    "OutputTokens": 10693,
+    "TotalTokens": 900118,
+    "ReasoningTokens": 4961,
+    "CacheReadTokens": 796160,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 156585,
+    "ToolCalls": 85,
+    "NanoAIUnits": 90538400000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 796160,
+      "cache_write": 0,
+      "input": 93265,
+      "output": 10693
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

@@ -1,0 +1,210 @@
+{
+  "PullRequest": {
+    "Number": 339454,
+    "Title": "agentHost: restore authentication on transport reconnect",
+    "Body": "## Summary\n\nFollow-up to #339229. The transport can now reconnect, but the client still assumed that a remembered client ID meant authentication survived on the replacement connection. A host that requires authentication again can reject later requests with `AuthRequired`, while local authentication caching prevents a new authentication request from being sent.\n\n- Restore required or previously established authentication for replay and snapshot reconnects, not only fresh initialization.\n- Defer protected subscriptions reported missing before authentication, and restore subscriptions omitted from handshake snapshots after authentication.\n- Keep recovery in progress and queued actions buffered until authentication and subscription restoration settle.\n- Preserve errors for resources that remain missing or forbidden after authentication; keep the existing behavior for connections without authentication.\n- Add six regressions covering cached/resolved credentials, replay/snapshot recovery, traffic ordering, response continuity through turn completion, and terminal subscription failures.\n\n## Validation\n\n- Four new regressions reproduced the old behavior before the fix: readiness was reported too early and protected subscriptions were marked unavailable.\n- 321 related protocol-client, sandbox service, credential, and telemetry tests pass in Electron.\n- 122 sandbox service/credential/telemetry tests pass in each of Chromium, Firefox, and WebKit. The protocol-client suite is Electron-only and was excluded by the browser runner.\n- Targeted TypeScript diagnostics, ESLint, whitespace checks, and pre-commit hygiene pass.\n- Independent read-only review found no blocking issues.\n\n## Manual verification pending\n\nOn mobile, open a sandbox chat, send a message, switch to another app, return, and send a follow-up. Verify recovery authenticates before messages are released and that responses remain visible after completion.\n\nThe supplied logs establish the post-reconnect authentication failure. They do not identify the chat-state update that removed an earlier streamed reply, so this PR does not claim that the separate disappearing-response symptom is conclusively resolved. Live mobile validation remains pending. The separately reported regular-tunnel recovery issue is also outside this fix.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339454",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "osortega",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "253b7648aa69de1a651a327370098f3814b8922f",
+    "HeadRef": "osortega/agents/mobile-sandbox-auth-recovery",
+    "HeadSHA": "cf2bcc21a4cfb6244047bdbef92678a68b243a49",
+    "CreatedAt": "2026-10-03T05:34:28Z",
+    "UpdatedAt": "2026-10-03T07:41:56Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-8196FEA63AD6",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts",
+      "Side": "RIGHT",
+      "Line": 955,
+      "Severity": "high",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "Production wiring always configures the resolver for cloud sandboxes; the forced Mission Control refresh, 30-second limiter, and reconnect-gate ordering are explicit. Only the exact remote duration varies.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Mission Control network calls, authenticate RPCs, and provider authentication work",
+      "PerformanceScaling": "One forced cloud credential refresh and one authenticate RPC per cached authentication entry on every replacement transport; cost grows with reconnect frequency and credential count.",
+      "PerformanceOutcome": "Higher resume latency and potentially about 30 seconds of blocked reconnect progress on closely spaced transport failures.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Ordinary replay reconnects reused host authentication and drained queued traffic; restoration ran only for fresh initialization or an interrupted restore pass.",
+      "ChangedBehavior": "Every replacement transport with configured or cached authentication now awaits authentication restoration before outbox drain and Connected state, regardless of whether reconnect reported any authentication loss.",
+      "CausalDiffEvidence": "RIGHT line 955 newly makes restoration true from the mere presence of a resolver or cached credential, so even Replay with missing=[] enters the blocking authentication path.",
+      "Title": "Avoid reminting credentials on every replay reconnect",
+      "Impact": "An ordinary mobile resume or network flap now blocks queued cloud-sandbox chat traffic on a Mission Control request and host authentication even for Replay with missing=[]. A second flap within 30 seconds hits the refresh limiter, delaying recovery until a later retry.",
+      "Evidence": "CloudSandboxConnectionFactory always supplies resolveInitialAuthentication. Its prepareAuthentication calls refreshAuthenticationCredentials when the current sealed token was previously used, which forces ICloudSandboxApiService.reconnect. CloudSandboxCredentialRefresher rejects another forced refresh within MIN_CREDENTIAL_REFRESH_DELAY_MS=30,000. This predicate ignores result.missing and AuthRequired, and reconnect awaits it before draining queued messages.",
+      "Recommendation": "Restore only on a concrete loss signal, such as missing protected subscriptions or AuthRequired, while retaining fresh-initialize and interrupted-pass restoration; let Replay with no authentication debt drain immediately."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "eager-work",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cloud-sandbox transport reconnect that returns Replay with no missing subscriptions, such as mobile app resume or a transient network change",
+        "CriticalPath": "Transport preparation/connect and the reconnect RPC must finish; the diff then synchronously gates outbox drain and Connected state on credential preparation/resolution and all authenticate RPCs.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:248 and CloudSandboxCredentialRefresher.refreshAuthenticationCredentials",
+            "Operation": "Refresh Web PubSub and sealed GitHub credentials through ICloudSandboxApiService.reconnect.",
+            "Cardinality": "Newly one forced Mission Control request per successful ordinary replacement transport when the previously used sealed token is still current; shared only with an already in-flight refresh and rejected inside the 30-second forced-refresh window.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Ordinary Replay reconnects with no pending authentication restore did not invoke prepareAuthentication or the Mission Control refresh.",
+            "CriticalPathEffect": "Blocks protocol authentication, reconnect completion, and all queued chat traffic."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:963 _restoreAuthentication",
+            "Operation": "Send authenticate RPCs that fan out to matching host providers.",
+            "Cardinality": "One RPC per non-expired cached authentication key, issued in parallel after the single credential-preparation phase.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These RPCs ran after fresh initialization or interrupted restoration, not every ordinary Replay reconnect.",
+            "CriticalPathEffect": "All RPCs settle before reconnect can drain its outbox or report Connected."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:1035 _reconnectOrInitialize",
+            "Operation": "Reconnect the logical protocol client over the replacement Web PubSub transport.",
+            "Cardinality": "One RPC per reconnect attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same reconnect RPC and transport setup occurred before the diff.",
+            "CriticalPathEffect": "Required handshake work that precedes the new authentication work."
+          }
+        ],
+        "ScalingInput": "Transport-failure frequency and the number of cached protected-resource credentials; even one credential triggers the production cloud refresh path.",
+        "EffectiveConcurrency": "Credential refresh is serialized before authentication; authentication keys are then sent concurrently with Promise.all. Reconnect attempts themselves are sequenced by the reconnect state/backoff.",
+        "CacheBehavior": "Warm transport credentials normally let prepareReconnect avoid I/O, but the newly unconditional authentication pass defeats that warm path by requiring a fresh sealed token. Forced refreshes are coalesced only while in flight and are rejected for 30 seconds after the last refresh.",
+        "MechanismConfidence": "High: the added predicate, production callback wiring, API boundary, limiter, and reconnect gate were traced directly.",
+        "MagnitudeUncertainty": "Mission Control and provider-authentication duration varies by network and provider count, but the extra request is certain; a second flap within the explicit 30-second limiter has a deterministic failed-attempt mechanism.",
+        "Verdict": "Reportable high-severity latency regression because authentication is repeated without any loss signal, including Replay responses with missing=[], and blocks the resume critical path."
+      },
+      {
+        "Scenario": "Reconnect where protected session/chat subscriptions are reported missing before authentication",
+        "CriticalPath": "Reconnect handshake completes, authentication is restored, then every active omitted/missing subscription is re-subscribed and snapshotted before queued actions are released.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:963 _restoreAuthentication",
+            "Operation": "Refresh cloud credentials when necessary and authenticate protected resources.",
+            "Cardinality": "One cloud credential refresh in the production cloud path and one authenticate RPC per cached key.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "On ordinary reconnect, missing subscriptions were immediately marked unavailable without reauthentication.",
+            "CriticalPathEffect": "Required before protected subscription restoration can start."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:1110 _restoreSubscriptionsAwaitingRestore",
+            "Operation": "Issue subscribe RPCs and receive full snapshots for active channels omitted by the handshake.",
+            "Cardinality": "One RPC per effective active missing/omitted resource after URI deduplication. Session subscriptions run concurrently as one phase; chat and other resources run concurrently in the next phase.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Replay-missing resources were marked unavailable; fresh-initialize restoration already used this per-resource path.",
+            "CriticalPathEffect": "The complete session phase and then chat/other phase are awaited before reconnect completion."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:1110 and AgentSubscriptionManager.applyReconnectSnapshot",
+            "Operation": "Deserialize and apply one returned state snapshot per restored resource.",
+            "Cardinality": "One snapshot per active missing resource, with payload size determined by session, chat, terminal, or changeset state.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No snapshots were fetched for ordinary Replay-missing resources.",
+            "CriticalPathEffect": "Snapshot application is part of each awaited subscribe completion."
+          }
+        ],
+        "ScalingInput": "Effective active subscription count, not holder refcount: normally session plus chat for each open/hydrating chat, with observed terminal and changeset resources adding distinct channels.",
+        "EffectiveConcurrency": "All session restores run in parallel first; chat and non-chat restores then run in parallel together. There is no shared limiter, but active-resource cardinality is UI-lifecycle bounded and the work is necessary to restore previously unavailable state.",
+        "CacheBehavior": "The active-subscription map deduplicates holders by resource. Successful snapshots delete restore debt; disconnected attempts retain debt for retry; terminal NotFound/PermissionDenied removes debt and marks the subscription missing.",
+        "MechanismConfidence": "High for boundary count and ordering from the implementation; moderate for upper-end real-world active-resource counts.",
+        "MagnitudeUncertainty": "Large chats and many observed terminal resources can increase bytes and fan-out, but no evidence establishes a separate unacceptable regression beyond the unconditional authentication finding.",
+        "Verdict": "No separate finding: this fan-out is newly exercised for protected missing resources but directly implements required state restoration, is deduplicated by active resource, and lacks evidence of an independent performance failure."
+      },
+      {
+        "Scenario": "Fresh initial connection or reconnect after the host forgot the client",
+        "CriticalPath": "Transport connect, initialize, optional authentication, then queued messages are released; fresh reconnect may additionally restore omitted active subscriptions.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:675 connect and :1049 _reconnectOrInitialize",
+            "Operation": "Initialize the protocol client and obtain root/initial snapshots.",
+            "Cardinality": "One initialize RPC for initial connection, or one fallback initialize after a reconnect NotFound.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same initialization boundary existed before the diff.",
+            "CriticalPathEffect": "Blocks readiness as before."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:696 and :963",
+            "Operation": "Prepare credentials and authenticate cached/resolved resources.",
+            "Cardinality": "One preparation plus one RPC per non-expired authentication key.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Fresh initialization already restored authentication and awaited it.",
+            "CriticalPathEffect": "Blocks readiness as before for fresh initialization."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:1110 _restoreSubscriptionsAwaitingRestore",
+            "Operation": "Subscribe channels omitted from a fresh handshake snapshot.",
+            "Cardinality": "One request per deduplicated active omitted resource.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Fresh host-restart recovery already marked omitted channels and restored them.",
+            "CriticalPathEffect": "Blocks fresh reconnect completion until snapshots settle."
+          }
+        ],
+        "ScalingInput": "Cached authentication-key count and deduplicated active subscriptions.",
+        "EffectiveConcurrency": "Authentication keys are parallel; subscription restoration uses the existing session-first two-phase parallel grouping.",
+        "CacheBehavior": "Authentication entries remain cached until expiry or explicit token removal; active subscriptions are refcounted and deduplicated. Fresh snapshots settle outstanding restore debt.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Provider and snapshot costs vary, but this scenario's boundary placement and cardinality are materially unchanged.",
+        "Verdict": "No regression in this scenario; the method rename/generalization preserves the pre-diff fresh-initialization cost."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and traced reconnect, cloud credential refresh, authentication provider fan-out, active-subscription lifecycle, snapshot restoration, cache state, concurrency, and all network/serialization boundaries. Submitted one high-confidence reconnect-latency finding; no performance-fix learning record applies."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-03T08:28:37.632545935Z",
+    "CompletedAt": "2026-10-03T08:31:27.892959273Z",
+    "WallClockMilliseconds": 170260,
+    "ModelCalls": 13,
+    "InputTokens": 620252,
+    "OutputTokens": 10622,
+    "TotalTokens": 630874,
+    "ReasoningTokens": 4875,
+    "CacheReadTokens": 545792,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 156772,
+    "ToolCalls": 53,
+    "NanoAIUnits": 72859680000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 545792,
+      "cache_write": 0,
+      "input": 74460,
+      "output": 10622
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
