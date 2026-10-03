@@ -1,0 +1,243 @@
+{
+  "PullRequest": {
+    "Number": 339476,
+    "Title": "agentHost: Restore peer chats lost after session refresh",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #339409.\n\n### What changed\n\n- Revert #339074 in full, including its Codex continuation UI, model/account plumbing, telemetry, and supporting storage APIs. This intentionally removes the entire feature, not just the URI-resolution change.\n- Restore fragment-free backend session resolution. Selecting a peer chat must not register its chat fragment as a separate backend session.\n- Automatically recover erased peer-chat membership for verified affected local Copilot CLI sessions, retaining original chat URIs, surviving transcripts, and provider continuation metadata.\n- Remove verified phantom registrations without deleting their shared backing storage, and refresh recovered list projections before the first session-list response, including after a restart.\n\n### Why\n\nThe fragment-bearing resolution introduced by #339074 can register a phantom session separately from its real parent, while both use the same path-based local database. The phantom writes an empty peer-chat mirror; subsequent legacy reconciliation can erase the parent's authoritative membership. Reverting prevents the corruption, but does not repair membership already lost.\n\n### Recovery safety and limitations\n\n- Recovery requires a restore-created phantom, a matching registered parent, and surviving selected-chat backing metadata. Additional candidates require affirmative parent membership evidence; healthy catalogues are not scavenged.\n- Respect explicit deletions, authoritative ownership elsewhere, and concurrent membership changes. Do not rewrite child transcripts or chat-local provider metadata, and do not create missing child databases.\n- Persist the pre-recovery membership and a completion marker. Interrupted recovery uses frozen candidates; completed recovery does not resurrect later removals.\n- Preserve existing order and archive state. Missing peers are appended deterministically and restored as active because their original order/archive flags cannot be reconstructed.\n- Legacy directory names are only recovery evidence, not authoritative current ownership; this does not require redesigning stable chat identities or chat moves.\n\n### Validation\n\n- `npm run compile` - passed.\n- `npm run hygiene` - passed (12,895 files checked).\n- `npm run test-node -- --run src/vs/platform/agentHost/test/node/agentHostPeerChatStore.test.ts --run src/vs/platform/agentHost/test/node/agentHostDatabase.test.ts --run src/vs/platform/agentHost/test/node/agentService.test.ts --run src/vs/platform/agentHost/test/node/agentSessionRegistry.test.ts` - passed: 792 passing, 16 pending.\n- `git diff --check origin/main...HEAD` - passed.\n- Previously validated recovery against 91 isolated SQLite backup copies: 23 affected peers recovered; healthy catalogues, 86 child databases, and 110 foreign membership rows unchanged. No manual changes to live storage.\n- Verified recovery in the installed build, including preserved author/reviewer transcripts. Regression tests cover first-list visibility for live, cold, and already-completed recovery; the new cold projection tests failed on the pre-fix implementation.\n\nCI build [480291](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=480291) hit an intermittent macOS managed-settings diagnostics timeout also reproduced on main in builds [480293](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=480293) and [480122](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=480122). That failure is being investigated separately.\n\nBuild [480297](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=480297) is still running on the temporary integration-test recovery-bypass commit. The bypass has been reverted; that build is not validation of the current head. Recovery remains enabled in tests. A full cross-platform CI run on the current head has not yet completed.\n\nTo test manually, start the fixed build against an isolated copy of affected storage with a verified restore-created fragment registration and an empty peer-chat mirror. The initial list should show recovered peers without opening the parent; opening a recovered peer should load its original transcript. Refresh/restart should retain membership without duplicating it, and subsequent intentional removals should stay removed.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339476",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "45373f06ff77cc97a7754a376548d8937fb3af54",
+    "HeadRef": "agents/vscode-issue-339409-analysis-check",
+    "HeadSHA": "6255f7845f274ef3dbbcca150b9bc50f98613947",
+    "CreatedAt": "2026-10-03T13:51:19Z",
+    "UpdatedAt": "2026-10-03T17:35:48Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-3E2F548BB6A6",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentService.ts",
+      "Side": "RIGHT",
+      "Line": 3768,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed call path, default-enabled catalog path, one-call-per-candidate cardinality, cold-process cache behavior, and database-wide serialization are explicit in code. Exact milliseconds vary by catalog size and disk cache, which affects severity rather than mechanism confidence.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "serialized SQLite queries and decoded chat-row objects",
+      "PerformanceScaling": "On the first list in each agent-host process, cost grows as one `getSessionChatCatalog` query per eligible local Copilot CLI session, plus all peer rows returned; the database's single `Sequencer` makes the effective query concurrency 1 despite the limiter of 4.",
+      "PerformanceOutcome": "increased first-session-list and startup latency for users with large local Copilot CLI catalogs",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The list path fetched all eligible `sessions_v2` rows with the single bulk `readMany`/`listSessionsV2` query and did not read each session's chat catalog separately.",
+      "ChangedBehavior": "After the bulk read, the added loop awaits `_refreshRecoveredSessionProjection` for every eligible local Copilot CLI session not yet checked; that helper immediately calls `getSessionChatCatalog(sessionKey)`, even for healthy sessions that never underwent recovery.",
+      "CausalDiffEvidence": "The added `centralResults[index] = await this._refreshRecoveredSessionProjection(...)` line places a per-session catalog lookup, through `_refreshRecoveredSessionProjection`, directly after and on the critical path of the existing bulk catalog read.",
+      "Title": "Batch the recovery projection check before listing sessions",
+      "Impact": "Opening the Sessions UI or requesting the initial session list after each restart now blocks on N additional serialized SQLite queries for N local Copilot CLI sessions. Large catalogs therefore lose the bulk-read startup behavior this path otherwise preserves; the in-memory checked set only helps later lists in the same process.",
+      "Evidence": "`AgentHostCatalogListReader.readMany` issues one `listSessionsV2(sessions)` query. The added call at 3768 reaches `_refreshRecoveredSessionProjection`, whose first operation is `this._orchestratorDatabase.getSessionChatCatalog(sessionKey)`. `AgentHostDatabase.getSessionChatCatalog` queues one SELECT through the database-wide `_transactionSequencer`, so all candidate calls serialize and each materializes that session's chat rows. Candidate selection includes every eligible, non-external local `copilotcli` parent, not only sessions with a recovery marker.",
+      "Recommendation": "Perform one batched chat-catalog lookup for all candidates and compare in memory, or persist/query recovery candidates in bulk so healthy sessions are excluded before any per-session read; keep the existing per-session synchronization only for mismatches that are known to have completed recovery."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Initial Sessions list after agent-host startup with a healthy local Copilot CLI catalog",
+        "CriticalPath": "Registry enumeration and the bulk `sessions_v2` read complete first; the added recovery-projection candidate loop is then fully awaited before list results can be returned.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogListReader.ts:55 `readMany`",
+            "Operation": "Bulk-read all candidate `sessions_v2` catalog rows.",
+            "Cardinality": "One SQLite query for all registered candidates.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This single bulk query was the central-catalog listing cost.",
+            "CriticalPathEffect": "Required before list metadata is available."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:3768 `_refreshRecoveredSessionProjection` -\u003e AgentHostDatabase.getSessionChatCatalog",
+            "Operation": "Read authoritative peer-chat catalog and all chat rows for one session.",
+            "Cardinality": "One query for every eligible non-external local Copilot CLI parent on the first list in each process, even when it was never recovered.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No per-session chat-catalog read followed the bulk listing query.",
+            "CriticalPathEffect": "All calls are awaited before the list can proceed and serialize through the database-wide sequencer."
+          }
+        ],
+        "ScalingInput": "Number of eligible local Copilot CLI parent sessions, plus the peer rows materialized by each query.",
+        "EffectiveConcurrency": "The loop uses a limiter of 4, but `getSessionChatCatalog` queues through one `AgentHostDatabase._transactionSequencer`, so effective SQLite concurrency is 1.",
+        "CacheBehavior": "`_checkedRecoveredSessionProjections` avoids repeat work only for later lists in the same process; it is empty after every restart. Healthy matches are positively cached; read/parse failures are not.",
+        "MechanismConfidence": "High: candidate cardinality, awaited critical path, query implementation, default-enabled catalog mode, and serialization are explicit.",
+        "MagnitudeUncertainty": "Exact delay depends on catalog size, SQLite page cache, and storage speed; large long-lived catalogs are the realistic worst case.",
+        "Verdict": "Reportable boundary fan-out; submitted one medium-severity finding."
+      },
+      {
+        "Scenario": "First list repairing fragment-registration peer-chat corruption",
+        "CriticalPath": "When a restore-created fragment registration exists, recovery runs before normal catalog listing and must finish or fail per parent before the list advances.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:89 `listSessionDataIds('')`",
+            "Operation": "Resolve the entire session-data directory and enumerate all child directories.",
+            "Cardinality": "Once per affected parent; `_recoverChatSelectionCorruption` processes parents serially, so P parents cause P full directory enumerations.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The list path did not scan session-data directories for peer-chat recovery.",
+            "CriticalPathEffect": "Blocks the first list while recovery candidates are discovered."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:92-151 `recoverChatSelectionCorruption`",
+            "Operation": "Open the parent database, read recovery/legacy/title metadata, open candidate backing databases, and read provider metadata.",
+            "Cardinality": "One parent open per affected parent and one backing open per suffix-matching candidate that passes ownership evidence.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No repair-time per-candidate database inspection occurred.",
+            "CriticalPathEffect": "Awaited before recovery can verify phantoms and listing can continue."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:153-194 and src/vs/platform/agentHost/node/agentService.ts:3366-3388",
+            "Operation": "Read/update central chat membership, write the legacy mirror/completion marker, and unregister verified phantoms.",
+            "Cardinality": "Normally one recovery transaction and mirror update per affected parent, plus one unregister per verified phantom.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Corrupted membership remained unrepaired and phantom registrations remained.",
+            "CriticalPathEffect": "Required to make repaired membership visible in the first response."
+          }
+        ],
+        "ScalingInput": "Number of affected parents P, total session-data directories N, and surviving peer candidates C; directory discovery is O(P*N), with candidate database work bounded by matching parent suffixes and catalog limits.",
+        "EffectiveConcurrency": "Parents are processed serially; candidate database opens inside a parent are also sequential. Central database mutations are sequenced.",
+        "CacheBehavior": "Successful recovery writes a completion marker and unregisters verified phantoms, so subsequent lists normally skip the path. Malformed evidence preserves the phantom and retries on later lists; there is no negative cache.",
+        "MechanismConfidence": "High for the I/O and scaling mechanism; lower for user-visible magnitude because this is an exceptional repair path.",
+        "MagnitudeUncertainty": "Affected users and parent counts are limited to the corruption cohort; a typical repair is expected to be one-shot. Malformed persistent evidence can repeat the scan, but prevalence and directory counts are uncertain.",
+        "Verdict": "No separate finding: the broad scan is tied to one-time recovery evidence and no high-confidence material delay beyond the reported normal-list fan-out was established."
+      },
+      {
+        "Scenario": "Restart after recovery completed but the central list projection is stale",
+        "CriticalPath": "The same cold projection check first compares central membership. A mismatch then opens the parent database to read the completion marker and synchronizes the projection before returning the list.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:71 `hasCompletedChatSelectionRecovery`",
+            "Operation": "Read the durable completion marker from the per-session database.",
+            "Cardinality": "Only for sessions whose authoritative membership differs from the projected peer list.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No recovery completion marker was consulted during listing.",
+            "CriticalPathEffect": "Determines whether a stale projection may be refreshed before response."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:3423-3464 `_refreshRecoveredSessionProjection`",
+            "Operation": "Read authoritative peers, build/write a synchronized catalog payload, and re-read the refreshed row.",
+            "Cardinality": "Once per mismatching session with a completed recovery marker.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A stale central projection could be returned without this synchronization work.",
+            "CriticalPathEffect": "Fully awaited so recovered peers appear in the first response."
+          }
+        ],
+        "ScalingInput": "Number of previously recovered sessions whose projected peer list remains stale.",
+        "EffectiveConcurrency": "Candidate wrappers allow 4, while central orchestrator DB operations serialize; per-session databases may overlap.",
+        "CacheBehavior": "A successful refresh enters the process-local checked set. Missing/incomplete markers are cached as checked; read errors are retried on future lists.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "The mismatching completed-recovery cohort should be small and the synchronization is required for first-list visibility.",
+        "Verdict": "The necessary mismatch refresh is not separately reported; the finding targets the avoidable per-session checks imposed on every healthy candidate before mismatches are known."
+      },
+      {
+        "Scenario": "Opening/restoring a Codex session after model metadata and continuation plumbing are reverted",
+        "CriticalPath": "Explicit restore activates Codex, requests authoritative thread metadata, materializes provider backing, and restores history. The changed model fallback is downstream of this existing restore boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts `_activate` / `_ensureConnection` / `_startRawConnection`",
+            "Operation": "Start and initialize the Codex app-server when explicit restore crosses the activation boundary.",
+            "Cardinality": "One coalesced persistent connection per activated provider process.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Restore already activated and retained the app-server.",
+            "CriticalPathEffect": "Existing explicit-restore startup cost."
+          },
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts `_doReadSession`",
+            "Operation": "Request `thread/read` metadata/history from the Codex app-server.",
+            "Cardinality": "One metadata read and, depending on history mode, paginated or full history reads for the opened session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "`_getSessionMetadataForRestore` already requested authoritative metadata with `activation: 'restore'` before materialization.",
+            "CriticalPathEffect": "Existing restore/open critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts `_refreshCopilotModels`",
+            "Operation": "Refresh Copilot model catalog when no model catalog is populated.",
+            "Cardinality": "Coalesced by `_modelsRefreshPromise`; not per restored session while warm.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "`_resolveRestoredModel` already refreshed an empty catalog.",
+            "CriticalPathEffect": "Can be joined by restored-model resolution, but the diff did not establish a new call on the normal restore path."
+          }
+        ],
+        "ScalingInput": "Opened sessions and model-catalog coldness; provider connection and refresh promises coalesce work.",
+        "EffectiveConcurrency": "Cold session reads are limited; connection startup and model refresh are coalesced/sequenced.",
+        "CacheBehavior": "Warm model and discovered-thread caches avoid repeated enumeration; explicit restore still obtains authoritative metadata.",
+        "MechanismConfidence": "High for the traced production call order.",
+        "MagnitudeUncertainty": "Direct isolated materialization behavior changed, but the production restore path performs the existing activation/read first, so no independent added boundary was proven.",
+        "Verdict": "No performance finding."
+      },
+      {
+        "Scenario": "Removal of Codex continuation notices, spotlight adapters, storage CAS APIs, and model-picker guided opening",
+        "CriticalPath": "The feature contributions and UI/service hooks are removed; remaining picker and spotlight flows use their prior generic paths.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of workbench windows, visible notices, spotlight steps, and model-picker opens.",
+        "EffectiveConcurrency": "Removed coordinators/listeners no longer schedule work; no new limiter or burst is introduced.",
+        "CacheBehavior": "Deleted continuation storage coordination and account/session candidate caches no longer participate.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "The diff mostly removes work and behavior, so any performance effect is neutral or beneficial.",
+        "Verdict": "No performance regression."
+      }
+    ],
+    "Summary": "Reviewed all 92 changed files and the performance-sensitive call paths. Submitted one finding for the newly introduced cold-list per-session SQLite fan-out. Recovery repair I/O, Codex restore boundaries, UI removals, IPC/storage removals, and cache/lifecycle behavior were traced without another high-confidence diff-caused performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-03T17:36:15.089094183Z",
+    "CompletedAt": "2026-10-03T17:40:04.054412125Z",
+    "WallClockMilliseconds": 228965,
+    "ModelCalls": 20,
+    "InputTokens": 2733500,
+    "OutputTokens": 15887,
+    "TotalTokens": 2749387,
+    "ReasoningTokens": 5597,
+    "CacheReadTokens": 2525696,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 207542,
+    "ToolCalls": 179,
+    "NanoAIUnits": 215923440000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 2525696,
+      "cache_write": 0,
+      "input": 207804,
+      "output": 15887
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
