@@ -1,0 +1,211 @@
+{
+  "PullRequest": {
+    "Number": 332588,
+    "Title": "Back off GitHub requests instead of hammering a failing service",
+    "Body": "## The bug\n\n`GitHubCredentialService` kept no memory of failure. Any failed identity resolution cleared the current generation, so the very next `getCredential()` immediately reissued `GET /user`.\n\nA 401 amplified that. `handleRequestError` invalidates the generation, and both `PullRequestResourceService` and `GitHubQueryService` answer the resulting `onDidInvalidate` by rescheduling **every** fragment and entity at `now` — each of which asks for a credential again. So when `/user` succeeded but real requests kept being refused (an auth outage, or a token GraphQL rejects), this was an unbounded zero-delay loop: roughly one identity request plus nine fragment requests per network round trip, per subscribed pull request, per user, for the whole outage.\n\nThe main consumer is `AgentMergeController`, which holds a background pull request subscription per session.\n\n## The fix\n\nNew `githubBackoff.ts` holds the concern in one place:\n\n- `GitHubBackoffPolicy` — `{ immediateRetries, base, maximum, jitter, decay? }`\n- `gitHubBackoffDelay(policy, scheduler, attempts, minimum?)` — the shared escalating, jittered delay\n- `GitHubBackoffGate` — holds back attempts against a subject that keeps failing\n\nCallers **wait** rather than being rejected, so recovery stays automatic once GitHub returns and everyone queued behind one delay shares the single attempt that follows it. Waiters are woken when the record changes instead of sleeping out a stale window, and a caller whose token was replaced mid-wait abandons rather than aborting the replacement''s in-flight request.\n\nA successful `/user` deliberately does **not** clear the record — it only proves identity resolution recovered, and clearing it would reset the delay to zero every round in exactly the loop above. Recovery is signalled by a new token, a new host, or the record decaying (5 min) while nothing fails.\n\n## Also\n\n- **Unified three other escalating retries** onto the same helper: the query service (which previously retried failures at its *normal* poll cadence forever), the capability probe, and `PullRequestResourceService`, which already had an identical inline copy of the formula.\n- **Capability probe negative cache** — an unusable probe result was re-probed on *every* capability lookup, and because the fragments that ask still succeed on REST fallbacks nothing throttled it. A degraded result is now reused for an escalating window.\n- **Rate limit hints** — a refusal carrying no usable hint recorded no block at all. Now: honour `Retry-After`; otherwise honour `x-ratelimit-reset` only when `x-ratelimit-remaining` is `0` (a secondary limit reports the *primary* hourly window, which would park the account for an hour over a 60s refusal); otherwise apply a 60s floor. Elapsed hints no longer retry immediately.\n\n## Validation\n\n`npm run typecheck-client` clean. 116 tests pass — all of `src/vs/platform/github/test/node` plus the agent merge suites — including new coverage for the escalation under a still-resolving identity call, immediate recovery on re-auth, the query-service escalation, jitter retention when the poll cadence dominates, and the three rate-limit hint shapes.",
+    "URL": "https://github.com/microsoft/vscode/pull/332588",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "90f9b51baae791e6e5b20bd45785c2439ee28fb8",
+    "HeadRef": "benibenj/github-client-auth-backoff",
+    "HeadSHA": "4bdc50b61673b5606f76a8cec68d3f63c41aeae8",
+    "CreatedAt": "2026-08-25T17:56:01Z",
+    "UpdatedAt": "2026-08-25T19:23:11Z",
+    "MergedAt": "2026-08-25T19:22:11Z",
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/github/common/githubCredentialService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 127,
+      "BasePath": "src/vs/platform/github/common/githubCredentialService.ts",
+      "BaseLine": 132,
+      "IntroducingPath": "src/vs/platform/github/common/githubCredentialService.ts",
+      "IntroducingCommit": "ff1603fb33ea729b0d8cab7f05ccc80575011a55",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "network",
+      "Mechanism": "Each authentication or identity failure discarded the only credential generation, while invalidation listeners immediately rescheduled all subscribed resources; with no retained failure state, every outage round reissued identity and resource network requests at zero delay.",
+      "Symptom": "During a persistent GitHub authentication/network outage, active Agent Merge pull-request subscriptions could sustain a zero-delay request loop whose work scaled with subscribed sessions and fragments.",
+      "FixedBehavior": "The credential service now retains consecutive failures per host/token, waits with jittered exponential backoff before rebuilding identity, and coalesces all callers behind the one generation created after the delay. Token or endpoint replacement releases the wait, preserving recovery.",
+      "Evidence": "In the base revision, a failed identity generation clears `_current` without retaining any failure/backoff state (base line 132, introduced by ff1603fb33ea729b0d8cab7f05ccc80575011a55). Authentication errors also invalidate the generation and synchronously notify `PullRequestResourceService` and `GitHubQueryService`; both handlers reschedule every active fragment/entity at `now`, and each refresh calls `getCredential`, so the next coalesced generation immediately performs another network `GET /user`. The changed line gates that generation before identity resolution, while added failure recording occurs both on identity-resolution failure and before authentication invalidation events.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Agent Merge background pull-request refresh during a persistent authentication or identity outage",
+        "CriticalPath": "Each active session refresh reaches `PullRequestResourceService._runFragmentFetch`, then `GitHubCredentialService.getCredential`; after a recorded failure the new gate must expire before one shared `/user` identity request and subsequent fragment request can proceed. This is background work except authoritative refresh and merge preparation, where the same chain is on the caller's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubCredentialService.ts `_resolveIdentity`",
+            "Operation": "Resolve the current token's stable account identity with REST `GET /user`.",
+            "Cardinality": "One in-flight identity request is coalesced per credential generation; waiting callers scale with active sessions/fragments but share the generation after the delay. A network GET may retry once inside the transport.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same boundary existed, but every failed/invalidated generation could be rebuilt immediately; invalidation listeners rescheduled all active work at `now`, producing repeated outage rounds with no retained delay.",
+            "CriticalPathEffect": "Required before any pull-request fragment or entity request can proceed with an account-scoped credential."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/pullRequestResourceService.ts `_runFragmentFetch` -\u003e `PullRequestQueryService.fetch`",
+            "Operation": "Fetch subscribed pull-request fragments over REST or GraphQL.",
+            "Cardinality": "Up to the effective subscribed fragment set per pull request (Agent Merge requests core, three conversation fragments, review threads, checks, and mergeability); transport coalescing applies only to identical reads, and the request queue serializes one request per account with two per host and four globally.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The boundaries were identical, but authentication invalidation immediately rescheduled every fragment and could repeat them each outage round.",
+            "CriticalPathEffect": "Authoritative subscription refresh waits for core and then all interested fragments; steady polling is background."
+          }
+        ],
+        "ScalingInput": "Number of active Agent Merge sessions, distinct pull requests, and effective fragments per subscription; identity work remains one request per generation while fragment work scales by distinct pull request/fragment after coalescing.",
+        "EffectiveConcurrency": "Credential generation and identical transport reads are coalesced. GitHubRequestQueue permits at most four global, two per host, and one active request per account, so the post-delay burst is serialized per account; many waiting callers still share one credential generation.",
+        "CacheBehavior": "A successful current credential is reused. Failures are now negatively remembered per host/token with one immediate retry, exponential 5s-to-120s delay, jitter, and five-minute decay. Token/host replacement releases the gate; transport ETags and in-flight maps continue to coalesce exact reads.",
+        "MechanismConfidence": "High: changed failure recording, gate wait, invalidation handlers, and network call path were all traced.",
+        "MagnitudeUncertainty": "The exact number of simultaneously active sessions per host and outage duration varies, but the zero-delay pre-diff loop and the bounded post-diff schedule are directly established.",
+        "Verdict": "No performance regression. The change removes repeated network work during outages and keeps aggregate request concurrency bounded."
+      },
+      {
+        "Scenario": "Capability-dependent checks, review-thread, and mergeability refresh after an unusable GraphQL introspection result",
+        "CriticalPath": "Each capability-dependent fragment first calls `GitHubHostCapabilitiesService.getCapabilities`. A cold host performs one coalesced GraphQL introspection; an unusable result now returns cached degraded capabilities until retryAt, after which the next lookup re-probes. Fragment fallback work remains on authoritative-refresh and merge-preparation critical paths.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubHostCapabilitiesService.ts `_probe`",
+            "Operation": "GraphQL schema introspection for pull-request/repository capabilities.",
+            "Cardinality": "One coalesced cold probe per host and enterprise version. After an unusable result, at most one re-probe per escalating 60s-to-15m window for the same credential generation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Successful/schema-negative probes were cached, but other unusable results deleted the entry immediately, so the next capability lookup reissued introspection.",
+            "CriticalPathEffect": "Cold capability-dependent fragment requests wait for it; warm positive or degraded-cache lookups do not cross the network."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/pullRequestQueryService.ts `_fetchChecksFallback` and `_fetchMergeabilityFallback`",
+            "Operation": "REST fallback reads for checks and mergeability when degraded capabilities disable GraphQL.",
+            "Cardinality": "Per pull request, checks use at least two REST calls plus check-run pagination, mergeability uses one REST call, and review threads perform no fallback call. Calls remain grouped by fragment and account-serialized.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same fallbacks ran for every caller receiving the unusable probe result; a later lookup could re-probe immediately and switch back to GraphQL sooner.",
+            "CriticalPathEffect": "These calls complete the degraded fragment refresh and can be on authoritative refresh or merge-preparation paths."
+          }
+        ],
+        "ScalingInput": "Distinct subscribed pull requests and capability-dependent fragment polls during a degraded window; the negative-cache key cardinality is effectively one for the configured host/version in the production service.",
+        "EffectiveConcurrency": "The capability probe is promise-coalesced per host/version. Distinct fallback requests are constrained by the shared GitHub request queue to one active request per account.",
+        "CacheBehavior": "Positive and schema-negative results remain cached indefinitely until endpoint clear. Unexpected degraded results are now negatively cached with escalating retry windows and discarded immediately on credential generation or endpoint change.",
+        "MechanismConfidence": "High for cache and boundary behavior; moderate for how often transient introspection errors recover inside the first window.",
+        "MagnitudeUncertainty": "A transient probe may recover before the first 60s retry, but Agent Merge's relevant background cadences are 60s or longer, limiting extra fallback work; interactive mutation timing varies.",
+        "Verdict": "No reportable regression. The bounded negative cache removes an otherwise per-lookup introspection request; fallback boundaries are pre-existing and production polling cadence limits the short recovery tradeoff."
+      },
+      {
+        "Scenario": "Repository and issue entity polling through repeated GitHub failures",
+        "CriticalPath": "Scheduled entity refresh obtains the shared credential and performs one REST read. On non-authentication failure, the changed scheduler uses at least the normal 60s visible or 300s background cadence and then exponentially increases toward 15 minutes; manual refresh can still run immediately.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubQueryServiceImpl.ts `_runEntityFetch`",
+            "Operation": "REST GET for one repository or issue entity.",
+            "Cardinality": "One request per distinct normalized entity per scheduled refresh; identical subscriptions share an entity entry and transport request. Effective cardinality is distinct active repositories/issues, not subscription count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Failures were retried forever at the ordinary visible/background poll cadence plus jitter; they did not escalate.",
+            "CriticalPathEffect": "Scheduled polling is background; explicit subscription refresh waits for the request but bypasses the scheduled delay."
+          }
+        ],
+        "ScalingInput": "Number of distinct active repository/issue entities and duration of consecutive failures.",
+        "EffectiveConcurrency": "One operation per entity is coalesced, PullRequestScheduler holds one task per entity key, and GitHubRequestQueue serializes requests per account while bounding host/global concurrency.",
+        "CacheBehavior": "Entity state and ETag cache are reused normally; failureCount resets on success and is retained with the entity while active/dormant. No new boundary cache key is created.",
+        "MechanismConfidence": "High: scheduling formula, reset point, entity deduplication, and REST boundary are explicit.",
+        "MagnitudeUncertainty": "Failure prevalence and outage duration vary, but request frequency can only decrease relative to the pre-diff cadence.",
+        "Verdict": "No performance regression. The change reduces repeated network I/O and concurrency during sustained failures."
+      },
+      {
+        "Scenario": "REST or GraphQL request following primary or secondary rate limiting without a usable retry hint",
+        "CriticalPath": "The refusal response updates the shared account/resource coordinator. Subsequent requests call `_enqueueWithRateLimit` and wait before entering the request queue or crossing the network; recovery is delayed by 60 seconds when no future hint is usable.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubTransport.ts `_enqueueWithRateLimit` and githubRateLimitCoordinator.ts `updateFromResponse`/`markGraphQLRateLimited`",
+            "Operation": "Subsequent REST or GraphQL request after a rate-limited refusal.",
+            "Cardinality": "All requests for the affected resource share one resource block; secondary limits share one account-wide block. No network calls occur during the cooldown, regardless of waiting request count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Hinted limits already waited. Unhinted, stale-hint, and primary 403 shapes could leave no block and allow the next request immediately; secondary reset headers could also over-park against the unrelated primary window.",
+            "CriticalPathEffect": "Interactive, mutation, and authoritative-refresh requests for the affected account wait; unrelated accounts remain independently queued."
+          }
+        ],
+        "ScalingInput": "Number of callers sharing the affected account/resource and duration/frequency of GitHub refusals; waiting callers coalesce on state, while timers are per request.",
+        "EffectiveConcurrency": "Waiters remain outside GitHubRequestQueue during cooldown, so they do not consume its four global/two host slots. Once released, the queue still permits only one active request per account.",
+        "CacheBehavior": "Rate-limit state is account/resource scoped and cleared when that account is invalidated. Retry-After wins; reset is honored only for spent quota; otherwise a 60s floor applies.",
+        "MechanismConfidence": "High: response classification, shared state, pre-queue wait, and tests for all hint shapes are explicit.",
+        "MagnitudeUncertainty": "Actual GitHub refusal duration is external, but the changed boundary suppression and maximum unhinted floor are exact.",
+        "Verdict": "No performance regression. The intentional latency prevents immediate repeated network calls, avoids holding queue slots, and corrects overlong secondary-limit waits."
+      },
+      {
+        "Scenario": "Pull-request fragment retry scheduling after ordinary transient failures",
+        "CriticalPath": "After a fragment fetch fails, `_scheduleAfterFailure` computes the next attempt. The shared helper replaces the prior inline exponential calculation, preserving a 30s base, 5m maximum, and positive jitter.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/pullRequestResourceService.ts `_scheduleAfterFailure`",
+            "Operation": "Retry the failed pull-request fragment's REST or GraphQL fetch.",
+            "Cardinality": "One scheduled task per pull-request entry and fragment key; retries scale with distinct active fragment failures and are account-serialized at execution.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same exponential delay and jitter were calculated inline with separate base/maximum policy fields.",
+            "CriticalPathEffect": "Only later background polling waits for this schedule; explicit authoritative refresh cancels/reuses current keyed work and can execute directly."
+          }
+        ],
+        "ScalingInput": "Distinct active pull requests times failing effective fragments.",
+        "EffectiveConcurrency": "PullRequestScheduler replaces tasks by fragment key and uses one timer; transport/request queue bounds actual network concurrency.",
+        "CacheBehavior": "Failure counts remain per fragment and reset on success; no cache or lifecycle semantics changed.",
+        "MechanismConfidence": "High: before/after formulas and default policy values match.",
+        "MagnitudeUncertainty": "None material for the refactor; default timing is equivalent.",
+        "Verdict": "No performance regression; this is a behavior-preserving helper consolidation."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 12 changed files and traced credential invalidation, capability probing/fallback, entity and fragment polling, and rate-limit scheduling through their network boundaries, cache states, and concurrency controls. No diff-introduced performance finding met the reporting threshold. Recorded the credential outage-loop removal as a concrete regression fix introduced by ff1603fb33ea729b0d8cab7f05ccc80575011a55."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-04T02:19:49.096167861Z",
+    "CompletedAt": "2026-10-04T02:23:58.81500677Z",
+    "WallClockMilliseconds": 249718,
+    "ModelCalls": 21,
+    "InputTokens": 2008426,
+    "OutputTokens": 14830,
+    "TotalTokens": 2023256,
+    "ReasoningTokens": 8066,
+    "CacheReadTokens": 1873920,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 234236,
+    "ToolCalls": 101,
+    "NanoAIUnits": 158419200000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1873920,
+      "cache_write": 0,
+      "input": 134506,
+      "output": 14830
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

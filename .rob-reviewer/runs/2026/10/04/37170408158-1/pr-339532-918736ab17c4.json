@@ -1,0 +1,307 @@
+{
+  "PullRequest": {
+    "Number": 339532,
+    "Title": "Copilot: migrate embedding-backed features to Metis",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nMigrates Copilot's embedding-backed features from text-embedding-3-small to Metis.\r\n\r\n## Changes\r\n\r\n- Select embedding endpoint metadata by model family and preserve Metis query/document input roles.\r\n- Move API context, settings/commands lookup, project-template matching, and virtual-tool embeddings to Metis.\r\n- Use model-scoped local caches and the lowercase Metis CDN prefix produced by the publishing pipeline.\r\n- Support both the published array-shaped tool cache and the legacy object-shaped cache.\r\n- Keep the generic `vscode.lm` embeddings provider on text3small because that API cannot express query/document roles.\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339532",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6fad7188e7dbf7db564e5e4a85960eb2bf69bdf4",
+    "HeadRef": "bhavyaus/metis-embeddings",
+    "HeadSHA": "918736ab17c4dfc1b5490cbf6f20e687cdc4ee87",
+    "CreatedAt": "2026-10-04T00:54:15Z",
+    "UpdatedAt": "2026-10-04T01:20:34Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-505ECB865E87",
+      "Focus": "performance-review",
+      "Path": "extensions/copilot/src/platform/embeddings/common/vscodeIndex.ts",
+      "Side": "RIGHT",
+      "Line": 294,
+      "Severity": "medium",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The model dimensions, number-array representation, full-index retention, and component-wise ranking loop are explicit in the repository, so the 2x scaling mechanism is certain. Exact heap and latency magnitude depends on each installation's contributed setting/command count and engine representation, which is why severity is medium rather than high.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "Long-lived JavaScript number-array elements for every cached setting and command embedding, plus CPU work for their dot products",
+      "PerformanceScaling": "Resident elements and dot-product iterations scale with the total settings and commands loaded from core and installed extensions; changing each vector from 512 to 1024 dimensions doubles both per-entry quantities.",
+      "PerformanceOutcome": "Increased retained heap and CPU/GC pressure, with longer synchronous ranking work after each settings search or VS Code assistant query",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "The settings and command caches and query embeddings used text3small_512, so each retained item had 512 numeric components and each distance calculation iterated 512 components.",
+      "ChangedBehavior": "The changed cache constructors load Metis 1024-dimensional vectors for both complete indexes, while BaseEmbeddingsIndex keeps every vector in its session-long maps and rankEmbeddings/distance scans every component of every indexed entry.",
+      "CausalDiffEvidence": "RIGHT line 294 replaces EmbeddingType.text3small_512 with EmbeddingType.metis_1024_I16_Binary for the complete settings cache; the adjacent changed command-cache line makes the same replacement, increasing retained vector width for all entries from 512 to 1024.",
+      "Title": "Keep binary Metis index vectors compact",
+      "Impact": "On installations with thousands of core and extension-contributed settings/commands, loading these indexes now retains twice as many JS numeric elements, and every settings-editor search or VS Code assistant lookup performs twice as many multiply-add iterations before returning ranked results.",
+      "Evidence": "EmbeddingType metadata defines Metis at 1024 dimensions versus text3small at 512, and EmbeddingVector remains readonly number[]. RemoteEmbeddingsCache JSON-parses these arrays, BaseEmbeddingsIndex._calculateEmbeddings attaches them to every item in _items, and distance() loops to the vector length. The changed lines 294-298 migrate both all-settings and all-commands caches to Metis, while provideSettingsSearchResults and VscodePrompt synchronously rank the full loaded indexes on their response path.",
+      "Recommendation": "Convert cached binary document embeddings to a compact representation (for example a bit-packed or Int8-backed vector) as they are loaded and make distance consume that representation, rather than retaining 1,024 boxed/JS-number components per entry; keep query/document semantics and ranking results unchanged."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "cache-lifecycle",
+      "boundary-fanout",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Settings Editor semantic search and VS Code assistant settings/command lookup",
+        "CriticalPath": "A query must complete one remote embedding request, then on the first lookup load the command/settings indexes, and synchronously score/sort their retained entries before results progress. Optional LLM reranking occurs afterward. The diff doubles vector width on this critical path from 512 to 1024.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/embeddings/common/remoteEmbeddingsComputer.ts:computeEmbeddings",
+            "Operation": "Compute the query embedding through Dotcom embeddings or CAPI embeddings",
+            "Cardinality": "One request for the single query; for no-auth CAPI, one models request can additionally occur on a cold or older-than-10-minute metadata cache.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same query path made one text3small embedding request; the diff changes model family and payload role, not request count.",
+            "CriticalPathEffect": "Blocks ranking and all embedding-based results."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/copilot/src/platform/workbench/vscode/workbenchServiceImpt.ts:getAllSettings/getAllCommands",
+            "Operation": "Execute _getAllSettings and _getAllCommands through vscode.commands",
+            "Cardinality": "Two IPC calls on cold index initialization, one per complete collection, in parallel.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two collection-wide IPC calls initialized the text3small indexes.",
+            "CriticalPathEffect": "Blocks first index construction; absent after the in-memory indexes are loaded."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/embeddings/common/embeddingsIndex.ts:RemoteEmbeddingsExtensionCache.getCache",
+            "Operation": "Fetch CDN latest/core files and missing installed-extension embedding files",
+            "Cardinality": "Cold: two latest checks, up to two core downloads, and up to two requests per installed non-VS-Code extension (one settings and one commands cache); per-index extension requests are sequential. Warm in-memory indexes make zero calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cold-cache fan-out existed for text3small; the diff changes the container and local cache namespace because the embeddings are incompatible.",
+            "CriticalPathEffect": "Blocks first settings/command index load."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/embeddings/common/embeddingsIndex.ts:EmbeddingsCache",
+            "Operation": "Read, clear, and persist the two model-scoped embedding caches",
+            "Cardinality": "At most one read and, when CDN state changed, one clear/write sequence per settings or command cache during cold initialization.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same operations used unscoped text3small filenames.",
+            "CriticalPathEffect": "Blocks first index load; no index filesystem operations after in-memory load."
+          }
+        ],
+        "ScalingInput": "All core and installed-extension settings plus commands; effective ranking cardinality is the number of entries with embeddings, with no grouping or result-limit shortcut before scoring.",
+        "EffectiveConcurrency": "The command and settings index loads run in parallel via Promise.all. Within each index, extension CDN files are fetched sequentially. A one-input embedding request is one network call; CAPI batching is globally serial within that request.",
+        "CacheBehavior": "Cold index load checks each model-scoped disk cache and CDN latest marker, downloads core and missing per-extension caches, and persists them. Once BaseEmbeddingsIndex is loaded, later queries reuse its in-memory maps and do not reload the CDN/disk indexes; each query still requests a fresh query embedding. The new model key correctly prevents incompatible text3small reuse but retains twice as many numeric vector elements.",
+        "MechanismConfidence": "High: dimensions, number-array retention, all-entry scoring, and changed model selection are explicit.",
+        "MagnitudeUncertainty": "Exact entry counts, JS-engine element representation, and milliseconds vary by installed extensions, but thousands of settings/commands are realistic and the 2x component count is deterministic.",
+        "Verdict": "Reportable: the model migration materially amplifies long-lived numeric elements and full-index dot-product work by 2x; submitted as a medium memory/CPU regression."
+      },
+      {
+        "Scenario": "VS Code API context retrieval for extension-development chat",
+        "CriticalPath": "The API cache update must finish, then one remote query embedding and a full API-chunk ranking must complete before prompt context is rendered.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/embeddings/common/embeddingsIndex.ts:RemoteEmbeddingsCache.getCache",
+            "Operation": "Check/download the API embedding CDN cache",
+            "Cardinality": "One latest check per render and one core download per cache instance/version when cold.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same latest/core operations occurred against the text3small container.",
+            "CriticalPathEffect": "Blocks API context retrieval."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/embeddings/common/embeddingsIndex.ts:EmbeddingsCache",
+            "Operation": "Read or persist the API embedding cache JSON",
+            "Cardinality": "One read per update and a clear/write sequence when the CDN version differs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same operations with the prior cache filename/model.",
+            "CriticalPathEffect": "On the prompt critical path before query ranking."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/context/node/resolvers/extensionApi.tsx:VSCodeAPIContextElement.getSnippets",
+            "Operation": "Compute one API-context query embedding",
+            "Cardinality": "One request per rendered API-context query.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One text3small request was made at the same point.",
+            "CriticalPathEffect": "Blocks context construction."
+          }
+        ],
+        "ScalingInput": "All API/documentation chunks in the CDN cache; ranking scores every chunk before sorting and taking five.",
+        "EffectiveConcurrency": "Cache update, embedding request, and ranking are sequential. The one-input embedding request is a single network call.",
+        "CacheBehavior": "Cold use checks latest, downloads the Metis API cache, and persists it. The RemoteEmbeddingsCache instance retains the downloaded object, but updateIndex still performs the pre-existing latest check on each render. The diff changes cache namespace/model and doubles vector component width.",
+        "MechanismConfidence": "High for path and boundary counts; medium for exact memory/latency magnitude.",
+        "MagnitudeUncertainty": "The repository does not expose the published API chunk count or endpoint latency.",
+        "Verdict": "The same 1024-number retention/scoring amplification exists, but it is the same mechanism as the submitted full-index finding and was not duplicated."
+      },
+      {
+        "Scenario": "New workspace project-template selection",
+        "CriticalPath": "Intent classification chat completes first; for project intent with templates enabled, one query embedding, first-use template cache load, full template ranking, then recursive GitHub repository content fetches must complete.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/prompts/node/panel/newWorkspace/newWorkspace.tsx:prepare",
+            "Operation": "Classify new-workspace intent with the utility chat model",
+            "Cardinality": "One chat request per invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged.",
+            "CriticalPathEffect": "Blocks determining whether template search runs."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/prompts/node/panel/newWorkspace/newWorkspace.tsx:prepare",
+            "Operation": "Compute the project description query embedding",
+            "Cardinality": "One request for project intent with templates enabled.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One text3small embedding request occurred at the same point.",
+            "CriticalPathEffect": "Blocks template ranking."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/projectTemplatesIndex/common/projectTemplatesIndex.ts:updateIndex",
+            "Operation": "Check/download the project-template CDN cache",
+            "Cardinality": "One latest check and at most one core download on first use per service lifetime.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same count against the text3small cache.",
+            "CriticalPathEffect": "Blocks first template selection."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/embeddings/common/embeddingsIndex.ts:EmbeddingsCache",
+            "Operation": "Read or persist the project-template embedding cache",
+            "Cardinality": "One cold read and optional clear/write.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same operations under the old cache key.",
+            "CriticalPathEffect": "Blocks first template selection."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/github/node/githubRepositoryService.ts:getRepositoryItems",
+            "Operation": "Recursively list selected template repository contents",
+            "Cardinality": "One request for the root and one additional request per nested directory, sequentially.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged downstream path.",
+            "CriticalPathEffect": "Blocks workspace metadata/result construction after a template is selected."
+          }
+        ],
+        "ScalingInput": "One query, all template entries for ranking, then one GitHub contents request per directory reached in the selected template repository.",
+        "EffectiveConcurrency": "Intent, embedding, cache/ranking, and repository traversal are sequential. GitHub directory traversal is recursively serial. CAPI embedding batching has effective parallelism one.",
+        "CacheBehavior": "ProjectTemplatesIndex loads once per service lifetime. Cold use checks/downloads/persists the model-scoped CDN cache; warm use reuses the in-memory array. Query embeddings are never cached.",
+        "MechanismConfidence": "High for call ordering, cache behavior, and boundary multiplicity.",
+        "MagnitudeUncertainty": "Published template count and selected repository depth vary.",
+        "Verdict": "No additional finding: model/cache target changes preserve boundary cardinality; vector-width amplification is covered by the submitted mechanism."
+      },
+      {
+        "Scenario": "Virtual-tool prediction, search, and grouping",
+        "CriticalPath": "On first use, precomputed CDN and local tool caches initialize; then a query embedding is fetched, embeddings for cache-missing available tools are computed in batches, and available tools are ranked/grouped before tool selection completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/tools/common/virtualTools/preComputedToolEmbeddingsCache.ts:initialize",
+            "Operation": "Check/download precomputed tool embeddings from the CDN",
+            "Cardinality": "One latest check and at most one core download on lazy first use.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same operations for the text3small precomputed cache.",
+            "CriticalPathEffect": "Blocks first embedding-backed tool operation."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/extension/tools/common/virtualTools/toolEmbeddingsLocalCache.ts",
+            "Operation": "Read the model-scoped CDN cache and binary local tool cache; persist runtime-computed tools after a scheduler delay",
+            "Cardinality": "One local read on initialization; one deferred aggregate write after new entries, not on the immediate critical path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same lifecycle, with the old model cache becoming incompatible once due to migration.",
+            "CriticalPathEffect": "Initial read blocks first use; delayed save is off the request critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/tools/common/virtualTools/toolEmbeddingsComputer.ts:searchToolsByQuery/computeEmbeddingsForTools",
+            "Operation": "Compute query embedding and document embeddings for cache-missing tools",
+            "Cardinality": "One query request plus ceil(missingTools/batchLimit) document requests; requests are serial.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same request grouping and frequency using text3small; the diff supplies Metis roles/model.",
+            "CriticalPathEffect": "Both block tool ranking when needed."
+          }
+        ],
+        "ScalingInput": "Available extension/MCP tools after built-in filtering; missing tool documents are grouped into batches of 100 on Dotcom or endpoint max_inputs on CAPI, while ranking scales with available embedded tools.",
+        "EffectiveConcurrency": "Precomputed and local cache initialization run in parallel. Missing tools share one computeEmbeddings invocation; Dotcom sends batches sequentially and CAPI uses Limiter parallelism 1. Tool result waits are serialized by tool order but share the same batch promise.",
+        "CacheBehavior": "The precomputed cache is loaded once through Lazy initialization. The local cache rejects the old embedding type and is repopulated for missing tools; later calls reuse precomputed/local/in-memory entries. CDN negative extension behavior is not involved.",
+        "MechanismConfidence": "High for coalescing, batch cardinality, and cache lifecycle.",
+        "MagnitudeUncertainty": "Available and cache-missing tool counts differ substantially by extension/MCP configuration.",
+        "Verdict": "No separate finding: no new fan-out or concurrency burst; wider retained precomputed vectors share the reported allocation mechanism."
+      },
+      {
+        "Scenario": "Related-information provider queries for settings and commands",
+        "CriticalPath": "If an index is not loaded, calculation is started in the background and the request returns immediately. Once loaded, one remote query embedding blocks the request, followed by a synchronous scan/sort of all embedded items.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/embeddings/common/vscodeIndex.ts:provideRelatedInformation",
+            "Operation": "Compute one related-information query embedding",
+            "Cardinality": "One request per loaded-index provider query.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One text3small request was made at the same point.",
+            "CriticalPathEffect": "Blocks results; cold-index requests avoid this by returning immediately."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/copilot/src/platform/workbench/vscode/workbenchServiceImpt.ts",
+            "Operation": "Load all settings or all commands during background index construction",
+            "Cardinality": "One collection-wide IPC call per index initialization, coalesced.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged.",
+            "CriticalPathEffect": "Off the triggering cold request path, but required before later queries can return matches."
+          }
+        ],
+        "ScalingInput": "Every loaded setting or command entry with an embedding; result cap applies only after all scores are computed.",
+        "EffectiveConcurrency": "Cold background index calculation is coalesced by _calculationPromise. Loaded-query scoring is single-threaded; one embedding network request is in flight per provider call, subject to caller cancellation.",
+        "CacheBehavior": "Cold calculation uses the same model-scoped remote extension caches as settings search. Loaded maps are reused for the service lifetime. Query embeddings are not cached.",
+        "MechanismConfidence": "High for the hot scan and changed 2x dimensionality.",
+        "MagnitudeUncertainty": "Invocation frequency is controlled by VS Code consumers and is not quantified in this repository.",
+        "Verdict": "The doubled component-wise scan is covered by the submitted settings/command index finding; no separate boundary regression."
+      }
+    ],
+    "Summary": "Reviewed all 16 changed files and traced embedding queries, cache loading, endpoint resolution, full-index ranking, tool initialization, and project-template lookup. Submitted one medium-confidence-severity finding for materially amplified retained vector storage and component-wise ranking work after moving full settings/command indexes from 512 to 1024 dimensions. Cache namespaces, endpoint selection, input roles, and array/object cache compatibility did not otherwise add reportable boundary counts or concurrency."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-04T02:26:08.864372577Z",
+    "CompletedAt": "2026-10-04T02:29:03.407436767Z",
+    "WallClockMilliseconds": 174543,
+    "ModelCalls": 11,
+    "InputTokens": 598156,
+    "OutputTokens": 11779,
+    "TotalTokens": 609935,
+    "ReasoningTokens": 5271,
+    "CacheReadTokens": 515072,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 160517,
+    "ToolCalls": 71,
+    "NanoAIUnits": 77394480000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 515072,
+      "cache_write": 0,
+      "input": 83084,
+      "output": 11779
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
