@@ -1,0 +1,141 @@
+{
+  "PullRequest": {
+    "Number": 339676,
+    "Title": "Try to fix \"archiving a never-restored session survives a host restart\"",
+    "Body": "Fixes https://github.com/microsoft/vscode/issues/339664",
+    "URL": "https://github.com/microsoft/vscode/pull/339676",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexr00",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "2dca67a07aba894351849f39d337a921758722e8",
+    "HeadRef": "alexr00/sufficient-skunk",
+    "HeadSHA": "f6cc5a417a93bfa811b15dcea2404f0c51054cda",
+    "CreatedAt": "2026-10-05T09:10:22Z",
+    "UpdatedAt": "2026-10-05T09:18:53Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Graceful Agent Host shutdown with pending catalog, session-data, and customization persistence",
+        "CriticalPath": "Protocol ingress is disposed, protocol requests drain, providers shut down, AgentService drains catalog/background metadata work and closes the orchestrator database, then session-data and customization flushes run before process exit. The entire sequence remains bounded by the existing 4500 ms outer race; the changed per-flush handling only prevents one rejection from short-circuiting the other already-started flushes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:1187 and AgentService.shutdown",
+            "Operation": "Drain per-session catalog synchronization and passive metadata updates, replay pending metadata, and close the central orchestrator database",
+            "Cardinality": "At most one active coalesced catalog-state write and one active coalesced passive-metadata write per affected session; shutdown drains the effective pending-session set.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same writes were awaited on the successful path, but a reconciliation/storage rejection could skip later drains or database cleanup.",
+            "CriticalPathEffect": "These pre-existing writes and database close must complete before graceful shutdown progresses, subject to the outer shutdown timeout."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostServerMain.ts:389 via flushAgentHostPersistenceBeforeShutdown",
+            "Operation": "Wait for session-data and customization/global storage writes to become idle",
+            "Cardinality": "Two grouped flush promises, independent of session count at this boundary; their internal writes are already queued/coalesced.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Both promises were already started concurrently, but Promise.all returned on the first rejection and could let process exit while the other write remained pending.",
+            "CriticalPathEffect": "Both existing flushes are now allowed to settle even if one rejects; a stalled peer can delay exit only up to the existing 4500 ms whole-shutdown cap."
+          }
+        ],
+        "ScalingInput": "Number of sessions with already-pending background metadata/catalog writes at shutdown; final flush boundary cardinality remains two grouped promises.",
+        "EffectiveConcurrency": "Provider/catalog shutdown is ordered before persistence flush. The two final persistence promises run concurrently through Promise.all; catalog and passive metadata writes are coalesced per session and awaited in snapshots until their maps empty.",
+        "CacheBehavior": "No cache lookup is added. Background work is deduplicated/coalesced by session maps, and global storage writes are coalesced by the existing Throttler.",
+        "MechanismConfidence": "High: call order, promise grouping, per-session maps, and the outer timeout are explicit in the traced code.",
+        "MagnitudeUncertainty": "Database and filesystem latency vary, especially during failure, but the total shutdown path remains bounded by the unchanged outer 4500 ms timeout.",
+        "Verdict": "No reportable regression. The diff waits for already-started persistence work after a sibling failure, without increasing operation cardinality or removing the existing whole-shutdown bound."
+      },
+      {
+        "Scenario": "Host-owned JSON storage updates for automation state, SDK consent, recent sessions, customization state, reconciliation cursors, and MCP routing metadata",
+        "CriticalPath": "Ordinary set/delete callers update memory and schedule background persistence, so disk work is off their immediate critical path. setAndFlush callers, notably automation mutations and SDK consent, await the coalesced storage write before publishing/returning.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostStorageService.ts:149-159",
+            "Operation": "Ensure the directory exists, write the complete JSON snapshot to a same-directory temporary file, atomically rename it over storage, then force-remove any remaining temporary file",
+            "Cardinality": "One mkdir, one full-snapshot write, one rename, and one cleanup attempt per effective throttled write; bursts collapse to one active plus at most one trailing write.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Each effective write performed mkdir plus one direct full-snapshot write to the destination, with no rename or temporary cleanup.",
+            "CriticalPathEffect": "Background set/delete calls do not wait. setAndFlush calls wait for these operations, adding fixed metadata operations while preserving atomic durability."
+          }
+        ],
+        "ScalingInput": "Effective throttled write count and serialized JSON snapshot size; storage is bounded by feature-level limits for major collections, while update bursts are coalesced globally.",
+        "EffectiveConcurrency": "A single Throttler permits one active write and coalesces all concurrently queued updates into at most one trailing write; there is no per-key filesystem fan-out.",
+        "CacheBehavior": "The in-memory object is authoritative after synchronous startup load. Warm updates serialize current memory; there is no read-through miss path. Throttling coalesces writes but does not cache failed writes.",
+        "MechanismConfidence": "High: the exact filesystem sequence and global coalescing semantics are explicit.",
+        "MagnitudeUncertainty": "Filesystem metadata-operation latency varies by platform, but each effective write gains only fixed rename/cleanup work and no extra full-data copy or concurrency burst.",
+        "Verdict": "No reportable regression. The fixed additional metadata operations implement atomic replacement, are globally coalesced, and do not establish a realistic latency or throughput bug at the observed update frequency."
+      },
+      {
+        "Scenario": "Waiting for catalog reconciliation to become idle during tests, deletion coordination, and shutdown",
+        "CriticalPath": "The waiter first observes catalog reconciliation idle, then drains any already-running catalog-state and passive-metadata promises. During shutdown this is on the exit path; elsewhere production deletion uses the session-scoped equivalent rather than the changed global method.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:1187-1204",
+            "Operation": "Await existing catalog-state and passive-session-metadata synchronization promises, which can access session and orchestrator databases",
+            "Cardinality": "One promise per affected session per write class after per-session coalescing; no new database operation is created by the waiter.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "On a reconciliation rejection, the method exited before draining the tracked background promises; on success it already awaited the same promise snapshots and looped.",
+            "CriticalPathEffect": "The method waits for pre-existing work. The changed finally placement guarantees those promises drain even if reconciliation idle rejects, but does not initiate additional persistence."
+          }
+        ],
+        "ScalingInput": "Effective number of sessions that already have tracked background writes, not total catalog size.",
+        "EffectiveConcurrency": "All currently tracked per-session promises are awaited concurrently with Promise.allSettled; each session's own producer coalesces trailing updates serially. The loop repeats only if producers queued more tracked work.",
+        "CacheBehavior": "No cache behavior changes. The maps serve as in-flight coalescing/ownership state and entries remove themselves in producer finally blocks.",
+        "MechanismConfidence": "High: producer ownership, deletion in finally blocks, and waiter behavior were traced directly.",
+        "MagnitudeUncertainty": "The duration of pre-existing database writes depends on backend health, but the changed method neither duplicates them nor increases their effective cardinality.",
+        "Verdict": "No reportable regression. The change strengthens cleanup ordering around existing work without adding repeated database calls, retention, or concurrency."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files and all diff hunks. Traced shutdown, catalog-idle draining, and atomic host-storage persistence through their filesystem/database boundaries, coalescing, concurrency, and timeout behavior. No high-confidence actionable performance regression was introduced."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-05T12:35:03.083345446Z",
+    "CompletedAt": "2026-10-05T12:36:31.888520508Z",
+    "WallClockMilliseconds": 88805,
+    "ModelCalls": 10,
+    "InputTokens": 334590,
+    "OutputTokens": 6387,
+    "TotalTokens": 340977,
+    "ReasoningTokens": 2107,
+    "CacheReadTokens": 279289,
+    "CacheWriteTokens": 55271,
+    "APIDurationMilliseconds": 73022,
+    "ToolCalls": 65,
+    "NanoAIUnits": 51593060000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 279289,
+      "cache_write": 55271,
+      "input": 30,
+      "output": 6387
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

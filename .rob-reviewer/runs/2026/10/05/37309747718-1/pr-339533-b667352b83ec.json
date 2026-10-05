@@ -1,0 +1,212 @@
+{
+  "PullRequest": {
+    "Number": 339533,
+    "Title": "github: migrate Dev Container sample reads",
+    "Body": "Related: https://github.com/microsoft/vscode-internalbacklog/issues/9678\r\n\r\n- Route public Dev Container sample reads through the owning host's leased `IGitHubAnonymousClient.getFile(...)`: resolve repository `HEAD` with one REST API request, then download raw content pinned to that commit. Host options include `rawBaseUri`, defaulting to `https://raw.githubusercontent.com` for GitHub.com.\r\n- Preserve raw UTF-8 content without a Contents API/base64 round trip. Downloads omit credentials and API-identification headers, enforce the existing 1 MiB byte limit and pinned-origin redirect boundary, and track raw-host throttling separately from the REST API quota. File content does not require a second REST API request.\r\n- Preserve the `{ commit, content }` cache, checkout pinning, JSONC/config validation, volume identities, clone-before-hooks ordering, and cleanup. Both operations use the local governed engine, caller-selected attribution/priority and a shared deadline. `GitHubCancellation` (`AbortSignal | CancellationToken`) is normalized inside the client. Custom API hosts must configure their raw base explicitly; JSON API reads remain confined to `apiBaseUri`.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339533",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "445a177dce6c45e7dacaa8a9bb0d2f673467a1f9",
+    "HeadRef": "agents/github-devcontainer-anonymous-reads",
+    "HeadSHA": "b667352b83ec87c5baf3aeaa3f7d1e6892314729",
+    "CreatedAt": "2026-10-04T00:55:39Z",
+    "UpdatedAt": "2026-10-05T12:22:27Z",
+    "MergedAt": null,
+    "Labels": [
+      "network"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold Dev Container sample launch",
+        "CriticalPath": "Reading source.json, resolving repository HEAD, downloading the pinned devcontainer.json, validating and writing it must complete before volume/container setup, clone, hooks, and agent-host startup can proceed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerSamples.ts:98-112",
+            "Operation": "Read source.json and, on a miss, atomically write the fetched commit/content cache.",
+            "Cardinality": "One read per launch and one write per cold sample cache; six built-in sample cache keys.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same source.json read/write cache existed before the diff.",
+            "CriticalPathEffect": "The read determines whether network is needed; the cold write completes before Docker setup."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/anonymousClient.ts:96-99",
+            "Operation": "Resolve /repos/{owner}/{repo}/commits/HEAD through the anonymous REST client.",
+            "Cardinality": "One request per cold sample; overlapping reads of the same repository can coalesce while the shared client lease is live.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The sample path already made one direct REST request for commits/HEAD.",
+            "CriticalPathEffect": "Sequential first network boundary; raw download cannot start until the SHA is validated."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/anonymousClient.ts:112-121",
+            "Operation": "Download the commit-pinned raw devcontainer.json with a 1 MiB cap.",
+            "Cardinality": "One raw request per cold sample, plus at most five same-origin redirects; no raw request on a source-cache hit.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The sample path already made one direct raw.githubusercontent.com request after resolving HEAD.",
+            "CriticalPathEffect": "Sequential second network boundary and required before configuration validation and container setup."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerSamples.ts:119-184",
+            "Operation": "Run Docker and Dev Container CLI commands, clone the repository, inspect configuration, and run lifecycle hooks.",
+            "Cardinality": "A fixed sequence per launch, with conditional volume creation/image inspection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same subprocess sequence and ordering existed before the diff.",
+            "CriticalPathEffect": "Dominates the remaining launch path after source acquisition."
+          }
+        ],
+        "ScalingInput": "Cold launches across the six distinct built-in samples. Same-source connections are serialized by SequencerByKey; distinct samples may overlap. The governed queue permits one active anonymous request per origin, allowing an API request and raw-host request to overlap across launches but serializing requests within each origin.",
+        "EffectiveConcurrency": "Each launch awaits REST then raw serially. Across distinct launches, the shared queue has global concurrency 4, host concurrency 2, caller concurrency 2, and account identity effectively limits each anonymous origin to one active request. Same sample connections are serialized before preparation.",
+        "CacheBehavior": "source.json eliminates all GitHub reads on warm launches. On cold concurrent reads, REST HEAD requests for an identical repository coalesce while leases overlap; different repositories do not. The raw body is bounded to 1 MiB and is not retained beyond the returned text/source cache.",
+        "MechanismConfidence": "High confidence in the two unchanged network calls, cache gating, and queue limits from traced code; lower confidence that multi-sample cold fan-out is common or materially affects total startup.",
+        "MagnitudeUncertainty": "Several distinct sample launches can now queue their same-origin network stages where direct requests previously had no GitHub queue, but the cardinality is bounded to six and typical interaction launches one sample; no evidence shows a meaningful user-visible regression against the much larger unchanged container/clone path.",
+        "Verdict": "No reportable regression. The diff preserves the cold boundary count, bounds raw allocation, keeps network off warm launches, and moves requests into intentional bounded admission. The only reduced concurrency requires simultaneous cold launches of different samples and lacks evidence of material impact."
+      },
+      {
+        "Scenario": "Warm Dev Container sample reconnect",
+        "CriticalPath": "The cached source file is read and parsed, then the existing Docker/Dev Container setup, checkout verification, and hooks run. GitHub client acquisition and network access are off this path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerSamples.ts:98-118,135-180",
+            "Operation": "Read and parse the existing source.json cache and rewrite derived configuration/source after checkout verification.",
+            "Cardinality": "One source read and bounded atomic writes per reconnect.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical cache-hit filesystem behavior.",
+            "CriticalPathEffect": "Required before container commands, but avoids both GitHub requests."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerSamples.ts:119-184",
+            "Operation": "Execute Docker/Dev Container setup, clone-or-verify checkout, and lifecycle hooks.",
+            "Cardinality": "Fixed sequence per reconnect with conditional operations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical subprocess sequence.",
+            "CriticalPathEffect": "Forms the main reconnect critical path."
+          }
+        ],
+        "ScalingInput": "Repeated launches of a sample with a valid source.json cache.",
+        "EffectiveConcurrency": "Connections for the same sample key are serialized by the existing SequencerByKey; different sample keys can proceed independently through container work.",
+        "CacheBehavior": "A positive source cache bypasses readSource entirely, so no anonymous client, cancellation adapter, REST request, or raw download is created. Invalid cache behavior and checkout pinning are unchanged.",
+        "MechanismConfidence": "High, directly established by the sourceContent guard and service callback placement.",
+        "MagnitudeUncertainty": "None material for the changed path because it is not reached on a cache hit.",
+        "Verdict": "No performance regression; the primary warm path remains unchanged and performs zero new network/IPC work."
+      },
+      {
+        "Scenario": "Existing anonymous GitHub JSON reads, including issue search through the shared-process service",
+        "CriticalPath": "A renderer IPC call, where applicable, acquires the same normalized anonymous client and performs one governed REST GET; cancellation adaptation now occurs inside the client before queueing/fetch.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/github/common/githubIpc.ts:60-72",
+            "Operation": "Invoke the shared-process GitHub channel for an anonymous JSON read.",
+            "Cardinality": "One IPC call per logical request; unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC request existed; only token-to-signal adaptation moved into the client.",
+            "CriticalPathEffect": "Required before the renderer receives search/API data."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/anonymousClient.ts:78-90",
+            "Operation": "Perform an anonymous REST GET under apiBaseUri.",
+            "Cardinality": "One wire request per cold unique URL, with in-flight coalescing and ETag revalidation on a retained client.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The former in-file GitHubAnonymousClient used the same GitHubTransport REST path.",
+            "CriticalPathEffect": "Required for uncached/current JSON data."
+          }
+        ],
+        "ScalingInput": "Issue searches and other anonymous JSON reads; effective wire cardinality is reduced by per-client in-flight coalescing and ETag cache reuse.",
+        "EffectiveConcurrency": "Existing shared queue limits remain global 4, host 2, caller 2, and one active request per anonymous origin/account. The refactor does not alter JSON-read queue placement.",
+        "CacheBehavior": "The existing 500-entry transport LRU, redirects, ETags, and coalescing remain. Default and explicit GitHub.com acquisitions normalize to the same client identity; failures are not negatively cached.",
+        "MechanismConfidence": "High from the extracted client implementation and unchanged transport path.",
+        "MagnitudeUncertainty": "No changed multiplicity or boundary placement was found.",
+        "Verdict": "No reportable regression; cancellation allocation is scoped and disposed, while network count, caching, and queue behavior for existing JSON reads are preserved."
+      },
+      {
+        "Scenario": "Authenticated and new anonymous raw downloads through GitHubTransport",
+        "CriticalPath": "A download is admitted by the shared queue, follows bounded redirects, streams a bounded response, and decodes it after the body read. Existing authenticated callers use the same prior boundary with only constant-time anonymous branching added.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubTransport.ts:289-387",
+            "Operation": "Fetch download content and follow up to five redirects.",
+            "Cardinality": "One initial request plus at most five redirects per download.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Authenticated downloads already used this loop; the diff exposes the same boundary for raw anonymous content.",
+            "CriticalPathEffect": "The body must arrive before decoded text is returned."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/github/common/githubTransport.ts:380-386",
+            "Operation": "Buffer up to the configured byte limit and UTF-8 decode the response.",
+            "Cardinality": "Linear in response bytes; repository-file callers cap input at 1 MiB.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The transport already buffered and decoded authenticated downloads; anonymous getFile newly reuses it instead of the prior request-service text buffering.",
+            "CriticalPathEffect": "Occurs before content is returned to the caller."
+          }
+        ],
+        "ScalingInput": "Response bytes up to 1 MiB for getFile and redirect count up to five; existing authenticated limits remain unchanged.",
+        "EffectiveConcurrency": "Governed by the shared queue; raw.githubusercontent.com has a separate anonymous account/origin from api.github.com, preventing REST quota cooldown from blocking raw content.",
+        "CacheBehavior": "Raw downloads intentionally use no-store and have no body cache; the Dev Container source cache prevents repeat calls. Raw and REST cooldowns are keyed to separate origins/resources.",
+        "MechanismConfidence": "High from explicit byte, redirect, deadline, and queue bounds.",
+        "MagnitudeUncertainty": "No unbounded input or increased authenticated-download frequency was found.",
+        "Verdict": "No reportable regression; raw allocation is newly bounded and existing authenticated download cost is not materially amplified."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 21 changed files and all diff pages. Traced cold/warm sample launch, anonymous JSON/IPC reads, queue/rate-limit behavior, client/cache lifecycles, cancellation cleanup, raw download bounds, and unchanged authenticated downloads. No high-confidence diff-introduced performance issue met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-05T12:33:11.132282599Z",
+    "CompletedAt": "2026-10-05T12:34:58.94840263Z",
+    "WallClockMilliseconds": 107816,
+    "ModelCalls": 7,
+    "InputTokens": 394099,
+    "OutputTokens": 7937,
+    "TotalTokens": 402036,
+    "ReasoningTokens": 3580,
+    "CacheReadTokens": 295810,
+    "CacheWriteTokens": 98268,
+    "APIDurationMilliseconds": 90541,
+    "ToolCalls": 57,
+    "NanoAIUnits": 76848800000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 295810,
+      "cache_write": 98268,
+      "input": 21,
+      "output": 7937
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
