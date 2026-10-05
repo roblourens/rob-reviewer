@@ -1,0 +1,192 @@
+{
+  "PullRequest": {
+    "Number": 339628,
+    "Title": "Report failed and cancelled subagent turn outcomes",
+    "Body": "When the host closes a subagent's child turn on the task-list path, it always records the turn as `success`: `completeSubagentSession` in `agentSideEffects.ts` dispatches `ChatTurnComplete` and calls `_completeTurn(..., 'success')`. A `task` subagent whose task ends as `failed` or `cancelled` therefore shows a completed child turn with no error in the UI, and `agentHost.turnCompleted` reports it as `success`. The same applies to an inline subagent the runtime tears down, which sends `subagent.completed` with `cancelled: true`. #339619 fixed this only for `subagent.failed` on subagents with no task.\n\n## Telemetry\n\nLast 3 days, `copilotcli` provider. Each child `agenthost.turncompleted` is joined (by `parenttoolcallid`) to the `copilotsdk/tool_call_executed` event of the tool call that spawned it. The tool's `result_type` is the actual outcome.\n\n**`task` subagents:**\n\n| Tool result | Child turn recorded as | Child turns | Devices |\n|---|---|---|---|\n| FAILURE | `error` | 1,977 | 727 |\n| FAILURE | **`success`** | **652** | **134** |\n| FAILURE | `cancelled` | 81 | 3 |\n| SUCCESS | `success` | 190,290 | 17,680 |\n\n- **24% of failed sync `task` subagents (652 of 2,710) are recorded as `success`**, about 0.3% of all `task` subagent turns. The `task` subagent failure rate is therefore understated by about a quarter.\n- The two failure groups look different. Turns already recorded as `error` mostly failed at startup: 77% made zero model calls, with a median of 3 s. The child's own `session.error` already ends those as errors. Turns recorded as `success` did real work first (median 3 model calls, 28 s), then failed through a `failed` task status or `subagent.failed`. That is the path this PR fixes.\n- This is a lower bound. A background `task` call reports `SUCCESS` as soon as the agent launches, so later background failures can't be counted this way.\n- The behavior is the same on stable 1.135–1.140 and 1.141 Insiders, so it is long-standing, not a regression.\n\n## Fix\n\nThe host now reports how the subagent ended before it closes the child turn:\n\n- **Task status `failed`**: emit a child-scoped `ChatError` (`errorType: 'subagentFailed'`). The message and duration come from a pending `subagent.failed` when there is one, and otherwise from the task's `error` and `activeTimeMs`.\n- **Task status `cancelled`**, or **`subagent.completed` with `cancelled: true`** on a subagent with no task: emit a child-scoped `ChatTurnCancelled`.\n- **Task status `idle` / `completed`**: unchanged, recorded as `success`.\n\nThe outcome is emitted only while the subagent is still active, so a turn the host already closed through its own abort path is not reported twice. Side effects remap the action onto the child turn and record `error` or `cancelled`. The `subagent_completed` that follows then finds no active turn and does nothing.\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339628",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3d51b7d4555ef45234d6c8761a7f7b2d423db83d",
+    "HeadRef": "bhavyaus/subagent-failure-outcomes",
+    "HeadSHA": "18d0e4e6065b0b9489636b57865399000fa91e0c",
+    "CreatedAt": "2026-10-04T22:56:47Z",
+    "UpdatedAt": "2026-10-04T23:46:05Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-C6C3C1C0A14E",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts",
+      "Side": "RIGHT",
+      "Line": 1963,
+      "Severity": "medium",
+      "Confidence": 0.95,
+      "ConfidenceRationale": "The changed task-status path, child-action routing, and downstream contribution calls are explicit. Subagent starts bypass the normal send/checkpoint-start path, but the contribution still schedules session and branch changeset recomputes, and the Git-state contributor still runs. Exact wall-clock cost varies by repository size and whether failures overlap enough to coalesce, which affects severity rather than mechanism confidence.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Git subprocesses, diff-worker/database operations, and Git-state refresh work",
+      "PerformanceScaling": "For K task-backed subagent failures, staggered failures trigger K full child error turn-end pipelines. Same-strategy requests coalesce only while a recompute is already pending; a single failure can still enqueue both the immediate fileEditTracker session recompute and the post-checkpoint auto recompute because they use different strategies. Branch recomputation can fan out across repositories with concurrency capped at five.",
+      "PerformanceOutcome": "Repeated background Git/diff/database work consumes CPU and I/O, reduces agent-host throughput, and can delay legitimate checkpoint and Git-state work for the parent session.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this change, a task whose status became failed was finalized through `_completeSubagentTurn`; `completeSubagentSession` dispatched a child `ChatTurnComplete` and directly called `_completeTurn`, without invoking the generic chat-contribution `turnEnd` pipeline.",
+      "ChangedBehavior": "The new failed outcome emits `ChatError` before `subagent_completed`. AgentSideEffects routes that action to the child chat and invokes every `onTurnEnd` contribution, including workspace-wide checkpoint/changeset and GitHub-reference processing.",
+      "CausalDiffEvidence": "RIGHT line 1963 adds the child `ChatError` emitted by `_emitSubagentOutcome`; the same diff replaces the old terminal-task `_completeSubagentTurn(...)` call with `_settleSubagentTurn(..., this._taskOutcome(task))`, moving task failures into the generic error turn-end fan-out.",
+      "Title": "Skip workspace-wide turn-end work for failed subagents",
+      "Impact": "When an agent workflow has one or more task-backed subagents fail, each failure now starts parent-workspace recomputation that is unrelated to reporting the child outcome. In a multi-repository session this can launch Git diff work across repositories; repeated or staggered failures repeat that work and contend with the active parent workflow.",
+      "Evidence": "`_taskOutcome` turns a terminal task status into `kind: 'failed'`, and this added `ChatError` reaches `AgentSideEffects._dispatchActionForSession`, whose error branch calls `_chatContributions.turnEnd`. `CheckpointAndChangesetContribution.onTurnEnd` accepts non-resumable errors, calls `changesets.onTurnComplete`, then calls `refreshSessionChangeset(..., 'auto')`; `AgentHostChangesetService.onTurnComplete` already schedules branch and containing-session recomputes with `fileEditTracker`. `_scheduleStaticRecompute` only replaces adjacent requests with the same strategy, so the fileEditTracker and auto requests are distinct. `GitHubReferencesContribution.onTurnEnd` also calls `attachSessionGitHubPullRequest`, which refreshes Git state. None of this pipeline ran for task-backed failed statuses before the changed `_settleSubagentTurn` path.",
+      "Recommendation": "Keep emitting and persisting the child error for state and telemetry, but prevent Tool-origin/subagent chats from running workspace-wide turn-end contributors such as checkpoint/changeset and GitHub-reference refresh. Alternatively add a child-outcome flag that those contributors can gate on; preserve the lightweight child completion/error lifecycle."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A task-backed subagent reaches failed status during a parent agent workflow",
+        "CriticalPath": "The per-agent quiet-period scheduler calls the existing background-task reconciliation RPC and awaits `tasks.list`; once the failed snapshot is authoritative, the changed path synchronously emits the child `ChatError` and completes child state. Workspace recomputes, database persistence, and Git/GitHub refreshes are fire-and-forget after action dispatch, so they are off the immediate UI completion path but contend with subsequent parent-session work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts `_reconcileBackgroundTasks`",
+            "Operation": "Copilot SDK `rpc.tasks.list()` reads the authoritative background-task snapshot.",
+            "Cardinality": "One read per accepted reconciliation; overlapping refreshes are throttled/serialized and superseded revisions are discarded.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same reconciliation and task-list RPC determined terminal child status before this PR.",
+            "CriticalPathEffect": "Awaited before the child can settle after the quiet period."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/persistedFailedTurns/persistedFailedTurnsContribution.ts `onTurnEnd` / `_persist`",
+            "Operation": "Serializes the failed child turn and inserts a persisted-turn record.",
+            "Cardinality": "One insert per newly reported task-backed failed child; per-chat sequencing does not coalesce distinct child chats.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Task-backed failed statuses were closed as success and did not enter the error `turnEnd` contribution, so no failed-turn insert occurred.",
+            "CriticalPathEffect": "Fire-and-forget and off the immediate child completion path, but adds database/serialization load."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/checkpointAndChangeset/checkpointAndChangesetContribution.ts `onTurnEnd` -\u003e AgentHostChangesetService",
+            "Operation": "Schedules parent session/branch changeset recomputation, including DB/diff-worker scans and Git diff subprocesses where Git-backed strategies apply.",
+            "Cardinality": "A failure schedules an immediate fileEditTracker recompute and a post-checkpoint auto recompute; branch work is also scheduled. Same-strategy requests can coalesce during overlap, but different strategies and staggered failures remain separate; multi-root fan-out is capped at five repositories concurrently.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old task-status path called `_completeSubagentTurn` and bypassed chat-contribution `turnEnd`, so these workspace-wide recomputes were not scheduled for task-backed failures.",
+            "CriticalPathEffect": "Asynchronous after child state completion, but consumes the same host CPU/I/O and sequencers used by later parent-session checkpoint and changeset work."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/githubReferences/githubReferencesContribution.ts `onTurnEnd` -\u003e AgentHostGitStateService",
+            "Operation": "Refreshes repository Git state and may resolve the branch's pull request through GitHub.",
+            "Cardinality": "One trigger per failed child; per-session throttling/serialization bounds overlapping triggers, while failures outside the throttle window repeat repository queries and unresolved branch lookups.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Task-backed failed statuses did not invoke this `turnEnd` contribution.",
+            "CriticalPathEffect": "Fire-and-forget from `turnEnd`; background Git/network work can delay later queued refreshes."
+          }
+        ],
+        "ScalingInput": "Number K of task-backed child failures in a session, repository count R, tracked edit/history size, and repository size. Same-strategy recomputes may coalesce during a tight burst, but staggered failures repeat work; multi-root Git work is limited to min(R, 5) concurrent repository operations.",
+        "EffectiveConcurrency": "Background-task RPC reads are serialized/coalesced by `_backgroundTaskStatusRefreshThrottler`; completion timers are per child. Changeset jobs serialize by session/kind and only coalesce adjacent requests with the same strategy, while multi-repository work uses a limiter of five. Git-state refresh is throttled per session with a five-second window. Failed-turn persistence is sequenced per child chat.",
+        "CacheBehavior": "Task outcomes use existing in-memory task snapshots and pending lifecycle maps, which are deleted on completion. Changeset state is retained, but terminal recomputes are still scheduled; fileEditTracker and auto requests do not coalesce because their strategy keys differ. Git state is cached, although each accepted refresh still queries the repository before comparing it. No negative-cache change was introduced.",
+        "MechanismConfidence": "High: the changed failed-task path, child action routing, unconditional `turnEnd` fan-out, and downstream boundary implementations are explicit.",
+        "MagnitudeUncertainty": "Exact cost depends on repository size, enabled changeset state, failure spacing, and whether GitHub association is already resolved. Tight bursts coalesce some work, while sequential failures do not.",
+        "Verdict": "Reportable boundary fan-out: preserving the child error outcome now also starts unrelated workspace-wide work for task-backed failures. One medium-severity finding was submitted."
+      },
+      {
+        "Scenario": "A task-backed subagent is cancelled, or a taskless subagent reports `completed(cancelled: true)`",
+        "CriticalPath": "Task-backed cancellation uses the existing reconciled task snapshot; taskless runtime cancellation enters the existing quiet-period scheduler. The changed path emits `ChatTurnCancelled` before `subagent_completed`, synchronously ending the child state. Cancellation-specific checkpoint discard and contribution work are asynchronous/off the immediate completion path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts `_reconcileBackgroundTasks`",
+            "Operation": "Lists background tasks for authoritative task-backed cancellation state.",
+            "Cardinality": "One effective reconciled read after throttling/supersession per terminal confirmation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Cancellation already used the same task-list reconciliation; only the emitted terminal outcome changed.",
+            "CriticalPathEffect": "Awaited before task-backed cancellation settles."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/githubReferences/githubReferencesContribution.ts `onTurnEnd`",
+            "Operation": "Refreshes Git state and may perform a pull-request lookup for the owning session.",
+            "Cardinality": "One trigger per newly emitted child cancellation, with overlapping work throttled/serialized per session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These child cancellation cases were finalized by `subagent_completed` as success and did not run the cancellation `turnEnd` pipeline.",
+            "CriticalPathEffect": "Off the immediate child completion path."
+          }
+        ],
+        "ScalingInput": "Number of cancelled child chats in a parent session. Each child has one active terminal action because `_settleSubagentTurn` removes it before the following completion signal.",
+        "EffectiveConcurrency": "Task reconciliation remains serialized. Checkpoint discard is sequenced per parent session. Git-state refreshes caused by the generic `turnEnd` contribution are throttled/serialized per resolved session key.",
+        "CacheBehavior": "Pending lifecycle outcome and completion scheduler entries are deleted by `_completeSubagentTurn`. Cancelled turn IDs remain until parent-session removal, matching the retained child-chat lifetime; no standalone unbounded resource was established. Git state is cached but refresh queries are throttled rather than eliminated.",
+        "MechanismConfidence": "High for the extra terminal action and Git refresh trigger; moderate impact because refresh throttling limits bursts.",
+        "MagnitudeUncertainty": "Most overlapping cancellations are bounded by Git refresh throttling, and cancellation skips checkpoint/changeset capture, so the remaining incremental cost is smaller than the failed-task path.",
+        "Verdict": "No separate finding: this is the same generic child terminal-action fan-out root cause as the reported failed-subagent issue, with lower incremental cost and no evidence warranting a duplicate comment."
+      },
+      {
+        "Scenario": "A task-backed subagent becomes idle/completed successfully, or a taskless failure follows the pre-existing lifecycle event path",
+        "CriticalPath": "Successful task snapshots still settle after the existing task-list confirmation and emit only `subagent_completed`. A taskless explicit failure still emits the same `ChatError` it emitted before this PR, now represented by the outcome union.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts `_reconcileBackgroundTasks`",
+            "Operation": "Reads the task list to confirm successful terminal status.",
+            "Cardinality": "Existing throttled reconciliations; no new calls from the outcome representation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical task-list reads and completion scheduling.",
+            "CriticalPathEffect": "Existing terminal-confirmation critical path."
+          }
+        ],
+        "ScalingInput": "Number of completed children or taskless explicit failures; no changed multiplicity was found for these cases.",
+        "EffectiveConcurrency": "Existing per-child schedulers and the shared task reconciliation throttler remain unchanged.",
+        "CacheBehavior": "Schedulers, pending lifecycle entries, activity revisions, and token-usage maps are cleaned on completion as before. Warm/cold behavior is unchanged.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "None material for PR causality; the outcome type change is allocation-neutral at realistic scale.",
+        "Verdict": "No performance regression: successful completion behavior is unchanged, and taskless failure already used the error action path before this PR."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and traced child failure, cancellation, and success paths through task RPC reconciliation, state routing, contributions, Git/diff/database boundaries, cleanup, coalescing, and concurrency. One medium-severity boundary-fanout regression was reported for task-backed failures entering workspace-wide turn-end processing."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-05T00:09:17.509435004Z",
+    "CompletedAt": "2026-10-05T00:12:26.150219597Z",
+    "WallClockMilliseconds": 188640,
+    "ModelCalls": 17,
+    "InputTokens": 1063574,
+    "OutputTokens": 12909,
+    "TotalTokens": 1076483,
+    "ReasoningTokens": 5797,
+    "CacheReadTokens": 947200,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 174871,
+    "ToolCalls": 98,
+    "NanoAIUnits": 110255600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 947200,
+      "cache_write": 0,
+      "input": 116374,
+      "output": 12909
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
