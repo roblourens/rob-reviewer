@@ -1,0 +1,187 @@
+{
+  "PullRequest": {
+    "Number": 323170,
+    "Title": "AgentHost - adopt the ChangesetContentChanged action",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n",
+    "URL": "https://github.com/microsoft/vscode/pull/323170",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "02b84aba348385a86c8a6dc276d74659ff32f1f5",
+    "HeadRef": "lszomoru/surprising-swordfish",
+    "HeadSHA": "80998a35fe6b36821ff45e38634e20eecd91a820",
+    "CreatedAt": "2026-06-26T17:07:13Z",
+    "UpdatedAt": "2026-08-10T23:32:03Z",
+    "MergedAt": "2026-06-26T18:29:30Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-564C889E60BC",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostChangesetService.ts",
+      "Side": "RIGHT",
+      "Line": 881,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed full-list envelope, repeated publish call paths, 1,000-envelope retention, and reconnect traversal are directly visible. Exact heap size depends on repository file count and action mix, but the multiplicative retention mechanism and realistic repeated-turn trigger do not.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceResource": "ChangesetFile arrays and objects retained by action envelopes in the 1,000-entry protocol replay buffer",
+      "PerformanceScaling": "Retention grows with the product of changed-file count and buffered recompute count: each successful branch/session/turn recompute now contributes a complete N-file snapshot, and up to 1,000 envelopes remain live until displaced or server shutdown.",
+      "PerformanceOutcome": "Increased retained heap and GC pressure, plus oversized reconnect replay payloads after repeated changeset recomputes.",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "A publish emitted one ChangesetFileSet envelope per file (plus removals), so the envelope-count cap retained at most roughly 1,000 individual file payloads regardless of files per snapshot.",
+      "ChangedBehavior": "Each publish emits one ChangesetContentChanged envelope containing the entire file list. ProtocolServerHandler retains envelopes by count rather than bytes or semantic supersession, so many obsolete full snapshots for the same changeset coexist in the replay buffer.",
+      "CausalDiffEvidence": "The added `files` field on the single ChangesetContentChanged dispatch carries all diffs in one envelope; the deleted implementation instead dispatched one ChangesetFileSet envelope for each file. Because the unchanged replay cache is capped by envelopes, this changes retained file cardinality from O(1,000) to O(1,000 × files-per-snapshot).",
+      "Title": "Coalesce superseded full snapshots in the replay buffer",
+      "Impact": "Long-running agent sessions that repeatedly recompute a large branch/session changeset (after tool edits and each turn completion) retain many historical copies of every ChangesetFile until 1,000 later actions evict them; reconnecting clients can also receive all relevant obsolete snapshots. This can materially increase Agent Host heap/GC and reconnect latency for repositories with tens or hundreds of changed files.",
+      "Evidence": "_publishChangesetDiffs is reached by branch, session, uncommitted, turn, compare, and persisted-restore paths. Tool edits schedule branch/session (and subscribed turn) recomputes after a 5s debounce, while every turn completion schedules fresh static recomputes. ProtocolServerHandler pushes every emitted envelope into _replayBuffer, caps only envelope count at 1,000, and retains it until FIFO eviction or shutdown; reconnect iterates and returns every relevant retained envelope. The new action's files array is therefore retained as a complete snapshot on every successful recompute.",
+      "Recommendation": "Before storing replay actions, coalesce a new ChangesetContentChanged with older buffered content snapshots for the same channel (while preserving required ordering with later incremental/status actions), or enforce a byte/file-entry budget and fall back to a fresh state snapshot when replay no longer fits. This preserves the batched live update without retaining hundreds of superseded full lists."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "serialization-allocation",
+      "boundary-fanout",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Changeset recomputation after tool-call edits and turn completion",
+        "CriticalPath": "After a 5-second edit debounce or turn completion, checkpoint capture precedes recomputation; each changeset compute must finish its database/git diff before publishing the new state. Publication then synchronously reduces, caches, and broadcasts the action. The changed operation lookup is in-process and synchronous.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts compute paths -\u003e AgentHostGitService",
+            "Operation": "Git repository discovery/status/diff and checkpoint-ref diff commands",
+            "Cardinality": "Several git commands per successful git-backed changeset compute; branch/session run per completed turn, and subscribed turn/uncommitted paths add their own grouped compute.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same compute paths and git command cardinality produced the same complete diffs before this PR.",
+            "CriticalPathEffect": "Git completion is required before that changeset can publish ready content; distinct changeset kinds can overlap."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts _doComputeStaticChangeset/computeTurnChangeset",
+            "Operation": "Open/read session databases and file-edit records for fallback/session diff aggregation",
+            "Cardinality": "One owning session database per compute plus one per peer chat for multi-chat union; incremental single-chat reads can narrow to the changed turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Database reads and grouping are unchanged; only publication action shape changes afterward.",
+            "CriticalPathEffect": "Database reads and worker diff computation must finish before publication."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts _broadcastAction",
+            "Operation": "Broadcast the resulting action over each relevant client protocol transport",
+            "Cardinality": "After the PR, one full-list action send per relevant client per successful publish instead of N file-set sends (plus removals); total file payload per publish remains O(N), while send count decreases.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The existing boundary sent each file as a separate action; the PR batches the same complete list into one action.",
+            "CriticalPathEffect": "Synchronous transport.send occurs during publication after state reduction."
+          }
+        ],
+        "ScalingInput": "Number of changed files N; repeated edit batches/turns R; subscribed changeset kinds (branch and session always scheduled at turn completion, with uncommitted/turn additionally recomputed when subscribed).",
+        "EffectiveConcurrency": "Computes serialize per session+changeset key through the sequencer, while distinct branch/session/turn/uncommitted keys may run independently. Debounces coalesce edit notifications within five seconds but each completed turn schedules fresh static recomputes.",
+        "CacheBehavior": "Incremental session diff computation reuses previous file diffs when possible, and persisted snapshots can seed cold state. The changed publication still rebuilds N ChangesetFile wrappers every pass. Protocol replay retains each published full snapshot until FIFO eviction from a 1,000-envelope buffer, without semantic coalescing.",
+        "MechanismConfidence": "High: all trigger, sequencing, boundary, and changed publication paths are explicit in code.",
+        "MagnitudeUncertainty": "Exact N, turn duration, connected-client count, and object size vary, but repositories/sessions with tens or hundreds of changed files and repeated recomputes are realistic.",
+        "Verdict": "The batched live publish reduces reducer copying and transport call count, but materially amplifies retained replay-cache contents because the unchanged 1,000-entry cap counts envelopes rather than enclosed file entries. Reported as a medium memory/cache-lifecycle regression."
+      },
+      {
+        "Scenario": "Protocol reconnect and replay of changeset updates",
+        "CriticalPath": "Reconnect restores subscriptions, then either scans buffered envelopes newer than lastSeenServerSeq and returns them in one replay response, or returns fresh snapshots when the requested sequence predates the buffer. Constructing and sending this response is on reconnect's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts _restoreReconnectSubscriptions",
+            "Operation": "Return a JSON-RPC reconnect response containing all relevant buffered actions",
+            "Cardinality": "Up to the relevant subset of 1,000 envelopes; changed content envelopes each carry N files, so serialized entries can scale as O(R×N).",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Reconnect used the same boundary and envelope cap, but each buffered file-set envelope carried one file, limiting retained/replayed file entries to roughly the envelope count.",
+            "CriticalPathEffect": "The complete replay response must be assembled and transmitted before reconnect restoration completes."
+          }
+        ],
+        "ScalingInput": "Number of buffered recomputes R, files per full snapshot N, relevant subscriptions, and gap since the client's last seen sequence.",
+        "EffectiveConcurrency": "Subscription restoration uses Promise.all across requested subscriptions; replay-buffer scanning and action collection are synchronous. No limiter or coalescer removes superseded changeset snapshots.",
+        "CacheBehavior": "The replay cache is warm across connections for the Agent Host lifetime, capped at 1,000 envelopes and cleared only at disposal. A cold/too-old reconnect falls back to current snapshots; an in-range reconnect replays every relevant retained full snapshot.",
+        "MechanismConfidence": "High: replay retention, cap, scan, and changed payload cardinality are directly established.",
+        "MagnitudeUncertainty": "Reconnect gaps and changed-file counts vary, so latency severity is workload-dependent; retained-memory amplification occurs even without reconnect.",
+        "Verdict": "Reportable together with the replay-cache retention finding; coalescing superseded full snapshots or using a byte/file budget bounds both heap and reconnect serialization."
+      },
+      {
+        "Scenario": "Changeset subscription, restore, and operation advertisement",
+        "CriticalPath": "Subscription/restore triggers the existing changeset compute or persisted seed; operation labels are now derived synchronously inside _publishChangesetDiffs and included with the content snapshot. No subprocess, filesystem, database, IPC, or network lookup occurs in getOperations itself.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts _publishChangesetDiffs",
+            "Operation": "Advertise operations as part of the same changeset content action",
+            "Cardinality": "One bounded operations array (at most the small fixed provider set) per successful changeset publish and relevant client.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Operations were sent in separate ChangesetOperationsChanged actions on subscription/git-state events; the PR removes those subscription-time dispatches and embeds the bounded list during content publication.",
+            "CriticalPathEffect": "Piggybacks on the existing changeset broadcast rather than adding a separate send."
+          }
+        ],
+        "ScalingInput": "Four registered operation contributions and number of subscribed changesets; available operations are a small bounded list.",
+        "EffectiveConcurrency": "Contribution evaluation is synchronous and sequential over four providers; changeset computes retain their existing per-key sequencing.",
+        "CacheBehavior": "Git/GitHub state is read from in-memory session metadata. There is no operation-result cache, but provider work is bounded property checks and small allocations; cold and warm behavior are equivalent.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "None material: provider count and work are statically bounded in the inspected implementation.",
+        "Verdict": "No additional performance finding: operation computation is cheap and bounded, and removed standalone updates offset the small repeated allocation."
+      },
+      {
+        "Scenario": "Agent service initialization and operation contribution registration",
+        "CriticalPath": "AgentHostChangesetOperationService is created before AgentHostChangesetService, then four existing contribution instances/handlers are registered before completion services are initialized.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Fixed four contributions and fixed handler count.",
+        "EffectiveConcurrency": "Initialization is synchronous and serial, as before; no queue or burst scales with user data.",
+        "CacheBehavior": "No cold/warm cache distinction; handlers remain service-lifetime objects and are disposed with their registrations.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "None material.",
+        "Verdict": "No performance regression: the PR changes construction order/ownership but does not add heavyweight boundaries, multiplicity, or longer-lived resources."
+      }
+    ],
+    "Summary": "Completed the performance pass across all 11 changed files. One medium cache-lifecycle regression was submitted: full changeset snapshots accumulate in the envelope-counted replay buffer, multiplying retained file entries and reconnect payloads across repeated recomputes. The batching otherwise reduces per-file reducer copies and live transport fan-out; operation registration/computation changes are bounded and add no expensive boundary."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "/responses",
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-06T14:59:52.029910659Z",
+    "CompletedAt": "2026-10-06T15:02:28.033083602Z",
+    "WallClockMilliseconds": 156003,
+    "ModelCalls": 11,
+    "InputTokens": 545151,
+    "OutputTokens": 7761,
+    "TotalTokens": 552912,
+    "ReasoningTokens": 2501,
+    "CacheReadTokens": 484804,
+    "CacheWriteTokens": 60314,
+    "APIDurationMilliseconds": 131138,
+    "ToolCalls": 67,
+    "NanoAIUnits": 65084360000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 484804,
+      "cache_write": 60314,
+      "input": 33,
+      "output": 7761
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
