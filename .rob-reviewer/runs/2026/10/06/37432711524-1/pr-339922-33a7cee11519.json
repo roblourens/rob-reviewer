@@ -1,0 +1,227 @@
+{
+  "PullRequest": {
+    "Number": 339922,
+    "Title": "agentHost: avoid peer hydration and repeated MCP installs",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #339893.\n\n## Changes\n\n- Replace peer-history hydration during client turn-ID validation with best-effort lookups in existing SQLite databases. Retain cheap in-memory checks, recheck memory after asynchronous reads, and exclude subagent chats. Missing or unreadable databases do not block a turn; read failures are logged. No provider runtimes or MCP servers are started just to validate peer turn IDs.\n- Replace unconditional `npm ci` in the automation MCP startup script with the existing repository fast installer. Unchanged Node/dependency inputs skip installation; stale inputs use the normal repository-wide install before compilation.\n\nThe log investigation found approximately 99 seconds before host turn registration while restoring peer histories, followed by another 71 seconds in session refresh/turn preparation. The first change removes the peer-hydration dependency; the second avoids reinstalling the automation MCP dependencies on every launch.\n\n## Separate runtime follow-up\n\nSandbox/MCP reconfiguration and restart churn is intentionally not changed here. That is planned to be fixed later this week with adoption of [github/copilot-agent-runtime#24575](https://github.com/github/copilot-agent-runtime/pull/24575).\n\n## Validation\n\n- `scripts\\test.bat --run src\\vs\\platform\\agentHost\\test\\node\\agentService.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\sessionDatabase.test.ts --grep \"dispatchAction|SessionDatabase\"` — **162 passing** on the final branch. Includes no-peer-hydration, host/provider-ID collisions, missing/unreadable databases, subagent exclusion, and concurrent in-memory collision coverage.\n- `node_modules\\@typescript\\typescript-win32-x64\\lib\\tsc.exe --project src\\tsconfig.json --noEmit --skipLibCheck` — **passed** on the final branch.\n- Targeted ESLint on the six changed TypeScript files — **passed**.\n- `npm --prefix test\\mcp run compile` — **passed**.\n- `node ..\\..\\build\\npm\\fast-install.ts` from `test\\mcp` — **passed**, skipped dependency installation in **167 ms**.\n- `npm --prefix test\\mcp run -s start-stdio` — **passed** with an MCP `initialize` / `tools/list` exchange; advertised four tools and completed startup in **7.77 seconds**, with dependency installation skipped.\n\nThe existing incomplete MCP dependency tree was repaired before the protocol startup check. Commit hooks reported skipping their npm script because npm was absent from the session PATH; the validation above was run manually.",
+    "URL": "https://github.com/microsoft/vscode/pull/339922",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "connor4312",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d524f802d9e69dfea758c248e067d99337b36048",
+    "HeadRef": "connor4312/339893-chat-latency",
+    "HeadSHA": "33a7cee11519ba13c67fec2142128325e2980061",
+    "CreatedAt": "2026-10-05T22:03:36Z",
+    "UpdatedAt": "2026-10-05T23:18:06Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-5D60C5FC587F",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentService.ts",
+      "Side": "RIGHT",
+      "Line": 7931,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed call path, per-peer filesystem stat, per-peer SQL query, await on the send critical path, and prior hydrated-peer fast path are all explicit in production code; only the exact wall-clock cost and typical peer count vary by machine and session.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "One filesystem stat plus a SQLite database acquisition/query (and potentially connection open/migrations/close) for every non-tool peer chat",
+      "PerformanceScaling": "For a session with P peer chats and T newly started turns, the added work is P filesystem probes and P SQLite lookups per turn, or O(P*T); Promise.all makes each turn issue the P operations as an aggregate I/O burst.",
+      "PerformanceOutcome": "Increased message-send latency and filesystem/SQLite I/O, with later actions for the same client also blocked behind the lookup queue.",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "The old `_getUnresolvedPeerChats` selected only peers without hydrated state. Once peers were hydrated, `requiresTurnOwnerResolution` was false, so subsequent `ChatTurnStarted` actions stayed on the synchronous fast path with no peer filesystem or database work.",
+      "ChangedBehavior": "`_getPeerChatsForTurnValidation` now returns hydrated as well as unresolved peers, and this `Promise.all` invokes `tryOpenDatabase(...).hasTurn(...)` for every peer whenever a turn starts and the in-memory collision check misses.",
+      "CausalDiffEvidence": "RIGHT line 7931 adds `Promise.all(peerChats.map(...))` over all eligible peers; together with changed `_getPeerChatsForTurnValidation`, hydrated peers that the deleted `_getUnresolvedPeerChats` filtered out are now included on every turn.",
+      "Title": "Avoid probing every hydrated peer database on every turn",
+      "Impact": "After a session has multiple ordinary peer chats, starting any new turn waits for all peer database probes before dispatching the message. This repeats on every turn and becomes visible as send latency on slower or scanned filesystems as peer count grows.",
+      "Evidence": "`dispatchAction` awaits `_isPersistedTurnIdUsedByAnotherChat` before `_dispatchActionNow`. The changed helper maps every non-default, non-tool, non-subagent peer through `tryOpenDatabase` and `hasTurn`. `SessionDataService.tryOpenDatabase` always performs `fileService.stat` and then acquires a ref-counted SQLite connection; `hasTurn` executes a SQL query, and disposing the last reference closes the connection. The added tests explicitly exercise this lookup with an already `hydrated` peer, proving that the repeated I/O is intentional and reachable after hydration rather than limited to one-time restore.",
+      "Recommendation": "Keep hydrated peers on an in-memory fast path by retaining the host/event/local turn-ID information needed for validation when they are loaded and updating it with turn writes/deletes; restrict SQLite probes to unresolved peers (or provide a session-level persisted ID index) so validation does not fan out to every peer for every send."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/node/agentService.ts",
+      "FixedSide": "LEFT",
+      "FixedLine": 7271,
+      "BasePath": "src/vs/platform/agentHost/node/agentService.ts",
+      "BaseLine": 7271,
+      "IntroducingPath": "src/vs/platform/agentHost/node/agentService.ts",
+      "IntroducingCommit": "b10759526092db723a7217e7627ae309d74719f4",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceCategory": "latency",
+      "Mechanism": "Every `ChatTurnStarted` with unresolved peers awaited `_resolvePeerChatsForTurnValidation`, which called `resolveChatState` for all unresolved chats in parallel. A restored chat's resolver materializes its provider backing and full history, so turn validation eagerly started provider/runtime and history work once per unresolved peer.",
+      "Symptom": "Starting a turn in a restored multi-chat session was blocked by peer runtime/history hydration, with latency scaling across unresolved peers before the message could be dispatched.",
+      "FixedBehavior": "The PR deletes the awaited peer-state resolution and replaces it with direct best-effort checks of existing peer SQLite databases, excluding tool/subagent chats, so provider runtimes and full histories are no longer materialized solely to validate a turn ID.",
+      "Evidence": "The deleted base line 7271 awaited `_resolvePeerChatsForTurnValidation` on the `ChatTurnStarted` dispatch critical path. That helper mapped unresolved peers to `stateManager.resolveChatState`; `resolveChatState` invokes each registered resolver, and production registration points to `_materializeRestoredPeerChat`, which loads backing state/history. The changed dispatch instead awaits `_isPersistedTurnIdUsedByAnotherChat` and the old hydration helper is removed.",
+      "Confidence": 0.97
+    },
+    {
+      "FixedPath": "test/mcp/package.json",
+      "FixedSide": "RIGHT",
+      "FixedLine": 12,
+      "BasePath": "test/mcp/package.json",
+      "BaseLine": 12,
+      "IntroducingPath": "test/mcp/package.json",
+      "IntroducingCommit": "c8d90ab45fd1612379bbdf2208f042a4d4e58ed3",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "startup",
+      "Mechanism": "The MCP `start-stdio` script synchronously ran `npm ci` before every compile and server launch, reinstalling the dependency tree on every startup even when Node and dependency inputs were unchanged.",
+      "Symptom": "Every automation MCP launch was blocked on a full npm clean install, causing repeated subprocess, filesystem, package extraction, and lifecycle-script work before the server could accept protocol requests.",
+      "FixedBehavior": "The startup script now invokes the repository's hash-based `fast-install.ts`; when Node and all tracked dependency inputs match the saved state it skips installation, while stale inputs still trigger the normal repository install before compilation.",
+      "Evidence": "Base package line 12 placed `npm ci` directly in the serial `start-stdio` command. The replacement calls `fast-install.ts`; its `isUpToDate()` compares saved Node/input hashes and exits before spawning npm when unchanged, otherwise spawning `npm install`. Thus warm repeated starts remove the unconditional install boundary.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst",
+      "cache-lifecycle",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Start the first turn after restoring a session with ordinary unresolved peer chats",
+        "CriticalPath": "Session restore and current-chat resolution complete first; the changed turn-ID validation then awaits every eligible peer database probe before `_dispatchActionNow` can send the turn. The former provider materialization/history hydration was on this same critical path and is removed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sessionDataService.ts:114 and src/vs/platform/agentHost/node/agentService.ts:7936",
+            "Operation": "Stat each peer's session database path in `tryOpenDatabase`",
+            "Cardinality": "P stats per started turn unless the preceding in-memory collision check succeeds",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old path did not stat peer databases; it resolved each unresolved peer's provider backing and history instead.",
+            "CriticalPathEffect": "All probes must settle before the new turn is dispatched."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts:536",
+            "Operation": "Open/acquire each existing per-peer SQLite database and execute the indexed `hasTurn` query",
+            "Cardinality": "Up to P opens/acquisitions and P SQL reads per started turn",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No direct turn-ID SQL lookup existed; unresolved peers were hydrated and checked from resulting in-memory state.",
+            "CriticalPathEffect": "Awaited collectively before dispatch; each read also waits behind earlier writes for that peer."
+          }
+        ],
+        "ScalingInput": "Number P of non-default, non-tool, non-subagent peer chats restored in the session; validation performs one existence probe and at most one SQL query per peer after in-memory deduplication/exclusions.",
+        "EffectiveConcurrency": "Peer probes run concurrently via one unbounded `Promise.all`; each peer database serializes its own turn-data operation, while all actions from the same client remain serialized behind `_clientDispatchQueues`.",
+        "CacheBehavior": "A live SQLite connection can be shared by reference, but `tryOpenDatabase` still stats every peer path. Missing databases have no negative cache and are restatted on later turns; newly acquired databases are closed when the last reference is disposed. In-memory collisions short-circuit all peer probes.",
+        "MechanismConfidence": "High: the production call path, Promise.all cardinality, file stat, SQL read, reference disposal, and removed resolver path are explicit.",
+        "MagnitudeUncertainty": "Peer counts and filesystem/SQLite latency vary by session and platform; the removed provider runtime/history work is likely much larger on the first restored turn, but the new probes recur.",
+        "Verdict": "The first restored turn is a genuine performance fix because it avoids eager provider/runtime and full-history hydration. Its recurring probe mechanism is assessed in the hydrated-turn scenario and is not reported twice."
+      },
+      {
+        "Scenario": "Start repeated turns in an already hydrated multi-chat session",
+        "CriticalPath": "Every `ChatTurnStarted` with at least one eligible peer is moved from the synchronous dispatch path into the per-client async queue and awaits `_isPersistedTurnIdUsedByAnotherChat`; message sending and later same-client actions cannot progress until all peer probes finish.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/sessionDataService.ts:114 and src/vs/platform/agentHost/node/agentService.ts:7936",
+            "Operation": "Probe every hydrated peer database file with `fileService.stat`",
+            "Cardinality": "P per turn on the normal unique-ID path",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Once peers were hydrated, `_getUnresolvedPeerChats` returned none and the action used the no-I/O synchronous fast path.",
+            "CriticalPathEffect": "Adds awaited filesystem latency before each message send."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts:536",
+            "Operation": "Execute `hasTurn` against every existing hydrated peer database",
+            "Cardinality": "Up to P SQL queries and connection acquisitions/opens per turn",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Hydrated peers were checked only in memory, with no database reads on subsequent turns.",
+            "CriticalPathEffect": "All queries settle before dispatch; connection setup/teardown may also occur when no other references are held."
+          }
+        ],
+        "ScalingInput": "P eligible hydrated peers times T newly started turns, yielding P*T filesystem stats and SQL lookups on the common no-collision path.",
+        "EffectiveConcurrency": "Each turn launches P peer probes concurrently with no aggregate limiter; client actions are serialized, so bursts do not overlap for one client but every turn incurs a new burst.",
+        "CacheBehavior": "Hydrated chat state does not suppress persisted lookup. A found in-memory collision avoids I/O, but ordinary unique turn IDs miss; neither misses nor absent database paths are cached. Existing live DBs avoid a connection cache miss but not the stat or SQL query.",
+        "MechanismConfidence": "Very high: an added test explicitly exercises persisted-ID lookup for a hydrated peer, and all boundaries and awaits are visible in production code.",
+        "MagnitudeUncertainty": "Typical peer counts and platform-specific stat/open costs are not measured here; repository diagnostics explicitly identify per-session database opens as dominant and filesystem costs as platform-sensitive.",
+        "Verdict": "Reportable medium-severity boundary fan-out: the PR materially changes repeated hydrated sends from zero peer I/O to O(P) critical-path filesystem and SQLite work."
+      },
+      {
+        "Scenario": "Launch the automation MCP server with unchanged versus missing/stale dependency state",
+        "CriticalPath": "The serial `start-stdio` command runs the fast installer, compilation, then the server. On a warm dependency hash the installer only hashes tracked inputs and restores Electron typings before compilation; on a missing/stale hash one repository-wide npm install must finish before compilation and server startup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "build/npm/installStateHash.ts and build/npm/fast-install.ts",
+            "Operation": "Read and hash tracked package manifests, lockfiles, npmrc files, Node version state, and Electron typings state",
+            "Cardinality": "One bounded scan of dependency metadata across the configured repository npm directories per MCP launch",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The MCP package did not perform the repository hash scan; it immediately entered `npm ci`, whose much larger clean-install filesystem work ran every launch.",
+            "CriticalPathEffect": "Runs before compile, but replaces unconditional dependency installation on warm starts."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/fast-install.ts:19 and test/mcp/package.json:12",
+            "Operation": "Run repository `npm install` only when dependency state is missing or stale",
+            "Cardinality": "Zero npm subprocesses on warm launches; one on stale/cold launches",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One local `npm ci` subprocess blocked every launch regardless of dependency state.",
+            "CriticalPathEffect": "Blocks startup only when installation is required."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "test/mcp/package.json:12",
+            "Operation": "Compile the MCP and start its Node stdio server",
+            "Cardinality": "One compile and one server start per launch",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same compile and server start followed `npm ci`.",
+            "CriticalPathEffect": "Compilation remains on startup; server availability follows it."
+          }
+        ],
+        "ScalingInput": "Warm check scans package metadata across roughly 57 configured npm directories; stale/cold startup runs one root install. Each launch then runs one compile and one server process.",
+        "EffectiveConcurrency": "The startup stages are serial shell steps. `fast-install.ts` spawns at most one synchronous npm process; no new subprocess burst is introduced.",
+        "CacheBehavior": "`.postinstall-state` plus Node version and normalized dependency-file hashes form the cache key. Unchanged inputs skip npm entirely; missing or changed state triggers installation. There is no negative cache, but install failures stop startup rather than being treated as warm.",
+        "MechanismConfidence": "High: the script ordering, hash inputs, warm early exit, and stale synchronous npm spawn are explicit.",
+        "MagnitudeUncertainty": "The exact warm hash-scan duration and the relative cost of a stale root install versus the former local clean install depend on machine and dependency state.",
+        "Verdict": "No new reportable regression. Warm starts remove an unconditional clean install; stale/cold starts retain a single intentional install, and the bounded metadata scan is substantially less work than the replaced install."
+      }
+    ],
+    "Summary": "Completed the performance pass over all seven changed files. Submitted one boundary-fanout finding for repeated per-peer filesystem/SQLite probes on hydrated turns, and recorded two verified regression fixes: removal of peer provider/history hydration from turn validation and removal of unconditional npm installs from warm MCP startup."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-06T08:08:03.230104271Z",
+    "CompletedAt": "2026-10-06T08:11:34.049544299Z",
+    "WallClockMilliseconds": 210819,
+    "ModelCalls": 11,
+    "InputTokens": 450221,
+    "OutputTokens": 9599,
+    "TotalTokens": 459820,
+    "ReasoningTokens": 4491,
+    "CacheReadTokens": 387489,
+    "CacheWriteTokens": 62699,
+    "APIDurationMilliseconds": 111834,
+    "ToolCalls": 46,
+    "NanoAIUnits": 66060260000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 387489,
+      "cache_write": 62699,
+      "input": 33,
+      "output": 9599
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
