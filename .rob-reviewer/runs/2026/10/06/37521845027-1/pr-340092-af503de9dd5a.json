@@ -1,0 +1,100 @@
+{
+  "PullRequest": {
+    "Number": 340092,
+    "Title": "sessions: mount pill row before data in chat input toolbar fixtures",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Problem\n\nThe screenshot diff report on #340050 flagged `sessions/sessionChatInputToolbar/SessionChatPills_HorizontalOverflow/Light`, but that PR does not touch the sessions pills. The base image (`36072ebc`, #339990) shows a gray horizontal scrollbar under the overflowing pill row (`7 Files +128 -34`, `3 Artifacts`, `2 Active…`). The normal image has no scrollbar.\n\n### Evidence\n\n**Per-commit manifests on `main`.** I fetched the screenshot-service manifest for the last 80 first-parent `main` commits (79 had one). The fixture is strictly bimodal:\n\n| Image hash | Renders | Commits |\n|---|---|---|\n| [`a594aeda…`](https://hediet-screenshots.azurewebsites.net/images/a594aeda53ea8a2751b1443f075ee461d8089705a4e890f4986b64829c30ff48) (scrollbar hidden) | 76 / 79 | all others |\n| [`d8a2d3ea…`](https://hediet-screenshots.azurewebsites.net/images/d8a2d3ea48116c368b40559685ab0c611e4f98fb1757feaf805aff6b7ad0a2de) (scrollbar visible) | 3 / 79 | `a99f6a11`, `8bfb0d83`, `36072ebc` |\n\nThat works out to about 1 render in 25–60, depending on the window. Neither image changed for any other reason in this window. The sibling `SessionChatPills_ResponsiveOverflow` also overflows, but uses `compact: 'auto'` and produced a single hash (`f03c8d99`) in all 79 renders.\n\n**Pixel diff.** Both images are 304×83. The difference is 664 px inside bbox `(13, 35)–(179, 39)`: the 6 px horizontal slider of the pill row's `DomScrollableElement`, drawn at the row's left edge and sized to the 280/491 visible ratio.\n\n![HorizontalOverflow before/after](https://gist.githubusercontent.com/alexdima/6a0f4d73554768e08b014e76421b9865/raw/fa8afa5697115629ef7e764d532bd62844e55063/horizontal_overflow_annotated.png)\n\n## Root cause\n\n`ChatPillsRow` (`src/vs/workbench/browser/chatPills.ts`) wraps the pills in a `DomScrollableElement` with `horizontal: ScrollbarVisibility.Auto`. Whenever its scroll width changes, the auto-hiding scrollbar is revealed and a 500 ms hide is scheduled.\n\nThe fixture helper `renderPills` set the session data **before** attaching the row, and set the container's 280px width **last**. So the row's synchronous `scanDomNode()` ran while detached and measured nothing. A non-compact row has no other trigger, so its first real measurement came from a native `ResizeObserver` callback, and that callback did the reveal. `ResizeObserver` delivery is owned by the browser, not by the fixture's virtual time:\n\n- **Observer fires inside the 1000 ms virtual window (usual case).** The hide timer is virtual and gets drained, so the scrollbar is hidden (`a594aeda`).\n- **Observer fires after the window (under CPU contention).** The hide runs on real timers, and the screenshot catches the scrollbar visible (`d8a2d3ea`).\n\n### How other fixtures handle auto-hiding scrollbars\n\n| Pattern | Fixtures |\n|---|---|\n| Nothing: the scroll size is measured synchronously during render, so the hide is drained by virtual time | most overflowing fixtures, including the sibling `SessionChatPills_ResponsiveOverflow`. It is stable only because `compact: 'auto'` adds a MutationObserver, which runs inside virtual time. |\n| Poll real frames until the scrollbar is idle | `chatScrollAnchoring`, `connectionDiagnostics`, `chatPetAchievementsEditor` |\n| Pin visibility with a component option | editor fixtures (`scrollbar: { … 'hidden' }`), `tabs` (`titleScrollbarVisibility`) |\n| Force-hide with `style.visibility = 'hidden'` | `aiCustomizationManagementEditor` |\n\nThis PR puts `HorizontalOverflow` in the first group.\n\n## Fix\n\nThis change touches only the fixture. Production code is unchanged.\n\n`renderPills` now sizes the container and mounts the row **before** setting session and debug data. When the data arrives, the row's existing `scanDomNode()` measures the overflow synchronously. The reveal and hide are scheduled on virtual time and drained before capture. The later `ResizeObserver` callback sees unchanged dimensions and does nothing. Virtual time stays on, and there is no wait or extra helper. The DOM order and the final styles are unchanged.\n\n## Validation\n\nI ran all of these on macOS against `npx rspack serve --config rspack.serve-out.config.mts`, which is the CI bundle in serve mode. Each probe is a headless Playwright page that calls `window.__componentExplorer__.renderFixture(id)`, the same call CI's `component-explorer render` makes. It reads the slider's classes and opacity immediately after the call resolves and again one frame later. Every third render remounts after a different fixture. \"Under load\" means two 4× CPU-throttled Playwright pages ran the same loop in parallel.\n\n| Probe | Before (`main`) | After (this PR) |\n|---|---|---|\n| Slider state, 300 renders, under load | **5 / 300 `visible@1`** (3 on remount, 2 warm) | **0 / 300** (all `invisible fade@0`) |\n| Slider state, 2 × 150 renders on the throttled pages | 0 / 300 | 0 / 300 |\n| PNG hash, `Light`, 150 renders under load | `3e1ed1b3` ×139, **`1dfa773a` ×11** | n/a |\n| Median render time | – | 32 ms (65 ms on the throttled pages) |\n\n- Without the fix, how often the outlier appears depends on contention. It ranged from 0 / 300 on an idle machine to 34 / 150 on the first loaded run. Locally, the outlier's diff bbox is `(13, 35)–(170, 39)`, the same row and slider as CI's `(13, 35)–(179, 39)`. The width differs only because of macOS font rasterization.\n- `./node_modules/.bin/component-explorer render --project ./test/componentFixtures/component-explorer.json --fixture-id-regex 'sessions/sessionChatInputToolbar/|sessions/chatReferences/'`, run on both `main` and this branch: 74 fixtures, **0 errors**, including disposable-leak checks. **All 74 image hashes are identical** to `main`. `HorizontalOverflow` renders the majority image in both themes.\n- `npx eslint src/vs/workbench/test/browser/componentFixtures/sessions/sessionChatInputToolbar.fixture.ts` passed.\n- I did not run `npm run typecheck-client` or unit tests. Only a test fixture changed, so they don't cover it, and CI type-checks the fixture.\n- This fixture is not in `blocks-ci-screenshots.md`, so no hash update is needed.\n\ncc @benibenj (fixture added in #331724, #340010), @ulugbekna (#340015)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/340092",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3dabe9b5512f025eb64934ce456f4867ec6a11c9",
+    "HeadRef": "agents/fix-flaky-session-chat-pills-fixture",
+    "HeadSHA": "af503de9dd5ab8593b3d7d18abeb5d34e9ac8801",
+    "CreatedAt": "2026-10-06T17:06:53Z",
+    "UpdatedAt": "2026-10-06T19:08:22Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Render standalone session chat input toolbar component fixtures, including horizontal and responsive overflow variants",
+        "CriticalPath": "Fixture service construction, container sizing, toolbar construction, DOM mount, session/debug observable updates, synchronous scrollbar geometry scan, then virtual-time drain must complete before screenshot capture. The diff moves the authoritative overflow scan onto this critical path, replacing the later native ResizeObserver-dependent scan.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Cost scales with fixture renders and the small number of pills/observable transitions in each fixture. Effective DOM cardinality is one toolbar row per render; debug and responsive fixtures have a bounded handful of pill elements.",
+        "EffectiveConcurrency": "Each fixture instance performs its own setup; within an instance the mount and setter calls are serialized. Headless screenshot rendering may use multiple workers, while explorer UI can render fixtures in parallel, but the change adds no shared queue, burst, or asynchronous fan-out.",
+        "CacheBehavior": "No cache keys, warm/cold behavior, or coalescing changes. Toolbar action/hover caches are created and disposed exactly as before; setter order does not add cache misses.",
+        "MechanismConfidence": "High: the changed lines size and mount the row before setters, and ChatInputPills synchronously calls ChatPillsRow.scanDomNode, which reads client/scroll dimensions. The subsequent ResizeObserver remains but sees stable dimensions.",
+        "MagnitudeUncertainty": "Exact browser style/layout duration varies by fixture and host load, but the changed work is one bounded connected geometry scan during fixture setup and avoids the delayed observer race; there is no realistic unbounded or collection-amplified cost.",
+        "Verdict": "No reportable regression. Before the PR, setter-driven scans occurred while detached and the effective overflow measurement was deferred to ResizeObserver; after the PR, the bounded scan happens synchronously while connected. This intentionally exchanges one delayed measurement for one critical-path measurement and does not multiply work by a realistic large input."
+      },
+      {
+        "Scenario": "Render and interact with session reference fixtures that reuse renderPills with popup placement and mocked GitHub/file services",
+        "CriticalPath": "Initial fixture progress requires renderPills setup and session assignment. Mocked GitHub model refreshes resolve immediately; delayed workbench GitHub data and fixture file reads occur only in later hover/open interactions and are off the initial screenshot critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/test/browser/componentFixtures/sessions/sessionChatInputToolbar.fixture.ts:createImageReferenceContent/readFile",
+            "Operation": "Fetch fixture image bytes through the mocked IFileService when an image reference is explicitly opened",
+            "Cardinality": "At most once per explicit fixture image read; zero during the initial render path examined here",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same mocked readFile and fetch path existed with identical cardinality before the mount/setter reorder.",
+            "CriticalPathEffect": "Off the initial render/screenshot critical path and reached only by a later interaction"
+          }
+        ],
+        "ScalingInput": "Initial work scales with the deduplicated references in the fixture session. Mounting before assignment does not change reference count or model acquisition cardinality.",
+        "EffectiveConcurrency": "Toolbar setup is serialized. GitHub reference models are reference-counted and fixture refresh/poll methods are no-op or promise-resolved; the diff does not increase concurrent refreshes, polling, or file reads.",
+        "CacheBehavior": "Reference collections and hover caches have unchanged ownership and retention. Cold and warm interaction behavior is unchanged because only DOM connection timing, not reference keys or service calls, moved.",
+        "MechanismConfidence": "High: the shared helper's changed lines only reorder style assignment, appendChild, and existing setters; service registration and all boundary implementations are unchanged.",
+        "MagnitudeUncertainty": "Interactive fixture contents can vary, but the only real fetch remains lazy and unchanged; mocked GitHub delays are timers rather than external network calls.",
+        "Verdict": "No reportable regression. The reordering neither introduces an external boundary nor moves the existing lazy fixture-image fetch onto render, and mocked GitHub work retains the same effective cardinality."
+      }
+    ],
+    "Summary": "Completed the performance pass over the complete one-file, two-hunk inventory. Traced connected DOM measurement, observable rendering, ResizeObserver scheduling, fixture virtual time, shared callers, caches, and transitive mocked file/GitHub services. The change adds only a bounded synchronous geometry scan during fixture setup while eliminating reliance on a later observer callback; no actionable performance regression or qualifying regression-fix learning signal was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-06T19:57:56.247595529Z",
+    "CompletedAt": "2026-10-06T19:59:19.096698228Z",
+    "WallClockMilliseconds": 82849,
+    "ModelCalls": 13,
+    "InputTokens": 377006,
+    "OutputTokens": 4536,
+    "TotalTokens": 381542,
+    "ReasoningTokens": 1484,
+    "CacheReadTokens": 326456,
+    "CacheWriteTokens": 50511,
+    "APIDurationMilliseconds": 67449,
+    "ToolCalls": 45,
+    "NanoAIUnits": 47401340000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 326456,
+      "cache_write": 50511,
+      "input": 39,
+      "output": 4536
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
