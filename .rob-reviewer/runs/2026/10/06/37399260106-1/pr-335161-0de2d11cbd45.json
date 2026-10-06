@@ -1,0 +1,228 @@
+{
+  "PullRequest": {
+    "Number": 335161,
+    "Title": "agentHost: Restrict automatic PR association",
+    "Body": "## Summary\n\n- add an experiment-controlled `chat.agentHost.experimental.autoAttachPullRequests` setting, defaulting to `false` outside Stable\n- when automatic association is disabled, limit branch-aware PR state to agent-recorded PR artifacts and PRs explicitly selected or created through session actions\n- continue validating eligible candidates against the checked-out branch or exact HEAD commit before exposing Mark Ready, Merge, Auto-Merge, and Agent Merge actions\n- extract candidate ordering, reconciliation, race handling, and GitHub matching into an owned `AgentHostPullRequestAssociationResolver`\n\n## Behavior\n\n- PRs created or reused through the Create PR action remain associated\n- sessions created through the PR picker retain their selected PR as an explicit association\n- PR references (`isArtifact: false`) remain visible but never become actionable\n- newly added and removed artifacts, branch changes, setting changes, failed turns, and cancelled turns all trigger reconciliation\n- an open candidate wins over closed candidates, then the most recently signaled eligible candidate wins\n- lookup failures still apply the restricted candidate filter before being surfaced\n\n## Validation\n\n- `npm run typecheck-client`\n- targeted ESLint across all changed TypeScript files\n- 202 focused unit tests covering schema, resolver policy, Git state integration, GitHub matching, turn lifecycle, and PR-picker provenance",
+    "URL": "https://github.com/microsoft/vscode/pull/335161",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3c81a516ca6eea241eb50e3ee5a7832fdd0abd91",
+    "HeadRef": "benibenj/agents/disable-pr-picking-feature-analysis",
+    "HeadSHA": "0de2d11cbd454348ff4be54779d1d4a82806e088",
+    "CreatedAt": "2026-09-08T21:29:36Z",
+    "UpdatedAt": "2026-09-08T21:46:57Z",
+    "MergedAt": "2026-09-08T21:45:43Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-DEF4408B9E95",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostGitStateService.ts",
+      "Side": "RIGHT",
+      "Line": 75,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed fan-out, per-key-only sequencing, default resident-session cardinality, and exact network/subprocess call chain are all directly established. The proportion of sessions that are cold/unassociated is workload-dependent, affecting magnitude rather than the mechanism.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "Concurrent GitHub API requests and git rev-parse subprocesses",
+      "PerformanceScaling": "The burst grows linearly with every resident session lacking a verified pull request. The default residency limit is 10 (and held/subscribed sessions can exceed it); each cold miss performs one branch GET, then a git rev-parse and a second commit-to-PR GET.",
+      "PerformanceOutcome": "A single setting or experiment flip can produce a burst of subprocess and network activity, consuming GitHub rate limit and contending with interactive repository work.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff there was no auto-attach setting listener, so a root configuration change did not trigger repository-wide pull-request discovery across resident sessions.",
+      "ChangedBehavior": "Changing this root setting now starts reconciliation independently for every materialized session with no aggregate concurrency limit.",
+      "CausalDiffEvidence": "The added loop queues `_queuePullRequestLookup(sessionKey)` for every session as soon as `autoAttachPullRequests` changes; `_pullRequestSequencer` serializes only by session key, so all different sessions run concurrently.",
+      "Title": "Bound pull-request reconciliation when the setting changes",
+      "Impact": "With ten cold feature-branch sessions, enabling automatic association can immediately issue roughly ten concurrent branch lookups and, on misses, ten concurrent `git rev-parse` processes followed by ten more GitHub requests. This background burst can throttle GitHub requests and slow other git work.",
+      "Evidence": "`getSessionUris()` enumerates all materialized session states; normal residency allows 10. `_queuePullRequestLookup` uses `SequencerByKey`, which provides no global limit. `resolveForCheckout` calls `findPullRequestByHeadBranch`; a miss calls `revParse('HEAD')` and `findPullRequestByHeadSha`. The OctoKit cache only revalidates an already-seen exact route and does not coalesce cold requests across distinct session branches.",
+      "Recommendation": "Run setting-triggered reconciliation through a small shared limiter (and prioritize the active session), or lazily reconcile inactive sessions; preserve per-session sequencing while bounding aggregate GitHub and subprocess concurrency."
+    },
+    {
+      "ID": "PERF-6AC411A59B7B",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/chatContributions/githubReferences/githubReferencesContribution.ts",
+      "Side": "RIGHT",
+      "Line": 27,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The before/after event filter and subprocess call path are direct, and the added tests explicitly require success, cancelled, and error outcomes. Exact wall-clock impact varies by repository size and cancellation/error frequency.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Git subprocess launches and repository filesystem I/O",
+      "PerformanceScaling": "The added cost occurs once per non-coalesced cancelled or errored turn. A refresh launches at least `git status` and `git remote -v`, usually `symbolic-ref`, and may add push-remote and base-divergence probes; rapid events coalesce per session, but ordinary turns separated by more than the five-second throttle each pay again.",
+      "PerformanceOutcome": "Cancelled and failed requests now leave several background git processes running, increasing CPU/I/O load and contention with user or agent git commands.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before the diff, cancelled and errored turns performed no GitHub-reference attachment and therefore did not call `refreshSessionGitState` or its git probes.",
+      "ChangedBehavior": "Every started turn that ends in cancellation or error now invokes the same full attach path previously reserved for successful turns.",
+      "CausalDiffEvidence": "The condition changed from `turn.reason.kind === 'success'` to accepting every outcome except `rejected` and `localCommand`, newly invoking `attachSessionGitHubPullRequest` for `cancelled` and `error`.",
+      "Title": "Avoid a full git refresh after every failed or cancelled turn",
+      "Impact": "Users who cancel slow turns or retry repeated provider errors now incur a full repository-state probe after each outcome. Even when restricted-resolution caching or an existing branch association avoids all GitHub traffic, the git refresh still runs and can slow concurrent source-control operations in large repositories.",
+      "Evidence": "`GitHubReferencesContribution.onTurnEnd` fire-and-forgets `attachSessionGitHubPullRequest`; that method unconditionally awaits `refreshSessionGitState` first. `refreshSessionGitState` calls `getSessionGitState`, whose implementation launches 3 initial git probes in parallel and additional branch probes as needed, then holds its per-session throttler for five seconds. Turn errors do not set `SessionLifecycle.Failed` (that lifecycle is for session creation failure), so the refresh is reachable.",
+      "Recommendation": "Preserve reconciliation semantics without always refreshing the repository: track whether the turn changed PR artifacts or checkout-relevant state and skip unchanged failed/cancelled turns, or add a restricted reconciliation entry point that uses the already-recorded git state when only artifact metadata changed."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "concurrency-burst",
+      "boundary-fanout",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A started agent turn ends successfully, is cancelled, or errors, and GitHub references are reconciled.",
+        "CriticalPath": "`onTurnEnd` invokes attachment fire-and-forget, so reconciliation is off the chat-response critical path. Within the background task, git refresh must finish before pull-request lookup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitStateService.ts:82 and src/vs/platform/agentHost/node/agentHostGitService.ts:_computeSessionGitState",
+            "Operation": "Compute session git state using parallel `git status`, `git remote -v`, and usually `git symbolic-ref`, followed by optional push-remote and base-divergence probes.",
+            "Cardinality": "Approximately 2-6 git subprocesses per non-coalesced outcome for one session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Successful turns already paid this cost; cancelled and errored turns did not invoke attachment before this diff.",
+            "CriticalPathEffect": "Off the response critical path, but competes with user/agent source-control work and keeps background work active."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostPullRequestAssociationResolver.ts:resolveForCheckout",
+            "Operation": "Look up a pull request by head branch; on a miss, resolve HEAD locally and query pull requests by exact commit.",
+            "Cardinality": "Warm verified association: zero requests. Cold unresolved branch: one GET; a miss can cause a second GET after one `git rev-parse`.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This lookup ran after successful turns only.",
+            "CriticalPathEffect": "Off the response critical path; contributes API traffic after failed/cancelled turns only when association caches cannot short-circuit."
+          }
+        ],
+        "ScalingInput": "Number of cancelled/errored turns separated enough to escape the five-second per-session throttle; one active session is typical, with multiple sessions possible.",
+        "EffectiveConcurrency": "Git refreshes coalesce per session with `ThrottlerByKey`, retaining at most the active and latest queued task; PR lookups serialize per session with `SequencerByKey`. Different sessions remain independent and concurrent.",
+        "CacheBehavior": "A verified current branch association avoids network lookup; restricted mode records successful positive and negative resolutions keyed by checkout/candidate inputs. Git-state probing still runs before either cache can short-circuit. OctoKit uses ETag revalidation rather than a no-request warm hit.",
+        "MechanismConfidence": "High: the changed outcome predicate, unconditional refresh-before-lookup, subprocess implementation, and test covering all three outcomes are direct.",
+        "MagnitudeUncertainty": "Repository size, git probe duration, and cancellation/error frequency vary; this affects severity, not reachability of the added subprocess work.",
+        "Verdict": "Reportable repeated subprocess work: the diff newly runs the full attachment path after cancellation and error even when no relevant state changed."
+      },
+      {
+        "Scenario": "The automatic pull-request association setting or experiment assignment changes while several sessions are resident.",
+        "CriticalPath": "The setting update itself does not await reconciliation, but all queued session lookups start immediately in the background; each session's branch lookup precedes its optional SHA fallback.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitStateService.ts:75 -\u003e AgentHostPullRequestAssociationResolver.resolveForCheckout",
+            "Operation": "GitHub branch lookup and optional exact-HEAD pull-request lookup.",
+            "Cardinality": "For N cold eligible sessions, N branch GETs and up to N additional commit GETs. Default residency permits 10 sessions; held/subscribed sessions can increase N.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Root configuration changes did not trigger pull-request discovery across all sessions.",
+            "CriticalPathEffect": "Off the setting UI critical path, but aggregate requests contend for network/API quota and determine when session actions become available."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostPullRequestAssociationResolver.ts:130",
+            "Operation": "Resolve exact HEAD using `git rev-parse` after a branch lookup miss.",
+            "Cardinality": "Up to one subprocess per cold session whose branch lookup misses.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No all-session setting-change path existed.",
+            "CriticalPathEffect": "Required before that session's SHA fallback can proceed; concurrent across session keys."
+          }
+        ],
+        "ScalingInput": "Number of resident sessions with ready non-base branches and no reusable association; normal bounded cardinality is up to 10, with exceptions for held/subscribed sessions.",
+        "EffectiveConcurrency": "Only same-session work is sequenced. The loop starts all distinct session keys without a shared limiter, so effective aggregate concurrency is N.",
+        "CacheBehavior": "Current verified associations and empty restricted candidate sets short-circuit. Cold distinct branch routes do not share cache entries; OctoKit ETags help only after the exact route has already been requested and do not coalesce concurrent requests.",
+        "MechanismConfidence": "High: all-session enumeration, per-key-only sequencing, and the exact branch/SHA fallback chain are established in code.",
+        "MagnitudeUncertainty": "The fraction of resident sessions that are eligible and cold depends on usage, but ten resident sessions is an explicit normal configuration.",
+        "Verdict": "Reportable concurrency burst: the new listener fans setting changes into unbounded aggregate per-session boundary work."
+      },
+      {
+        "Scenario": "Restricted mode reconciles agent-recorded PR artifacts or explicitly associated PRs after artifacts, branch state, or PR status changes.",
+        "CriticalPath": "Reconciliation is background work. Candidate filtering and cached-resolution checks run synchronously before authentication/network; branch lookup then optional SHA fallback are sequential.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/shared/agentHostOctoKitService.ts:findPullRequestByHeadBranch and findPullRequestByHeadSha",
+            "Operation": "Fetch up to 100 pull requests for a branch to select among allowed candidate URLs; optionally query commit-associated PRs after a miss.",
+            "Cardinality": "At most one branch request plus one SHA request per changed checkout/candidate resolution; repeated unchanged successful or negative resolutions make zero requests.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Restricted candidate reconciliation did not exist; automatic lookup requested only one most-recent branch result.",
+            "CriticalPathEffect": "Determines when the restricted actionable association updates, but is off unrelated session progress."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostPullRequestAssociationResolver.ts:130",
+            "Operation": "Resolve `HEAD` for SHA fallback.",
+            "Cardinality": "One only when the allowed branch lookup finds no candidate and a working directory exists.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The previous automatic checkout resolver used the same branch-miss `rev-parse` fallback.",
+            "CriticalPathEffect": "Blocks the SHA fallback for this reconciliation."
+          }
+        ],
+        "ScalingInput": "Effective candidate count is distinct recorded GitHub PR artifacts plus associated URLs. Associated history is bounded to 10; artifact storage is not explicitly bounded but typical sessions record few PR artifacts.",
+        "EffectiveConcurrency": "Per-session requests serialize; separate sessions are concurrent. Candidate selection itself is local linear work over artifacts and returned items.",
+        "CacheBehavior": "Resolver caches both successful selection and successful absence while checkout/artifact/candidate inputs remain unchanged. It invalidates on artifact and setting changes and cleans entries on session removal. OctoKit keeps 100 ETag/body entries; failures are not negative-cached.",
+        "MechanismConfidence": "High for the call path and caching; uncertain prevalence of large branch histories.",
+        "MagnitudeUncertainty": "Branches with many historical PRs can make the `per_page=100` response larger, but common cardinality and a semantics-preserving narrower existing API were not established strongly enough for a separate finding.",
+        "Verdict": "No additional finding beyond the reported triggering paths: the restricted resolver coalesces unchanged inputs and owns cleanup, while the larger branch response is required by current candidate-selection semantics."
+      },
+      {
+        "Scenario": "A session is created from the PR picker or restored with automatic attachment enabled.",
+        "CriticalPath": "PR-picker metadata construction is local and synchronous. Session restoration launches attachment fire-and-forget after restoration; its git refresh and GitHub lookup are not required for restore completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:5815 -\u003e AgentHostPullRequestAssociationResolver.resolveForCheckout",
+            "Operation": "Existing automatic branch lookup and optional SHA fallback during restored-session attachment.",
+            "Cardinality": "Zero for the picker metadata helper itself; restored cold sessions perform one branch GET and possibly one commit GET.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Restored sessions already invoked attachment and the resolver extraction preserves automatic-mode boundary count.",
+            "CriticalPathEffect": "Off restore completion because the attachment promise is not awaited."
+          }
+        ],
+        "ScalingInput": "One selected PR per picker-created session; one attachment per restored session.",
+        "EffectiveConcurrency": "Restores can run across sessions; each session's PR lookup is sequenced. Picker metadata performs no asynchronous work.",
+        "CacheBehavior": "The picker now marks its selected URL as associated, allowing restricted mode to trust it without a lookup. Automatic-mode restore retains OctoKit ETag behavior and current-branch short-circuiting.",
+        "MechanismConfidence": "High: changed picker code only constructs bounded metadata and the restored-session attach call is pre-existing.",
+        "MagnitudeUncertainty": "Restore concurrency depends on client workflow, but this diff does not increase automatic-mode restore boundary count.",
+        "Verdict": "No performance regression: picker provenance is metadata-only, and automatic-mode resolver extraction preserves the prior lookup sequence."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 16 changed files. Reported two diff-caused regressions: repeated git subprocess work after cancelled/errored turns, and an aggregate network/subprocess burst when the new setting changes across resident sessions. Reviewed restricted-candidate caching, ETag behavior, resolver cleanup, picker provenance, and restore behavior; no other high-confidence performance issue or regression fix was established."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-06T01:44:24.141084626Z",
+    "CompletedAt": "2026-10-06T01:47:28.224469969Z",
+    "WallClockMilliseconds": 184083,
+    "ModelCalls": 13,
+    "InputTokens": 895096,
+    "OutputTokens": 12475,
+    "TotalTokens": 907571,
+    "ReasoningTokens": 5329,
+    "CacheReadTokens": 790493,
+    "CacheWriteTokens": 104564,
+    "APIDurationMilliseconds": 173001,
+    "ToolCalls": 97,
+    "NanoAIUnits": 108867320000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 790493,
+      "cache_write": 104564,
+      "input": 39,
+      "output": 12475
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

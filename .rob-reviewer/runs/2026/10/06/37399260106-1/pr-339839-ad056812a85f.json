@@ -1,0 +1,184 @@
+{
+  "PullRequest": {
+    "Number": 339839,
+    "Title": "nes: latch quota-triggered Copilot token refreshes",
+    "Body": "Fixes #331579\r\n\r\nRepeated NES quota errors can leave the legacy quota flags unchanged, causing the client to reset and mint a Copilot token on every failed request.\r\n\r\n- Latch quota-triggered refreshes per account, endpoint, and model across completions and HTTP/WebSocket chat. Preserve known-exhausted guards and coalesce concurrent refreshes.\r\n- Keep the latch across token rotations and elapsed time. A newer successful request rearms its scope; a five-minute backstop bounds failed refreshes and rapid recovery/failure cycles.\r\n- Track request ordering so an older success cannot discard a newer quota failure or rearm its latch. Use GitHub account/issuer identity, snapshot static-session IDs separately.\r\n- Stop successful requests from invalidating tokens based on unrelated legacy quota flags. Make the explicit `github.copilot.refreshToken` command force renewal so plan upgrades still refresh cached entitlement metadata.\r\n- Add regression tests and forward the request context through the simulation fetcher.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339839",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3d5764c14dea123b0fd50fb61788328c33c076b8",
+    "HeadRef": "agents/nes-402-copilot-token-fix",
+    "HeadSHA": "ad056812a85fd5d85f22bef5213b593b0611eff1",
+    "CreatedAt": "2026-10-05T16:43:30Z",
+    "UpdatedAt": "2026-10-05T22:55:56Z",
+    "MergedAt": null,
+    "Labels": [
+      "network",
+      "ghost-text",
+      "authentication-github",
+      "NES"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "extensions/copilot/src/platform/authentication/common/quotaTokenRefresh.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 68,
+      "BasePath": "extensions/copilot/src/extension/prompt/node/chatMLFetcher.ts",
+      "BaseLine": 1714,
+      "IntroducingPath": "extensions/copilot/src/extension/prompt/node/chatMLFetcher.ts",
+      "IntroducingCommit": "12b75316326c32737472cd3d496133b4501e54ec",
+      "MechanismFamily": "missing-coalescing",
+      "PerformanceCategory": "network",
+      "Mechanism": "Each sequential HTTP 402 (and the analogous WebSocket quota error) could reset the cached Copilot token and synchronously await another remote token mint when legacy quota metadata remained false, placing repeated authentication network calls on every failed inference's error path.",
+      "Symptom": "Repeated quota-exhausted chat requests incurred repeated token-reset and token-mint latency/network traffic instead of one refresh per quota episode.",
+      "FixedBehavior": "QuotaTokenRefreshRequest sets the scope latch before starting a token refresh and shares the in-flight promise, so repeated failures for the same account/endpoint/model perform at most one token mint until a newer successful inference rearms the scope; a five-minute gate bounds retries after refresh failures or rapid recovery cycles.",
+      "Evidence": "In the base HTTP 402 path, line 1714 awaited getCopilotToken() after resetCopilotToken whenever the newly minted token still reported isChatQuotaExceeded=false. The same handler is reached once per failed chat inference request, so sequential quota failures each performed another Copilot-token mint network request. The PR routes HTTP and WebSocket quota failures through QuotaTokenRefreshRequest; its per-account/scope `latched` state and shared `pending` promise are exercised by the added regression tests, including repeated quota errors and concurrent refreshes.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "missing-coalescing",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "unbounded-retention"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Chat inference over HTTP or the persistent Responses WebSocket, including quota rejection handling",
+        "CriticalPath": "The existing inference network response remains the primary critical path. On an HTTP 402 or WebSocket quota error, token refresh is awaited before the failed result returns, as it was before; successful responses perform only local scope-state updates.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/prompt/node/chatMLFetcher.ts:_doFetchViaHttp/_doFetchViaWebSocket",
+            "Operation": "Send one chat inference request over HTTP or an existing persistent WebSocket.",
+            "Cardinality": "One inference operation per model call; endpoint/model grouping does not add additional inference calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same HTTP or WebSocket inference boundary already occurred once per model call.",
+            "CriticalPathEffect": "The response or first WebSocket event must arrive before the scenario progresses."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/authentication/common/quotaTokenRefresh.ts:QuotaTokenRefreshRequest.refresh",
+            "Operation": "Reset and mint a Copilot token after an unknown quota rejection.",
+            "Cardinality": "At most one in-flight mint per account/endpoint/model scope and normally one per quota episode; no call on successful requests or known-exhausted tokens.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old HTTP and WebSocket handlers already reset and awaited token minting on unknown quota errors, but could repeat it for every failure when refreshed legacy quota flags stayed false.",
+            "CriticalPathEffect": "Quota-error handling awaits the mint before returning the failed inference result."
+          }
+        ],
+        "ScalingInput": "Model-call frequency and the effective number of distinct endpoint/model scopes. Repeated failures in one scope no longer scale token mints with request count.",
+        "EffectiveConcurrency": "One QuotaTokenRefreshRequest is created per inference. Requests sharing account, endpoint metadata, and model share one pending refresh and latch. Different endpoint/model scopes are independent; the normal VS Code token manager additionally coalesces token minting by authentication-session key. The diff does not increase cross-scope concurrency versus the prior reset/get race on concurrent quota failures.",
+        "CacheBehavior": "The token cache is unchanged on success. New weakly keyed state caches a small record per stable endpoint/model scope, distinguishes pending/latched/rearmed states, survives token rotation, resets on account identity change, and coalesces same-scope misses. Scope cardinality is bounded in normal use by configured endpoints and the model catalog.",
+        "MechanismConfidence": "High: the changed callers, latch/pending implementation, authentication token manager, and regression tests directly establish the call path and coalescing behavior.",
+        "MagnitudeUncertainty": "Exact quota-failure prevalence and remote token-mint duration vary, but the request path and reduction from repeated mints to one per episode are established.",
+        "Verdict": "No reportable regression. The change removes repeated authentication network work; per-request bookkeeping is constant and retained scope cardinality is realistically bounded."
+      },
+      {
+        "Scenario": "Inline code completions/NES requests triggered while typing, including HTTP 402 handling",
+        "CriticalPath": "Each non-cancelled completion serializes and sends the existing network request. A 402 waits for the same quota-refresh helper before returning the failure; ordinary 200 responses only mark the stable scope successful before streaming.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/nesFetch/node/completionsFetchServiceImpl.ts:CompletionsFetchService._fetchFromUrl",
+            "Operation": "POST a streaming completion request.",
+            "Cardinality": "One request per uncancelled completion attempt, plus the pre-existing single retry only after an interrupted network error.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical completion POST cardinality and retry behavior.",
+            "CriticalPathEffect": "The first response and stream are on the inline-completion critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/authentication/common/quotaTokenRefresh.ts:QuotaTokenRefreshRequest.refresh",
+            "Operation": "Mint a replacement Copilot token after an unknown completions-quota 402.",
+            "Cardinality": "At most one in-flight mint for the account/completions URL/model scope per quota episode instead of potentially one per repeated 402.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old 402 branch synchronously reset and fetched a token whenever legacy completions quota metadata remained false.",
+            "CriticalPathEffect": "The failed completion result waits for refresh, matching the old placement."
+          }
+        ],
+        "ScalingInput": "Typing-driven completion request count and distinct configured engine models. Effective scope cardinality is small after grouping identical URL/model pairs.",
+        "EffectiveConcurrency": "Completion requests may overlap due to typing, but same URL/model quota failures share one pending refresh. Different scopes are independent; the product URL and model derive from the bounded engine configuration. Existing cancellation and one retry after interrupted networking are unchanged.",
+        "CacheBehavior": "The scope key uses the stable completion URL and model. Successful requests rearm only that scope; pending refreshes coalesce, known quota exhaustion is negatively cached by the latch, and account changes replace the state.",
+        "MechanismConfidence": "High: the fetch call, status branch, stable key construction, and helper state are directly traced.",
+        "MagnitudeUncertainty": "The number of 402s depends on account quota state, but the old and new boundary placement and coalescing are explicit.",
+        "Verdict": "No reportable regression. The helper reduces quota-error network fan-out and adds only constant local allocations on the existing request path."
+      },
+      {
+        "Scenario": "User invokes the explicit GitHub Copilot refresh/retry command after connectivity or entitlement changes",
+        "CriticalPath": "The command now awaits a forced token renewal before updating context keys, so one token mint is intentionally on this user-invoked command's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/contextKeys/vscode-node/contextKeys.contribution.ts:_inspectContext",
+            "Operation": "Force renewal of the Copilot token through the authentication service.",
+            "Cardinality": "One forced mint per explicit command invocation, coalesced with a simultaneous same-session mint by the token manager.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The command called getCopilotToken without force and could return the cached token without a network request.",
+            "CriticalPathEffect": "The command and context refresh wait for the renewed entitlement metadata."
+          }
+        ],
+        "ScalingInput": "Only explicit command invocation frequency, not window events or background checks.",
+        "EffectiveConcurrency": "One command invocation issues one getCopilotToken(true); the underlying normal VS Code token manager coalesces simultaneous requests for the same authentication-session key.",
+        "CacheBehavior": "This explicit command deliberately bypasses the positive token cache; constructor-time and background context inspections still call without force and preserve cache hits.",
+        "MechanismConfidence": "High: the added true argument directly selects the token managers' force-refresh branch.",
+        "MagnitudeUncertainty": "Remote mint latency varies, but invocation frequency is low and controlled by the user.",
+        "Verdict": "No reportable regression. The added boundary is the required semantics of an explicit refresh/retry command and is not placed on startup or recurring background inspection."
+      },
+      {
+        "Scenario": "Extension startup/testing authentication setup with optional static GitHub credentials",
+        "CriticalPath": "Static provider construction reads two environment variables and returns a closure only when credentials exist; it performs no authentication or network work itself.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Constant with process startup; independent of requests, files, models, or workspace size.",
+        "EffectiveConcurrency": "Synchronous single initialization; no queue or parallel boundary is introduced.",
+        "CacheBehavior": "Environment values are snapshotted once into the returned closure when present; missing credentials now produce no provider. No growing cache is involved.",
+        "MechanismConfidence": "High: the changed function contains no transitive I/O call.",
+        "MagnitudeUncertainty": "None material for performance; only constant environment lookups changed.",
+        "Verdict": "No performance regression; the modification removes branches and does not add work or retention."
+      }
+    ],
+    "Summary": "Completed the performance pass over all nine changed files and every diff page. No actionable diff-introduced performance issue was found. The PR instead fixes a verified missing-coalescing regression in quota-triggered token minting; that regression fix was recorded against its introducing commit."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-06T01:47:31.056625591Z",
+    "CompletedAt": "2026-10-06T01:50:25.442169132Z",
+    "WallClockMilliseconds": 174385,
+    "ModelCalls": 12,
+    "InputTokens": 493457,
+    "OutputTokens": 8312,
+    "TotalTokens": 501769,
+    "ReasoningTokens": 2904,
+    "CacheReadTokens": 430868,
+    "CacheWriteTokens": 62553,
+    "APIDurationMilliseconds": 128411,
+    "ToolCalls": 83,
+    "NanoAIUnits": 65149620000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 430868,
+      "cache_write": 62553,
+      "input": 36,
+      "output": 8312
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
