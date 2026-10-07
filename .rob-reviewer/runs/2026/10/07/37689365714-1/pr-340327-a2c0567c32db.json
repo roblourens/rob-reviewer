@@ -1,0 +1,136 @@
+{
+  "PullRequest": {
+    "Number": 340327,
+    "Title": "Copilot NES: add ExP toggle to omit max_tokens",
+    "Body": "## Summary\nAdds the ExP-capable boolean setting `github.copilot.chat.advanced.inlineEdits.xtabProvider.useMaxTokens` (default: `true`).\n\nWhen `usePrediction=false`, setting `useMaxTokens=false` omits `max_tokens`, allowing reasoning-model deployments that reject the legacy parameter to choose their server-side output budget. The default preserves the endpoint limit (currently 4096). Prediction-enabled requests are unchanged.\n\nExP treatment variable: `copilotchat.config.chat.advanced.inlineEdits.xtabProvider.useMaxTokens`.\n\nTests cover the toggle combinations, unset/default behavior, ExP assignment and user override precedence, and actual serialized request omission. The new NES cases use an isolated endpoint provider to avoid unrelated model-metadata cache access. No nullable ExP plumbing or numeric-limit setting is included.\n\n## Current NES model requests also omit `max_tokens`\n\nIn current NES model requests, `max_tokens` is not set, because `usePrediction=true`\n\nTherefore, I do not expect `github.copilot.chat.advanced.inlineEdits.xtabProvider.useMaxTokens = false` to worsen latency or oversized suggestions.\n\n## Validation\n- 37 focused tests passed (configuration, shared fetcher/retry suite, and all five new NES toggle cases).\n- Copilot extension TypeScript check passed.\n- Changed-file ESLint and staged whitespace checks passed.\n- A prior broader NES test run reported three failures in existing cases and LFS-backed SQLite cache errors. Baseline reproduction has not been established; this is not a claim that the full suite passes.",
+    "URL": "https://github.com/microsoft/vscode/pull/340327",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bluerose73",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "35c48f9946eecf40beed751940607f184a03b6de",
+    "HeadRef": "shengjiema/nes-max-response-tokens",
+    "HeadSHA": "a2c0567c32dbd2cd63fa713e369f6ae9484820c8",
+    "CreatedAt": "2026-10-07T16:51:56Z",
+    "UpdatedAt": "2026-10-07T19:09:21Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-501B8F4A48FE",
+      "Focus": "performance-review",
+      "Path": "extensions/copilot/src/extension/xtab/node/xtabProvider.ts",
+      "Side": "RIGHT",
+      "Line": 902,
+      "Severity": "medium",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The changed request serialization, prior 4,096-token bound, one-network-call-per-NES-request path, stream retention, and active/speculative consumption are directly traced in the repository. Exact server defaults and how often models stop naturally are deployment-dependent, which limits severity rather than confidence in the mechanism.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "model generation, streamed network bytes, response strings, and per-chunk objects",
+      "PerformanceScaling": "For every active or speculative NES request in the false treatment, server generation and client streaming now scale to the deployment's server-side default output budget rather than the endpoint's 4,096-token cap; reasoning deployments can have substantially larger defaults.",
+      "PerformanceOutcome": "increased time to first/complete edit, network usage, CPU/GC pressure, and background work from superseded or speculative requests",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "When prediction was disabled, ChatMLFetcher always prepended max_tokens: endpoint.maxOutputTokens; both XtabEndpoint and proxyXtabEndpoint declare that limit as 4096, so each NES model call was bounded to 4,096 generated tokens.",
+      "ChangedBehavior": "When both experiment toggles are false, the added assignment overrides ChatMLFetcher's default with undefined, and JSON serialization removes the output limit entirely from the network request.",
+      "CausalDiffEvidence": "RIGHT line 902 assigns undefined specifically to override and remove the existing endpoint.maxOutputTokens value; without this added assignment ChatMLFetcher serializes the 4096 cap.",
+      "Title": "Keep a bounded output budget for non-prediction NES requests",
+      "Impact": "A user assigned to this treatment on a reasoning-model deployment can pay the deployment's full default reasoning/output budget on each next-edit request. Active requests wait on streamed model output to form edits, while the caller also continues consuming remaining edits in the background; speculative requests do the same off the critical path, so a large default can make suggestions slower and retain/process much more response data during normal typing.",
+      "Evidence": "The changed line sets requestOptions.max_tokens to undefined. ChatMLFetcher.fetchMany merges { max_tokens: chatEndpoint.maxOutputTokens, ...requestOptions }, so this explicitly defeats its cap. Both Xtab endpoint implementations set max_output_tokens to 4096. createCapiRequestBody copies the undefined property and JSON serialization omits it. The fetcher stores every streamed delta in FetchStreamRecorder and XtabProvider accumulates responseSoFar/feeds each chunk through its parsers; NextEditProvider continues draining the stream in an unawaited background loop after the first edit and also issues speculative provider calls. Thus larger server defaults translate directly into more generation, bytes, allocations, and potentially first-edit latency.",
+      "Recommendation": "Preserve endpoint.maxOutputTokens and make the endpoint select a deployment-compatible bounded field (for example max_completion_tokens for reasoning Chat Completions models) instead of omitting the budget. If parameter selection cannot be known here, add an endpoint capability/config for the accepted token-limit field and keep the 4,096 value."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "serialization-allocation",
+      "concurrency-burst",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Interactive next-edit suggestion after a user edit, with prediction disabled",
+        "CriticalPath": "On a next-edit cache miss, debounce/context construction completes, then one chat-completions request must produce the first token and enough streamed lines to parse the first edit. Remaining edits continue streaming in the background after the first result. A warm next-edit cache can avoid this request.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/xtab/node/xtabProvider.ts:_performFetch (lines 906-938)",
+            "Operation": "Stream a Chat Completions request through endpoint.makeChatRequest2/ChatMLFetcher",
+            "Cardinality": "One call for the normal cold/cache-miss request, with existing retry/cursor-jump behavior unchanged; the response can now run to the server default instead of 4096 tokens in the false treatment.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same boundary call was made, but ChatMLFetcher serialized max_tokens: endpoint.maxOutputTokens (4096 for both Xtab endpoints). The diff changes its output cardinality, not its call count.",
+            "CriticalPathEffect": "Time to first token and enough output to parse the first edit are on the interactive suggestion critical path; later chunks are drained in the background."
+          }
+        ],
+        "ScalingInput": "One model request per cache-missing NES opportunity; output work scales with generated reasoning/output tokens. Before the diff it was capped at endpoint.maxOutputTokens (4096); in the false treatment it scales to the deployment's server-side default.",
+        "EffectiveConcurrency": "A newly started regular request cancels the previous pending request, while consumer cancellation may allow an issued request to remain for up to one second. No new request fan-out is introduced, but the longer output budget can extend overlap with replacement work.",
+        "CacheBehavior": "The next-edit cache can serve/rebase a warm result and skip the network path. On a cold miss, the model response itself is not reused by ChatMLFetcher; successful streamed edits populate the next-edit cache. This diff does not change cache keys, coalescing, or negative caching.",
+        "MechanismConfidence": "High: the added undefined value overrides ChatMLFetcher's 4096 default and is omitted by JSON serialization; the streamed response path and continued background draining are directly traced.",
+        "MagnitudeUncertainty": "The exact server default and natural model stopping point vary by deployment, so the absolute latency/bytes are uncertain; reasoning deployments with defaults above 4096 are the realistic adverse case targeted by the toggle.",
+        "Verdict": "Reportable medium regression: the treatment removes the only client output bound from a latency-sensitive, frequently triggered network request, allowing materially more generation, bytes, allocations, and latency."
+      },
+      {
+        "Scenario": "Speculative next-edit generation used to pre-populate the edit cache",
+        "CriticalPath": "The model request starts in the background and is off the current interaction's critical path, but a later request can wait for/reuse its first edit. It is therefore latency-relevant when reused and otherwise consumes background resources.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/inlineEdits/node/nextEditProvider.ts:_runSpeculativeProviderCall -\u003e extensions/copilot/src/extension/xtab/node/xtabProvider.ts:_performFetch",
+            "Operation": "Stream a speculative Chat Completions request and process/cache every returned edit",
+            "Cardinality": "One boundary call per speculative provider invocation; effective request count is unchanged, but each treated call can consume the deployment default output budget rather than 4096 tokens.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same speculative call existed with the 4096-token ChatMLFetcher cap. The diff removes that cap for the false treatment.",
+            "CriticalPathEffect": "Initially off critical path; may become the source awaited/reused by the next edit request. Regardless, all chunks consume network, parser, recording, and cache-processing resources in the background."
+          }
+        ],
+        "ScalingInput": "One request per speculative trigger; work scales with response tokens and can overlap a regular request. The false treatment raises the possible response cardinality from 4096 tokens to the server default.",
+        "EffectiveConcurrency": "Speculative work is launched asynchronously and can coexist with a regular NES request. The speculative manager cancels mismatched or rejected work, but there is no newly added limiter or fan-out in this diff.",
+        "CacheBehavior": "Cold speculative work fills the next-edit cache; a matching later request can reuse it. Mismatched/rejected speculative work is cancelled. The diff does not alter cache invalidation, keying, or coalescing.",
+        "MechanismConfidence": "High for increased possible per-call work and active/speculative overlap; exact simultaneous request count in a given session depends on cancellation timing.",
+        "MagnitudeUncertainty": "Frequency depends on speculative experiment configuration and user edit patterns; deployment output defaults determine the excess work.",
+        "Verdict": "Covered by the same reported regression because this path amplifies its background CPU/network/GC cost; no separate finding is needed."
+      }
+    ],
+    "Summary": "Completed the performance pass over all five changed files and all diff pages. Traced active and speculative NES request paths, serialization, response retention/processing, cache behavior, cancellation, and concurrency. Submitted one finding for removing the 4096-token output bound; test-only and configuration lookup changes introduced no additional reportable performance mechanism."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-07T21:35:01.880069953Z",
+    "CompletedAt": "2026-10-07T21:36:56.051776841Z",
+    "WallClockMilliseconds": 114171,
+    "ModelCalls": 15,
+    "InputTokens": 660991,
+    "OutputTokens": 7794,
+    "TotalTokens": 668785,
+    "ReasoningTokens": 2363,
+    "CacheReadTokens": 592758,
+    "CacheWriteTokens": 68188,
+    "APIDurationMilliseconds": 98098,
+    "ToolCalls": 90,
+    "NanoAIUnits": 73410320000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 592758,
+      "cache_write": 68188,
+      "input": 45,
+      "output": 7794
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
