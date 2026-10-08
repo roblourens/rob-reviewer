@@ -1,0 +1,173 @@
+{
+  "PullRequest": {
+    "Number": 340095,
+    "Title": "agentHost: add agent title review and consolidate title settings",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nConsolidates the automatic title settings into one experiment-controlled enum, `chat.agentHost.experimental.titleGeneration`, and adds a new strategy, `agentReview`.\n\nNo issue is linked.\n\n### One setting, three strategies\n\n| Value | Who writes the title | Agent asked to rename | `rename_chat` |\n|---|---|---|---|\n| `utility` | Utility model, immediately | Never | Not offered |\n| `activeAgent` | The active agent | From the first turn | Loaded eagerly |\n| `agentReview` | Utility model after the first response; the agent may correct it | Turns 2–4, only if the title is wrong | Deferred |\n\n- Strategies are mutually exclusive, and the treatment value is the same string reported as `titleGenerationStrategy`.\n- The default keeps today's behavior: `activeAgent` outside Stable, `utility` in Stable.\n- It replaces `activeAgentTitleGeneration` and `deferredTitleGeneration`. User values of those two are migrated to the new setting and the old keys are removed from settings. `deferredTitleGeneration: true` migrates to `agentReview`.\n- `deferred` (deferred host naming with no agent review) is no longer selectable. It still works for sessions that already persisted it and for older clients that send the legacy boolean root key.\n- The host prefers the `titleGeneration` root key and still reads the two legacy boolean root keys, so a client that predates this change keeps working against a newer host. Because hosts persist root config, a newer client also keeps writing the two legacy keys, derived from the strategy (`activeAgent` → `activeAgentTitleGeneration: true`, `agentReview` → `deferredTitleGeneration: true`), so an older host follows the current setting rather than its last stored legacy value. This uses a new optional `derivedKeys` mapping on agent host configuration sync.\n\n### The `agentReview` strategy\n\nA middle ground between host-only naming (a poor title is never corrected) and `activeAgent` (the agent names every chat on its first turn).\n\n- The host seeds a title from the first message and refines it with the utility model after the first response.\n- From the second turn, the active agent gets a soft reminder that quotes the current title and asks it to call `rename_chat` only if the title is inaccurate or no longer reflects the user's goal, at the end of its answer rather than in a separate step before it.\n- The reminder is withheld until the first response after the seed has finished and while a host refinement is still in flight (including one still keyed by the session after a peer chat is added), and is offered on at most three turns per chat. A cancelled or failed first response consumes refinement without running it, so the unrefined seed is reviewed on the next turn. It stops once the user or agent renames the chat.\n- `rename_chat` stays deferred and keeps its `automatic` argument, so first-turn requests carry no naming instruction and no eager tool schema.\n\nThe `activeAgent` naming reminder also now asks the agent not to spend a separate step on renaming before it responds. `rename_chat` stays deferred for `activeAgent`, matching the revert of eager loading in #340159.\n\n### How to test\n\n1. Set `chat.agentHost.experimental.titleGeneration` to `agentReview` and start a new Agent Host chat.\n2. Send `hey`, then ask for something concrete on the next turns. The title should start as the seed and the agent should rename it on a later turn.\n3. On a chat whose title is already accurate, the agent should leave it alone, and the reminder should stop after three turns.\n\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/340095",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "31293417a6222caa5fab6b24ed358d6196be9f79",
+    "HeadRef": "bhavyaus/agent-title-review",
+    "HeadSHA": "3bc755a3639d15f4c78363c923ada003981d9b0f",
+    "CreatedAt": "2026-10-06T17:09:32Z",
+    "UpdatedAt": "2026-10-07T22:50:49Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Initial/reconnected Agent Host configuration sync and title-setting migration",
+        "CriticalPath": "Configuration migration runs while settings are initialized; on connection or reconnect, `_forwardClientConfig` builds one patch and dispatches it without awaiting a response. A live title-setting change synchronously builds the same patch before one root-config dispatch.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:517 and :1283",
+            "Operation": "Dispatch a RootConfigChanged patch to the Agent Host.",
+            "Cardinality": "One IPC dispatch per initial connection/reconnection, or one per relevant configuration-change event; the title strategy now contributes three scalar keys in the same patch rather than separate calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same scenario already dispatched one root-config patch. The diff enlarges that existing message by two derived booleans but does not add another IPC call.",
+            "CriticalPathEffect": "The dispatch is not awaited, so it does not add a remote round trip to connection or configuration-change progress; local patch construction is synchronous and bounded by registered sync entries."
+          }
+        ],
+        "ScalingInput": "Number of registered Agent Host configuration entries on initial sync, and number of affected entries on a live change; each title entry has exactly two derived keys.",
+        "EffectiveConcurrency": "Configuration events are handled synchronously; each event emits at most one combined root-config action.",
+        "CacheBehavior": "No cache is involved. Derived values are recomputed on each sync, but only constant-time scalar transforms are added for this setting.",
+        "MechanismConfidence": "High: the call path and single-dispatch behavior are explicit in the changed helper and protocol client.",
+        "MagnitudeUncertainty": "The total registry size is not quantified, but the diff adds only two constant-time derivations and two scalar fields.",
+        "Verdict": "No reportable regression: no boundary fan-out or blocking round trip was introduced, and the added allocation/serialization is constant and negligible."
+      },
+      {
+        "Scenario": "Creating an `agentReview` chat and refining its seed after the first response",
+        "CriticalPath": "The seed is published immediately. `SessionTitleContribution.onTurnEnd` invokes refinement synchronously, but `_generateTitleSoon` starts the network work without awaiting it, so the user-visible first response is not blocked by GitHub enrichment, utility-model completion, or title persistence.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:197 and persistence helpers",
+            "Operation": "Persist automatic-title provenance and a deferred seed in the per-session SQLite database.",
+            "Cardinality": "A constant number of metadata writes when a chat is seeded, plus clearing/updating metadata once when first-response refinement is consumed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Legacy `deferred` performed the same seed persistence. The new `agentReview` strategy is routed through that existing deferred path; `activeAgent` persisted automatic provenance but not a deferred seed.",
+            "CriticalPathEffect": "The fallback title is applied synchronously; persistence is fire-and-forget and does not block the first response."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:696-767",
+            "Operation": "Optionally query referenced GitHub issues/pull requests, then request one Copilot utility chat completion for the refined title.",
+            "Cardinality": "At most one utility completion per chat's first successful response. GitHub references are deduplicated and capped at 10; successful lookups are grouped into that one utility request.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The exact refinement boundary already existed for legacy `deferred` sessions and immediate utility naming. The diff makes the same bounded path serve the newly selectable `agentReview` strategy; migrated deferred users retain their prior boundary count.",
+            "CriticalPathEffect": "Off the completed response critical path; only background title refinement waits for these calls."
+          }
+        ],
+        "ScalingInput": "One first successful response per chat; optional GitHub fan-out scales with unique references in that first user message up to 10.",
+        "EffectiveConcurrency": "Only one generation source is retained per chat key and replacement cancels it. Up to 10 GitHub lookups run concurrently within one refinement; there is no newly added global limiter, but this is the pre-existing deferred/utility implementation rather than a diff-amplified loop.",
+        "CacheBehavior": "No result cache is present. Duplicate GitHub URLs in one prompt are coalesced by a local set; refinement eligibility is consumed once, including on failed/cancelled first turns, preventing retries.",
+        "MechanismConfidence": "High: the changed strategy routing, one-shot eligibility, cancellation map, reference cap, and non-awaited call path are explicit.",
+        "MagnitudeUncertainty": "Network latency and the prevalence of prompts containing many distinct GitHub references vary, but all work is bounded per chat and off the response critical path.",
+        "Verdict": "No reportable regression: `agentReview` intentionally reuses the existing one-shot deferred refinement, with bounded fan-out and no newly blocked response path."
+      },
+      {
+        "Scenario": "Sending turns 2-4 in an `agentReview` chat",
+        "CriticalPath": "Ordered outgoing-turn contributions await `prepareInstructionForAgent` before provider dispatch. Eligible review turns therefore await one persisted provenance lookup, then append a bounded reminder to the existing model request.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:587 and :1117",
+            "Operation": "Open/reference the per-session SQLite database and read title-source metadata.",
+            "Cardinality": "One metadata read on each eligible reminder attempt, capped at three per chat and skipped before the first response, during refinement, after rename, and after the cap.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Legacy deferred mode supplied no review instruction and did not perform this outgoing-turn read. Active-agent naming already used the same persisted-source lookup without the new three-turn cap.",
+            "CriticalPathEffect": "This lookup is serial on the send path before the provider request starts."
+          },
+          {
+            "Kind": "network",
+            "Location": "Provider turn reached from src/vs/platform/agentHost/node/chatContributions/sessionTitle/sessionTitleContribution.ts:45-48",
+            "Operation": "Send the normal agent model request with an additional short title-review instruction; if the agent judges the title inaccurate, deferred tool search and `rename_chat` execution may occur in that same response.",
+            "Cardinality": "The reminder is injected on at most three turns per chat. A rename ends future reminders; an accurate title adds no tool call. The ordinary provider request already existed for every turn.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Deferred sessions sent the same user turns without this reminder; active-agent sessions already carried mandatory rename guidance. The new mode trades bounded review prompt tokens for avoiding mandatory first-turn agent naming.",
+            "CriticalPathEffect": "The bounded prompt text is part of the normal request. A deferred tool-search/tool invocation occurs only if the model decides to rename."
+          }
+        ],
+        "ScalingInput": "At most three eligible turns per chat; reminder size is bounded by the title limit (200 characters) plus fixed text.",
+        "EffectiveConcurrency": "Outgoing contributions are awaited sequentially for one turn. Different chats can prepare concurrently, but each performs at most one SQLite read and uses its existing provider request.",
+        "CacheBehavior": "The in-memory reminder count suppresses work after three attempts and rename state suppresses it earlier. Persisted provenance is reread on eligible attempts to observe authoritative user/agent renames; the count intentionally resets after host restart.",
+        "MechanismConfidence": "High: the sequential await and exact cap are covered by implementation and tests.",
+        "MagnitudeUncertainty": "SQLite open/query latency depends on connection warmth and storage, and model behavior determines whether deferred tool search is used. The small, three-turn cap limits aggregate cost.",
+        "Verdict": "No finding: although the new mode adds a critical-path metadata read and bounded prompt tokens, the work is capped to three turns, reuses authoritative provenance, and does not establish a concrete user-visible regression at reportable magnitude."
+      },
+      {
+        "Scenario": "Restoring, materializing tools for, and tearing down `agentReview` sessions/chats",
+        "CriticalPath": "Restore awaits persisted strategy and deferred-seed metadata before title scheduling is re-established. Tool definition materialization is in-memory. Session teardown clears controller state and cancels generation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionTitleController.ts:1006-1108",
+            "Operation": "Read strategy, deferred seed, title, and title-source metadata from the session database; optionally read a normalized peer chat.",
+            "Cardinality": "One strategy read per restored session and one bounded seed-restore sequence per restored chat. Default-chat fallback can add one extra metadata read; title and source reads are paired.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Legacy deferred sessions followed this same restore sequence. The diff extends the same path to persisted `agentReview` sessions rather than adding another restore pass.",
+            "CriticalPathEffect": "Restore waits for these reads before title-generation state is authoritative, as legacy deferred restore already did."
+          }
+        ],
+        "ScalingInput": "Number of sessions/chats restored; each chat contributes a constant number of metadata reads.",
+        "EffectiveConcurrency": "Repeated strategy restores for one session share one promise. Chat seed restores may run independently, while generation remains one cancellable operation per key.",
+        "CacheBehavior": "In-flight strategy restore is coalesced per session. Strategy remains cached in memory after restore, and deferred refinement eligibility is restored only when persisted seed, title, and provenance match.",
+        "MechanismConfidence": "High: coalescing maps, database reference disposal, generation cancellation, and session cleanup are explicit.",
+        "MagnitudeUncertainty": "The number of restored chats and storage latency vary, but per-chat work is constant and unchanged from the deferred mechanism reused by this strategy.",
+        "Verdict": "No reportable regression: restore work is bounded/coalesced and teardown clears the newly added reminder-count map; the extra strategy adds no duplicate persistence pass."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 20 changed files and every diff page. Traced configuration IPC, SQLite metadata access, background GitHub/utility-model refinement, outgoing-turn prompt preparation, deferred tool loading, cache/coalescing, concurrency, and cleanup. No high-confidence actionable performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-08T01:15:48.936816114Z",
+    "CompletedAt": "2026-10-08T01:18:06.969803043Z",
+    "WallClockMilliseconds": 138032,
+    "ModelCalls": 8,
+    "InputTokens": 363880,
+    "OutputTokens": 8586,
+    "TotalTokens": 372466,
+    "ReasoningTokens": 4011,
+    "CacheReadTokens": 289285,
+    "CacheWriteTokens": 74571,
+    "APIDurationMilliseconds": 126338,
+    "ToolCalls": 57,
+    "NanoAIUnits": 66038500000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 289285,
+      "cache_write": 74571,
+      "input": 24,
+      "output": 8586
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
