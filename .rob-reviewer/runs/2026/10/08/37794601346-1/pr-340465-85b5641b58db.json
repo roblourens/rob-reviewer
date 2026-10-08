@@ -1,0 +1,190 @@
+{
+  "PullRequest": {
+    "Number": 340465,
+    "Title": "Restore canvases closed by session and chat switches",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes microsoft/vscode-internalbacklog#9872\n\nIn the Agents window, a canvas tab closed as soon as you switched to another session (or to another chat, when `sessions.experimental.layoutScope` is `chat` or `chat-shared`). Switching back did not restore it; it only appeared as reopenable in the Add Tab (+) menu.\n\n## Why it happened\n\nOn a switch, the layout saves the outgoing owner's editor working set and applies the incoming one. Canvas inputs had no editor serializer, so the saved working set omitted them. Applying the next working set closed the canvas input, and the canvas service interpreted that close as an intentional user dismissal. The BrowserView model was also owned by the editor pane, so closing the input destroyed the page process and its JavaScript state.\n\n## What changed\n\n- **Generic working-set lifecycle:** `ISessionEditorWorkingSetService` publishes the intended owner and restore state before workspace hydration, then remains active through the sequenced working-set apply. `BaseLayoutController` stays unaware of canvas types.\n- **Queued versus applying:** restore state distinguishes a queued owner transition from the moment `EditorParts` actually replaces the working set. Canvas tabs stay stable while workspace hydration is pending and are marked for suspension only when the single editor-system apply begins, avoiding an extra pre-close tab-strip transition.\n- **Opaque live-runtime serialization:** canvases join editor working sets through an `IEditorSerializer` that stores only an opaque per-runtime ID. It stores no provider, session, chat, canvas, title, source, endpoint, token, or browser state. The ID is honored only by the live `SessionCanvasService` that issued it, while a published restore is applying for the matching owner; a fresh service after reload rejects it.\n- **Suspension versus dismissal:** switching owners suspends admitted canvases when the working-set apply disposes them. Only a user close records a dismissal, so dismissed canvases remain dismissed and available from Add Tab.\n- **Native editor restoration:** ordinary working-set restoration preserves tab order, groups, sticky state, selection, active editor, hidden-pane state, and focus. Session-shared working sets also restore canvases belonging to sibling chats.\n- **Browser and JavaScript state retention:** the live canvas presentation owns and creates its `IBrowserViewModel`. Editor panes attach and detach that model as sessions switch instead of disposing and recreating it, so the same WebContentsView, page heap, DOM, and browser-side JavaScript state survive. User dismissal, authoritative source loss, membership removal, archive, chat deletion, service disposal, or a changed source dispose the model.\n- **Details-only retention:** live editors can register that a presentation-only Details collapse must keep their input alive. Canvas inputs use this path, so switching through an empty session may hide Editor but cannot dispose the canvas or convert the layout close into a user dismissal. Revealing the canvas restores the same canvas/file strip.\n- **Focus-safe fallback:** if the working set cannot bring a canvas back—for example a modal canvas, a failed apply, or a delayed open—the service reopens it in the main editor part with `preserveFocus`, `PRESERVE` activation, no side-pane reveal, and inactive state unless the canvas was previously active. An explicit reveal waiting on that fallback performs a normal focused reveal after the fallback settles.\n- **Hydration and lifecycle reconciliation:** while a chat's canvas reference reloads before its channel state hydrates, the input retains the last hydrated title/status and existing BrowserView, strips the exposed source, and shows a waiting state. A hydrated canvas that genuinely reports no source shows the provider-unavailable state and disposes its old model. Authoritative membership removal and chat deletion invalidate the live admission without stale model recreation.\n- **Rapid switches:** returning to the settled owner before an intermediate workspace finishes hydrating re-applies that owner's working set, settles the restore, and makes the later workspace-folder arrival inert. The latest working-set owner remains published while superseded asynchronous work drains.\n\n### Storage\n\nOpaque runtime IDs are written to the existing workspace-machine `editor.workingSets` record. They contain no canvas identity and have no authority in a new process. Canvas membership, sources, browser models, and JavaScript state do not persist across application reloads, preserving the contract in `SESSIONS.md`.\n\n## Relation to #340288\n\nThis PR adopts the editor-serializer approach from #340288 for exact working-set restoration, along with several of its regression scenarios, adapted for this design. Credit to @jruales for that approach and coverage.\n\nThe key differences are:\n\n- this PR serializes opaque per-runtime IDs rather than provider/session/chat/canvas identities;\n- `BaseLayoutController` publishes a generic queued/applying lifecycle and does not import `SessionCanvasInput`;\n- service-owned admission and reconciliation cover sibling-chat restoration, workspace-hydration races, deleted/archived chats and sessions, and the `workbench.editor.useModal: all` fallback;\n- registered live inputs survive presentation-only Details collapse instead of being destroyed;\n- the live presentation owns and retains the BrowserView model, preserving page/JavaScript state across switches.\n\nOnly one of the two PRs should land.\n\n## Commit structure\n\n1. **`sessions: Publish editor working-set lifecycle`** — generic owner publication, queued/applying state, stale-apply rejection, and live-editor retention for Details-only layout.\n2. **`sessions: Restore live canvases through working sets`** — opaque serializer, suspension/dismissal semantics, BrowserView lifetime, hydration, fallback, cleanup, and focused unit coverage.\n3. **`sessions: Cover live canvas restoration end to end`** — real `EditorParts`/`EditorService`/layout-controller scenarios.\n4. **`sessions: Document live canvas retention`** — durable Sessions, desktop composition, and canvas lifetime contracts.\n\n## How to test\n\n1. In the Agents window, open a session that has a canvas (for example via `/create-canvas`) with a file tab beside it.\n2. Change some browser-side canvas state, such as an input value, selection, scroll position, or in-page counter. Switch to another session and back. The same state should remain without a page reload.\n3. Confirm the canvas and file return at the same tab positions, the previous active editor is preserved, and focus stays in the chat input. The canvas tab should neither disappear separately before the rest of the outgoing working set changes nor temporarily fall back to the title “Canvas.”\n4. Close the canvas tab, switch away and back, and confirm it stays closed and is offered in Add Tab (+).\n5. Set `sessions.experimental.layoutScope` to `chat`, reload, and repeat while switching between chats in one session.\n6. Set `workbench.editor.useModal` to `all`, open a canvas, and switch away and back. The restored canvas is docked in the main editor part, no modal is recreated, the side pane is not revealed if hidden, and focus stays where it was.\n7. Switch from A to a session B whose workspace is still loading, then immediately return to A before B's workspace folder arrives. A's canvas should return, explicit reveal should resolve, and B's later folder arrival should not change A.\n8. In default `session-shared` mode, switch from an editor-bearing A to an empty B and back. Editor may remain hidden by the shared Details-only composition, but opening A's canvas pill must reveal the original canvas and file strip without treating the canvas as dismissed or reloading its page.\n\n## Validation\n\nRun on macOS on signed head `85b5641b58d`:\n\n| Command | Result |\n|---|---|\n| `npm run build-fast -- --client-only` | Passed |\n| `./scripts/test.sh --reporter dot --runGlob '**/sessions/contrib/{layout,canvases}/test/**/*.test.js'` | **327 passing**, 0 failing |\n| `npm run typecheck-client` | Passed |\n| Changed-file `npm run eslint -- ...` | Passed |\n| `npm run valid-layers-check` | Passed |\n| `git diff --check` | Passed |\n| `git verify-commit HEAD` | Passed |\n| Dev Code OSS scenario with local Agent Host + project canvas extension | Passed: provider-backed canvas, independent empty B, A→B→A twice, retained Details-only state, exact canvas/file order, active editor, group count, part visibility, no additional canvas page request, no partial file-only tab state, and no placeholder-title transition |\n\nThe regression coverage includes real `EditorParts`, `EditorService`, and `BaseLayoutController` paths; queued versus applying restore state; all three layout scopes; mixed files and canvases; split groups; active-editor and focus preservation; sibling chats; unknown versus unavailable canvas state; dismissal, archive, and deletion; incoming canvases during apply; rapid workspace-hydration switches; cold-service rejection; modal fallback and explicit reveal precedence; Details-only retention; retained BrowserView identity; stale model-creation rejection; and model disposal on dismissal, source loss, deletion, and source replacement.\n\nThe OSS scenario ran against Code OSS Dev 1.142.0 on macOS arm64 with a deterministic mock model and real Agent Host project canvas extension. Its HTTP server observed no additional page request across two A→B→A round trips, confirming that the BrowserView was detached and reattached rather than reloaded. A MutationObserver over the editor tab strip observed neither an intermediate state where the canvas disappeared while the outgoing file remained nor a temporary placeholder title. No scenario steps were skipped. Not run locally: Windows or Linux OSS UI validation.\n\n## Known limits\n\n- A canvas restored through the fallback path returns in the main active editor group rather than its exact original modal or auxiliary position. The ordinary serialized working-set path retains exact placement.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/340465",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "ulugbekna",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "38d9885c15878f05c638755aedf59d1c760df4b3",
+    "HeadRef": "ulugbekna/agents/fix-session-canvas-reopen-issue",
+    "HeadSHA": "85b5641b58db76006c4fb63b7a819ab145b3ea3c",
+    "CreatedAt": "2026-10-08T09:11:09Z",
+    "UpdatedAt": "2026-10-08T14:40:46Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-6C9210BD55B8",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/canvases/electron-browser/sessionCanvasService.ts",
+      "Side": "RIGHT",
+      "Line": 287,
+      "Severity": "high",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The ownership transfer, switch-time retention, native WebContents allocation, and destroy-on-model-dispose behavior are directly traced in code and covered by new retention tests. Exact per-page memory and how many canvases typical users visit are uncertain, but the linear unbounded mechanism is not.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "unbounded-retention",
+      "PerformanceResource": "Live Chromium WebContentsView instances together with their renderer page heaps, DOM, JavaScript state, and BrowserView model/listener objects.",
+      "PerformanceScaling": "Retention grows by one heavyweight WebContents/page for every distinct admitted canvas the user opens across sessions or chats. There is no count, byte, or age bound; cleanup requires explicit dismissal, membership/source removal, archive/deletion, service disposal, or reload.",
+      "PerformanceOutcome": "A long-lived Agents window can accumulate substantial retained memory and GC pressure as the user visits canvas-bearing sessions, eventually degrading responsiveness or exhausting memory.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The editor pane owned the model in a registered MutableDisposable; closing/disposal during a working-set switch cleared that disposable, and BrowserViewModel.dispose() destroyed the native BrowserView/WebContents.",
+      "ChangedBehavior": "The canvas service now stores each created IBrowserViewModel on a long-lived presentation. A working-set suspension only marks that presentation closed, so switching sessions/chats leaves the model retained for later reattachment.",
+      "CausalDiffEvidence": "This diff removes the pane-owned registered `MutableDisposable\u003cIBrowserViewModel\u003e` and its `browserModel.clear()` disposal, then adds `presentation.model = model` at RIGHT line 287 and intentionally preserves that presentation when a working-set switch disposes its input.",
+      "Title": "Bound suspended canvas BrowserViews",
+      "Impact": "Opening canvases in many sessions/chats and switching away from each leaves all of their Chromium pages alive even though only the current owner is visible. Unlike before the PR, ordinary session/chat switching no longer releases those page heaps.",
+      "Evidence": "The added assignment at line 287 roots the model in `_presentations`. Suspension paths at lines 394-400 and 553-558 retain the presentation and only set `opened = false`; tests explicitly expect the interrupted/service-owned model not to be disposed and reattached later. `WebContentsViewHost` detachment only calls `model.setVisible(false)`, while `BrowserView.setVisible` merely calls Electron `WebContentsView.setVisible`; actual renderer destruction occurs only from `BrowserViewModel.dispose()` via `destroyBrowserView`. The service has disposal on dismissal/removal/source replacement/shutdown but no retention budget for suspended presentations.",
+      "Recommendation": "Keep models for the active owner, but add an explicit bounded suspended-model policy (for example, an LRU/count or memory budget) and dispose evicted BrowserViewModels so older canvases reload on return. Apply eviction when presentations become suspended, while preserving the current cleanup and restore ordering."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "unbounded-retention",
+      "cleanup-lifecycle",
+      "cache-lifecycle",
+      "boundary-fanout",
+      "concurrency-burst",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open a canvas, switch from session/chat A to B, then return to A",
+        "CriticalPath": "The switch publishes the incoming owner, serially applies the editor working set, disposes the outgoing input, and restores the target working set. On first canvas display, BrowserView creation and initial page navigation must complete before content is usable; on return, the retained model is reattached without navigation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/canvases/electron-browser/sessionCanvasService.ts:282 `resolveCanvasModel`",
+            "Operation": "Create an external BrowserView through the main-process BrowserView service, allocating a native WebContentsView.",
+            "Cardinality": "One cold creation per distinct canvas/source after per-key promise coalescing; zero on a warm return while retained.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The editor pane invoked the same creation boundary on first display and again after switching back because closing the pane disposed the prior model.",
+            "CriticalPathEffect": "Cold creation blocks canvas content availability; warm reuse removes this boundary from the return path."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/browserView/electron-browser/browserViewWorkbenchService.ts:385 `createExternalBrowserView`",
+            "Operation": "Navigate the new WebContents to the canvas HTTP(S) source.",
+            "Cardinality": "One initial navigation per cold model/source; zero for a retained warm model.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same page navigation occurred on initial display and after each prior switch-driven model recreation.",
+            "CriticalPathEffect": "Cold canvas rendering waits for navigation; warm return does not."
+          }
+        ],
+        "ScalingInput": "Distinct canvases opened across all visited sessions/chats. Working-set operations scale with editors/groups in the selected owner; retained BrowserViews scale with every admitted canvas across owners.",
+        "EffectiveConcurrency": "Working-set applications are serialized by `_workingSetSequencer`. Per-canvas model creation is coalesced by `presentation.modelPromise`, but different canvases can create independently without a shared limiter.",
+        "CacheBehavior": "Cold canvas display creates one model and loads its source. A warm A-B-A return reuses the service-owned model. There is no negative cache for creation failures and, critically, no size/age budget for successfully retained suspended models.",
+        "MechanismConfidence": "High: the diff roots each model in `_presentations`, suspension preserves it, hiding does not freeze/destroy it, and model disposal is the path that destroys the native BrowserView.",
+        "MagnitudeUncertainty": "Per-page heap size and how many canvas-bearing sessions a typical user visits vary, but each retained item is a real Chromium WebContents/page and the collection has no budget.",
+        "Verdict": "Reportable: the warm-return optimization changes bounded per-active-editor ownership into unbounded cross-session retention of heavyweight Chromium pages."
+      },
+      {
+        "Scenario": "Hide Editor into Details-only composition and reveal it again",
+        "CriticalPath": "The coordinator skips closing registered live canvas inputs, hides the editor part, then reveals the same input/model later. No creation or navigation is needed on reveal.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of registered live canvas inputs in the hidden editor group; normally the canvases already open in that owner.",
+        "EffectiveConcurrency": "Synchronous filtering over active-group editors; no new queue or parallel boundary work.",
+        "CacheBehavior": "The existing live model remains attached to service state and is reused. No cache miss occurs unless the source changes or the model was otherwise disposed.",
+        "MechanismConfidence": "High: `shouldRetainEditor` causes the close loop to skip registered canvas inputs.",
+        "MagnitudeUncertainty": "Editor counts per owner are usually small; the dominant cost is retained model memory already covered by the finding.",
+        "Verdict": "No separate finding: this path intentionally avoids reconstruction and does not add repeated boundary work beyond the same unbounded retention mechanism already reported."
+      },
+      {
+        "Scenario": "Dismiss a canvas, remove membership, replace its source, archive/delete its owner, or shut down the service",
+        "CriticalPath": "These events delete the presentation or replace its source, call model disposal, and close any live input. A replacement source then creates and navigates one fresh model when displayed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/canvases/electron-browser/sessionCanvasService.ts:608 `_disposePresentationModel`",
+            "Operation": "Dispose BrowserViewModel, which calls the BrowserView service to destroy the native WebContentsView.",
+            "Cardinality": "One destroy per retained model affected by the lifecycle event.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Pane disposal issued the same destroy when the editor closed; the diff centralizes and delays it for suspended models.",
+            "CriticalPathEffect": "Cleanup releases native page resources; source replacement must finish a subsequent create/navigation before fresh content is usable."
+          }
+        ],
+        "ScalingInput": "Affected presentations: one for dismissal/source replacement, or all presentations belonging to the removed session/chat on bulk cleanup.",
+        "EffectiveConcurrency": "Cleanup loops synchronously identify presentations; editor closes are asynchronous and may overlap across affected inputs. Browser model disposal issues one destroy operation per affected presentation.",
+        "CacheBehavior": "Positive retained entries are invalidated on source change/removal and on lifecycle cleanup. Dismissal is tracked separately and does not recreate a model until explicit reopen.",
+        "MechanismConfidence": "High: every authoritative cleanup path reaches `_deletePresentation` and `_disposePresentationModel`.",
+        "MagnitudeUncertainty": "Bulk archive/delete cardinality depends on how many canvases were opened for the owner.",
+        "Verdict": "No additional finding: explicit cleanup is present and source replacement does not leak the old model."
+      },
+      {
+        "Scenario": "Rapid A→hydrating B→A owner switches and working-set restoration",
+        "CriticalPath": "Owner publication happens immediately; workspace hydration gates B's apply. Returning to settled A can enqueue an A working-set apply, while `_workingSetSequencer` ensures stale/older applications drain serially before progress settles.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Rapid owner transitions and editor count/group layout in each working set, not canvas collection size alone.",
+        "EffectiveConcurrency": "Global serialization through `_workingSetSequencer`; stale applies are rejected by owner/state checks. Restore handles may overlap in state but editor replacement itself does not run concurrently.",
+        "CacheBehavior": "Saved editor working sets are reused. Canvas serializer resolves only live opaque IDs; no BrowserView is created during deserialization, and retained models are reused if restoration succeeds.",
+        "MechanismConfidence": "High for sequencing and stale rejection; no newly introduced subprocess, filesystem, database, or network fan-out was found.",
+        "MagnitudeUncertainty": "Full working-set replacement cost depends on open editor/group count and rapid-switch frequency.",
+        "Verdict": "No finding: the extra restoration work is bounded per switch, serialized, and required to reconcile rapid owner transitions; no realistic repeated expensive boundary regression was established."
+      },
+      {
+        "Scenario": "Workbench reload/startup with persisted working sets",
+        "CriticalPath": "Existing working-set storage is read and canvas serializer parses a small opaque capability. A fresh canvas service rejects the capability, so no canvas model or network load occurs during cold restore.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "existing `editor.workingSets` workspace-machine storage used by editor working sets",
+            "Operation": "Persist/read the working-set record containing the new fixed-size opaque canvas serializer payload.",
+            "Cardinality": "One existing working-set storage update/read with fixed-size incremental data per serialized canvas, not one filesystem call per canvas.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same working-set record was persisted/read, but canvases were omitted because they lacked a serializer.",
+            "CriticalPathEffect": "Startup already reads the working-set record; the diff adds only small payload parsing and rejects cold canvas identities before BrowserView creation."
+          }
+        ],
+        "ScalingInput": "Number of serialized editors in stored working sets; each canvas contributes a fixed-size version/id JSON object.",
+        "EffectiveConcurrency": "Normal editor working-set deserialization; canvas restore is synchronous and does not launch parallel BrowserViews.",
+        "CacheBehavior": "Opaque runtime IDs deliberately have no authority after reload. This is effectively a cold negative result without creating a model; live-process restores can resolve the existing presentation.",
+        "MechanismConfidence": "High: serializer output is fixed-shape JSON and fresh-service tests establish no model restoration.",
+        "MagnitudeUncertainty": "Stored editor counts vary, but each new payload is bounded and contains only an opaque UUID.",
+        "Verdict": "No finding: serialization allocation and storage growth are bounded per editor and do not introduce startup BrowserView/network work."
+      }
+    ],
+    "Summary": "Completed the performance review over all 19 changed files and relevant BrowserView/working-set call paths. Submitted one high-confidence unbounded-retention finding for service-owned suspended WebContents; cleanup, restore sequencing, serialization, boundary fan-out, and cold/warm behavior produced no additional reportable regressions."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-08T14:50:00.919738852Z",
+    "CompletedAt": "2026-10-08T14:52:40.990606258Z",
+    "WallClockMilliseconds": 160070,
+    "ModelCalls": 13,
+    "InputTokens": 1014519,
+    "OutputTokens": 10085,
+    "TotalTokens": 1024604,
+    "ReasoningTokens": 3686,
+    "CacheReadTokens": 895857,
+    "CacheWriteTokens": 118623,
+    "APIDurationMilliseconds": 143551,
+    "ToolCalls": 92,
+    "NanoAIUnits": 115331380000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 895857,
+      "cache_write": 118623,
+      "input": 39,
+      "output": 10085
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
