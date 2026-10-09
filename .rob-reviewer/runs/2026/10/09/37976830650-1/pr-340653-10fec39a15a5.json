@@ -1,0 +1,172 @@
+{
+  "PullRequest": {
+    "Number": 340653,
+    "Title": "agentHost: stabilize subagent streams and snapshots",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Summary\n\nAddress two independent subagent stability findings:\n\n- Keep Copilot subagent markdown/reasoning stream state alive independently of the parent turn, without allowing cancelled tails to poison a later child turn.\n- Compare the retained-subagent behavior snapshot's independent chat streams by their per-chat order, rather than imposing a cross-chat total order.\n\nObserved in [GitHub 37852164334, macOS](https://github.com/microsoft/vscode/actions/runs/37852164334/job/113567486541): `custom agent without a display name completes as a subagent` returned one completed child turn with two distinct markdown parts containing the same answer. The duplication was present in the authoritative AHP subscription snapshot, not just the test's notification buffer. Linux and Windows passed that revision.\n\n## Cause and ownership\n\nThe trace has child text delta at `22:18:06.770`, parent idle at `.812`, then the child's assembled message at `.834`. Both response parts came from live callbacks; no history reconstruction occurred between them.\n\nThe host kept child part identifiers on the parent's `CopilotTurn`. Completing or replacing that parent discarded the child's identifiers. A later assembled child message consequently looked unstreamed and was emitted again. Further child text/reasoning deltas were also dropped when no parent turn remained.\n\n**This confirmed defect is VS Code-owned.** Retained/background children can legitimately outlive the parent. The SDK's inter-agent delivery timing exposes the incorrect lifetime assumption; the fix does not require delaying SDK idle or changing native event ordering.\n\n### Cross-chat snapshot contract\n\n[GitHub 37816575914, macOS](https://github.com/microsoft/vscode/actions/runs/37816575914/job/113446633877) passed the retained-subagent test's primary response/turn-state assertions but failed because parent tool completion interleaved differently with a child's response. This is a test projection issue, not evidence that the runtime must serialize independent agents.\n\nUse the existing `orderIndependentActionTypes` opt-in only for this scenario. The generated AHP snapshot has identical client actions and identical server fields, event counts, and per-chat sequences in all three rounds; only cross-chat order changes. A deterministic regression verifies that same-chat reordering, failed tools, and missing or duplicated child replies still fail.\n\n## Changes\n\n- Store actual subagent response-part identifiers separately from root-turn/Fusion-phase state.\n- Reset child state at its own user-message, tool-round, and confirmed-completion boundaries, preserving legitimate repeated answers.\n- Keep root cancellation/late-event guards and root-owned Fusion phase handling intact.\n- Add seven deterministic regression/compatibility cases for parent idle/replacement, continuing markdown/reasoning, identical follow-up answers, tool-round boundaries, and cancelled-tail reuse.\n- Opt the retained-subagent scenario into the existing partial-order projection and regenerate only its AHP snapshot in tokenless strict replay. Preserve its exact parent tool sequence and child transcript/state assertions.\n- Document the lifetime invariant and the diagnostic distinction from text-based deduplication.\n\nNo model fixtures, timeouts, retries, platform gates, runtime event ordering, or primary final-response assertions are changed.\n\n## Validation\n\n- Before the fix: `env -u COPILOT_HOME VSCODE_SKIP_PRELAUNCH=1 ./scripts/test.sh --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --grep 'subagent content lifetime' --reporter dot` — 1 passed, 5 failed on unchanged production code.\n- After the fix: `env -u COPILOT_HOME VSCODE_SKIP_PRELAUNCH=1 ./scripts/test.sh --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --grep 'subagent content lifetime|subagent message delta does not suppress|subagent reasoning delta routes|reasoning delta after tool_start' --reporter dot` — all 9 passed.\n- `env -u COPILOT_HOME VSCODE_SKIP_PRELAUNCH=1 ./scripts/test.sh --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts --run src/vs/platform/agentHost/test/node/ahpSnapshot.test.ts --reporter dot` — final implementation: 1621 passed, 1 existing pending. The added cancelled-tail test failed before the quarantine guard and passes with it.\n- `env -u COPILOT_HOME VSCODE_SKIP_PRELAUNCH=1 ./scripts/test-integration.sh --run src/vs/platform/agentHost/test/node/e2e/providers/copilotAgentHostE2E.integrationTest.ts --grep 'custom agent without a display name completes as a subagent|retained background subagent completes repeated follow-up turns|provider errors:' --reporter dot` — five unchanged strict-replay executions, all 6 passed each time (30 passes).\n- The same six-case strict-replay command passed on the final cancellation-compatible implementation. After regenerating the retained-subagent AHP snapshot, `env -u COPILOT_HOME VSCODE_SKIP_PRELAUNCH=1 ./scripts/test-integration.sh --run src/vs/platform/agentHost/test/node/e2e/providers/copilotAgentHostE2E.integrationTest.ts --grep 'retained background subagent completes repeated follow-up turns|custom agent without a display name completes as a subagent' --reporter dot` passed five times (10 passes).\n- `npm run typecheck-client` — passed.\n- `npm run eslint -- src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts src/vs/platform/agentHost/test/node/ahpSnapshot.test.ts src/vs/platform/agentHost/test/node/e2e/suites/subagentSuite.ts` — passed.\n- `node build/lib/formatter.ts --verify src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts src/vs/platform/agentHost/test/node/ahpSnapshot.test.ts src/vs/platform/agentHost/test/node/e2e/suites/subagentSuite.ts` — passed.\n- `git diff --check` and signed commit hygiene — passed.\n\nClient output was refreshed using the repository incremental transpiler. Shared dependencies were not modified. Main, including the landed full-snapshot diagnostics, was merged without rewriting history.\n\nFinal head `10fec39a15a5` passed [GitHub 37882030913](https://github.com/microsoft/vscode/actions/runs/37882030913) overall, including Compile \u0026 Hygiene and all three Electron integration jobs. Its Linux Dev Container preparation UI smoke timeout, also observed on the unchanged diagnostics-only branch, passed on an isolated retry without code changes; the original UI timeout's cause is not claimed fixed.\n\nBoth independent packaged Windows x64/Linux x64/macOS ARM64 Electron integration matrices passed: [482615](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=482615) and [482616](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=482616). All six logs explicitly show both the originally failing custom-agent case and retained-subagent follow-up case executing and passing (12 packaged regression passes, excluding other providers' intentional skips).\n\nAzure 482615 completed green overall after its isolated Windows smoke retry. Azure 482616's isolated Linux smoke retry failed again on the same `272K` model-picker DOM click timeout reproduced on unchanged main 482526. Both original and retry logs are preserved. No further blind retries are being queued and no UI/product/test changes have been made to hide this separate failure. Publishing and release are disabled. Old-head builds 482609/482610 and GitHub runs were superseded. The Agent Host fixes have completed repeated cross-platform integration validation, but the PR remains draft with this overall CI gate unresolved; auto-merge is not enabled.\n\n(Written by Copilot)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/340653",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "dc6d7b3d2082c43dfb8d3d46736c4498421180d6",
+    "HeadRef": "roblou/agents/subagent-response-reconciliation",
+    "HeadSHA": "10fec39a15a5f0cea601c6353d223dc20f29bc53",
+    "CreatedAt": "2026-10-09T03:43:43Z",
+    "UpdatedAt": "2026-10-09T15:59:02Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "cache-lifecycle",
+      "serialization-allocation",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A retained/background Copilot subagent continues markdown or reasoning streaming after its parent root turn becomes idle or is replaced.",
+        "CriticalPath": "An already-running provider stream delivers assistant.message_delta or assistant.reasoning_delta; the callback resolves the child tool-call scope, performs O(1) map lookup/update, and synchronously emits the corresponding chat action through AgentSideEffects/state management to subscribed clients. This is on the child response critical path. The diff does not add model/network requests; it permits the post-parent tail to use the same existing dispatch path instead of dropping it.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts: wrapper.onMessageDelta/onReasoningDelta event handlers around lines 6832 and 7780",
+            "Operation": "Receive chunks from the already-established Copilot SDK/model event stream.",
+            "Cardinality": "One inbound event per provider stream chunk across active children; effective cardinality is response chunk count, not tool or repository item count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same upstream events already arrived. Events after parent-turn teardown were dropped because their part IDs were stored on the root CopilotTurn.",
+            "CriticalPathEffect": "Each event is the source of the next visible child-stream update; no new outbound model call is awaited."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_emitAction and src/vs/platform/agentHost/node/agentSideEffects.ts:_handleAgentSignal",
+            "Operation": "Dispatch ChatResponsePart/ChatDelta/ChatReasoning through host state to subscribed clients.",
+            "Cardinality": "One initial response-part action per child content round, then one delta action per provider chunk. The assembled full message is suppressed when deltas already established the part.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This existing boundary was used while the parent turn remained alive, but post-parent child chunks were dropped. The diff extends the same bounded dispatch to the legitimate retained-child lifetime.",
+            "CriticalPathEffect": "Synchronous dispatch is required for live streaming; work is proportional to actual stream chunks and is not multiplied by listeners or collection size in the changed code."
+          }
+        ],
+        "ScalingInput": "Cost scales linearly with provider chunk count and concurrently live child scopes. Retained state is at most two short IDs per scope that has open markdown/reasoning content, rather than response text or history.",
+        "EffectiveConcurrency": "SDK event callbacks are handled synchronously per delivered event. Independent children can interleave, but each child scope has one markdown ID and one reasoning ID; there is no new Promise.all burst, queue, subprocess, or boundary fan-out.",
+        "CacheBehavior": "Cold child content creates one UUID and map entry; warm deltas hit the session-wide map in O(1). Entries are deleted on the child's next user message, tool-round boundary, confirmed completion, and abort completion; session disposal releases the maps. There is no negative-cache or retry behavior.",
+        "MechanismConfidence": "High: changed handlers, map insertion/deletion sites, completion/abort paths, and synchronous downstream routing were all traced.",
+        "MagnitudeUncertainty": "Exact chunk rates and number of simultaneously retained children vary by model/session, but the state and dispatch cardinality are directly bounded by live stream activity.",
+        "Verdict": "No reportable regression. The additional work is the required delivery of previously omitted child output, remains one-for-one with real stream chunks, and introduces neither redundant serialization nor unbounded retention."
+      },
+      {
+        "Scenario": "A streamed child response is followed by the SDK's assembled assistant.message after the parent turn has already completed or been replaced.",
+        "CriticalPath": "The assembled-message callback checks the session-wide child part map before dispatch. An existing part causes the full response to be skipped; otherwise one ChatResponsePart is emitted. This check is on message-finalization but is O(1).",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:renderMessage around added lines 6842-6860",
+            "Operation": "Potentially dispatch a full ChatResponsePart to host state/subscribed clients.",
+            "Cardinality": "At most one full-part dispatch when no deltas preceded the message; zero when the same response already streamed.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The dispatch boundary already existed, but losing root-turn IDs made the assembled message appear unstreamed and could emit the full child answer again after parent teardown.",
+            "CriticalPathEffect": "The map check prevents a duplicate full-response allocation/state dispatch before child turn completion."
+          }
+        ],
+        "ScalingInput": "The avoided duplicate cost scales with assembled child response bytes; lookup and retained metadata remain O(1) per message/scope.",
+        "EffectiveConcurrency": "Per-message synchronous map access; interleaved children use distinct parent tool-call keys and do not contend on an asynchronous limiter or shared remote boundary.",
+        "CacheBehavior": "The child part ID is a positive memo of an already-open response part. It survives parent turnover and is invalidated at child-owned user-message, tool-round, completion, or abort boundaries, so legitimate identical later answers miss and create a new part.",
+        "MechanismConfidence": "High for the deduplication mechanism and call path; lower only for any user-visible performance magnitude.",
+        "MagnitudeUncertainty": "Response sizes vary, and no measured latency or memory symptom establishes this as a shipped performance regression rather than primarily a duplicate-output correctness defect.",
+        "Verdict": "No finding. The diff reduces serialization/state/render work for the duplicate case and does not add a scaling mechanism. It was not recorded as a performance regression fix because the supplied evidence establishes duplicate output, not a concrete performance symptom."
+      },
+      {
+        "Scenario": "Cancellation is followed by late child text/reasoning/message events, then the retained child is reused in a later turn.",
+        "CriticalPath": "abort marks late root events for quarantine and completes active child turns, which clears child part IDs. Late callbacks now return at the guard before UUID allocation or host dispatch; the resumed turn creates fresh IDs.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:abort and late SDK event handlers",
+            "Operation": "Receive late events from the existing provider stream after cancellation.",
+            "Cardinality": "One callback per late provider event; all are locally dropped while quarantine is active.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Late provider events could still reach deeper response-part handling before existing action/drop guards rejected them.",
+            "CriticalPathEffect": "Late events are off the cancelled turn's progress path and do not cross into client state."
+          }
+        ],
+        "ScalingInput": "Local guard cost scales linearly with the number of provider events already in flight at cancellation; retained response-part state does not grow.",
+        "EffectiveConcurrency": "Abort iterates the pre-existing active-subagent set once; late callbacks are independently rejected synchronously. No new remote call, retry loop, or concurrent burst is added.",
+        "CacheBehavior": "Abort completion deletes both child response-part entries; cancelled tails cannot repopulate them, and reuse starts cold with fresh IDs.",
+        "MechanismConfidence": "High from abort, completion, guard, and regression-test paths.",
+        "MagnitudeUncertainty": "The count of late in-flight events is provider-dependent, but the changed path strictly removes downstream work.",
+        "Verdict": "No reportable regression; cancellation now performs less work and preserves bounded lifecycle cleanup."
+      },
+      {
+        "Scenario": "The retained-subagent E2E behavior snapshot compares independent parent and child action streams.",
+        "CriticalPath": "Only test execution is affected. Snapshot serialization projects captured AHP messages and, for this scenario, canonicalizes participating channels with a sort before reading/comparing the fixture. This is off every product/startup/rendering path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/ahpSnapshot.ts:assertRecordedAhpSnapshot",
+            "Operation": "Read/compare, or in update mode write, the YAML traffic snapshot.",
+            "Cardinality": "One fixture operation for this test after all three rounds; enabling orderIndependentActionTypes does not add another filesystem operation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same snapshot fixture was serialized and compared; only cross-channel ordering was strict.",
+            "CriticalPathEffect": "Affects E2E test completion only, not the shipped application."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/test/node/e2e/harness/ahpSnapshot.ts:canonicalizeActionInterleaving",
+            "Operation": "Sort captured entries by channel while preserving per-channel order.",
+            "Cardinality": "One sort per recorded round over the scenario's captured server actions; realistic inventory is tens of actions per round.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "With no order-independent action types, serialization returned entries without this canonicalizing sort.",
+            "CriticalPathEffect": "Adds bounded CPU/allocation to this one E2E assertion only."
+          }
+        ],
+        "ScalingInput": "Test-only CPU scales O(n log n) with captured actions in each of three bounded rounds.",
+        "EffectiveConcurrency": "The E2E driver performs three sequential rounds; canonicalization is one in-process O(n log n) sort over bounded captured actions, with no parallel remote burst introduced.",
+        "CacheBehavior": "No product cache is touched. The recorder accumulates messages for the test and releases them with the test object; fixture I/O remains one-shot.",
+        "MechanismConfidence": "High from the changed option and canonicalizer implementation.",
+        "MagnitudeUncertainty": "Exact captured action count varies slightly by provider timing, but remains test-scoped and bounded by the scenario.",
+        "Verdict": "No reportable product performance regression; the small sort is isolated to one E2E snapshot assertion."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over all six changed files and every diff page. Traced stream-state ownership, invalidation, cancellation, downstream action routing, snapshot serialization, and all touched network/IPC/filesystem boundaries. No high-confidence diff-introduced performance issue was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-09T19:02:09.374886122Z",
+    "CompletedAt": "2026-10-09T19:04:21.033835373Z",
+    "WallClockMilliseconds": 131658,
+    "ModelCalls": 12,
+    "InputTokens": 544974,
+    "OutputTokens": 7324,
+    "TotalTokens": 552298,
+    "ReasoningTokens": 2841,
+    "CacheReadTokens": 472949,
+    "CacheWriteTokens": 71989,
+    "APIDurationMilliseconds": 114176,
+    "ToolCalls": 50,
+    "NanoAIUnits": 69574860000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 472949,
+      "cache_write": 71989,
+      "input": 36,
+      "output": 7324
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
