@@ -1,0 +1,222 @@
+{
+  "PullRequest": {
+    "Number": 340566,
+    "Title": "agentHost: preserve Codespaces tokens in remote sessions",
+    "Body": "## Summary\r\n\r\nForward the remote resolver's environment to server-owned Agent Host launches so shell tools can inherit Codespaces-provisioned credentials such as `GITHUB_TOKEN`.\r\n\r\nNormal remote terminals and the extension host already merge `extensionHostEnv`. The remote Agent Host connection did not forward it, leaving its child processes without variables supplied through that route. This affects both editor chat and the Agents window; changing the default harness can expose the gap but is not required to hit it.\r\n\r\n## Changes\r\n\r\n- Resolve the current authority environment for each IPC connection, preserving resolver precedence over debug-launch overrides.\r\n- Carry and validate optional launch overrides through the VS Code-only `connect` IPC call, outside AHP messages and logs.\r\n- Apply overrides before the default server-owned lazy launch; preserve null removals, empty strings, launcher-owned values, and environment snapshots for crash recovery.\r\n- Leave explicitly configured/external upstreams unchanged.\r\n- Add coverage for both window types, reconnect-time resolution, disposal and error handling, log privacy, launch precedence, and retained restart overrides.\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/340566",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "7537e22cb972756d10ae6975d8bfb2ca17771a48",
+    "HeadRef": "agents/fix-github-token-issue-codespaces",
+    "HeadSHA": "cb16f295f83af9df9de14040804b081c2bcac69c",
+    "CreatedAt": "2026-10-08T19:24:51Z",
+    "UpdatedAt": "2026-10-09T10:07:39Z",
+    "MergedAt": null,
+    "Labels": [
+      "github-codespaces",
+      "agent-host"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "serialization-allocation",
+      "concurrency-burst",
+      "repeated-work",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First Agent Host connection from a remote editor or Agents window to the default lazy server-owned host",
+        "CriticalPath": "The client awaits the already-established remote authority's resolver result, then the renderer-to-server connect IPC, server endpoint resolution, cold Agent Host process readiness, and the per-context upstream socket connection. Resolver lookup and IPC are on the critical path; cold process startup was already on this path before the change.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostIpcChannelTransport.ts:75",
+            "Operation": "Renderer calls the remote server's AgentHost connect channel, now including resolver/debug environment overrides.",
+            "Cardinality": "One IPC call per Agent Host transport connection; typically one per active editor or Agents window. The environment payload is one record per call, not per variable call.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same connect IPC call occurred without the environment payload.",
+            "CriticalPathEffect": "Must complete before the AHP handshake can begin."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/server/node/serverServices.ts:383 via ServerAgentHostManager.ensureStarted",
+            "Operation": "Cold default-mode connection starts the server-owned Agent Host child process and resolves shell environment.",
+            "Cardinality": "One cold launch for all concurrent renderer contexts because ensureStarted shares _startPromise.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The default lazy endpoint already called ensureStarted and performed the same single cold process launch.",
+            "CriticalPathEffect": "Cold process readiness blocks the first Agent Host connection; warm connections reuse the started host."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/nodeAgentHostStarter.ts:164",
+            "Operation": "Removes a stale Unix socket before the cold Agent Host launch.",
+            "Cardinality": "Once per actual process launch, not once per renderer callback, due startup coalescing.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The starter already removed the stale socket before launching.",
+            "CriticalPathEffect": "Part of cold process startup only."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/server/node/agentHostChannel.ts LazyUpstreamConnection._connect",
+            "Operation": "Each renderer context opens its upstream WebSocket or Unix/TCP socket to the Agent Host.",
+            "Cardinality": "One upstream connection per renderer context after endpoint readiness.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Each context already owned and opened a distinct LazyUpstreamConnection; the removed promise only coalesced endpoint lookup, not upstream sockets.",
+            "CriticalPathEffect": "Blocks that context's transport connection."
+          }
+        ],
+        "ScalingInput": "One connection per workbench window/context (realistically editor and Agents windows), with environment serialization proportional to the resolver/debug environment key count. Effective startup cardinality is one because ServerAgentHostManager coalesces ensureStarted().",
+        "EffectiveConcurrency": "Different renderer contexts can resolve the endpoint concurrently. Each invokes the endpoint callback, but all calls share ServerAgentHostManager._startPromise; after readiness, each context opens its own upstream connection as it did before the diff.",
+        "CacheBehavior": "IRemoteAuthorityResolverService keeps one DeferredPromise per authority, so normal initial Agent Host use reads the authority already resolved to establish the remote workbench connection. The Agent Host manager caches the successful process start; no separate negative cache is introduced.",
+        "MechanismConfidence": "High: resolver caching, process-start coalescing, per-context socket ownership, and before/after IPC cardinality are explicit in the traced implementations.",
+        "MagnitudeUncertainty": "Environment records can vary in size, but realistic resolver environments are bounded process-environment maps and are serialized only once per transport attempt; no evidence shows payload size or window count sufficient for material latency or allocation pressure.",
+        "Verdict": "No reportable regression. The diff adds one bounded environment payload and O(environment keys) validation/merge per connection, while expensive cold startup remains coalesced and socket cardinality is unchanged."
+      },
+      {
+        "Scenario": "Automatic Agent Host transport reconnect after an upstream drop",
+        "CriticalPath": "Reconnect backoff is followed by transport construction, cached authority resolution, connect IPC, server endpoint callback, and a replacement upstream socket. If the Agent Host is alive, ensureStarted returns its settled promise; if it crashed, the manager's existing recovery startup is awaited.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostIpcChannelTransport.ts:75",
+            "Operation": "Reconnect sends connect IPC with the current cached resolver environment.",
+            "Cardinality": "One per reconnect attempt per protocol client, matching the existing connect call frequency.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Reconnect already issued the connect IPC; the diff adds the environment payload and cached resolver lookup.",
+            "CriticalPathEffect": "Blocks opening the replacement transport."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/server/node/agentHostChannel.ts LazyUpstreamConnection._connect",
+            "Operation": "Opens the replacement upstream socket for the reconnecting renderer context.",
+            "Cardinality": "One socket attempt per reconnect attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The replacement LazyUpstreamConnection already opened one socket per reconnect.",
+            "CriticalPathEffect": "Directly blocks protocol reconnection."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/server/node/serverAgentHostManager.ts:144",
+            "Operation": "Restarts Agent Host only when the managed process has failed.",
+            "Cardinality": "At most one shared process start across concurrent renderer reconnects; existing restart budget is five.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Crash recovery and startup coalescing already existed; the diff changes only which retained environment is used.",
+            "CriticalPathEffect": "Only on host crash; ordinary socket reconnects reuse the settled startup promise."
+          }
+        ],
+        "ScalingInput": "One attempt at a time per protocol client under its reconnect state machine; cost scales with bounded retry attempts and the number of active workbench windows, not session or chat count.",
+        "EffectiveConcurrency": "The protocol client prevents concurrent attempts per client. Editor and Agents windows may reconnect concurrently, but Agent Host process startup remains globally coalesced; each retains its independently required upstream socket.",
+        "CacheBehavior": "Each attempt calls resolveAuthority, but the resolver returns the same cached/settled per-authority promise unless the broader remote connection subsystem clears it. This does not independently repeat remote resolver extension work. The latest environment snapshot is retained for process crash recovery.",
+        "MechanismConfidence": "High: the reconnect state machine constructs and awaits one transport at a time, resolver requests are keyed by authority, and manager startup is shared.",
+        "MagnitudeUncertainty": "Actual disconnect frequency is workload/environment dependent, but attempt serialization and resolver/startup coalescing are explicit, leaving no realistic fan-out mechanism introduced by the change.",
+        "Verdict": "No reportable regression. Fresh environment capture adds bounded per-attempt serialization, while no new network, subprocess, or resolver fan-out is introduced."
+      },
+      {
+        "Scenario": "Connection through an explicitly configured or externally managed Agent Host bridge",
+        "CriticalPath": "The renderer resolves the cached authority and sends connect IPC; AgentHostChannel uses the fixed endpoint and opens the configured upstream connection. No server-owned process launch occurs on this path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostIpcChannelTransport.ts:75",
+            "Operation": "Sends connect plus environment options to the server bridge.",
+            "Cardinality": "One per transport attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC request was made without the options payload.",
+            "CriticalPathEffect": "Required to request the existing bridge connection."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/server/node/agentHostChannel.ts LazyUpstreamConnection._connect",
+            "Operation": "Opens the configured external Agent Host WebSocket/TCP/Unix socket.",
+            "Cardinality": "One per renderer context or reconnect attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same upstream connection was opened with the same cardinality; connection options do not reach the external host.",
+            "CriticalPathEffect": "Blocks transport readiness."
+          }
+        ],
+        "ScalingInput": "One connection per renderer context or reconnect attempt; environment map size controls added IPC bytes, but it is ignored by the fixed endpoint.",
+        "EffectiveConcurrency": "Each renderer context owns one upstream connection. There is no process-start concurrency because the fixed endpoint bypasses the starter and manager.",
+        "CacheBehavior": "Authority resolution remains the shared per-authority promise. The fixed endpoint has no launch environment cache because the overrides are intentionally not applied externally.",
+        "MechanismConfidence": "High: fixed endpoints return before consulting options and tests confirm options are not forwarded to externally managed upstreams.",
+        "MagnitudeUncertainty": "The added payload size varies by resolver environment, but it is a single process-environment record per connection and causes no downstream launch or remote fan-out.",
+        "Verdict": "No reportable regression. Only bounded IPC serialization is added; external network and connection cardinality are unchanged."
+      },
+      {
+        "Scenario": "Managed Agent Host crash recovery using the retained resolver environment",
+        "CriticalPath": "The existing crash handler invokes a single coalesced process restart; NodeAgentHostStarter resolves shell environment, merges process/shell/resolver/launcher maps, removes the stale socket, and starts the child. Renderer reconnection subsequently opens its socket.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/nodeAgentHostStarter.ts:167",
+            "Operation": "Starts the replacement Agent Host process with merged environment values.",
+            "Cardinality": "One child per recovery attempt, globally coalesced and bounded by the existing restart limit.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same recovery launches occurred; the diff augments the child environment and performs linear map merging.",
+            "CriticalPathEffect": "Recovery cannot complete until the process is ready."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/nodeAgentHostStarter.ts:164",
+            "Operation": "Removes the stale Unix socket before restart.",
+            "Cardinality": "Once per actual restart attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical stale-socket cleanup already ran before each launch.",
+            "CriticalPathEffect": "On the restart critical path."
+          }
+        ],
+        "ScalingInput": "Environment merge work is linear in the combined environment key count once per process launch. Restart count remains bounded by the existing five-attempt budget.",
+        "EffectiveConcurrency": "ServerAgentHostManager owns one restart promise globally. Concurrent renderer activity cannot create additional child launches.",
+        "CacheBehavior": "setEnvironment snapshots the most recently supplied overrides; the snapshot is replaced on a later connection and reused for crash recovery. It is bounded to one environment map rather than accumulating versions.",
+        "MechanismConfidence": "High: one _environment field replaces its prior snapshot, merge work is linear, and the manager bounds and coalesces launches.",
+        "MagnitudeUncertainty": "Environment cardinality varies, but it is bounded and only one snapshot is retained; there is no lifetime growth or per-session multiplication.",
+        "Verdict": "No reportable regression. The change retains one bounded snapshot and adds linear environment merging to already-expensive, infrequent process starts without increasing restart cardinality."
+      }
+    ],
+    "Summary": "Completed the performance review across all changed files and relevant call paths. Checked boundary fan-out, removed endpoint coalescing, reconnect scheduling, environment serialization/allocation, startup and crash-recovery lifecycle, and cache behavior. No high-confidence actionable performance regression was introduced, and the PR does not provide sufficient evidence of fixing a previously shipped performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-09T13:35:34.868965642Z",
+    "CompletedAt": "2026-10-09T13:37:08.786878933Z",
+    "WallClockMilliseconds": 93917,
+    "ModelCalls": 6,
+    "InputTokens": 184570,
+    "OutputTokens": 5200,
+    "TotalTokens": 189770,
+    "ReasoningTokens": 1396,
+    "CacheReadTokens": 130373,
+    "CacheWriteTokens": 54179,
+    "APIDurationMilliseconds": 77048,
+    "ToolCalls": 36,
+    "NanoAIUnits": 42711620000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 130373,
+      "cache_write": 54179,
+      "input": 18,
+      "output": 5200
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
