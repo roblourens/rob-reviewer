@@ -1,0 +1,188 @@
+{
+  "PullRequest": {
+    "Number": 340576,
+    "Title": "chat: make cloud sandbox wake retries deadline-driven",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Summary\n\nKeep initial cloud sandbox connections alive through transient request failures and pending wake responses, within the existing ten-minute connection deadline.\n\nPreviously, a single ten-second request timeout ended the entire connection attempt. Pending responses also exhausted a twenty-request limit well before the overall deadline.\n\n- Give connect/reconnect requests a 30-second timeout without changing environment-read, discovery, or task-operation budgets.\n- Distinguish unanswered network requests from explicit HTTP failures and retry the former after 30 seconds.\n- Replace the twenty-response cutoff with the existing connection deadline.\n- Follow pending `Retry-After` responses with a one-second minimum and positive jitter; cancel oversized waits at the deadline instead of retrying early.\n- Preserve cancellation, terminal HTTP/authentication/setup errors, and the separate credential-completion retry limits.\n\nRegression coverage includes recovery after more than twenty pending responses, readiness at 590 seconds, termination at 600 seconds, cancellation during retry waits, and zero/oversized server delays.\n\n## Validation\n\n**Passed: 288 focused unit tests**\n\n```sh\n./scripts/test.sh \\\n  --run src/vs/platform/agentHost/test/common/cloudSandboxAgentHost.test.ts \\\n  --run src/vs/workbench/contrib/chat/test/browser/remoteAgentHost/cloudSandboxApiService.test.ts \\\n  --run src/vs/workbench/contrib/chat/test/browser/remoteAgentHost/cloudSandboxAgentHostService.test.ts \\\n  --run src/vs/workbench/contrib/chat/test/browser/remoteAgentHost/cloudSandboxCredentialRefresh.test.ts \\\n  --reporter dot\n```\n\n\u003cdetails\u003e\n\u003csummary\u003eOther validation commands and results\u003c/summary\u003e\n\n**Passed: targeted ESLint for all six changed files**\n\n```sh\nnpm run eslint -- \\\n  src/vs/platform/agentHost/common/cloudSandboxAgentHost.ts \\\n  src/vs/platform/agentHost/test/common/cloudSandboxAgentHost.test.ts \\\n  src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxApiService.ts \\\n  src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts \\\n  src/vs/workbench/contrib/chat/test/browser/remoteAgentHost/cloudSandboxApiService.test.ts \\\n  src/vs/workbench/contrib/chat/test/browser/remoteAgentHost/cloudSandboxAgentHostService.test.ts\n```\n\nThe following passed again after subsequent edits; unchanged-file results were reused:\n\n```sh\nnpm run eslint -- src/vs/platform/agentHost/test/common/cloudSandboxAgentHost.test.ts\nnpm run eslint -- \\\n  src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts \\\n  src/vs/workbench/contrib/chat/test/browser/remoteAgentHost/cloudSandboxAgentHostService.test.ts\n```\n\n- `git diff --check`: passed.\n- `npm run -s precommit`: passed through the commit hook; hygiene checked all six files.\n- `npm run transpile-client`: passed. Subsequent edits were refreshed with the repository's incremental client transpiler before the focused tests.\n- `npm run build-fast -- --client-only`: blocked by a pre-existing SDK/runtime dependency version mismatch during build prerequisites.\n\nFull compilation/type-check and live sandbox testing were not run. The tests above use simulated responses and virtual time.\n\n\u003c/details\u003e\n\n## Manual verification still needed\n\nConnect to a sleeping cloud sandbox and verify that pending responses or a transient network interruption do not require another click, that a successful wake establishes the session, and that an environment which never becomes ready stops at the connection deadline. Verify cancellation stops further requests.\n\nThis changes VS Code's client retry policy only; it does not change server wake behavior or the AHP contract. Explicit HTTP failures, including 429, remain terminal for the initial connection.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/340576",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "osortega",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "49b24202921f02dc1215eb8db80d50ae239b3da7",
+    "HeadRef": "osortega/agents/vscode-cloud-sandbox-retry-analysis",
+    "HeadSHA": "61d7c10a3b0f8b4ae19d51ef0bd5bcf742bb76b6",
+    "CreatedAt": "2026-10-08T20:37:42Z",
+    "UpdatedAt": "2026-10-08T22:18:57Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-BC2CF04E74CC",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts",
+      "Side": "RIGHT",
+      "Line": 495,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The loop, delay, global deadline, network boundary, and caller coalescing are directly traced. The added test proves the long-wake cadence; only exact production response latency and rate-limit thresholds are uncertain.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "authenticated HTTPS `/connect` calls plus per-call authentication lookup, telemetry, and logging",
+      "PerformanceScaling": "Sequential requests grow with wake duration divided by Retry-After. At the tested one-second cadence, a 590-second wake produces roughly 500-plus calls. Normal callers coalesce to one loop per environment, so concurrency is one but cardinality is hundreds.",
+      "PerformanceOutcome": "excessive I/O and reduced throughput under control-plane rate limiting",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "The connection imposed a 5,000 ms minimum and stopped after 20 waking responses, so this scenario made at most 20 `/connect` calls.",
+      "ChangedBehavior": "A coalesced connection attempt now issues `/connect` requests for the full ten-minute deadline and honors a one-second Retry-After, rather than stopping after 20 attempts with a five-second floor.",
+      "CausalDiffEvidence": "RIGHT line 495 replaces the 20-attempt loop with an unbounded loop; the same diff lowers the pending-response client floor from 5,000 ms to 1,000 ms. The added 590-second test explicitly asserts more than 20 sequential requests at roughly one-second intervals.",
+      "Title": "Bound deadline-driven wake polling",
+      "Impact": "A sandbox returning `202 waking` with `Retry-After: 1` can cause roughly 500 authenticated HTTPS requests during one connect, increasing network/power use and consuming control-plane quota enough to risk rate-limiting this connection or neighboring Mission Control operations.",
+      "Evidence": "Each `_mintWithWaking` iteration calls `CloudSandboxApiService.connect`, which resolves the auth session and invokes `_requestService.request` against the GitHub Copilot API. The loop is now attempt-unbounded, the floor is 1,000 ms, and cancellation occurs after 600,000 ms. The new 590-second test proves more than 20 calls at this cadence. This API service separately documents that a few dozen Mission Control requests can trip GitHub rate limits and starve later calls.",
+      "Recommendation": "Keep the overall deadline, but bound polling frequency by retaining the five-second client floor or backing off after the first few one-second polls."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst",
+      "missing-coalescing",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open or explicitly connect to a sleeping cloud sandbox that repeatedly returns `202 waking`.",
+        "CriticalPath": "Every pending `/connect` response and retry delay is on the user-visible session-open critical path until credentials are returned, followed by the pre-existing Web PubSub connection and handshake.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:_mintWithWaking and cloudSandboxApiService.ts:_request",
+            "Operation": "Authenticated HTTPS GET to the GitHub Copilot Mission Control `/agents/environments/{id}/connect` endpoint.",
+            "Cardinality": "Previously at most 20 calls with a five-second floor; now roughly wake-duration/Retry-After, about 500-plus calls in the added 590-second, one-second-response test.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same path stopped after 20 pending responses and used at least a five-second delay.",
+            "CriticalPathEffect": "Each response and delay gates credential readiness and therefore session activation."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:_establish",
+            "Operation": "Establish the remote Web PubSub transport and agent-host protocol handshake.",
+            "Cardinality": "Once after credentials become ready.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One establishment attempt on this path, unchanged.",
+            "CriticalPathEffect": "The Web PubSub dial and protocol handshake must finish before connect returns."
+          }
+        ],
+        "ScalingInput": "One sandbox's wake duration and returned Retry-After; effective cardinality is hundreds for a near-deadline wake, after per-address coalescing.",
+        "EffectiveConcurrency": "Requests are sequential within one attempt. Normal cloud-session callers coalesce to one pending attempt per environment; different environments can still connect independently.",
+        "CacheBehavior": "There is no response cache for connection credentials, appropriately; each poll resolves the current authentication session and sends a fresh request. The session contribution coalesces in-flight connects by sandbox address, and a live remote connection is reused.",
+        "MechanismConfidence": "High: loop cardinality, one-second floor, global deadline, request boundary, and caller coalescing are all directly visible and test-covered.",
+        "MagnitudeUncertainty": "Exact production wake durations and endpoint quota thresholds are unknown, lowering severity, but the added test establishes that 590-second one-second polling is an intended supported case.",
+        "Verdict": "Reportable medium network boundary fan-out: deadline-driven recovery is useful, but lowering the floor while removing the request cap amplifies one connect from at most 20 requests to hundreds."
+      },
+      {
+        "Scenario": "Initial cloud-sandbox connect encounters unanswered network requests.",
+        "CriticalPath": "The failed request timeout and fixed retry delay are on the connection critical path; the outer ten-minute token cancels requests and waits.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:_mintWithWaking and cloudSandboxApiService.ts:_request",
+            "Operation": "Retry unanswered authenticated `/connect` requests after a 30-second delay.",
+            "Cardinality": "At most about ten sequential calls for full 30-second timeouts; immediate network failures can retry every 30 seconds, at most about twenty. Previously one request failed after its ten-second timeout with no retry.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A single unanswered request terminated the connection attempt after the shared ten-second request timeout.",
+            "CriticalPathEffect": "Retries delay terminal failure but can recover the same user action without another click; all work remains within the established ten-minute connection budget."
+          }
+        ],
+        "ScalingInput": "Elapsed connection deadline and network failure duration, not collection size; effective count is bounded to roughly 10-20.",
+        "EffectiveConcurrency": "One request at a time per coalesced environment attempt. A full 30-second request failure followed by a 30-second delay yields at most ten attempts within ten minutes.",
+        "CacheBehavior": "No negative cache is used for transient network failures. The same attempt is retried because the failure is classified as unanswered; successful live connections are still reused. Authentication sessions are looked up for each retry.",
+        "MechanismConfidence": "High: error classification, timeout, delay, sequential await, and cancellation tests are explicit.",
+        "MagnitudeUncertainty": "Actual network failures may complete before the 30-second request budget, but retry frequency is still bounded by the fixed 30-second delay and global cancellation.",
+        "Verdict": "No additional finding: the retry boundary is intentional, sequential, coalesced, globally bounded, and paced at 30 seconds."
+      },
+      {
+        "Scenario": "Initial token lacks a sealed GitHub credential and requires reconnect refreshes.",
+        "CriticalPath": "A reconnect request for a missing sealed token is on initial authentication readiness, but the loop can fall back to the initial token after its bounded attempts. The outer connection deadline also applies.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxAgentHostService.ts:_awaitSealedToken and cloudSandboxApiService.ts:_sendEnvironment",
+            "Operation": "Authenticated HTTPS `/reconnect` credential refresh.",
+            "Cardinality": "At most 12 reconnect requests after the initial connect, unchanged; each request may now wait up to 30 seconds instead of 10 seconds, while the ten-minute outer deadline remains authoritative.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same maximum of 12 sequential reconnects with a five-second retry floor, but a ten-second per-request timeout.",
+            "CriticalPathEffect": "Each reconnect wait delays establishment while seeking complete credentials."
+          }
+        ],
+        "ScalingInput": "Missing sealed-token attempts, capped at 12.",
+        "EffectiveConcurrency": "Sequential reconnect calls; no parallel fan-out.",
+        "CacheBehavior": "Credential responses are not cached beyond the staged current connection. The existing sealed-token retry loop remains capped at 12 attempts, and the changed helper call explicitly retains the prior five-second minimum.",
+        "MechanismConfidence": "High: the fixed attempt cap and preserved delay are directly test-covered.",
+        "MagnitudeUncertainty": "Server reconnect latency distribution is unknown; extending the request budget may improve successful completion and does not increase request cardinality.",
+        "Verdict": "No finding: request count remains bounded and sequential; the longer per-request timeout is within the existing overall deadline."
+      },
+      {
+        "Scenario": "Cloud sandbox connect succeeds immediately or receives an explicit HTTP/authentication/setup error.",
+        "CriticalPath": "The single connect request and subsequent unchanged handshake are on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxApiService.ts:_connectRequest",
+            "Operation": "Initial `/connect` returning credentials or an explicit HTTP error.",
+            "Cardinality": "One authenticated HTTPS connect request, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One request; only its timeout ceiling changed from 10 to 30 seconds.",
+            "CriticalPathEffect": "Its response determines whether the connection proceeds to handshake or fails."
+          }
+        ],
+        "ScalingInput": "Single connection action; cardinality one.",
+        "EffectiveConcurrency": "One request for immediate success or explicit HTTP failure.",
+        "CacheBehavior": "No retry cache is relevant. Explicit HTTP responses remain terminal and successful credentials are staged for connection reuse.",
+        "MechanismConfidence": "High: explicit HTTP errors are excluded from retries by type and covered across status codes.",
+        "MagnitudeUncertainty": "The distribution of server response times is unknown.",
+        "Verdict": "No finding: no added boundary cardinality, eager work, retention, or concurrency."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and traced connection, retry, cancellation, authentication, and handshake paths. Submitted one medium boundary-fan-out finding for the unbounded one-second pending-response polling loop; other retry paths are sequential, coalesced, and deadline/attempt bounded."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-09T00:30:53.97297707Z",
+    "CompletedAt": "2026-10-09T00:32:52.793244297Z",
+    "WallClockMilliseconds": 118820,
+    "ModelCalls": 11,
+    "InputTokens": 410570,
+    "OutputTokens": 7126,
+    "TotalTokens": 417696,
+    "ReasoningTokens": 1970,
+    "CacheReadTokens": 355545,
+    "CacheWriteTokens": 54992,
+    "APIDurationMilliseconds": 104298,
+    "ToolCalls": 44,
+    "NanoAIUnits": 55983000000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 355545,
+      "cache_write": 54992,
+      "input": 33,
+      "output": 7126
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
