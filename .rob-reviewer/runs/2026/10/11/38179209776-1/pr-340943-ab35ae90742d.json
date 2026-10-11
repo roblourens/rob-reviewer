@@ -1,0 +1,228 @@
+{
+  "PullRequest": {
+    "Number": 340943,
+    "Title": "improve migrate with agent skill, use session tool to report results",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n",
+    "URL": "https://github.com/microsoft/vscode/pull/340943",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "aeschli",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "32bbe1b8cba30e49cd6b74cc73c26b0279a201fe",
+    "HeadRef": "aeschli/violent-fowl-233",
+    "HeadSHA": "ab35ae90742da5d3e4ad832ee3dbab998c14c509",
+    "CreatedAt": "2026-10-11T19:42:57Z",
+    "UpdatedAt": "2026-10-11T21:55:06Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-A4FE06654754",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts",
+      "Side": "RIGHT",
+      "Line": 2540,
+      "Severity": "low",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The allocation path, workbench-scoped owner, ordinary-session call frequency, and missing teardown call are directly visible in the changed code and all repository callers; only the exact bytes retained per session are uncertain.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "ResourceMap keys, URI objects, and settable observable objects retained by the workbench-scoped AgentHostActiveClientService",
+      "PerformanceScaling": "Retention grows by one _sessionTools entry for every distinct ordinary agent-host session created during the lifetime of the workbench, including sessions that are later closed or fail to initialize.",
+      "PerformanceOutcome": "gradually increasing retained heap and associated GC pressure in long-lived windows with many agent sessions",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this change, ordinary ActiveClientEntry instances did not request or create per-session tool state, and the service had no _sessionTools map retaining session resources.",
+      "ChangedBehavior": "Every ActiveClientEntry now calls observeSessionTools(sessionResource); that method calls _getSessionTools, which allocates an observable and inserts it into _sessionTools even when the session has no additional tools.",
+      "CausalDiffEvidence": "Added line 2540 calls this._activeClientService.observeSessionTools(sessionResource) for every newly created ActiveClientEntry, which is the allocation path that inserts an empty per-session observable into the service map.",
+      "Title": "Release per-session tool observables when sessions close",
+      "Impact": "Creating and then closing ordinary agent-host chats leaves one map entry and observable behind per session. Users who keep a window open while cycling through many chats accumulate retained session state that is no longer reachable from the handler.",
+      "Evidence": "_ensureActiveClientEntry invokes observeSessionTools for every agent-host session. observeSessionTools delegates to _getSessionTools, which unconditionally stores a new observable in the singleton service's ResourceMap. Session teardown calls _disposeActiveClientEntry and disposes only ActiveClientEntry; it never removes the service entry. Repository-wide clearSessionTools callers are limited to the migration launch/result/error paths, so ordinary sessions have no cleanup path.",
+      "Recommendation": "Give observation explicit lifecycle ownership (for example, return a ref-counted disposable handle and release it from _disposeActiveClientEntry), deleting empty/unconfigured session entries when the last observer goes away while preserving configured migration tools across reconnects."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "unbounded-retention",
+      "boundary-fanout",
+      "repeated-work",
+      "eager-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create, use, and close ordinary agent-host chat sessions",
+        "CriticalPath": "Active-client state is created before the backend session can be claimed/reconciled. The added observeSessionTools call allocates session state synchronously on this path; publishing the active-client definition to the agent host remains on the claim/reconciliation path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts ActiveClientEntry",
+            "Operation": "Publish/reconcile SessionActiveClient tool and customization definitions to the agent host",
+            "Cardinality": "At least once per initialized session and again when observed active-client state changes; debounced per session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same active-client dispatch existed, but its observable came directly from the scope and had no per-session tool observable or retained URI-keyed entry.",
+            "CriticalPathEffect": "Initial publication must settle during session claim; later reconciliations occur asynchronously after observed state changes."
+          }
+        ],
+        "ScalingInput": "Distinct agent-host session resources created over a long-lived workbench window; one retained _sessionTools entry is added per resource, including sessions later disposed.",
+        "EffectiveConcurrency": "Each session owns one ActiveClientEntry; different sessions may initialize independently. Reconciliation is debounced per entry, with no lifecycle mechanism that releases the service-level session-tools entry.",
+        "CacheBehavior": "_sessionTools acts as a URI-keyed cache. Reopening the same URI is a warm hit, but every new URI is a miss and empty entries are never evicted for ordinary sessions; migration-only clearSessionTools calls do not cover them.",
+        "MechanismConfidence": "High: every ActiveClientEntry calls the allocating observer, teardown disposes only the entry, the service is workbench-scoped, and all clear callers are migration-specific.",
+        "MagnitudeUncertainty": "The retained bytes per session are small and exact real-world session counts are unknown, so severity is low; the monotonic lifetime scaling is certain.",
+        "Verdict": "Reportable cleanup-lifecycle regression: ordinary sessions leave URI and observable state retained indefinitely."
+      },
+      {
+        "Scenario": "Launch an agent-guided customization migration",
+        "CriticalPath": "Before the customization editor closes or chat opens, VS Code creates a recovery directory, copies every deduplicated selected source, recursively fingerprints source and backup, verifies equality, and writes the manifest. Session creation and the initial prompt follow only after that completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigrationRecovery.ts prepareCustomizationMigrationRecovery/fingerprintResource",
+            "Operation": "Create recovery folder; resolve and copy each source; recursively read/hash source and backup; write and atomically move manifest",
+            "Cardinality": "One copy plus two full fingerprints per distinct source; for directories each fingerprint resolves and reads every descendant file.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old path only created the recovery folder before opening chat; the agent later owned backup creation.",
+            "CriticalPathEffect": "Entirely blocks closing the editor and opening the migration chat."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatSessions/chatSessions.contribution.ts openChatSession",
+            "Operation": "Open a new agent-host chat session and send the initial migration prompt with one session-only tool",
+            "Cardinality": "One session open and one initial request per migration launch; active-client publication may repeat on reconciliation, but tool cardinality is one.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same chat/session launch occurred, without a sessionToolIds payload.",
+            "CriticalPathEffect": "Runs after recovery preparation and is required before migration can proceed."
+          }
+        ],
+        "ScalingInput": "Number of distinct selected source files/directories and total files/bytes inside selected skill directories after URI deduplication.",
+        "EffectiveConcurrency": "Sources are processed serially; recursive directory entries are resolved and read serially. Chat/session work begins only after all backups are complete.",
+        "CacheBehavior": "No content cache is used; each source and backup is fingerprinted from disk for each migration. Deduplication coalesces identical source URIs within one launch.",
+        "MechanismConfidence": "High for the filesystem work and serial placement; uncertain only in real-world byte counts.",
+        "MagnitudeUncertainty": "Selected customizations are normally small, but skill directories can contain multiple references and arbitrary bytes. No evidence establishes a common size large enough to outweigh the explicit backup-safety requirement.",
+        "Verdict": "No additional finding: the new blocking I/O is intentional safety work, bounded by the selected inventory, and the diff verifies the backup before allowing mutations."
+      },
+      {
+        "Scenario": "Open or refresh the Agent Customizations migration dashboard",
+        "CriticalPath": "Each migration-info refresh first enumerates recovery folders and reads every manifest before computing migration candidates and rendering the dashboard. Prompt, MCP, active-session, project-root, configuration, and explicit refresh events can trigger this path through the existing delayer.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/aiCustomizationManagementEditor.ts refreshAgentMigrationRecoveries and customizationMigrationRecovery.ts listCustomizationMigrationRecoveries",
+            "Operation": "Check recovery root, resolve children, check and read/parse every manifest, and rewrite stale running manifests",
+            "Cardinality": "Two root operations plus an existence check and bounded manifest read per retained recovery; one extra read/write/move for each stale running record.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No recovery-history enumeration occurred during migration-info refresh.",
+            "CriticalPathEffect": "Precedes migration candidate computation and dashboard settled state on each refresh."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigrationDashboard.ts renderRecoveries",
+            "Operation": "Create recovery-row DOM, hovers, and two buttons",
+            "Cardinality": "One row, two hovers, and two buttons per retained recovery on each full dashboard render.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No recovery rows were rendered.",
+            "CriticalPathEffect": "Synchronous rendering before layoutTree and content-change notification."
+          }
+        ],
+        "ScalingInput": "Number of retained recovery folders, plus recovery rows rendered; history persists until the user deletes individual backups.",
+        "EffectiveConcurrency": "Manifest existence checks and reads are serial by recovery folder. Candidate computation across enabled categories is parallel only after recovery scanning completes.",
+        "CacheBehavior": "No manifest cache or generation check; every refresh re-resolves the root and rereads each manifest. Backups are intentionally persistent and user-deletable.",
+        "MechanismConfidence": "High for serial reads and per-row rendering; moderate for user-visible magnitude.",
+        "MagnitudeUncertainty": "Recovery history can grow, but migrations are explicit and infrequent and the UI provides deletion. The diff gives no evidence that realistic histories are large enough for perceptible refresh or rendering cost.",
+        "Verdict": "No finding: growth is explicit user-managed recovery history, and realistic cardinality is likely low without evidence of measurable latency."
+      },
+      {
+        "Scenario": "Report completion from the migration-only language-model tool",
+        "CriticalPath": "The hidden tool validates aggregate counts, updates the recovery manifest through read/write/move, disposes telemetry listeners, sends aggregate telemetry, clears session tools, and only then returns its tool result.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/aiCustomizationManagementEditor.ts onDidFinish callback and customizationMigrationRecovery.ts updateCustomizationMigrationRecovery",
+            "Operation": "Read current manifest, write temporary manifest, and atomically move it into place",
+            "Cardinality": "One manifest update for a successful or terminal migration result; earlier launch lifecycle updates are separately bounded.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old result path wrote a result file from the agent and used a filesystem watcher/read; it did not update a recovery manifest.",
+            "CriticalPathEffect": "A successful tool invocation awaits this update before returning to the model."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/common/promptSyntax/service/customizationMigrationTelemetryService.ts migrationCompleted",
+            "Operation": "Emit aggregate customization migration telemetry",
+            "Cardinality": "At most one event per represented migration category after one accepted report.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Aggregate completion telemetry was also emitted after parsing the watched result file.",
+            "CriticalPathEffect": "Telemetry API calls are made after manifest status update; no evidence they synchronously block network completion."
+          }
+        ],
+        "ScalingInput": "Aggregate result entry count, bounded by categories/scope/type/outcome combinations and selected inventory; exactly one successful call is expected per migration.",
+        "EffectiveConcurrency": "One pending result per migration-flow ID; model/session listeners coalesce completion by deleting the pending record before asynchronous status handling on incomplete sessions.",
+        "CacheBehavior": "Pending flows are map-keyed and removed on successful report, cancellation/completion, missing session, explicit registration disposal, or service disposal. Manifest updates reread current state and do not cache.",
+        "MechanismConfidence": "High; lifecycle and boundary calls are directly traced.",
+        "MagnitudeUncertainty": "Manifest size is capped at 1 MiB and result cardinality is schema-bounded; actual filesystem latency varies.",
+        "Verdict": "No finding: work is one-shot, bounded, and replaces the prior result-file watch flow."
+      },
+      {
+        "Scenario": "Plan and execute restoration of original customization sources",
+        "CriticalPath": "On Restore Sources, VS Code reads the manifest and fingerprints all current sources to build the confirmation plan. After confirmation it serially validates backups and current state, stages copies, moves changed sources, verifies restored data, and cleans staging/displaced files.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMigrationRecovery.ts createCustomizationMigrationRecoveryPlan/restoreCustomizationMigrationSources",
+            "Operation": "Read manifest; recursively read/hash sources and backups; copy to staging; move sources; verify and delete temporary trees",
+            "Cardinality": "Plan: one existence check and up to one full fingerprint per source. Restore: multiple full fingerprints plus copy/moves/deletes for each non-unchanged source.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "VS Code had no native recovery planning or source restoration flow.",
+            "CriticalPathEffect": "Plan blocks confirmation; restore operations block the completion notification."
+          }
+        ],
+        "ScalingInput": "Number of manifest sources and total descendant files/bytes in backed-up skill directories.",
+        "EffectiveConcurrency": "Plan fingerprints run concurrently per source via Promise.all, with serial recursion within each source. Actual restore is serialized per source to preserve validation and rollback ordering.",
+        "CacheBehavior": "No fingerprint cache; plan, pre-move checks, staged-copy checks, and final checks reread content to detect concurrent changes. This repetition is deliberate consistency validation.",
+        "MechanismConfidence": "High for I/O cardinality and ordering; uncertain only in source sizes.",
+        "MagnitudeUncertainty": "Large skill directories increase duration, but restore is explicit and verification reads are necessary to avoid overwriting concurrent changes.",
+        "Verdict": "No finding: the repeated reads enforce backup integrity and race safety on an explicit recovery action."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 23 changed files. One low-severity, high-confidence cleanup-lifecycle issue was reported: ordinary agent-host sessions allocate service-level session-tool observables that session teardown never releases. Recovery backup, dashboard enumeration, result reporting, restoration, rendering, startup registration, telemetry, IPC, filesystem cardinality, cache behavior, and concurrency were traced; no other changed mechanism met the evidence and impact threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-11T22:12:54.101173316Z",
+    "CompletedAt": "2026-10-11T22:15:12.390711164Z",
+    "WallClockMilliseconds": 138289,
+    "ModelCalls": 8,
+    "InputTokens": 428239,
+    "OutputTokens": 8073,
+    "TotalTokens": 436312,
+    "ReasoningTokens": 2982,
+    "CacheReadTokens": 339456,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 119635,
+    "ToolCalls": 48,
+    "NanoAIUnits": 65237440000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 339456,
+      "cache_write": 0,
+      "input": 88783,
+      "output": 8073
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
