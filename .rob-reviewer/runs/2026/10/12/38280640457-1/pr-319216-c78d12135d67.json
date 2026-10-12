@@ -1,0 +1,168 @@
+{
+  "PullRequest": {
+    "Number": 319216,
+    "Title": "sessions: recover empty Agent Host session list after a failed initial refresh",
+    "Body": "## Problem\n\nIn the Agents app, the local Agent Host session list could stay empty on  the list just stayed blank. Starting a *new* local session would \"unstick\" it and make all the existing sessions appear.launch \n\n## Root cause\n\nThe provider's session cache is one-shot. `BaseAgentHostSessionsProvider._refreshSessions()` ran once (guarded by `_cacheInitialized`), but its blanket `catch {}` could not distinguish two very different outcomes:\n\n- `listSessions()` ** e.g. the agent throws `AHP_AUTH_REQUIRED` before its token is effective server-side, or a transient offline/network error.threw** \n- `listSessions()` ** a genuinely empty, valid result.returned `[]`** \n\nBoth collapsed to an empty cache marked initialized, and nothing retried until an unrelated AHP event (`SessionTurnComplete` / `notify/sessionAdded`) forced a re-fetch. That's exactly why starting a new  whose turn completes and fires ` made the whole list suddenly populate.SessionTurnComplete` session \n\n## Fix\n\n- `_refreshSessions` now **owns** `_cacheInitialized` and sets it `true` only on a *successful* list.\n 30s, reset on success), so a transient startup failure self-heals on its own without any user action.\n- An empty successful list is still treated as a valid result: it marks the cache initialized and arms no retry.\n- Listing sessions still **never** pops a sign-in  `AHP_AUTH_REQUIRED` is retried silently in the background.dialog \n- The local provider's auth autorun and the remote provider's `setConnection` no longer pre-set `_cacheInitialized`; `clearConnection` cancels any pending retry.\n\n## Tests\n\nThree new tests in `localAgentHostSessionsProvider.test.ts` (via a `listSessions` failure-injection hook on the mock):\n\n- recovers an empty list when the initial `listSessions` fails, without needing a new session\n- a successful empty `listSessions` arms no retry\n- retries with backoff until `listSessions` succeeds\n\nVerified: browser unit suite 78 passing (incl. the 3 new tests), full `test-node` 10640 passing, eslint + hygiene clean.\n\n(Written by Copilot)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/319216",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "c6baf76451a0b477ef1785b71ba59f3e599fddc3",
+    "HeadRef": "roblou/agents/fix-empty-session-list",
+    "HeadSHA": "c78d12135d67fa679616383b49daf5585950230c",
+    "CreatedAt": "2026-05-31T20:40:45Z",
+    "UpdatedAt": "2026-07-16T23:39:15Z",
+    "MergedAt": "2026-06-01T00:03:10Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-775009F4644F",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts",
+      "Side": "RIGHT",
+      "Line": 2220,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The recursive retry and lack of a lifetime bound are explicit in the changed code. The call path is concrete: the always-created enabled local provider eagerly refreshes after restoration, its `listSessions` crosses the renderer/main-process proxy into `AgentService.listSessions`, and that method fans out to every registered backend; remote providers similarly send a protocol request per connected host. Exact cost depends on enabled backends and session count, but the recurring boundary work does not.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "renderer-to-agent-host IPC/protocol requests plus repeated backend catalogue, SDK, and metadata work",
+      "PerformanceScaling": "After 1, 2, 4, 8, 16, and 30 seconds, cost remains one full attempt every 30 seconds indefinitely per live failed provider; aggregate work scales with provider/window count, connected remote hosts, catalogue size, and process lifetime.",
+      "PerformanceOutcome": "persistent excessive IPC/network and backend I/O after a non-recovering failure",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before the PR, the eager/connection refresh attempted `listSessions()` once and a failure did not create periodic work; another explicit connection/session event was required to refresh again.",
+      "ChangedBehavior": "A failed catalogue refresh now recursively re-arms a background timer forever, eventually issuing one full `listSessions()` request every 30 seconds for each affected provider.",
+      "CausalDiffEvidence": "RIGHT line 2220 saturates only the delay at 30 seconds; the new catch at line 2206 schedules after every rejection, and the timer callback invokes `_refreshSessions` again, whose next rejection schedules another timer. No attempt or elapsed-time limit terminates the cycle.",
+      "Title": "Bound catalogue retries after persistent failures",
+      "Impact": "If auth remains unavailable, an endpoint remains incompatible, or another persistent backend error occurs while the provider stays alive, each VS Code window (and each connected remote host) performs a full catalogue attempt every 30 seconds for the rest of its lifetime. This creates continuing IPC/network traffic and backend CPU/filesystem work; sibling providers may still execute because the local service fans them out in parallel, and the cost grows with open windows, remote hosts, session count, and uptime.",
+      "Evidence": "`_scheduleSessionRefreshRetry` doubles the delay only up to `SESSION_REFRESH_RETRY_MAX_MS` and always schedules `_refreshSessions`; every catch calls it again. `LocalAgentHostSessionsProvider` eagerly calls `_refreshSessions` after auth settles, `LocalAgentHostService.listSessions` forwards over its proxy, and `AgentService.listSessions` invokes every provider with `Promise.all`. Copilot's implementation calls its CLI client's `listSessions`; Claude lists SDK sessions and reads per-session overlays. `RemoteAgentHostProtocolClient.listSessions` sends a `listSessions` protocol request. Thus a persistent auth/configuration/offline failure keeps initiating catalogue boundary work rather than quiescing.",
+      "Recommendation": "Bound the automatic recovery window/attempt count and stop retrying terminal failures (especially auth-required without an auth-state transition). After the bound, re-arm only from existing authentication, connection, or explicit refresh events so transient startup failures still self-heal without permanent polling."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "missing-coalescing",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Local provider eager session discovery after authentication settles",
+        "CriticalPath": "The eager first `listSessions()` is required to populate the local Sessions UI. Each later timer attempt is off the immediate render path, but it is the only path to recovery after the initial failure and repeatedly executes while the window remains open.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/electron-browser/localAgentHostService.ts:199 `listSessions`",
+            "Operation": "Forward the full session-catalogue request through the delayed process proxy.",
+            "Cardinality": "One renderer-to-agent-host IPC request per attempt: after failures at roughly 1, 2, 4, 8, 16, and 30 seconds, then once every 30 seconds indefinitely for the window.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One eager request was made; a rejection did not schedule periodic IPC and another explicit agent event was required.",
+            "CriticalPathEffect": "The initial request gates catalogue population; retries are asynchronous recovery work but consume IPC and backend resources while the UI otherwise remains usable."
+          },
+          {
+            "Kind": "subprocess/filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:335 `listSessions` and provider implementations",
+            "Operation": "List every backend's sessions and, on successful fan-out, read metadata databases for returned sessions.",
+            "Cardinality": "Every IPC attempt fans out once to every registered agent backend in parallel. Copilot performs one CLI-client catalogue RPC when authenticated; Claude performs one SDK list and up to one overlay read per Claude session. If one provider rejects, already-started sibling work is not cancelled.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same full fan-out occurred for the single eager attempt, but was not repeated periodically after a rejection.",
+            "CriticalPathEffect": "Provider fan-out must settle for a successful local catalogue. On persistent failure it is re-entered by every timer attempt, even though the cache cannot advance."
+          }
+        ],
+        "ScalingInput": "Window lifetime, number of open VS Code windows, enabled agent backends, and backend/session catalogue size.",
+        "EffectiveConcurrency": "At most one timer is pending for the local provider, and ordinary cache reads are suppressed while a request or timer exists. Within one `AgentService.listSessions`, all registered agent providers execute in parallel via `Promise.all`; independent VS Code windows are not globally limited.",
+        "CacheBehavior": "A successful result, including `[]`, marks the cache initialized and resets backoff, so warm `getSessions()` reads do not cross the boundary. A failure remains distinct from an empty success; in-flight and pending-timer checks coalesce ordinary `getSessions()` calls, but the failed state has no terminal negative cache or retry lifetime bound.",
+        "MechanismConfidence": "High: construction after workbench restoration, eager refresh, recursive timer, IPC forwarding, backend fan-out, and lack of a stop condition are all directly traced.",
+        "MagnitudeUncertainty": "The per-attempt cost varies with enabled providers, whether auth failure occurs before a CLI RPC, and catalogue size. Persistent signed-out/configuration/offline states and the unbounded 30-second cadence are explicit; this uncertainty affects severity, not the mechanism.",
+        "Verdict": "Reportable medium repeated-work regression: transient recovery is useful, but all persistent errors now cause an unbounded polling loop across IPC and backend boundaries."
+      },
+      {
+        "Scenario": "Local successful/empty catalogue load and normal event-driven refresh",
+        "CriticalPath": "Successful eager discovery remains one asynchronous full-list operation. A turn-complete refresh is post-turn synchronization rather than input/render critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:2148 `_refreshSessions`",
+            "Operation": "Fetch and reconcile the complete session catalogue.",
+            "Cardinality": "One IPC/full backend list on eager success, and one on each existing turn-complete refresh; no timer request follows a successful empty or nonempty result.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same eager and event-driven full refreshes occurred; the PR changes cache ownership and failure handling, not successful-call cardinality.",
+            "CriticalPathEffect": "Needed to reconcile session metadata, but asynchronous and not on frame/input paths."
+          }
+        ],
+        "ScalingInput": "Number of returned sessions and frequency of turn-complete events.",
+        "EffectiveConcurrency": "Cache-triggered calls are coalesced by `_sessionRefreshInFlight` and the timer handle. Explicit action-triggered `_refreshSessions()` calls can still run independently, but the diff does not establish a realistic sustained concurrency burst on the success path.",
+        "CacheBehavior": "After a successful nonempty or empty refresh, `_cacheInitialized` prevents ordinary cache reads from listing again. Existing `SessionTurnComplete` refreshes remain explicit and reset retry backoff on success; a failed explicit refresh joins the new retry lifecycle.",
+        "MechanismConfidence": "High: success sets the initialized cache and explicitly clears/reset retry state.",
+        "MagnitudeUncertainty": "No material uncertainty affecting the verdict; catalogue reconciliation remains O(number of sessions) as before.",
+        "Verdict": "No additional finding: successful empty results are negatively cached, warm reads avoid IPC, and successful full-list work is not increased."
+      },
+      {
+        "Scenario": "Remote host connection, failed catalogue reconciliation, reconnect, and disconnect",
+        "CriticalPath": "The initial remote protocol request is required to reconcile and republish that host's sessions. Retries are background recovery work; disconnect cancellation is off the catalogue critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/remoteAgentHostProtocolClient.ts:833 `listSessions`",
+            "Operation": "Send a full remote session-catalogue request and deserialize/map every returned summary.",
+            "Cardinality": "One `listSessions` protocol request per failed attempt per connected host, reaching a steady one request every 30 seconds for each host whose connection remains assigned and keeps rejecting.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A connection establishment issued one refresh; rejection did not start periodic protocol traffic. Reconnection or another explicit event was needed.",
+            "CriticalPathEffect": "The first successful response gates accurate remote-session publication; repeated failures do not advance the UI but continue network/protocol and server catalogue work."
+          }
+        ],
+        "ScalingInput": "Number of configured connected remote/tunnel hosts, duration of a persistent request-level failure, and remote catalogue size.",
+        "EffectiveConcurrency": "One timer is coalesced per remote provider, but providers are instantiated per configured/tunnel host and retry independently, so aggregate concurrency/cardinality scales with connected hosts. Connection/action-triggered direct refreshes are not governed by a shared cross-host limiter.",
+        "CacheBehavior": "Each remote provider retains persisted summaries, refreshes on `setConnection`, and marks the live cache authoritative only after success. `clearConnection` resets the initialized flag and cancels a pending retry; disposal also owns the timer through the base disposable store. While a connection remains assigned and requests reject, there is no terminal failed state.",
+        "MechanismConfidence": "High for per-host recursive retries and cancellation on clear/disposal; medium-high for duration of specific remote failure modes because connection-state handling can terminate some failures.",
+        "MagnitudeUncertainty": "Connection management may promptly call `clearConnection` for transport failures, bounding those cases. Server-side auth, protocol, or catalogue failures can leave the connection object live; exact prevalence and server cost are uncertain.",
+        "Verdict": "Covered by the same reported unbounded-retry finding. Cleanup is present for explicit disconnect/disposal, but request-level persistent failures while connected still poll indefinitely."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and traced local startup, warm/empty cache behavior, action-driven refresh, remote connection lifecycle, timer cleanup, IPC/network boundaries, backend fan-out, and effective concurrency. Submitted one medium-confidence-severity finding for the newly unbounded full-catalogue retry loop; no performance-regression-fix learning record applies because the PR addresses cache recovery correctness rather than a proven prior performance symptom."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-12T17:08:33.202697938Z",
+    "CompletedAt": "2026-10-12T17:10:34.045129758Z",
+    "WallClockMilliseconds": 120842,
+    "ModelCalls": 10,
+    "InputTokens": 306335,
+    "OutputTokens": 8361,
+    "TotalTokens": 314696,
+    "ReasoningTokens": 3825,
+    "CacheReadTokens": 257073,
+    "CacheWriteTokens": 49232,
+    "APIDurationMilliseconds": 110272,
+    "ToolCalls": 49,
+    "NanoAIUnits": 51632920000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 257073,
+      "cache_write": 49232,
+      "input": 30,
+      "output": 8361
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

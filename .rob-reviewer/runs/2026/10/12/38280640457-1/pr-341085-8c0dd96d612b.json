@@ -1,0 +1,149 @@
+{
+  "PullRequest": {
+    "Number": 341085,
+    "Title": "sessions: stop polling the Agent Host session list when a listing fails to apply",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nOpening Agents window sessions on an older remote Agent Host over SSH could freeze the connection. The client was fetching the full session list from the host once a second and never stopped.\n\n## Root cause\n\n`BaseAgentHostSessionsProvider._refreshSessions` retries failed refreshes with exponential backoff (1s → 30s). #319216 added this to recover from authentication races at startup. A single `catch` covered both the `listSessions()` request and applying its result. The backoff resets as soon as the request succeeds, so a listing that always fails to apply was fetched again every second.\n\nSince #339492, `createAdapter` registers each listed session's backend identity and rejects conflicts. Hosts built before #340203 list legacy subagent rows (`copilotcli:/\u003cid\u003e#subagent/\u003ctoolCallId\u003e`) whose frontend identity collides with their parent session. As a result, every refresh threw `Conflicting backend identities`, and sessions listed after the first such row never appeared. In the affected logs, the client sent about 250 `listSessions` requests (about 311 KB each) every 5 minutes to an SSH host running a 1.141 Insiders build.\n\n## Changes\n\n- Skip a listed session that cannot be registered and log a warning, so the rest of the listing still applies.\n- Register fragment-free listed sessions before fragment rows. The frontend session key drops the fragment, so a `\u003cparent\u003e#subagent/\u003cid\u003e` row can no longer claim its parent's key by being listed first.\n- Arm the backoff retry only when `listSessions()` rejects. A failure while applying a returned listing is logged and not fetched again.\n\n#340203 already stops updated hosts from listing these rows. This change keeps the client working when it talks to an older host, and prevents any other failure while applying a listing from turning into the same poll.\n\n## How to test\n\n- `./scripts/test.sh --run src/vs/sessions/contrib/providers/remoteAgentHost/test/browser/remoteAgentHostSessionsProvider.test.ts --run src/vs/sessions/contrib/providers/agentHost/test/browser/localAgentHostSessionsProvider.test.ts`: passed (725 passing, 11 pending). Both new tests fail on `main` without the fix (10 list requests in 10 s instead of 1). The listing test lists the subagent row before its parent, which fails without the ordering.\n- `npm run typecheck-client`: passed.\n- `npm run eslint -- src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts src/vs/sessions/contrib/providers/remoteAgentHost/test/browser/remoteAgentHostSessionsProvider.test.ts`: passed.\n- `./scripts/test.sh --runGlob \"**/sessions/contrib/providers/**/*.test.js\"`: 4 failures in `AgentHostModePicker` and `Open Agent Host State File`. The same tests also fail on `main` without this change.\n\nNot run: a manual end-to-end check against a remote host built before #340203.\n\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341085",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "c0f2e898b16593abb270bf06ac9f4256acf3c650",
+    "HeadRef": "lramos15/agents/vscode-insiders-ssh-freeze-fix",
+    "HeadSHA": "8c0dd96d612b456178a1cf94ef6f2019c624f19b",
+    "CreatedAt": "2026-10-12T16:20:39Z",
+    "UpdatedAt": "2026-10-12T16:47:58Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 7998,
+      "BasePath": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts",
+      "BaseLine": 7902,
+      "IntroducingPath": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts",
+      "IntroducingCommit": "4918ed64f11c8fb78f89b7c40805c1ddab82790b",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "network",
+      "Mechanism": "A deterministic exception while applying an already-returned session catalog entered the network-failure retry path after the backoff had been reset, repeatedly fetching and deserializing the complete remote catalog once per second.",
+      "Symptom": "Opening/reconnecting an affected Agent Host could continuously transfer and deserialize the full session list at 1 Hz, consuming remote connection bandwidth and making an SSH-backed sessions window unresponsive.",
+      "FixedBehavior": "The added didList flag distinguishes a rejected listSessions boundary from failure after a listing was returned. At RIGHT line 7998, post-list failures are logged and returned without arming the retry timer, while genuine connection/auth listing failures retain the exponential-backoff retry. Per-row registration conflicts are also isolated so remaining rows can reconcile.",
+      "Evidence": "Before this diff, one catch covered both the listSessions RPC and all synchronous reconciliation. A successful RPC reset _sessionRefreshRetryDelay to the 1s minimum at base line 7902; if createAdapter/registerBackendSession or a later reconciliation hook then threw, that same catch called _scheduleSessionRefreshRetry. The next successful full-list RPC reset the delay again before the deterministic apply failure, producing a full list request every second. The added test advances 10 seconds and requires exactly one list call for a deterministic apply failure, directly exercising the old repeated-request path.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open or reconnect the Sessions window to an older remote Agent Host whose full catalog contains legacy fragment subagent rows that collide with parent identities.",
+        "CriticalPath": "setConnection immediately starts _refreshSessions; on a cold cache the listSessions round trip and catalog reconciliation must complete before the authoritative remote session list appears. Persisted summaries can render first on a warm cache, but reconciliation remains the background path that makes them authoritative.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_refreshSessions and src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:listSessions",
+            "Operation": "One Agent Host protocol listSessions request returns and deserializes the complete remote session catalog.",
+            "Cardinality": "One full-catalog request for the connection attempt after the diff. Before the diff, a deterministic registration/apply exception scheduled another request at the reset 1-second minimum, so cost grew with connection lifetime until the failure disappeared.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The boundary already existed, but successful listing followed by an apply exception entered the retry path and repeated the complete request every second.",
+            "CriticalPathEffect": "The first request is on the cold session-list critical path; erroneous retries consumed the same SSH/network connection and repeatedly parsed the catalog after the UI could not complete reconciliation."
+          }
+        ],
+        "ScalingInput": "N returned host sessions, including legacy subagent rows. The diff clones and sorts N entries in O(N log N), then performs the existing O(N) reconciliation; one operation serves the whole host and there is no per-session IPC fan-out.",
+        "EffectiveConcurrency": "_ensureSessionCache suppresses a second refresh while one request is in flight or a retry timer is armed. Direct refresh triggers use generations so only the newest response applies; the diff adds no concurrency burst.",
+        "CacheBehavior": "Cold cache creates adapters for valid rows. A warm persisted cache contains at most 100 summaries and updates existing adapters, while the live host listing itself is not capped. Failed registrations are not negatively cached, so a later explicit refresh retries them, but the diff no longer creates a timer-driven poll after the successful list response.",
+        "MechanismConfidence": "High: the single full-list protocol request, 1-second reset/retry loop before the fix, and post-list no-retry gate are directly traced in code and tests.",
+        "MagnitudeUncertainty": "Live catalog size and SSH latency vary. The added sort/allocation is real but comparator work is small relative to already-required full-catalog transfer, parsing, and reconciliation, so it does not establish a user-visible regression.",
+        "Verdict": "No reportable regression. The change removes repeated full-catalog network work; parent-first ordering and per-row isolation add only bounded in-process work without additional boundary calls."
+      },
+      {
+        "Scenario": "Local Agent Host startup when authentication is unsettled or listSessions transiently rejects.",
+        "CriticalPath": "After authenticationPending settles, the provider eagerly requests the catalog so the sidebar can populate. A rejected request leaves the cache non-authoritative and the exponential-backoff retry is required for startup recovery.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/electron-browser/localAgentHostService.ts:listSessions -\u003e src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:listSessions",
+            "Operation": "Agent Host protocol listSessions request to the local Agent Host process, including full-catalog serialization and client-side URI/metadata mapping.",
+            "Cardinality": "One initial request; genuine rejection retries at 1s, 2s, 4s up to 30s until success. This behavior is unchanged. A successful response that later fails to apply now makes no automatic retry.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC request and exponential backoff existed, but apply failures were incorrectly classified as request failures and repeatedly reset to the minimum delay.",
+            "CriticalPathEffect": "The first successful request is required for an authoritative cold startup catalog; backoff retries are delayed recovery work after failure."
+          }
+        ],
+        "ScalingInput": "N local sessions in one catalog. Ordering adds one N-element array and O(N log N) cheap fragment comparisons before the existing adapter/update pass.",
+        "EffectiveConcurrency": "The in-flight and pending-retry guards coalesce synchronous getSessions calls. One disposable timer owns backoff; no changed parallel IPC fan-out occurs.",
+        "CacheBehavior": "Up to 100 persisted summaries may render immediately on warm startup. Empty success is authoritative and resets backoff; rejection remains distinct and retried. The change preserves those positive, empty, and failure states.",
+        "MechanismConfidence": "High: constructor/auth autorun trigger, local protocol boundary, retry state, and tests for first-failure recovery are explicit.",
+        "MagnitudeUncertainty": "The local catalog is uncapped at the protocol boundary, but no evidence shows the added in-memory sort dominates the pre-existing full protocol mapping and reconciliation.",
+        "Verdict": "No regression. Genuine startup failures still recover with bounded backoff, while deterministic post-response failures stop generating repeated IPC."
+      },
+      {
+        "Scenario": "A chat turn completes or a newly committed session waits for reconciliation.",
+        "CriticalPath": "ChatTurnComplete starts a background refresh and is off the immediate action-dispatch critical path. _waitForNewSession explicitly awaits refresh, so its one catalog request and reconciliation are on the path to resolving the committed session.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_attachConnectionListeners and _waitForNewSession",
+            "Operation": "One full listSessions protocol request for the connected host.",
+            "Cardinality": "One host-wide request per completion/wait trigger, not one per session. This pre-existing cardinality is unchanged by the diff; generation checks prevent stale responses from applying.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same triggers issued the same full-list request. The diff only orders the returned array and changes retry classification after a response.",
+            "CriticalPathEffect": "Background for ordinary turn completion; blocking for _waitForNewSession until the returned catalog is reconciled."
+          }
+        ],
+        "ScalingInput": "N sessions per host catalog and event frequency. Added CPU is O(N log N) per pre-existing explicit refresh, with no new request multiplicity.",
+        "EffectiveConcurrency": "Refresh generations make the latest invocation authoritative; this change neither adds Promise.all fan-out nor increases aggregate request scheduling.",
+        "CacheBehavior": "Warm adapters are updated instead of recreated. Failed colliding rows are attempted on each explicit refresh because they are not cached; that is bounded by existing refresh events rather than a new timer.",
+        "MechanismConfidence": "High for trigger and boundary cardinality; low evidence of any measurable regression from the added ordering alone.",
+        "MagnitudeUncertainty": "Frequent turns and unusually large catalogs increase sorting/logging work, but the diff simultaneously eliminates the much larger 1 Hz failure loop and does not add a trigger or expensive boundary.",
+        "Verdict": "No reportable regression because request frequency is unchanged on healthy explicit-refresh paths and deterministic apply failures now avoid automatic polling."
+      }
+    ],
+    "Summary": "Reviewed the complete two-file diff and traced remote connection, local startup, explicit turn refresh, and new-session wait paths through their full-catalog protocol boundaries. No performance finding was introduced. Recorded the PR as a high-confidence fix for the prior 1 Hz repeated full-list regression introduced by commit 4918ed64f11c8fb78f89b7c40805c1ddab82790b."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-12T17:04:12.109590102Z",
+    "CompletedAt": "2026-10-12T17:08:28.375356225Z",
+    "WallClockMilliseconds": 256265,
+    "ModelCalls": 10,
+    "InputTokens": 266620,
+    "OutputTokens": 6208,
+    "TotalTokens": 272828,
+    "ReasoningTokens": 2552,
+    "CacheReadTokens": 223656,
+    "CacheWriteTokens": 42934,
+    "APIDurationMilliseconds": 88104,
+    "ToolCalls": 37,
+    "NanoAIUnits": 42841240000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 223656,
+      "cache_write": 42934,
+      "input": 30,
+      "output": 6208
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
