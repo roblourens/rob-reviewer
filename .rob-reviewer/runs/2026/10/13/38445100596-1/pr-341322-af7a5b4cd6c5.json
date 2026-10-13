@@ -1,0 +1,203 @@
+{
+  "PullRequest": {
+    "Number": 341322,
+    "Title": "sessions: make opening large Agent Host chats non-blocking",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Why\n\nOpening a large Agent Host chat in the Agents window froze the renderer. On the test chat \"Move chats\" (1,157 requests, 2,314 history items, ~1 GB session DB), the freeze was **~31s**, with ~27.6s spent applying history. Root causes:\n\n| Cause | Before | After |\n|---|---|---|\n| `SessionArtifacts` rescanned generated images for every replayed item | ~38.2s CPU | 0.27s |\n| Response `dataId` included the transcript-wide `isLast` flag (the chat list already appends a last-item suffix) | ~1.65s | 0.08s |\n| File-edit conversions rebuilt repeatedly | repeated | cached per immutable response |\n| Customization `_resolvePath` repeated after restore | 9 tasks × ~0.5s, ~4.2s total | memoized per immutable `CustomizationIndex` |\n| History replayed synchronously through the live progress path | one ~6.3s task (after the fixes above) | cooperative, see below |\n\n## What changed\n\n- **Cooperative replay:** large remote history is replayed in idle slices of at most 40ms (budgeted on model mutations only) into an *unpublished* model while the existing loading placeholder shows. The model is then published and attached once, in a fresh task.\n- **Correctness:** restored turns never toggle `requestInProgress`, and a live final turn is reapplied after publish. Sends and resends wait on the restore/refresh barriers. Concurrent loads, including untitled materialization, share one load. A cancelled load is abandoned after a microtask, so an immediate re-acquire joins the running load. History that changes during replay is preserved, with at most 3 pre-publish deferrals.\n- **Structure:** restore logic is extracted into `RemoteChatSessionRestorer` with a `CooperativeMutationBudget` helper, which shrinks `loadRemoteSession` from ~900 to 65 lines.\n- **Diagnostics:** new trace marks `modelPublishStart`/`modelPublishEnd` and `bufferedHistoryRefreshStart`/`bufferedHistoryRefreshEnd`. The `modelReady` record now includes `historyReplayYieldCount`.\n\n## Reviewer notes\n\n- @osortega: please check the remote history replay and refresh path, including the turn matching from #339458, #339635 and #340354, which now runs across yields.\n- @justschen: please check the customization path cache and the chat list widget test.\n- **Behavior changes to watch:** `getSession` doesn't return the model until restore completes. There is one extra macrotask before publish. Non-streaming sessions publish only after the editing session is ready.\n- **Known follow-ups:** the live-refresh diff is still unbudgeted (this predates the PR). The cost of the final attach of ~2,314 view models still needs measuring on an exact-session trace with the CI build.\n- Several rounds of independent review were done; the last returned \"ship\".\n\n## How to test\n\nOpen a large Agent Host chat in the Agents window. The loading placeholder should show without freezing the renderer, then the full transcript appears in one step. Sending right after open waits for the restore to finish.\n\n## Validation\n\nBranch merged with the latest `main`. All of the following passed:\n\n- `npm run build-fast -- --client-only`: passed\n- `./scripts/test.sh --reporter dot --run src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts --run src/vs/workbench/contrib/chat/test/browser/widget/chatListWidget.test.ts --run src/vs/workbench/contrib/chat/test/common/model/chatViewModel.test.ts --run src/vs/sessions/contrib/chat/test/browser/sessionArtifacts.test.ts --run src/vs/sessions/contrib/providers/agentHost/test/browser/agentHostSessionCustomizations.test.ts --run src/vs/workbench/contrib/chat/test/browser/agentHost/agentHostResponseFileChanges.test.ts`: passed, 438 tests\n- `npm run typecheck-client`: passed\n- `npm run eslint -- \u003c12 changed files\u003e`: passed\n- `node --experimental-strip-types build/hygiene.ts \u003c12 changed files\u003e`, plus the pre-commit hygiene hook on the merge: passed\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341322",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d414bcadf2255d82eff9bf5a58ef0b126f2d7e73",
+    "HeadRef": "sandy081/agents/fix-session-artifacts-replay-blocked",
+    "HeadSHA": "af7a5b4cd6c56c914d453d532f403c969ea49699",
+    "CreatedAt": "2026-10-13T16:18:25Z",
+    "UpdatedAt": "2026-10-13T17:58:31Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-E1E710E18059",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/chat/browser/sessionArtifacts.ts",
+      "Side": "RIGHT",
+      "Line": 592,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The added callback, response event call path, debounce semantics, and both transcript scans are directly visible in code. Exact user-visible duration varies with transcript size and streaming cadence, so severity is medium rather than high.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "CPU iterations and temporary Set/array allocations over every request and response listener",
+      "PerformanceScaling": "For a transcript with N requests, each non-coalesced live response-update burst now performs an added O(N) listener-tracking pass before the existing O(N) generated-image extraction pass, so added work grows as O(N × live update bursts).",
+      "PerformanceOutcome": "Increased renderer CPU and GC pressure while a response streams in a large chat, causing avoidable interaction lag.",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "A response onDidChange invalidated generatedImages directly, whose recomputation scanned model.getRequests once to extract generated images.",
+      "ChangedBehavior": "The coalesced event callback now always calls track(), which scans all requests, builds a Set, and iterates all tracked listeners; consuming that signal immediately recomputes generatedImages and scans the transcript again.",
+      "CausalDiffEvidence": "Added RIGHT line 592 invokes track() from the shared coalesced callback for both model-structure events and response-content events; before the diff, response-content events only invalidated the generatedImages derived and did not run a listener-maintenance scan.",
+      "Title": "Avoid rescanning listeners on every live response update",
+      "Impact": "With the artifacts presentation active on a large chat, every streamed progress update that lands in a separate event-loop burst pays two transcript-wide passes instead of one. The debounce only combines synchronous events, so ordinary network-paced streaming repeatedly incurs the extra scan.",
+      "Evidence": "Response progress calls ChatResponseModel.onDidChange without a structural ChatModel change (ChatModel.acceptResponseProgress delegates to response.updateContent). Line 592 runs track() for that response-only signal; track() calls model.getRequests(), allocates a Set, and walks responseListeners. The generatedImages derived then calls model.getRequests().slice().reverse() and scans responses. Event.accumulate with numeric delay 0 debounces only events arriving before its setTimeout fires, so separate streaming updates still trigger this pair of scans.",
+      "Recommendation": "Keep the coalesced image invalidation, but mark listener tracking dirty only from model structural changes (or use a separate coalesced model event); response onDidChange should fire the image signal without calling track()."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/sessions/contrib/chat/browser/sessionArtifacts.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 591,
+      "BasePath": "src/vs/sessions/contrib/chat/browser/sessionArtifacts.ts",
+      "BaseLine": 573,
+      "IntroducingPath": "src/vs/sessions/contrib/chat/browser/sessionArtifacts.ts",
+      "IntroducingCommit": "b7b5cb4f2494459186f4a1ac55faa27ed2ab949a",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "The generated-images derived subscribed directly to every model and response mutation and rescanned the entire transcript after each replayed mutation, making restore work grow with both mutation count and transcript size.",
+      "Symptom": "Opening a large restored Agent Host chat could spend substantial renderer CPU repeatedly rescanning generated images and freeze the UI.",
+      "FixedBehavior": "Event.accumulate coalesces synchronous restore mutation bursts before invalidating generatedImages, reducing many per-item transcript scans to one delayed scan per burst.",
+      "Evidence": "The old base line subscribed generated-image computation directly to response.onDidChange. The changed code routes model/response events through Event.accumulate, and the added test fires 50 model plus 50 response events, proves zero synchronous scans, and bounds the delayed scans to at most two.",
+      "Confidence": 0.98
+    },
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/common/model/chatViewModel.ts",
+      "FixedSide": "LEFT",
+      "FixedLine": 591,
+      "BasePath": "src/vs/workbench/contrib/chat/common/model/chatViewModel.ts",
+      "BaseLine": 591,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/common/chatViewModel.ts",
+      "IntroducingCommit": "8d8f0cd9d4b25e89621ce897e82f2111eca6a278",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "Each response dataId read called isLast, which called session.getItems() and rebuilt/scanned the transcript; list diffing reads identity for every row, producing collection-wide work inside a per-row path.",
+      "Symptom": "Refreshing or attaching a large chat list incurred quadratic transcript traversal and increased renderer latency.",
+      "FixedBehavior": "The response identity no longer appends this.isLast; the list widget's existing tail identity suffix handles last-row rerendering without per-response transcript scans.",
+      "Evidence": "The deleted base expression appended this.isLast, whose getter calls session.getItems().at(-1). The added unit test reads dataId before and after a response change and proves getItems is never called, while the widget test proves old/new tail rows still update using stable response data IDs.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "concurrency-burst",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open a cold large remote Agent Host chat and publish its model",
+        "CriticalPath": "Provider resolvability and session-content resolution must finish, then history replay runs in bounded idle slices, any buffered history is applied, non-streaming editing-session readiness completes, and publication occurs in a fresh task. Model attachment remains on the critical path; tracing and later live observers are off-path after publication.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts:898 loadRemoteSession",
+            "Operation": "Resolve the contributed/Agent Host session and obtain its history through IChatSessionsService.canResolveChatSession and getOrCreateChatSession.",
+            "Cardinality": "One provider resolution per cold resource after both service-level coalescing layers; zero for a warm published model.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Remote loads already called the same session service operations; the diff adds outer per-resource coalescing and can reduce duplicate calls during materialization/concurrent opens.",
+            "CriticalPathEffect": "The session history must arrive before replay can begin, so this boundary is on the open critical path."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts:958 createRemoteSessionModel",
+            "Operation": "Read persisted session metadata/input state synchronously via getMetadataForSessionSync.",
+            "Cardinality": "Once per cold model construction.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same metadata lookup existed in the prior loadRemoteSession implementation.",
+            "CriticalPathEffect": "Occurs before model replay/publication and is therefore on the open critical path."
+          }
+        ],
+        "ScalingInput": "History items, requests, and response parts in one session; replay mutations scale linearly with those items. Effective provider cardinality is one resolution per resource because concurrent consumers share _remoteSessionLoads and the sessions service also coalesces pending resolution.",
+        "EffectiveConcurrency": "One shared load and one cooperative replay per session resource; callers join it. Different resources are not globally limited, matching the prior ability to load different sessions concurrently. Replay itself is serialized and yields at model-mutation boundaries.",
+        "CacheBehavior": "Warm published models return through acquireExistingSession without provider work. Concurrent cold misses coalesce by resource. A fully abandoned load is cancelled and a subsequent load waits for it to unwind before retrying; pending maps are cleared on settlement. No new negative cache is retained.",
+        "MechanismConfidence": "High: service maps, scheduler implementation, tests, and provider call flow directly establish coalescing, serialization, and critical-path placement.",
+        "MagnitudeUncertainty": "Exact attach cost and aggregate concurrency across many simultaneously opened resources are not measured here; the per-resource scheduling, call count, and replay path are established.",
+        "Verdict": "No new reportable regression on cold opening. The main changes reduce synchronous replay work and duplicate provider loads; remaining final attachment cost is not introduced as a proven regression."
+      },
+      {
+        "Scenario": "Apply live remote-history refreshes, server-initiated requests, and sends/resends",
+        "CriticalPath": "A pending history refresh is serialized through _activeRefresh; sends, resends, queued requests, and server requests wait for the current refresh before mutating the model. Diff computation is synchronous, while changed model mutations yield in slices.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Current and incoming history turns. Mutation work scales with changed turns; equality/diff scans scale with full history, and anonymous-turn matching can be quadratic but is carried forward from the prior implementation rather than introduced on the normal live-refresh path.",
+        "EffectiveConcurrency": "Exactly one active refresh per restorer. New history snapshots overwrite _pendingHistory to coalesce to the latest state. Server requests queue behind refresh and progress is deferred until those requests are applied.",
+        "CacheBehavior": "No cross-refresh result cache; restored turns and request IDs are retained as authoritative incremental state. Pending history is latest-value coalesced, and refresh promises are cleared in finally. Send barriers recheck for a successor refresh.",
+        "MechanismConfidence": "High for serialization and critical-path waits from the restorer and ChatService call flow.",
+        "MagnitudeUncertainty": "Provider event frequency and anonymous-history prevalence vary; no changed boundary fan-out was found.",
+        "Verdict": "No reportable diff-caused regression. The changed path adds cooperative mutation scheduling and explicit coalescing/ordering; inherited synchronous diff scans were not materially amplified for ordinary published refreshes."
+      },
+      {
+        "Scenario": "Stream a live response while the session artifacts presentation tracks generated images",
+        "CriticalPath": "Each response-content event is debounced to a zero-delay task; the callback updates response listeners and invalidates generatedImages, whose transcript scan must finish before artifact sections update. This is renderer-local CPU work with no external boundary.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "N requests/responses in the open transcript times U response-update bursts that remain after zero-delay coalescing.",
+        "EffectiveConcurrency": "Events in one synchronous burst coalesce, but network-paced updates in separate tasks each trigger one callback. Work is serialized on the renderer event loop.",
+        "CacheBehavior": "Response listeners are retained only for current responses and disposed on structural changes. There is no cache for the transcript scan; every coalesced signal rebuilds generated-image results.",
+        "MechanismConfidence": "High: response progress fires response.onDidChange without a model structural event, Event.accumulate uses setTimeout(0), and the added track() plus existing generatedImages loops are explicit.",
+        "MagnitudeUncertainty": "Exact streaming cadence and transcript sizes vary, but the extra O(N) Set/listener pass per non-coalesced update is certain; this uncertainty is reflected in medium severity.",
+        "Verdict": "Reportable medium repeated-work regression: response-only updates now perform an unnecessary full listener-maintenance scan before the existing full image scan."
+      },
+      {
+        "Scenario": "Refresh/render a large chat list and compute row identities",
+        "CriticalPath": "List refresh asks the identity provider for each row before tree reconciliation and rendering. The diff removes response identity's call to isLast/session.getItems; the widget's own last-item suffix handles tail changes.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of visible/model rows and transcript items. Before the fix, per-row identity could invoke collection-wide getItems; after the fix identity work is constant per response.",
+        "EffectiveConcurrency": "Synchronous renderer work in one list refresh; no parallelism or external queue.",
+        "CacheBehavior": "Identity uses response id and model change count; no external cache. Tail state is computed once by the widget from its item array.",
+        "MechanismConfidence": "High from ChatResponseViewModel.dataId/isLast and ChatListWidget identity code.",
+        "MagnitudeUncertainty": "Exact tree refresh frequency varies, but elimination of nested transcript traversal is directly proven by the test.",
+        "Verdict": "This PR fixes a concrete repeated-work regression; it does not introduce a new one in this scenario."
+      },
+      {
+        "Scenario": "Resolve customizations and convert immutable Agent Host file edits for restored/history consumers",
+        "CriticalPath": "Customization path resolution occurs while parsing/replaying references; file-edit conversion occurs when change observables are consumed. Both are in-process CPU/allocation work with no new filesystem, subprocess, IPC, database, or network boundary.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Unique path tokens per immutable CustomizationIndex and unique immutable file-edit objects. Repeated references/consumers hit the new caches; retained entries are bounded by the immutable index/history objects' lifetime.",
+        "EffectiveConcurrency": "Synchronous lookups; observable consumers may re-observe, but WeakMap conversion caches share results without introducing work bursts.",
+        "CacheBehavior": "CustomizationIndex memoizes hits and misses for its immutable lifetime; a new index invalidates all entries. File conversions use WeakMap keys, so entries disappear when protocol edit objects are unreachable. Workspace-dependent classification is recomputed outside the cached conversion.",
+        "MechanismConfidence": "High from Map/WeakMap ownership and tests covering repeat observation and index replacement.",
+        "MagnitudeUncertainty": "Unique-token counts and edit counts vary, but cache ownership and invalidation are explicit and bounded by already-retained immutable objects.",
+        "Verdict": "No reportable regression. These changes remove repeated CPU/allocation work with appropriate immutable-object/index lifetimes."
+      }
+    ],
+    "Summary": "Reviewed all 12 changed files and every diff page. Traced remote-session loading/restoration, live refresh and streaming, artifact extraction, chat-list identity, customization lookup, and file-edit conversion. Submitted one medium repeated-work finding for an added transcript-wide listener-maintenance scan on each non-coalesced live response update. Recorded two concrete regression fixes: coalescing restore-time artifact scans and removing transcript scans from per-row response identity."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-13T18:26:16.693441162Z",
+    "CompletedAt": "2026-10-13T18:30:41.174435345Z",
+    "WallClockMilliseconds": 264480,
+    "ModelCalls": 12,
+    "InputTokens": 780251,
+    "OutputTokens": 10074,
+    "TotalTokens": 790325,
+    "ReasoningTokens": 4109,
+    "CacheReadTokens": 681635,
+    "CacheWriteTokens": 98580,
+    "APIDurationMilliseconds": 166040,
+    "ToolCalls": 68,
+    "NanoAIUnits": 96717800000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 681635,
+      "cache_write": 98580,
+      "input": 36,
+      "output": 10074
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
