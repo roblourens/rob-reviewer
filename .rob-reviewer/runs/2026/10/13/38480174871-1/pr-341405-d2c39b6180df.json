@@ -1,0 +1,218 @@
+{
+  "PullRequest": {
+    "Number": 341405,
+    "Title": "Fix symlink loops",
+    "Body": "Fix #143060. ",
+    "URL": "https://github.com/microsoft/vscode/pull/341405",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "1deec18b366f522703d357bb1d4cbd5558f18385",
+    "HeadRef": "lramos15/agents/fix-terminal-visibility-issue",
+    "HeadSHA": "d2c39b6180dfdd7be37fe0a292d3dc69a49d92fb",
+    "CreatedAt": "2026-10-13T21:36:54Z",
+    "UpdatedAt": "2026-10-13T22:10:02Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 158,
+      "BasePath": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts",
+      "BaseLine": 458,
+      "IntroducingPath": "src/vs/workbench/services/search/node/ripgrepTextSearchEH.ts",
+      "IntroducingCommit": "ee40fa3e0d742709ab6de5e00c9807e28d113775",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "subprocess",
+      "Mechanism": "Following symlinks in a cross-linked directory graph makes ripgrep revisit the same underlying folders through exponentially many distinct paths, consuming subprocess CPU and filesystem I/O while search appears not to finish.",
+      "Symptom": "Text search can effectively never finish on cross-linked symlink trees such as fake sysfs layouts.",
+      "FixedBehavior": "After more than 1,000 loop diagnostics, the changed stderr handler cancels the pathological ripgrep subprocess and line 158 retries the same folder once with `followSymlinks: false`, converting an exponentially expanding traversal into one bounded failed attempt plus one ordinary traversal.",
+      "Evidence": "In the base text-search argument builder, the blamed line is the `--follow` ripgrep path enabled by the default `search.followSymlinks: true`. The changed `RipgrepSymlinkLoopDetector` documents and counts ripgrep's `File system loop found` diagnostics; the added fixture creates N folders linking to every folder and states that ripgrep enumerates exponentially many paths because it detects only ancestor loops. The integration test drives this through `TextSearchEngineAdapter`, establishing the user search call path and subprocess boundary.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "unbounded-retention",
+      "boundary-fanout",
+      "concurrency-burst",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Ordinary text search with the default follow-symlinks setting",
+        "CriticalPath": "Each workspace folder's ripgrep subprocess and result parsing must complete before the aggregate search promise completes; message flattening occurs afterward and is negligible.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:84",
+            "Operation": "Spawn ripgrep for text search in one workspace folder.",
+            "Cardinality": "One process per folder, concurrently; no retry for ordinary stderr.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one-ripgrep-per-folder traversal ran before the diff.",
+            "CriticalPathEffect": "Each folder process is on the text-search critical path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:getRgArgs",
+            "Operation": "Ripgrep recursively reads workspace directory entries and candidate file contents.",
+            "Cardinality": "One traversal per folder, bounded by ignores, includes, max file size, cancellation, and the 20,000-result default.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical ripgrep filesystem work occurred before the diff.",
+            "CriticalPathEffect": "Filesystem traversal and reads dominate ordinary search latency."
+          }
+        ],
+        "ScalingInput": "Workspace-folder count controls subprocess concurrency; files and matches control ripgrep work. New path tracking grows with emitted matches and is normally bounded by the 20,000-result default per folder.",
+        "EffectiveConcurrency": "`Promise.all` runs one ripgrep process per folder concurrently. The diff does not add another process unless a folder exceeds 1,000 loop diagnostics.",
+        "CacheBehavior": "This provider has no result cache; every invocation is a cold ripgrep traversal apart from operating-system filesystem cache effects. There is no new negative cache or coalescing behavior.",
+        "MechanismConfidence": "High: the concurrent per-folder call path, result cap, and added path-array retention are explicit.",
+        "MagnitudeUncertainty": "Callers may request a larger result cap, but the common manager supplies 20,000 by default; exact path-reference memory depends on folder count and requested cap.",
+        "Verdict": "No reportable regression. On the no-loop path the diff adds stderr scanning and bounded path references but no boundary call; the overhead is small relative to the existing result objects and ripgrep traversal."
+      },
+      {
+        "Scenario": "Text search in a cross-linked symlink tree",
+        "CriticalPath": "The initial following-symlinks ripgrep run emits loop diagnostics; after the threshold it is killed, its close event fires, and one non-following retry must finish before completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:142",
+            "Operation": "Terminate a ripgrep run after more than 1,000 symlink-loop diagnostics and launch one retry without `--follow`.",
+            "Cardinality": "At most two sequential ripgrep processes per affected folder; unaffected folders remain at one.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One following-symlinks process continued enumerating exponentially many paths without a cutoff or fallback.",
+            "CriticalPathEffect": "The retry is on the critical path, but replaces an exponentially expanding process that previously could effectively never finish."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:184",
+            "Operation": "Rescan the real, non-symlink directory tree and suppress results already emitted by the aborted run.",
+            "Cardinality": "One ordinary rescan per affected folder after a bounded 1,001-diagnostic attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No fallback traversal existed; the original traversal could revisit folders exponentially.",
+            "CriticalPathEffect": "Adds a finite full traversal, while eliminating the prior unbounded repeated traversal through aliases."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/services/search/node/textSearchAdapter.ts:42",
+            "Operation": "Return the completion warning through the existing search completion protocol.",
+            "Cardinality": "One small warning per affected folder, flattened once at aggregate completion.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Completion carried an empty messages array.",
+            "CriticalPathEffect": "Negligible work after the retry completes."
+          }
+        ],
+        "ScalingInput": "Cross-link branching factor and depth drove exponential path enumeration before the diff; the new failed-attempt cost is bounded by 1,001 diagnostics and the retry scales with the physical non-symlink tree.",
+        "EffectiveConcurrency": "One initial process per folder runs concurrently. Within an affected folder, retry begins only from the old process's close handler, so at most one ripgrep process is active for that folder; multiple affected folders can retry concurrently.",
+        "CacheBehavior": "No result cache is involved. Duplicate suppression is per invocation and built from results emitted before cancellation; it is released at completion.",
+        "MechanismConfidence": "Very high: the fixture constructs every-folder-to-every-folder links, the detector observes ripgrep's loop message, and the retry disables symlink following.",
+        "MagnitudeUncertainty": "The exact time to reach 1,001 diagnostics and kill latency are platform-dependent, but the old exponential mechanism and new bound are explicit.",
+        "Verdict": "This is a concrete performance fix, recorded through `report_regression_fix`; it bounds an effectively non-terminating subprocess/filesystem traversal."
+      },
+      {
+        "Scenario": "Ordinary file search and Quick Open across workspace roots",
+        "CriticalPath": "On a cold search, one `rg --files` process per root streams paths through matching; sorted Quick Open then retains and scores all candidates. A warm sorted-search cache can bypass the walker and its subprocesses.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/search/node/fileSearch.ts:204",
+            "Operation": "Spawn `rg --files` for each workspace root.",
+            "Cardinality": "One process per root on a cold search; zero when the sorted-search cache satisfies the query.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same per-root ripgrep fan-out existed before the diff.",
+            "CriticalPathEffect": "Cold searches wait for traversal; cache hits avoid it."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/search/node/ripgrepFileSearch.ts:17",
+            "Operation": "Enumerate files under each workspace root.",
+            "Cardinality": "One traversal per root, with ignore/include/exclude filtering. Ordinary unsorted searches stop at their result cap; sorted searches intentionally enumerate all candidates for top-score selection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same enumeration and sorted-search all-candidate collection occurred before the diff.",
+            "CriticalPathEffect": "Directory enumeration is the dominant cold-path work."
+          }
+        ],
+        "ScalingInput": "Root count controls subprocess fan-out; candidate-file count controls traversal, matching, and sorted scoring. Added `reportedPaths` references scale with emitted matches; the default cap is 20,000, while sorted search already retains every candidate object and path.",
+        "EffectiveConcurrency": "`FileWalker.parallel` starts all root-folder ripgrep processes concurrently. No retry starts without the diagnostic threshold; existing result limits and cancellation kill active commands.",
+        "CacheBehavior": "Sorted searches can reuse `rawSearchService` prefix caches; cache hits do not invoke the changed walker. Cold and uncached searches allocate loop-detection state per root; there is no changed negative-cache behavior.",
+        "MechanismConfidence": "High: max-result disabling for sorted search, all-result retention, cache bypass, and per-root parallelism are explicit in the traced code.",
+        "MagnitudeUncertainty": "Very large sorted workspaces can have many candidates, but the new array mainly adds references to paths already retained by the existing sorted result collection.",
+        "Verdict": "No reportable regression. The no-loop path adds bounded stderr parsing and path references, but no new subprocess or filesystem operation; in the only unbounded candidate path, the existing sorter already retains the same candidate paths."
+      },
+      {
+        "Scenario": "File search in a cross-linked symlink tree",
+        "CriticalPath": "After more than 1,000 loop diagnostics, the affected root's process is killed and one non-following `rg --files` retry enumerates the physical tree; prior emitted paths are filtered before reporting.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/search/node/fileSearch.ts:252",
+            "Operation": "Kill the looping `rg --files` process and launch one retry with `ignoreSymlinks: true`.",
+            "Cardinality": "At most two invocations per affected root, with brief termination overlap; one per unaffected root.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The single following-symlinks process continued exponential alias traversal without fallback.",
+            "CriticalPathEffect": "The retry must finish, but bounds a traversal that previously could effectively never complete."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/search/node/fileSearch.ts:256",
+            "Operation": "Re-enumerate the root without following symlinks and test output paths against the prior-result set.",
+            "Cardinality": "One ordinary physical-tree traversal per affected root plus O(1) set lookup per emitted path.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No bounded non-following rescan or duplicate filter existed.",
+            "CriticalPathEffect": "Finite added traversal replaces unbounded repeated traversal through cross-links."
+          }
+        ],
+        "ScalingInput": "Cross-link branching and depth controlled the prior exponential work. The new first phase is bounded by loop diagnostics; retry cost and skip-set size scale linearly with the physical tree and already emitted matching paths.",
+        "EffectiveConcurrency": "One process initially runs per root. The retry is launched immediately after sending kill, so an affected root can have a brief old/new process overlap during termination; there is only one retry because loop detection is disabled on it. Aggregate concurrency remains proportional to root count.",
+        "CacheBehavior": "Sorted-search cache hits bypass this path. On a cold affected search, duplicate state is per root and per invocation, then released after callback completion.",
+        "MechanismConfidence": "Very high: the changed threshold handler, retry options, fixture, and integration test directly establish the path.",
+        "MagnitudeUncertainty": "Kill-to-close delay and filesystem size vary, but the bounded retry is decisively cheaper than the demonstrated exponential traversal.",
+        "Verdict": "No regression. The additional subprocess and traversal are an intentional bounded fallback that substantially reduces latency and resource consumption in the triggering scenario."
+      }
+    ],
+    "Summary": "Completed the performance pass over all nine changed files and all diff pages. Traced normal and pathological file/text search paths through subprocess, filesystem, result retention, aggregation, cache, cancellation, and concurrency behavior. No diff-introduced actionable performance regression met the reporting threshold. Recorded the text-search symlink-loop cutoff as a concrete repeated-work regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-13T23:00:35.328323591Z",
+    "CompletedAt": "2026-10-13T23:03:33.63213117Z",
+    "WallClockMilliseconds": 178303,
+    "ModelCalls": 9,
+    "InputTokens": 340582,
+    "OutputTokens": 9526,
+    "TotalTokens": 350108,
+    "ReasoningTokens": 5122,
+    "CacheReadTokens": 280818,
+    "CacheWriteTokens": 59737,
+    "APIDurationMilliseconds": 125932,
+    "ToolCalls": 45,
+    "NanoAIUnits": 60164020000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 280818,
+      "cache_write": 59737,
+      "input": 27,
+      "output": 9526
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

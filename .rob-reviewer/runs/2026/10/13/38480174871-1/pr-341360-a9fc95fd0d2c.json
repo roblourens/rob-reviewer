@@ -1,0 +1,128 @@
+{
+  "PullRequest": {
+    "Number": 341360,
+    "Title": "agentHost: forward VS Code ExP assignment context to Copilot sessions",
+    "Body": "Agent Host requests reach CAPI without `X-Copilot-Client-Exp-Assignment-Context`. Without it, CAPI cannot tell which VS Code experiment arm a request came from, so ExP cannot build A/B scorecards for VS Code experiments from CAPI-side metrics. For current runtime builds, the client assignment context in CAPI telemetry for VS Code + SDK traffic is 100% empty.\n\n## Why this header matters\nVS Code's experiment service (TAS) assigns users to treatment or control. CAPI records the client assignment context it receives in this header on each model request (`copilot_api_llm_request`, `metadata.client_assignment_context`). ExP uses that field to attribute CAPI-side outcomes (tokens, cost, latency, errors, model and tool usage) to a VS Code experiment arm.\n\nVS Code's own telemetry already carries the assignment (`abexp.assignmentcontext`), but those outcomes exist only at CAPI. VS Code and CAPI also identify the randomization unit differently (a VS Code install vs. a GitHub user), so the per-request header is what reliably ties a CAPI request to the right arm. Without it, VS Code + SDK traffic looks unassigned: scorecards that depend on CAPI data lose that traffic or show a sample ratio mismatch.\n\n## Why it broke\nRuntime PR github/copilot-agent-runtime#20885 stopped copying CAPI's returned server assignment (`X-Copilot-API-Exp-Assignment-Context`) into the outgoing client header on later requests. That copying was wrong: it attributed VS Code requests to CAPI's own experiments. But it masked a gap on our side. In Agent Host, the runtime, not VS Code, makes the CAPI requests, and Agent Host only put VS Code's assignment context on VS Code telemetry. It never passed the context to the SDK session, so the runtime had no client assignment to send.\n\nThe Copilot Chat extension calls CAPI directly and already adds this header itself (`capiClient.ts`); this PR is the Agent Host equivalent.\n\nThis matches the version split in the CAPI telemetry: runtimes without #20885 (e.g. `1.0.84-4`, `1.0.85-unstable…g3514c9a`) show a partially empty client context, while `1.0.89-7`+ show 100% empty.\n\n## Change\n`CopilotSessionLauncher` passes the workbench assignment context (root config `copilotCliVSCodeAssignmentContext`, already published by `AgentHostPrewarmer` from `IWorkbenchAssignmentService.getCurrentExperiments()`) to created and resumed sessions as SDK `expAssignments`, with only `AssignmentContext` set. The runtime then sends it as `X-Copilot-Client-Exp-Assignment-Context`. Nothing is sent when the value is empty or unset.\n\n- `expAssignments` is `@internal` in the SDK, so it is missing from the published config types; it is added through a small helper.\n- `Features`/`Flights`/`Configs` stay empty because VS Code resolves its own treatments. This payload shape is the one the runtime's own E2E test (`sdk-github-telemetry-forwarding.test.ts`) uses to check this header.\n- An already-running session picks up a refreshed assignment at its next create or resume.\n- CAPI's returned server context is unchanged: the runtime still reports it as `secondary_assignment_context`, which Agent Host records as `secondary.assignmentcontext` telemetry.\n\n## Validation\n- New launcher tests cover unset, empty, and populated contexts on create and resume. The launcher suite passes (120 tests), and client type-check and ESLint are clean.\n- Ran the pinned runtime (`1.0.95-0`) against real CAPI through a local header-recording proxy, two requests per session (`gpt-5-mini`, HTTP Responses):\n  - without `expAssignments`: header absent on both requests, even though CAPI returned its own context;\n  - with the payload this PR sends: header present on both requests.\n- Repeated with `gpt-6.1-sol` without the proxy, so the runtime used the WebSocket Responses transport (`response.create` frames, checked in the runtime wire log with `COPILOT_AGENT_DEBUG=1 RUST_LOG=model_wire=debug`): with `expAssignments`, both frames carried the header with the supplied value; without it, neither frame had the header.\n- Ran Code - OSS with experiments enabled through the same proxy: Agent Host `/responses` requests carried the full real VS Code assignment string.\n\nNot yet verified: that the ExP `secondary_assignment_context` column queried for this investigation maps to this header. I couldn't query the `exploratory_tier` database (no access).\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341360",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "76cf4ac8bd6ec2c9e97b83e16cfe115782a0773b",
+    "HeadRef": "bhavyaus/agent-host-exp-assignment-header",
+    "HeadSHA": "a9fc95fd0d2c46b28fafa7f6c1793d3afeea92b8",
+    "CreatedAt": "2026-10-13T18:35:47Z",
+    "UpdatedAt": "2026-10-13T21:32:20Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create a regular or ephemeral Copilot SDK session",
+        "CriticalPath": "The launcher builds session configuration, reads the already-published root assignment string synchronously, then the existing SDK createSession call must complete before the session is usable. The diff adds only a small object/string reference to that existing configuration path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_createSession and added configuration at line 1228",
+            "Operation": "Send SDK session configuration to the Copilot runtime through client.createSession.",
+            "Cardinality": "One existing create call per successful create launch; the assignment metadata is included once in that existing call.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same createSession IPC occurred with the full session configuration but without expAssignments.",
+            "CriticalPathEffect": "The create call was already on the session startup critical path. The diff slightly enlarges its serialized configuration but adds no round trip."
+          },
+          {
+            "Kind": "network",
+            "Location": "Transitive SDK/runtime behavior configured by src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:1228",
+            "Operation": "Send subsequent model requests from the runtime to CAPI with X-Copilot-Client-Exp-Assignment-Context.",
+            "Cardinality": "One added bounded header value on each existing CAPI model request made by the session; no additional request is created.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same CAPI requests occurred without the VS Code client assignment header.",
+            "CriticalPathEffect": "The existing model request remains critical; only header bytes and normal header serialization are added, with no evidenced material latency mechanism."
+          }
+        ],
+        "ScalingInput": "One metadata object per session launch; assignment length scales with the finite workbench experiment assignment list. Concurrent session launches retain their own config objects until their existing create calls settle.",
+        "EffectiveConcurrency": "Unchanged: each launch issues its existing createSession call, while aggregate launch concurrency remains controlled by callers. The diff adds no task, queue, timer, or parallel boundary operation.",
+        "CacheBehavior": "The assignment context is read from the in-memory root config value bag; no cache miss or fetch is introduced. TAS retrieval and publication occur earlier in AgentHostPrewarmer and are not invoked by the changed launcher. Empty or unset values avoid constructing expAssignments.",
+        "MechanismConfidence": "High: the changed line reads an in-memory object and spreads one optional object into configuration passed to the existing SDK call; the PR description and code establish transitive header forwarding without a new request.",
+        "MagnitudeUncertainty": "Exact assignment-string length and number of model requests vary by active experiments and conversation length, but the diff neither duplicates the string per item in host code nor creates an additional boundary call. The incremental header cost is not a reportable regression.",
+        "Verdict": "No reportable performance regression. The added bounded metadata is necessary for attribution and piggybacks on existing create and model-request boundaries."
+      },
+      {
+        "Scenario": "Resume an existing Copilot SDK session, including retry and empty-history fallback",
+        "CriticalPath": "The launcher builds configuration once, reads assignment context from memory, and waits for the existing resumeSession call. Existing custom-agent retry and empty-history create fallback reuse that same config object; the diff does not rebuild or refetch assignment data for each attempt.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_resumeSession/_createSession and added configuration at line 1228",
+            "Operation": "Send resume configuration to the Copilot runtime through client.resumeSession, with an optional existing createSession fallback.",
+            "Cardinality": "Normally one existing resume call; up to a second resume and one create only on pre-existing error/fallback paths. The same assignment metadata is reused for all attempts.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical resume/retry/fallback call counts without expAssignments in their configuration.",
+            "CriticalPathEffect": "These calls were already serialized on resume's critical path. The diff increases payload by one small assignment structure but does not increase attempt count."
+          },
+          {
+            "Kind": "network",
+            "Location": "Transitive SDK/runtime behavior configured by src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:1228",
+            "Operation": "Send subsequent resumed-session CAPI requests with the assignment-context header.",
+            "Cardinality": "One header value per existing model request after resume; effective network request cardinality is unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Existing CAPI requests omitted the VS Code client assignment context.",
+            "CriticalPathEffect": "Only existing request metadata changes; no separate attribution request or handshake is added."
+          }
+        ],
+        "ScalingInput": "One assignment object per logical resume launch, reused across at most the pre-existing resume retry/fallback attempts. Cost does not scale with session history because the launcher does not inspect or copy history.",
+        "EffectiveConcurrency": "Unchanged per-launch sequencing: resume attempts and fallback creation are serialized by existing control flow; separate session resumes may run concurrently as before. No new burst or limiter bypass is introduced.",
+        "CacheBehavior": "Warm in-memory root config read for both cold and previously active sessions. Refreshed assignments are consumed on the next launch; there is no new negative-cache behavior, polling, or network fetch on resume.",
+        "MechanismConfidence": "High for host-side allocation, call cardinality, and sequencing; medium-high for per-request runtime forwarding based on the SDK contract and PR's tested behavior.",
+        "MagnitudeUncertainty": "Runtime-internal serialization details are outside the repository, but the changed host call flow proves no additional IPC or network operation. Potential byte overhead varies with assignment length and request count and is too small/bounded to establish actionable degradation.",
+        "Verdict": "No reportable performance regression. Resume call cardinality, ordering, and concurrency are unchanged, and metadata construction occurs once per logical launch."
+      }
+    ],
+    "Summary": "Reviewed the complete three-file diff and traced session create/resume through configuration storage, SDK IPC, retry/fallback sequencing, and transitive CAPI requests. The change adds bounded metadata to existing boundaries without new calls, fan-out, eager heavyweight work, retention, cache churn, or concurrency, so no performance finding was submitted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-13T22:59:32.990587815Z",
+    "CompletedAt": "2026-10-13T23:00:29.986613883Z",
+    "WallClockMilliseconds": 56996,
+    "ModelCalls": 7,
+    "InputTokens": 158264,
+    "OutputTokens": 3488,
+    "TotalTokens": 161752,
+    "ReasoningTokens": 896,
+    "CacheReadTokens": 120104,
+    "CacheWriteTokens": 38139,
+    "APIDurationMilliseconds": 43999,
+    "ToolCalls": 31,
+    "NanoAIUnits": 30858060000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 120104,
+      "cache_write": 38139,
+      "input": 21,
+      "output": 3488
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
