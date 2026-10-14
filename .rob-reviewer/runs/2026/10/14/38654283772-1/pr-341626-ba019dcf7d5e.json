@@ -1,0 +1,357 @@
+{
+  "PullRequest": {
+    "Number": 341626,
+    "Title": "agentHost: make agent-host.db authoritative for session state (Block 3a)",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Goal\n\nThis is Block 3a of moving chats between sessions, following Block 2b (#341406, opaque chat URIs).\n\n`agent-host.db` becomes authoritative for session state. Each chat's own database holds only that chat's data. Whatever older builds read is written for them as write-only copies (the \"mirror\"), so a downgrade keeps working.\n\nBefore this change, session-level state (config, flags, workspace, git and GitHub state, titles, read state) lived in each session's `session.db`, mixed with data that belongs to individual chats. Moving a chat between sessions needs a clean split: state that belongs to the session, and data that belongs to a chat and can travel with it.\n\n## Design\n\n### Session state store\n- `IAgentHostSessionStateStore` is the single owner of central session state. It uses new, additive tables in `agent-host.db` (migration 15): `session_state`, `session_state_values`, `session_folder_state`, `session_chat_state` and `chat_row_mirror`. Older builds never read them.\n- **Load and import.** `load` imports a session from its `session.db` once, then reconciles. For each entry, a mirror that differs from the recorded merge base was edited by an older build after a downgrade, and that edit wins. Otherwise central state wins.\n- **Nothing imports without an explicit open.** Listing, lifecycle sweeps, discovery, catalog synchronization and metadata readers never import a session (`readWithoutImport`, `openMetadataWithoutImport`, `prefetchWithoutImport`, `readBaseBranchWithoutImport`). Until a session is imported, its `session.db` stays its authority. A page or pass makes one batched `agent-host.db` query, and a session written centrally after that query is read afresh.\n- **Writes** go to central state first, then to the old-format mirror, either immediately or coalesced. Mirror targets are computed from live chats at write time, so nothing is ever mirrored into a deleted chat's database.\n- The store never loads a chat or a detached worktree record as a session (`SessionStateNotASessionError`).\n- **Concurrency.** Each session is a per-session sequencer section. Code inside a section uses the `exclusive` handle and never calls back into the store for the same session. Tests drive every known nesting path end to end, so a re-entrant call would hang and fail.\n- **Guard.** `agentHostSessionStateOwnershipGuard.test.ts` fails on any direct `session.db` access to a store-owned key outside the store, its mirror and the database layer, except an allowlist with a justification for each entry. Keys passed through string constants and statics (such as `CopilotAgent._META_*`) are resolved like literals. It also fails if the removed central checkpoint or branch-changes state is reintroduced.\n\n### Binding decisions\n- **Group 1, session flags and config (central, mirrored):** `configValues`, `customizationEnablement`, `isArchived`, `isRead`, `defaultChatIsRead`, `agentHost.autoArchivedAt`, `agentHost.workspaceless`, `agentHost.workspaceConversionQuarantined`, `agentHost.createdBySession`.\n- **Group 2, workspace (central, mirrored):** `agentHost.sessionWorkingDirectories`, `agentHost.additionalWorktrees`, `copilot.worktree.*`, `sessionArtifacts`.\n- **Group 3, git, GitHub and source control (central per folder, mirrored):** `agentHost.git`/`gitData`, `github`/`githubData`, `pendingRecordedPullRequests`, `sourceControl`, `diffBaseBranch`.\n- **Group 4, not session state:**\n  - `vscode.scheduleCursors` is automation data.\n  - The Mission Control cursors are the default chat's own data in its own database.\n- **Group 5, chat summaries:** titles, title sources, read state and change summaries are central (the normalized catalog, or `session_chat_state` for legacy-catalog sessions). The session database keeps receiving exactly main's writes. `peerChats` is written only for legacy-catalog sessions, as on main.\n- **Group 6, keys in a peer's own database:**\n  - Legacy-catalog sessions keep main's keys (`chatProviderData`, `chatOrigin`, `chatInheritedTurnId`, `chatWorkingDirectories`, `isRead`).\n  - A normalized peer gets only `agentHost.chatWorkingDirectories`, and only when its folders change. Releases 1.140 and 1.141 overlay that key on every read.\n- **Group 7, rows:** drafts and local and failed turns are chat data in each chat's own database. A peer's rows are also mirrored into the session database, keyed by chat. New builds read that mirror only to take in an older build's edits after a downgrade, for every peer, including peers this build created (whose central entry records no storage).\n- **No changeset blobs.** Branch and session-wide changesets are computed live. They are no longer stored, migrated or mirrored. Existing values on disk are left for older builds.\n- **Checkpoints are chat data.**\n  - A chat's turn→ref rows and the repositories it captured in live in its own database.\n  - The default chat keeps main's ref names. A peer uses chat-only refs: `refs/agents/chats/\u003cchatKey\u003e/checkpoints/turn/\u003cN\u003e`, numbered per chat.\n  - There is no central checkpoint index or counter.\n- **Delete by recorded storage.**\n  - Session delete captures every chat, private chats included, with its recorded storage before tombstoning.\n  - A chat's storage is deleted only if no other live session or chat still records it.\n  - Single-peer delete also removes the peer's central rows and its row copies in the session database. It also redirects or drops any base branch mirrored into the peer's database.\n- **ehcli markers stay as on main.** `agentHost.ehcliAdopted` and `agentHost.ehcliLastMigratedTurn` are the adopted chat's own data.\n- **No `async_hooks`.** There is no re-entrancy detection at runtime; the structural rule above is enforced by tests instead.\n- **Schema v15 is purely additive.** The unused central checkpoint and branch-changes tables were removed before shipping.\n\n## Downgrade behaviour and accepted trade-offs\n\n- An older build reads the mirrored keys and sees the same sessions, titles, flags, git state, drafts and turns.\n- Edits that the older build makes to mirrored keys are picked up on the next load: a mirror that differs from the merge base wins.\n- Accepted trade-offs:\n  - After a downgrade, older builds can't show Turn Changes for new peer turns (chat-only refs). When they delete a session, they leave those refs behind.\n  - Branch and session-wide changesets are computed live, so they show \"computing\" briefly after a restart.\n  - Normalized-catalog peers stay invisible to 1.138, as on main.\n  - Legacy rows copied into a peer's own database keep their originals in the session database. Those originals are deleted with the session, as on main.\n\n## Performance\n\nMeasured with the agent host perf harness: seeded databases with 2,000 and 10,000 sessions, base and branch interleaved, every SQL statement diffed. Base is the merge base 50559e744a1; branch is 1f88938129b, before the P1, P2 and F3 fixes below.\n\n- **Listing: no regression.**\n  - `agent-host.db` statements are identical (7→7 at 2k, 27→27 at 10k).\n  - `session.db` opens are 0→0.\n  - Timings at 2k are within ±1.3 ms; the differences at 10k are noise (the sign flips).\n- **First listing:** +6 statements at 2k (one batched prefetch per listing, not per session), +0.9 ms. At 10k it is −17 to −20 ms.\n- **Startup (schema v15):** at most +0.9 ms. A first open of a v14 database runs migration 15: +0.2 to +0.65 ms.\n- **Lifecycle sweep:** `session.db` opens equal main's. The extra cost is one batched prefetch per sweep.\n- **Costlier than main, on paths with no budget:**\n  - First import of a session: +3 to +6 ms for v2, +8.5 to +10.8 ms for v1.\n  - Create: about +5 ms per session (about 9 separate central writes).\n  - Legacy restore: about 12 more statements per subagent chat. This is still about 7x cheaper than before Block 2b.\n  - An isolated git change flushed immediately: about +1.2 ms. A 50-change burst is cheaper than on main (one coalesced `session.db` write instead of 50).\n- **Fixed after the measurement:**\n  - **P1:** a v2 title write opens and writes exactly what main does. The per-key rendering of normalized chats into `session.db` is gone; a normalized peer's folders are written only when they change.\n  - **P2:** a database without legacy peer rows runs its turn statements without the foreign-row (`json_each`) filter. The filter cost +25% per checkpoint lookup even with no foreign rows.\n  - **F3:** listing discovered sessions that have no central state and no session folder opens no database for them, as on main.\n\n## How to test\n\nLive validation in Code OSS with real Copilot, using Insiders 1.143 as the old build. Rounds 1–3 ran on 1f88938129b, before the live-finding fixes below. Round 4 re-checked the rebased head b823e919c4a, and round 5 the final head 89e2b7bab05.\n\n| Scenario | Result |\n|---|---|\n| S1: fresh v2 session (default and peer turns, renames, archive and unarchive, unread, drafts, restart) | Pass |\n| S2: older-build data opened in 3a (legacy-catalog peer, worktree, renames, drafts, cancelled turn) | Pass |\n| S3: downgrade round trip 3a → 1.143 → 3a, with edits on both sides | Pass, nothing lost |\n| S4 / S4b: delete a peer, then the session; chat-only checkpoint refs | Pass |\n| R1–R6, R8–R9: list, config, Changes views, worktree isolation, merge state, fork, workspace-less → folder, cancelled turn | Pass |\n| R7, R11, F4, F6, W1 (subagent pill, workbench Chat view, tab title after rename, fork summary after restart, changeset warning) | Same as main (pre-existing) |\n| R10: Claude | Pass. Codex sessions missing after restart is pre-existing on main (follow-up below) |\n| Round 4 (b823e919c4a): S1 core, S3 round trip, log scan | Pass, with one finding (F8, fixed below) |\n| Round 5 (89e2b7bab05): S1 core, R4 worktree isolation (edit, Branch Changes, archive and restore, restart), S3 round trip with F8, log scan | Pass. An older build's draft edit in a 3a-created peer is reconciled after re-upgrade. The failed-turn row import could not be exercised live (1.143 kept the failed turn only in the SDK event log, not as a row), so that path is covered by unit tests only. No new error kinds from 3a; one pre-existing customization-publishing dispose race was seen once. |\n\nLive findings fixed in this PR:\n- **F1:** a chat's base-branch read no longer imports the chat as a session.\n- **F2:** discovery and catalog sync never import.\n- **F3:** listing opens no database for discovered sessions without a session folder.\n- **F5:** deleting a legacy-catalog peer now deletes its summary keys instead of leaving empty values. A normalized session keeps them, as on main.\n- The new store guard then caught a second phantom-session path: Copilot peer chat-backing resume. It is fixed too.\n- **F8:** an older build's edits to the drafts and local or failed turns of a peer this build created are reconciled after re-upgrade. Such a peer records no storage centrally, so its storage now resolves from the catalog.\n\n## Validation\n\nAll commands ran on head 89e2b7bab05 (rebased onto main 59e0b8222b4), with every `COPILOT_*`, `AGENT_HOST_*` and `GITHUB_TOKEN` variable unset, except where a row names an earlier head:\n\n| Command | Result |\n|---|---|\n| `npm run typecheck-client` | 0 errors |\n| `npm run eslint -- \u003cthe 99 .ts/.js files changed vs origin/main\u003e` (b823e919c4a), then on the 26 files the gap fixes changed and the 4 files F8 changed | clean |\n| `npm run valid-layers-check` | pass |\n| hygiene (pre-commit hook on every commit) | pass |\n| `./scripts/test.sh --reporter dot --grep \"AgentHost\\|Chat\"` (ab3c1178993) | 12,650 passing, 0 failing, 70 pending |\n| `./scripts/test.sh --reporter dot --grep \"^(?!AgentHostChangesetStrategy ).*(AgentHost\\|Chat)\"` (89e2b7bab05, machine load ~20 from other apps) | 12,538 passing, 0 failing, 70 pending. Under that load the excluded suite hits the known `_doComputeStaticChangeset` \"after each\" leak flake, at ab3c1178993 as well. |\n| `./scripts/test.sh --reporter dot --run src/vs/platform/agentHost/test/node/agentHostChangesetStrategy.test.ts`, 3 times (89e2b7bab05, load ~11) | 115 passing, 0 failing, each time |\n| `./scripts/test.sh --reporter dot --run src/vs/platform/agentHost/test/node/agentService.test.ts` (89e2b7bab05) | 904 passing, 0 failing, 16 pending |\n| `./scripts/test.sh --reporter dot --run src/vs/platform/agentHost/test/node/agentHostSessionStateStore.test.ts` (89e2b7bab05, incl. the F8 tests) | 60 passing, 0 failing |\n| `./scripts/test-integration.sh --run src/vs/platform/agentHost/test/node/e2e/providers/copilotAgentHostE2E.integrationTest.ts` (89e2b7bab05, strict replay) | 268 passing, 24 pending, 0 failing |\n| `./scripts/test.sh --reporter dot` with `--run` for agentService, copilotAgent, agentSideEffects, chatContributions, worktreeIsolation, sessionAdditionalWorktrees, agentHostSavedChatService, agentHostCustomizationEnablementService, agentHostSessionStateStore, agentHostSessionStateOwnershipGuard, agentHostGitStateService and the three turn/tool-call telemetry suites (`src/vs/platform/agentHost/test/node/`) | 2,410 passing, 0 failing, 17 pending |\n| `npm run test-agent-host-e2e` (strict replay, full profile, ab3c1178993) | all 6 suites pass: Conformance 368 (15 pending), Claude 124 (38), Codex 153 (34), Copilot 268 (24), Copilot OTel 22, Copilot managed settings 15 |\n| `npm run test-agent-host-e2e-coverage` (on cdd762d9844, before rebase) | all suites pass; coverage stats not committed |\n| `npm run smoketest-no-compile -- -g \"Agents Window\"` (b823e919c4a) | 5 passing, 0 failing, 4 pending (the Dev Container suites over Docker, SSH, Tunnel and WSL, which only run when that environment is available) |\n| `npm run smoketest-no-compile -- -g \"Electron\\) (Chat\\|Copilot CLI)\"` (b823e919c4a) | 14 passing, 0 failing (Chat Disabled, Chat Sandbox (darwin), Chat Sessions, Chat Model Configuration). The Copilot CLI smoke test is registered only for packaged builds, and its one test is `it.skip`. No test needed a real sign-in. |\n\nAfter the final rebase onto main b575e2828e1 (head 25818fc89bd; conflicts were import lists and two tests both sides added, all kept), with the same variables unset:\n\n| Command | Result |\n|---|---|\n| `npm run typecheck-client` | 0 errors |\n| `npm run eslint -- \u003cthe 103 .ts/.js files changed vs origin/main\u003e` | clean |\n| `npm run valid-layers-check` | pass |\n| `./scripts/test.sh --reporter dot --grep \"AgentHost\\|Chat\"` | 12,661 passing, 1 failing, 70 pending. The failure was main's updated base-branch test seeding session.db after the session's state is central; fixed in 25818fc89bd, then `--run src/vs/platform/agentHost/test/node/agentHostGitStateService.test.ts`: 78 passing, 0 failing |\n| `./scripts/test.sh --reporter dot --run` copilotAgent, worktreeIsolation, agentHostSessionStateStore, agentHostSessionStateOwnershipGuard, agentSideEffects, agentHostCheckpointService, sessionDatabase (`src/vs/platform/agentHost/test/node/`) | 1,272 passing, 0 failing, 1 pending |\n\nMain bumped `@github/copilot-sdk` to 1.0.22-preview.2 after the last local E2E run; the private npm feed rejected the local install, so that SDK version is validated by CI only.\n\nEvery behaviour fix has a mutation-checked test: the reverted change makes the test fail.\n\n## Not in this PR (follow-up issues)\n\n1. Codex peer chat overlays are never deleted.\n2. Sweep storage folders that already leaked from deleted sessions.\n3. Checkpoint refs leak in repositories of folders a session no longer uses.\n4. Copilot fork and side chats copy the source session's keys into the new chat's database.\n5. Per-chat overrides for session config (absorbed into Block 3b, configuration scopes).\n6. Archiving or deleting a session removes a worktree other sessions still use.\n7. Session Changes should show only the chat's changes.\n8. Forked chats share checkpoint refs with their source.\n9. Codex sessions disappear from the list after a restart: they are marked as their own chat backing (pre-existing on main).\n10. MCP state in the session's customization list is last-writer-wins across chats (pre-existing on main).\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341626",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e142434610b3bae70cfcbac5d9404909f94cad16",
+    "HeadRef": "agents/block3a-session-state-authority",
+    "HeadSHA": "ba019dcf7d5e844f6a53c062ab11773e6c138f51",
+    "CreatedAt": "2026-10-14T19:53:20Z",
+    "UpdatedAt": "2026-10-14T23:32:02Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-87D0C5213DD5",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts",
+      "Side": "RIGHT",
+      "Line": 1201,
+      "Severity": "high",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The per-entry call, central transaction, immediate mirror, serialization, 999-entry bound, and import call path are explicit; only storage-dependent elapsed time is uncertain.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "missing-coalescing",
+      "PerformanceResource": "SQLite transactions and peer-database metadata writes",
+      "PerformanceScaling": "For P changed peers, publication adds P central-state transactions and P extra peer-database mirror writes. The old P metadata writes retain concurrency 4, but the new store writes serialize per session; a legacy catalog can contain 999 peers.",
+      "PerformanceOutcome": "increased first-restore and large catalog-update latency from serialized database I/O",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "Compatibility publication wrote each changed peer's full metadata, including working directories, once with setMetadataValues under a concurrency-4 limiter.",
+      "ChangedBehavior": "Each peer still gets its metadata transaction, then the added immediate store write commits agent-host.db and flushes that peer's working-directories value back to the same database. The session-state sequencer serializes these cycles.",
+      "CausalDiffEvidence": "Added line 1201 places every changed peer in its own immediate central-write-and-mirror cycle after the existing peer metadata write.",
+      "Title": "Coalesce compatibility writes across the peer catalog",
+      "Impact": "Importing or republishing a large legacy peer catalog can add hundreds of serialized commits and duplicate writes before restore continues; at the supported limit this is 999 central transactions plus 999 extra peer writes.",
+      "Evidence": "_publishCompatibilityState invokes _writeChatMetadata for every changed entry. That method first awaits peer setMetadataValues, then line 1201 awaits SessionStateStore.write with Immediate. The store queues by session, _writeCentral calls writeSessionState for every nonempty patch, and Immediate awaits _flushLocked. reconcileLegacy reaches this publication while importing legacy membership. Tests exercise AGENT_HOST_CATALOG_CHILD_LIMIT - 1 compatibility entries, and the limit is 1000.",
+      "Recommendation": "Aggregate changed chat patches into one exclusive central write, include working directories in each peer's existing metadata transaction, then mark those entries mirrored or perform one aggregate flush."
+    },
+    {
+      "ID": "PERF-3B1101D01279",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostChatRowStore.ts",
+      "Side": "RIGHT",
+      "Line": 267,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The nested loops, one-query implementation, serialization, and restore critical path are directly traced. Exact delay varies with session history and storage speed, but the P×C query count is deterministic for unclaimed event-id-less rows.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "serialized SQLite point queries against each peer chat database",
+      "PerformanceScaling": "For P peer databases and C legacy checkpoint rows without event IDs, first open now performs up to P×C awaited getTurnEventId queries; misses and default-chat rows that no peer owns pay the full cross product, while matches pay until their owner is reached.",
+      "PerformanceOutcome": "increased session first-open latency and lower restore throughput",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR there was no checkpoint-ownership migration: legacy checkpoint rows stayed in session.db and opening a session did not probe every peer database for every checkpoint row.",
+      "ChangedBehavior": "The new first-load row migration reads all checkpoint records, then iterates peers and records and awaits getTurnEventId for each still-unclaimed row; each call executes its own SELECT through the peer database's sequencer before the next comparison can start.",
+      "CausalDiffEvidence": "The added condition at line 267 introduces an awaited per-record SQLite lookup inside both the added peer loop and checkpoint-record loop, on the awaited first-open migration path.",
+      "Title": "Batch checkpoint ownership probes during first-open migration",
+      "Impact": "Opening an older session with many peer chats/checkpointed turns can block restore on hundreds or thousands of serialized SQLite round trips before the session is usable.",
+      "Evidence": "AgentService._restoreSessionState awaits loadWithCatalog; AgentHostSessionStateStore._loadLocked awaits chatRows.moveRows; moveRows awaits _moveCheckpoints. _moveCheckpoints loads records once but then nests the peer loop around the record loop, and SessionDatabase.getTurnEventId issues `SELECT event_id FROM turns WHERE id = ?1 OR event_id = ?1 LIMIT 1` per call. The migration tests establish multiple peers and legacy checkpoint rows, and rows without event IDs are explicitly the ownership-classification case.",
+      "Recommendation": "Fetch each peer database's turn/event IDs in one query and classify all checkpoint rows in memory (or add a bulk membership API), preserving peer-order ownership and existing copy/foreign-row semantics."
+    },
+    {
+      "ID": "PERF-E04D359D4AEF",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts",
+      "Side": "RIGHT",
+      "Line": 644,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The insertion, sole deletion helper, restore path, and residency callback were all traced. Per-session retained byte size varies with metadata/chat count, but lifetime growth by distinct opened sessions is certain.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceResource": "retained per-session SessionStateModel maps, mirror base/dirty sets, snapshots, URIs, and schedulers",
+      "PerformanceScaling": "Retained memory grows with every distinct session restored during the agent-host process lifetime, rather than with the configured resident-session limit; reopening is warm, but normal idle eviction never removes historical entries.",
+      "PerformanceOutcome": "unbounded retained memory and increasing GC pressure in long-lived agent hosts",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR there was no authoritative session-state `_records` cache; normal AgentSessionResidency eviction removed a session's in-memory state, keeping residency bounded.",
+      "ChangedBehavior": "Every successful load now inserts a permanent record into `_records`. The new store has an `evict()` method that flushes and forgets a record, but normal AgentSessionResidency eviction still only calls AgentService._evictSessionState, which removes state-manager/chat contribution state and never calls the new store. Records are forgotten only by explicit store eviction or deletion.",
+      "CausalDiffEvidence": "Line 644 adds each loaded session to the new unbounded `_records` map; the PR does not connect this new cache to the existing normal residency-eviction path.",
+      "Title": "Release cached central state during residency eviction",
+      "Impact": "A long-lived host where a user opens more sessions than the residency limit continues retaining central state for all sessions ever opened, defeating the memory bound and causing process memory/GC cost to grow over time.",
+      "Evidence": "_restoreSessionState calls loadWithCatalog for each restored session, and _loadLocked stores the resulting record at line 644. AgentSessionResidency invokes its delegate's evictSessionState when releasing idle sessions; AgentService wires that to _evictSessionState, whose body clears chat/state-manager data but not `_sessionStateStore`. `_forget` is the only `_records.delete` site, reached by explicit `evict` and deletion, not normal residency release.",
+      "Recommendation": "Wire residency release to await `_sessionStateStore.evict(session)` after session data is idle (extending the residency delegate to support async cleanup if needed), so pending mirrors flush and the cache is bounded with the rest of resident session state."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Session listing, discovery pages, and lifecycle sweeps",
+        "CriticalPath": "A page or sweep first reads central state for its session set, then resolves list-visible metadata; unimported sessions may still need their existing session.db metadata read before the result is usable.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:prefetchWithoutImport",
+            "Operation": "Batch-read list-visible authoritative values from agent-host.db",
+            "Cardinality": "One query for all unloaded sessions in a page/sweep",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No central-state prefetch existed; list metadata came from the legacy session databases/catalog path.",
+            "CriticalPathEffect": "Must complete before metadata projection, but replaces per-session central lookups"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:readWithoutImport/_readDatabase",
+            "Operation": "Open/read session.db metadata for sessions not yet imported",
+            "Cardinality": "At most one database read per unimported session needing keys",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same unimported sessions were sourced from session.db before the diff.",
+            "CriticalPathEffect": "Required for those cold entries; imported entries avoid it"
+          }
+        ],
+        "ScalingInput": "Number of sessions in the requested page or lifecycle sweep after registry/catalog deduplication.",
+        "EffectiveConcurrency": "Central values are fetched in one batched agent-host.db query. Remaining per-session work follows the existing listing/sweep scheduling; the diff does not launch an unbounded request burst.",
+        "CacheBehavior": "Loaded sessions are served from the store record; unloaded imported sessions use the batched central prefetch; unimported sessions fall back to session.db. A central write invalidates a stale prefetch through the write sequence.",
+        "MechanismConfidence": "High: batching, fallback conditions, and call sites in listing/sweep paths were traced.",
+        "MagnitudeUncertainty": "Page sizes and the fraction of already-imported sessions vary, but effective central query cardinality is one per batch.",
+        "Verdict": "No finding: the new central work is batched, and unimported sessions do not gain an additional per-session central query."
+      },
+      {
+        "Scenario": "First explicit open of a legacy session, central import, row migration, and restore",
+        "CriticalPath": "AgentService restore awaits the catalog snapshot and loadWithCatalog; that awaits central import/reconciliation and chat-row migration before provider/chat restoration can continue.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:_loadLocked",
+            "Operation": "Read/import authoritative session state and reconcile legacy mirrors",
+            "Cardinality": "A bounded set of central transactions plus legacy database reads per session and peer resource",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Restore read legacy state directly without importing it into agent-host.db.",
+            "CriticalPathEffect": "Awaited before restore proceeds"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostChatRowStore.ts:_moveCheckpoints",
+            "Operation": "Probe each peer database for ownership of every unclaimed checkpoint row",
+            "Cardinality": "Up to P×C serialized SELECTs, plus writes for claimed rows",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Checkpoint rows stayed in session.db; no cross-peer ownership classification ran.",
+            "CriticalPathEffect": "Directly blocks first-open restore"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:_publishCompatibilityState/_writeChatMetadata",
+            "Operation": "Publish peer compatibility metadata and authoritative working-directory state",
+            "Cardinality": "P original peer writes plus P new central commits and P new mirror writes for P changed peers",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Each changed peer received one complete metadata write, concurrency-limited to four.",
+            "CriticalPathEffect": "Legacy reconciliation awaits all publication before restore continues"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_restoreSessionState/_restorePeerChats",
+            "Operation": "Resolve provider metadata and materialize the default/peer chats",
+            "Cardinality": "Provider metadata once, then materialization/history work per restored chat",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Provider restore/materialization already occurred when opening a session.",
+            "CriticalPathEffect": "Also awaited during restore, but the relevant provider boundary and chat cardinality predate this diff"
+          }
+        ],
+        "ScalingInput": "P peer chats, C legacy checkpoint rows without event IDs, and P changed legacy compatibility entries; peer catalogs support up to 999 peers.",
+        "EffectiveConcurrency": "The session-state store serializes work per session. Normal peer metadata compatibility writes use a limiter of 4, checkpoint ownership probes are awaited serially inside nested loops, and the new immediate state writes serialize through the session sequencer.",
+        "CacheBehavior": "This migration is cold-only per process/central import; a loaded record makes later reads warm. Persisted migration markers avoid most row work after success, but normal residency eviction currently fails to release the loaded record.",
+        "MechanismConfidence": "Very high: both reported I/O fan-outs, their query/transaction implementations, serialization, and awaited restore call paths are explicit.",
+        "MagnitudeUncertainty": "Real sessions vary in peer/checkpoint count and disk latency; the supported 999-peer bound and deterministic P×C/P transaction relationships establish the mechanisms independently.",
+        "Verdict": "Two findings reported: batch checkpoint ownership membership checks, and coalesce compatibility-state publication instead of one immediate cycle per peer."
+      },
+      {
+        "Scenario": "Ordinary metadata/catalog state updates and legacy mirroring",
+        "CriticalPath": "The authoritative agent-host.db write is on the mutation path. Coalesced legacy mirror writes are delayed/off the immediate critical path; operations requesting Immediate wait for the mirror flush.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:_writeCentral",
+            "Operation": "Commit an authoritative state patch to agent-host.db",
+            "Cardinality": "One transaction per logical store write",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Owned metadata was written directly to session.db/chat databases.",
+            "CriticalPathEffect": "Required before the mutation is acknowledged"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:_flushLocked",
+            "Operation": "Render and apply compatibility metadata changes to session.db or live chat databases",
+            "Cardinality": "One grouped write per distinct target resource containing dirty entries per flush",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The legacy database was authoritative, so no second compatibility mirror phase was needed.",
+            "CriticalPathEffect": "Usually scheduler-coalesced; Immediate callers await it"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogSyncService.ts:_synchronizeWithDatabaseLocked/_writeThroughCentral",
+            "Operation": "Write catalog receipt/outbox and project owned metadata through central state",
+            "Cardinality": "A bounded set per catalog synchronization, serialized per session",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Catalog receipt and metadata were written only through session.db/local catalog state.",
+            "CriticalPathEffect": "Awaited for synchronization ordering"
+          }
+        ],
+        "ScalingInput": "Number of changed state entries and distinct target session/chat databases between scheduler flushes.",
+        "EffectiveConcurrency": "Writes serialize per session and central database operations use the host database sequencer. Dirty mirror entries coalesce in one record and flush by target resource; catalog synchronization also serializes per session.",
+        "CacheBehavior": "The loaded SessionStateModel supplies warm reads and dirty/base tracking. Mirror failures retain dirty entries and schedule a bounded retry; successful flushes clear them.",
+        "MechanismConfidence": "High: central-first ordering, scheduler coalescing, target grouping, retry state, and immediate semantics were inspected.",
+        "MagnitudeUncertainty": "The ratio of coalesced to Immediate callers varies, but ordinary writes do not create an input-multiplying fan-out apart from the separately reported compatibility loop.",
+        "Verdict": "No additional finding: the general extra mirror phase is the intentional compatibility cost and is coalesced/grouped; the pathological per-peer Immediate placement was reported separately."
+      },
+      {
+        "Scenario": "Checkpoint capture, lookup, cleanup, and repository-ref tracking during turns",
+        "CriticalPath": "Checkpoint capture and reference persistence are awaited where the turn lifecycle requires them; later lookup/deletion waits on the owning chat database and git cleanup as before.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostCheckpointService.ts",
+            "Operation": "Create/read/delete Git checkpoint refs across repositories",
+            "Cardinality": "Per deduplicated repository root involved in the checkpoint operation",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Checkpoint service already performed Git operations per relevant repository.",
+            "CriticalPathEffect": "Git checkpoint work remains on the capture/restore/cleanup path"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCheckpointService.ts and sessionDatabase.ts",
+            "Operation": "Read/write checkpoint refs in the owning chat storage and record checkpoint repositories",
+            "Cardinality": "Bounded database operations per checkpoint/chat, plus metadata update when repository roots change",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Checkpoint refs and metadata were routed through session storage rather than per-chat authoritative ownership.",
+            "CriticalPathEffect": "Awaited for durable checkpoint state"
+          }
+        ],
+        "ScalingInput": "Deduplicated repository roots used by a chat and checkpoints/turns operated on, not all sessions globally.",
+        "EffectiveConcurrency": "Database operations use their existing sequencers; git work is performed per deduplicated repository according to the checkpoint service's existing ordering rather than an unbounded burst.",
+        "CacheBehavior": "Checkpoint repository roots are persisted in chat metadata; warm central state avoids re-import, though capture still verifies/records repository metadata when needed.",
+        "MechanismConfidence": "High for boundary placement and effective repository cardinality.",
+        "MagnitudeUncertainty": "Repository count and Git duration vary by workspace; no changed code multiplies Git subprocesses beyond the same deduplicated roots.",
+        "Verdict": "No independent finding: per-checkpoint routing adds bounded database work, while the collection-scaling checkpoint migration issue is confined to first-open ownership classification and was reported."
+      },
+      {
+        "Scenario": "Idle residency release after opening many distinct sessions",
+        "CriticalPath": "Residency waits for session data and provider chat release, then synchronously removes state-manager/chat contribution state; the new session-state store is not evicted.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_releaseSession",
+            "Operation": "Release provider chat/session resources during residency eviction",
+            "Cardinality": "One release per session chat",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Provider resources were already released per chat during residency eviction.",
+            "CriticalPathEffect": "Awaited before in-memory eviction and unchanged by the new cache"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:evict/whenIdle",
+            "Operation": "Flush pending state mirrors before a store record can be forgotten",
+            "Cardinality": "At most one drain/flush for the evicted session",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no authoritative-state record needing a flush/forget.",
+            "CriticalPathEffect": "This boundary is not reached by normal residency eviction because the new evict method is not wired"
+          }
+        ],
+        "ScalingInput": "U distinct sessions opened over the lifetime of a long-running agent-host process, including sessions beyond the configured residency limit.",
+        "EffectiveConcurrency": "Residency reconciliation/release is coordinated by AgentSessionResidency; provider releases iterate chats, while the omitted store cleanup means no competing flush/forget is scheduled.",
+        "CacheBehavior": "Every restore inserts a warm `_records` entry. Explicit deletion and stale-external pruning can call store eviction, but normal idle residency release leaves entries warm forever with no capacity bound.",
+        "MechanismConfidence": "Very high: insertion, sole delete helper, explicit evict method, residency delegate, and AgentService eviction body were traced.",
+        "MagnitudeUncertainty": "Bytes retained per session depend on metadata/chat count, but growth with U rather than the residency limit is certain.",
+        "Verdict": "Finding reported: wire normal residency eviction to flush and forget the new authoritative-state cache."
+      },
+      {
+        "Scenario": "Permanent session deletion and durable data cleanup",
+        "CriticalPath": "Deletion drains peer/catalog/state writes, disposes provider chats, tombstones registration, deletes per-chat/session data and worktrees, then removes in-memory state.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_doDisposeSession and AgentHostSessionStateStore.beginDeletion",
+            "Operation": "Read catalog/state, drain and delete central rows, and delete per-chat/session databases",
+            "Cardinality": "Central operations are bounded per session; chat storage deletion scales with P",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Deletion removed legacy session/chat storage without central session-state rows.",
+            "CriticalPathEffect": "All are awaited before deletion completes"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_disposeSession",
+            "Operation": "Dispose provider chats/session backing",
+            "Cardinality": "One call per recorded chat",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Provider disposal already scaled with session chats.",
+            "CriticalPathEffect": "Awaited and ordered before durable host cleanup"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_deleteChatStorage/deleteSessionData and worktree services",
+            "Operation": "Delete chat/session data directories and additional worktrees",
+            "Cardinality": "Per chat plus W worktrees and R repository cleanups",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Session deletion already removed these durable resources.",
+            "CriticalPathEffect": "Awaited before deletion completes"
+          }
+        ],
+        "ScalingInput": "Number of recorded chats P, additional worktrees W, and deduplicated repository roots R.",
+        "EffectiveConcurrency": "Deletion is fenced and ordered; provider/chat and worktree cleanup loops are intentionally serialized, while drains prevent racing writes. No new unbounded concurrency was introduced.",
+        "CacheBehavior": "beginDeletion drains the loaded record, and its disposer calls `_forget`, so permanent deletion releases the new cache unlike idle eviction.",
+        "MechanismConfidence": "High: fences, drain points, loop cardinalities, and store cleanup were inspected.",
+        "MagnitudeUncertainty": "Deletion duration depends on provider, filesystem, and Git speed, but the diff does not newly increase their effective cardinality.",
+        "Verdict": "No finding: the new central-state cleanup is bounded per deletion and correctly forgets cached records; existing per-chat/worktree boundaries retain their prior scaling."
+      }
+    ],
+    "Summary": "Completed the performance pass over the 106-file diff. Reported three diff-caused regressions: peer×checkpoint SQLite probes on cold restore, per-peer immediate central/mirror write cycles during compatibility publication, and authoritative-state records surviving normal residency eviction. Listing, ordinary coalesced state writes, checkpoint capture, and deletion were traced without another high-confidence regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-14T23:35:57.889460467Z",
+    "CompletedAt": "2026-10-14T23:41:20.679968402Z",
+    "WallClockMilliseconds": 322790,
+    "ModelCalls": 27,
+    "InputTokens": 2309344,
+    "OutputTokens": 22057,
+    "TotalTokens": 2331401,
+    "ReasoningTokens": 7339,
+    "CacheReadTokens": 1966658,
+    "CacheWriteTokens": 241492,
+    "APIDurationMilliseconds": 284037,
+    "ToolCalls": 215,
+    "NanoAIUnits": 217312960000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1966658,
+      "cache_write": 241492,
+      "input": 101194,
+      "output": 22057
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

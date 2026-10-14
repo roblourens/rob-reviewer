@@ -1,0 +1,260 @@
+{
+  "PullRequest": {
+    "Number": 341640,
+    "Title": "Update Foundry Local SDK to 2.1.0",
+    "Body": "## Summary\n\n- update `foundry-local-sdk` and the packaged dictation runtime from 2.0.1 to 2.1.0\n- pick up upstream live-audio language forwarding fixes from microsoft/Foundry-Local#1064 and microsoft/Foundry-Local#1138\n- align dictation runtime packaging tests with ONNX Runtime 1.30.0 and ONNX Runtime GenAI 0.17.1\n\nSDK 2.0.1 exposed `session.settings.language` but dropped it in the live transcription adapter, while its native streaming path did not bind the request language to Nemotron's `lang_id`. SDK 2.1.0 fixes both layers and normalizes canonical language tags such as `es-US` before lookup.\n\n## Testing\n\n- `node --test build/lib/test/dictationRuntime.test.ts`\n- `npm run eslint -- build/lib/test/dictationRuntime.test.ts`\n- `cd build \u0026\u0026 npm run typecheck`\n- verified the installed 2.1.0 runtime layout and VS Code native-loader patch\n\nFixes #341152\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341640",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "meganrogge",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "27d8c30a5ff6672118a7d71bb86570b59590b21f",
+    "HeadRef": "fix/341152-foundry-language",
+    "HeadSHA": "4024b18cb0452a9b7e0199786148adedde58fc66",
+    "CreatedAt": "2026-10-14T21:06:47Z",
+    "UpdatedAt": "2026-10-14T21:14:24Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-65395CEAD29E",
+      "Focus": "performance-review",
+      "Path": "package.json",
+      "Side": "RIGHT",
+      "Line": 148,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The cache-key flow and absence of version eviction are explicit in repository code, and first-use reachability is confirmed through the local dictation start path. Exact compressed/uncompressed artifact sizes are not recorded in source, which affects magnitude but not the mechanism.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceResource": "versioned native-runtime bytes on disk and one replacement CDN transfer",
+      "PerformanceScaling": "Each foundry-local-sdk version used for on-device dictation creates another `\u003ccacheHome\u003e/chatDictationRuntime/\u003cversion\u003e` tree; because only staging and partial-download paths are removed, retained bytes grow linearly with SDK upgrades used on that profile.",
+      "PerformanceOutcome": "Persistent duplicate native-runtime storage and repeated full runtime download/write cost after upgrades, eventually increasing disk pressure and risking cache writes failing on constrained profiles.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "With the 2.0.1 pin, an already provisioned `\u003ccacheHome\u003e/chatDictationRuntime/2.0.1` was a verified cache hit and no new runtime directory or CDN transfer was needed.",
+      "ChangedBehavior": "The new 2.1.0 pin is read by `getRuntimeVersion()`, stamped into `product.dictationRuntime`, and passed to `ensureFoundryLocalRuntime`, which now provisions `\u003ccacheHome\u003e/chatDictationRuntime/2.1.0`; the existing 2.0.1 directory is left untouched.",
+      "CausalDiffEvidence": "Changing `foundry-local-sdk` from 2.0.1 to 2.1.0 at package.json:148 directly changes the versioned cache directory and makes the prior 2.0.1 payload unreachable from the updated product while leaving it retained.",
+      "Title": "Evict superseded dictation runtime versions",
+      "Impact": "A user who has used on-device dictation before upgrading pays a full native-runtime download/extraction on first use and permanently retains both the old and new ONNX/Foundry payloads. The same accumulation repeats on later SDK updates.",
+      "Evidence": "`build/dictation-runtime/common.ts:getRuntimeVersion` reads this exact dependency pin; `produce.ts` stamps it into the product; `LocalTranscriptionService` passes that version to `ensureFoundryLocalRuntime`; and `foundryLocalRuntime.ts` derives `overrideDir = join(cacheRoot, download.version)`. Repository-wide searches show removals only for staging/temp/partial target paths, with no cleanup of sibling version directories. The payload contains two N-API addons plus Foundry Local, ONNX Runtime, and ONNX Runtime GenAI shared libraries, so this is substantial retained data rather than metadata.",
+      "Recommendation": "When provisioning 2.1.0 succeeds, prune superseded sibling version directories under `chatDictationRuntime` with cross-process-safe, age-based retention (for example, keep the current and recently used version for rollback), rather than deleting only staging data."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "unbounded-retention",
+      "boundary-fanout",
+      "concurrency-burst",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First on-device dictation after updating from a build that provisioned Foundry Local 2.0.1",
+        "CriticalPath": "The renderer starts capture immediately, but first transcript/session readiness waits for utility-process IPC, `ensureFoundryLocalRuntime`, SDK import and manager creation, model catalog lookup/download if needed, and native model/session load. The changed runtime version makes provisioning a cache miss, so the CDN download, filesystem write, extraction, verification, and publish are on the critical path to transcription even though audio is buffered meanwhile.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/localTranscription/electron-browser/localTranscriptionService.ts:_getProxy/start",
+            "Operation": "Start and stream local transcription through a lazily created utility process",
+            "Cardinality": "One worker/channel per window on first local-transcription use, then one start call per dictation session",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical lazy utility-process boundary with SDK 2.0.1",
+            "CriticalPathEffect": "Worker creation and start dispatch precede local model/session readiness, though capture begins while preparation continues"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/localTranscription/node/foundryLocalRuntime.ts:downloadFile",
+            "Operation": "Download the platform-specific versioned native runtime tarball from the VS Code CDN",
+            "Cardinality": "One successful transfer per process racing on a cold profile/version/platform; zero on a warm 2.1.0 cache hit",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "An existing 2.0.1 cache was a hit and performed no runtime transfer; changing the key to 2.1.0 forces a replacement transfer",
+            "CriticalPathEffect": "Blocks SDK manager/session creation and therefore first transcript availability"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/localTranscription/node/foundryLocalRuntime.ts:downloadAndExtractTarball/provisionRuntime",
+            "Operation": "Write tarball, extract native libraries to staging, verify files, atomically publish, and write completion marker",
+            "Cardinality": "One full payload write/extraction per cold download, plus bounded existence checks for six or seven required files on every ensure",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A warm 2.0.1 profile only performed marker/file checks; 2.1.0 creates and writes a separate tree",
+            "CriticalPathEffect": "Cold extraction is on the path to manager creation; warm existence checks remain small and bounded"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/localTranscription/node/localTranscriptionService.ts:_ensureModel",
+            "Operation": "Query the Foundry model catalog and download the selected model on a model-cache miss",
+            "Cardinality": "One catalog lookup per service model load and at most one model download, coalesced by `_modelPromise`",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same model lookup/download behavior under SDK 2.0.1; the diff provides no evidence of changed request count",
+            "CriticalPathEffect": "Blocks native model/session readiness after runtime provisioning"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/localTranscription/node/foundryLocalRuntime.ts:versioned override directory",
+            "Operation": "Retain extracted Foundry Local, ONNX Runtime, and ONNX Runtime GenAI libraries under each SDK-version directory",
+            "Cardinality": "One complete platform payload retained for every SDK version first used by the profile",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the existing 2.0.1 payload was needed; this update adds 2.1.0 without evicting 2.0.1",
+            "CriticalPathEffect": "Retention is off the immediate critical path after provisioning but accumulates persistent disk pressure"
+          }
+        ],
+        "ScalingInput": "One native runtime payload for the current platform per SDK version and user profile; model work is one selected model. Concurrent windows can each initiate the same first-use payload download because coalescing is process-local.",
+        "EffectiveConcurrency": "Audio appends are serialized. Runtime provisioning coalesces to one promise per library path inside one utility process, but separate VS Code windows have separate utility processes and may download concurrently; a filesystem publish lock prevents conflicting final replacement, not duplicate transfers. NuGet/build concurrency is not involved at runtime.",
+        "CacheBehavior": "Before the diff, a previously provisioned 2.0.1 directory was a warm verified hit. The 2.1.0 pin changes both CDN and cache keys, producing a cold miss while retaining the 2.0.1 sibling indefinitely. Later 2.1.0 sessions verify the marker/files and are warm hits. In-process requests coalesce; cross-process requests download separately and only serialize final publication.",
+        "MechanismConfidence": "High: the changed manifest pin is explicitly the source of the stamped runtime version, the runtime joins that version into the cache path, and no sibling-version eviction exists.",
+        "MagnitudeUncertainty": "The repository does not record the compressed or extracted payload size, and not every user enables on-device dictation. The payload composition proves it is substantial native data, but exact disk and first-use latency vary by platform/network.",
+        "Verdict": "Reportable cache-lifecycle regression: this upgrade necessarily creates a new runtime cache entry for prior users but never retires the now-unreachable old entry, so retained native payload bytes grow with upgrades."
+      },
+      {
+        "Scenario": "Subsequent on-device dictation sessions on Foundry Local 2.1.0",
+        "CriticalPath": "Utility-process start, bounded cache verification, lazy SDK/manager initialization, model catalog/load, and session start remain on the path to transcript readiness; the native-runtime CDN transfer and extraction are off the path after the first successful provision.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/localTranscription/node/foundryLocalRuntime.ts:isRuntimeProvisioned",
+            "Operation": "Check the completion marker and required native library files",
+            "Cardinality": "A fixed seven-or-fewer existence checks per model ensure, with no collection-dependent fan-out",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same fixed checks occurred against the 2.0.1 directory",
+            "CriticalPathEffect": "Small bounded work before SDK manager creation"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/localTranscription/electron-browser/localTranscriptionService.ts",
+            "Operation": "Send start/audio/stop calls and transcription events across the utility-process channel",
+            "Cardinality": "One start and stop per session and one IPC call per audio chunk/result event",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged by the dependency pin",
+            "CriticalPathEffect": "Audio and result delivery use this existing boundary throughout the session"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/localTranscription/node/localTranscriptionService.ts:_ensureModel",
+            "Operation": "Catalog query and optional model download",
+            "Cardinality": "At most one lookup/load per selected model per utility-process lifetime; download only on a model-cache miss",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same call shape and coalescing with 2.0.1",
+            "CriticalPathEffect": "Model load remains on session-readiness path; warm model data avoids the large download"
+          }
+        ],
+        "ScalingInput": "One active singleton dictation session per renderer; audio chunks scale with recording duration and are serialized through one append chain. Runtime verification scales with a fixed required-file list.",
+        "EffectiveConcurrency": "One active session, serialized appends, one model preparation promise, and one in-process runtime provisioning promise. Separate windows remain independent utility processes.",
+        "CacheBehavior": "The 2.1.0 completion marker plus required files form a positive cache hit. The in-memory model promise coalesces same-model loads for the utility-process lifetime, and model files persist in their separate cache. No negative runtime cache is present, so failed provisioning retries on later starts as before.",
+        "MechanismConfidence": "High for the unchanged call path and bounded cache checks; insufficient evidence for any additional SDK-internal regression.",
+        "MagnitudeUncertainty": "Native execution cost may differ internally between opaque SDK versions, but the supplied diff and lockfile do not expose evidence of increased per-chunk CPU, allocations, or boundary calls.",
+        "Verdict": "No additional reportable regression: after the new cache is warm, cardinality, coalescing, IPC, and visible scheduling remain unchanged in the supplied code."
+      },
+      {
+        "Scenario": "Publish-build production of the per-platform dictation runtime",
+        "CriticalPath": "For each supported build target, the publish job copies SDK native files, sequentially downloads two pinned NuGet packages, extracts matching libraries, gzip-compresses the payload, hashes it, performs upload existence checking, and uploads when absent. Packaging then stamps the resulting 2.1.0 URL template.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/dictation-runtime/nuget.ts:fetchDependencyLibraries",
+            "Operation": "Resolve the authenticated NuGet service index and download ONNX Runtime plus ONNX Runtime GenAI packages",
+            "Cardinality": "One service-index request and two sequential package downloads per target build, subject to existing bounded retries",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two calls occurred for versions 1.28.0 and 0.15.2; only artifact versions change to 1.30.0 and 0.17.1",
+            "CriticalPathEffect": "All downloads and extraction must complete before tarball creation"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/dictation-runtime/package.ts:buildOne",
+            "Operation": "Copy native SDK files, extract NuGet libraries, gzip the tree, hash and stat the tarball",
+            "Cardinality": "One staging tree and one tarball per target job",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same operations and cardinality for the 2.0.1 payload",
+            "CriticalPathEffect": "Sequentially required before upload"
+          },
+          {
+            "Kind": "network",
+            "Location": "build/dictation-runtime/upload.ts:uploadOne",
+            "Operation": "Check and upload the versioned runtime tarball to CDN storage",
+            "Cardinality": "One HEAD decision and at most one upload per target/version",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "2.0.1 already addressed existing CDN objects; 2.1.0 requires a new object, as expected for changed native binaries",
+            "CriticalPathEffect": "Publish completion waits for the versioned artifact to exist"
+          }
+        ],
+        "ScalingInput": "Exactly one target per platform build job, two NuGet artifacts per target, and one tarball/CDN object per supported target and SDK version; five target jobs may operate independently in the pipeline.",
+        "EffectiveConcurrency": "The two NuGet artifacts are fetched sequentially inside each target build. Different platform jobs may run concurrently; there is no newly introduced per-item Promise fan-out.",
+        "CacheBehavior": "The NuGet service index is cached only within one `fetchDependencyLibraries` invocation. CDN upload uses HEAD-based idempotence for reruns. The version change intentionally selects a new CDN object and does not reuse 2.0.1 bytes.",
+        "MechanismConfidence": "High: source establishes exact boundary counts and sequential scheduling.",
+        "MagnitudeUncertainty": "The newer NuGet/package byte sizes are not present in the diff, so no claim about increased build duration or artifact size is supportable.",
+        "Verdict": "No separate reportable build regression: boundary cardinality and concurrency are unchanged, and producing one new versioned payload is required by the dependency update."
+      },
+      {
+        "Scenario": "Repository dependency installation and postinstall patching",
+        "CriticalPath": "Package installation fetches the new SDK tarball and runs its allowed install script; VS Code postinstall then reads and patches the SDK native loader in root and remote node_modules when present.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "package-lock.json:node_modules/foundry-local-sdk",
+            "Operation": "Fetch the pinned foundry-local-sdk 2.1.0 package during dependency installation",
+            "Cardinality": "One package fetch on npm cache miss",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same single package fetch targeted 2.0.1",
+            "CriticalPathEffect": "Required for dependency installation"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/npm/postinstall.ts:native loader patch loop",
+            "Operation": "Read, transform, and write up to two SDK native loader files",
+            "Cardinality": "At most root and remote copies; zero writes when already marked",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same bounded, marker-idempotent patching for 2.0.1",
+            "CriticalPathEffect": "Part of postinstall completion"
+          }
+        ],
+        "ScalingInput": "One pinned package tarball and at most two loader files per repository install.",
+        "EffectiveConcurrency": "Controlled by the existing package manager; VS Code's two patch targets are processed sequentially.",
+        "CacheBehavior": "npm's package cache may serve the 2.1.0 tarball after first fetch; the VS Code patch is marker-idempotent. The lockfile retains the same dependency set and install-script shape as 2.0.1.",
+        "MechanismConfidence": "High for repository-owned patching and lockfile dependency shape; low for opaque SDK-internal install work, which is therefore not reported.",
+        "MagnitudeUncertainty": "The external package's install-script internals and tarball byte delta are not exposed in the supplied repository diff, so an install-time regression cannot be established.",
+        "Verdict": "No reportable install-time performance regression is proven beyond the expected one-time fetch of a newly pinned package."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and traced runtime, build/publish, install, IPC, network, filesystem, cache, and concurrency paths. Submitted one medium-confidence-impact/high-mechanism-confidence cache-lifecycle finding for retained superseded native runtime versions; found no evidenced SDK-internal, warm-session, build-fanout, or install-time regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-14T23:41:29.765832518Z",
+    "CompletedAt": "2026-10-14T23:43:38.927826343Z",
+    "WallClockMilliseconds": 129161,
+    "ModelCalls": 10,
+    "InputTokens": 320095,
+    "OutputTokens": 7364,
+    "TotalTokens": 327459,
+    "ReasoningTokens": 2113,
+    "CacheReadTokens": 257024,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 114083,
+    "ToolCalls": 46,
+    "NanoAIUnits": 50237360000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 257024,
+      "cache_write": 0,
+      "input": 63071,
+      "output": 7364
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
