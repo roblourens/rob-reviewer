@@ -1,0 +1,181 @@
+{
+  "PullRequest": {
+    "Number": 341419,
+    "Title": "Experimental flags for search model and explore agent disablement",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nAdd scorecard flags for the search subagent model name and enabling/disabling explore agent for multi-arm flighting.\nTo test, build this branch and set the following variables in the settings.json:\n\n\n```json\n{\n  \"experiments.override.config.chat.copilot.searchSubagent.enabled\": true,\n  \"experiments.override.config.chat.copilot.searchSubagent.model\": \"any_capi_model_id\",\n  \"experiments.override.config.chat.copilot.exploreAgent.enabled\": false\n}\n```",
+    "URL": "https://github.com/microsoft/vscode/pull/341419",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "24anisha",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0a4d9f8b00105949cc1a1ef26175a69fcd18a5ec",
+    "HeadRef": "anisha/search_flags",
+    "HeadSHA": "fd2df5f990f376abfb50199c42cf939105fd8738",
+    "CreatedAt": "2026-10-13T22:51:25Z",
+    "UpdatedAt": "2026-10-14T00:45:39Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cleanup-lifecycle",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Workbench startup and agent-host root-config hydration",
+        "CriticalPath": "The contribution registers two additional setting forwarders and asynchronously reconciles them after the local agent-host schema is available. These pushes are not awaited by workbench startup or UI rendering. The agent already reads schema defaults, so forwarding the default empty model and enabled Explore value does not change the SDK startup configuration or restart an existing client.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostRootConfigForwarder.ts:_push",
+            "Operation": "Dispatch RootConfigChanged from the renderer/workbench to the local agent-host protocol",
+            "Cardinality": "At most two additional dispatches on a cold host for the two new keys; zero when the root state already contains structurally equal values.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same reconciliation existed for the prior key set; these two key dispatches did not exist.",
+            "CriticalPathEffect": "Off the workbench startup critical path because reconcile does not await the asynchronous pushes; constant agent-host processing follows each dispatch."
+          }
+        ],
+        "ScalingInput": "Constant: two new keys per local agent-host start or schema hydration, deduplicated by structural equality across windows.",
+        "EffectiveConcurrency": "Both key computations may run concurrently as microtasks; each dispatch is independent, and the root-state equality guard suppresses unchanged values. There is no collection-dependent concurrency.",
+        "CacheBehavior": "The root state is the authoritative cache. Warm/equal values cause no dispatch; on a cold host with absent values, each key is forwarded once. The schemaSeen set prevents repeated hydration pushes.",
+        "MechanismConfidence": "High: the forwarder, structural equality guard, and dispatch boundary are directly traced.",
+        "MagnitudeUncertainty": "Exact IPC duration is not measured, but the fixed cardinality and off-critical-path placement make material impact unlikely.",
+        "Verdict": "No reportable regression. The diff adds bounded, deduplicated constant work rather than hot-path or scaling fan-out."
+      },
+      {
+        "Scenario": "Changing the search-subagent model while a Copilot SDK client exists",
+        "CriticalPath": "A setting change forwards one root-config action. The agent detects the startup-baked model change, waits for active turns and subagents to finish, tears down the current SDK client, and lazily starts a replacement when SDK work is next requested. The next request can therefore pay the existing cold client-start path, including runtime resolution and subprocess start.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostCopilotCliSettingsContribution.ts:SearchSubagentModel descriptor",
+            "Operation": "Forward the changed model setting as RootConfigChanged",
+            "Cardinality": "One dispatch per distinct setting change after equality suppression.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no search-model key to forward.",
+            "CriticalPathEffect": "The dispatch itself is asynchronous; it schedules/defer-applies the restart."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_restartClientIfStartupConfigChanged/_applyPendingClientRestart/_ensureClientOnce",
+            "Operation": "Stop the existing stdio Copilot runtime and lazily start a replacement carrying SEARCH_SUBAGENT_MODEL",
+            "Cardinality": "At most one stop for a coalesced group of startup-config changes, followed by one lazy start when the client is next needed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Changing this newly introduced model setting could not restart the client; other pre-existing startup-baked settings already used the same restart path.",
+            "CriticalPathEffect": "Stop is deferred off active turns; the next SDK-dependent request may pay cold startup latency."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_ensureClientOnce",
+            "Operation": "Resolve bundled runtime and ripgrep paths during the subsequent existing cold SDK startup",
+            "Cardinality": "Once per replacement startup, with independent lookups run concurrently.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same work occurred on every pre-existing SDK client cold start and restart.",
+            "CriticalPathEffect": "On the next SDK-dependent request's cold-start path."
+          }
+        ],
+        "ScalingInput": "One restart request per distinct model value change. Multiple pending restart reasons are collected in a Set and applied together once all chats are idle; cost does not scale with open chats except for scanning live sessions to determine idleness and disposing resident entries once.",
+        "EffectiveConcurrency": "Restarts are serialized by _clientStarting/_clientStopping and deferred while work is active. Concurrent startup-config changes coalesce into one pending restart application rather than spawning multiple clients.",
+        "CacheBehavior": "No model cache is involved. Equal root values are suppressed by structural equality and equal startup snapshots return without restart. The model catalog is invalidated intentionally after an applied restart and refreshed once.",
+        "MechanismConfidence": "High: the new field is compared in CopilotAgentStartupConfig, and tests establish one stop per distinct model change. The operation is intentionally documented and coalesced.",
+        "MagnitudeUncertainty": "Runtime startup duration varies by platform and cache warmth, but the restart mechanism and lazy-start latency are certain.",
+        "Verdict": "No finding. A process restart is an intentional, bounded requirement for applying a subprocess environment variable; it is deferred past active work and coalesced rather than repeated on a hot path."
+      },
+      {
+        "Scenario": "Creating or resuming a Copilot session with Explore enabled or disabled",
+        "CriticalPath": "Session configuration construction now reads one boolean and includes a zero- or one-element excludedBuiltinAgents array before the existing SDK createSession/resumeSession call. The added read/allocation is constant and does not add an SDK call, filesystem operation, or network request.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_createSession/_resumeSession",
+            "Operation": "Existing SDK stdio createSession or resumeSession call carrying the session configuration",
+            "Cardinality": "One existing SDK call per session create or resume; excludedBuiltinAgents is serialized as part of that same call.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same create/resume call occurred without the constant-size excludedBuiltinAgents field.",
+            "CriticalPathEffect": "The existing call remains on the session launch/resume critical path, but the diff does not increase boundary-call count or payload with user-scaled data."
+          },
+          {
+            "Kind": "network",
+            "Location": "Copilot SDK runtime reached through CopilotSessionLauncher",
+            "Operation": "Potential runtime/CAPI activity associated with the existing session and later agent invocations",
+            "Cardinality": "No additional network operation is established by the changed host code; disabling Explore can only exclude a built-in agent, while enabling preserves the runtime default.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Explore was available according to the runtime default and existing session operations already crossed the SDK boundary.",
+            "CriticalPathEffect": "No newly introduced network boundary is placed on session launch by the diff."
+          }
+        ],
+        "ScalingInput": "One constant-size configuration value per session create or resume, independent of repository size, tool count, or history size.",
+        "EffectiveConcurrency": "Session creation/resumption retains its existing concurrency behavior. The diff adds no limiter, queue, fan-out, or parallel task.",
+        "CacheBehavior": "The current root configuration is read directly for every build; no cache is needed for a boolean and a constant-size array. Cold and warm session paths have the same added constant work.",
+        "MechanismConfidence": "High: the session config and SDK call sites are directly traced.",
+        "MagnitudeUncertainty": "The runtime's internal serialization cost is not measured, but the host adds only a constant-size array and no extra boundary call.",
+        "Verdict": "No reportable regression. The change modifies metadata on an existing boundary with constant payload and unchanged call cardinality."
+      },
+      {
+        "Scenario": "Invoking the search subagent with a configured model",
+        "CriticalPath": "When the separately controlled search tool is enabled and selected by the agent, the runtime reads SEARCH_SUBAGENT_MODEL to choose the CAPI model. This PR changes model selection, not the number or scheduling of search invocations from the host.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "Copilot runtime selected through SEARCH_SUBAGENT_MODEL from src/vs/platform/agentHost/node/copilot/copilotCliEnvironment.ts",
+            "Operation": "Existing runtime request(s) made when the search subagent is actually invoked",
+            "Cardinality": "No evidence of additional requests; only the model identifier on an existing optional subagent path changes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The runtime selected its default search-subagent model for the same invocation.",
+            "CriticalPathEffect": "Relevant only after the agent elects to invoke the optional search tool; model-specific latency is not established by this diff."
+          }
+        ],
+        "ScalingInput": "Search invocation count remains controlled by agent/tool use; the configured string is process-wide and does not grow with repository contents or session history.",
+        "EffectiveConcurrency": "No host-side concurrency behavior for search calls is added or changed by the diff.",
+        "CacheBehavior": "The environment value is fixed for the SDK client lifetime. Applying a different value uses the coalesced restart path; no per-search recomputation or retained-key cache is introduced.",
+        "MechanismConfidence": "High for environment propagation; low for any model-dependent latency claim, so no regression is inferred.",
+        "MagnitudeUncertainty": "Different models may have different latency, but no specific model is forced by default and the PR provides no code mechanism that increases request count or payload size.",
+        "Verdict": "No finding. Configurable model selection does not itself prove increased network work, latency, or fan-out."
+      }
+    ],
+    "Summary": "Reviewed all 10 changed files and traced configuration hydration, SDK restart, session launch/resume, environment construction, and optional search invocation. The diff adds two bounded root-config forwards, a coalesced intentional subprocess restart only when the model value changes, and constant-size session metadata. No high-confidence actionable performance regression was introduced."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-14T01:33:09.272960188Z",
+    "CompletedAt": "2026-10-14T01:34:46.537307622Z",
+    "WallClockMilliseconds": 97264,
+    "ModelCalls": 9,
+    "InputTokens": 322190,
+    "OutputTokens": 6300,
+    "TotalTokens": 328490,
+    "ReasoningTokens": 2044,
+    "CacheReadTokens": 264492,
+    "CacheWriteTokens": 57671,
+    "APIDurationMilliseconds": 82644,
+    "ToolCalls": 51,
+    "NanoAIUnits": 52025980000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 264492,
+      "cache_write": 57671,
+      "input": 27,
+      "output": 6300
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
