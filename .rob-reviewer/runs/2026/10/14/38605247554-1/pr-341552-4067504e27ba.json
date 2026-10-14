@@ -1,0 +1,208 @@
+{
+  "PullRequest": {
+    "Number": 341552,
+    "Title": "Support video and native context-menu media paste in Markdown",
+    "Body": "## Summary\n- Accept video/audio as well as image clipboard files; preserve native names, MIME types, and bytes through existing file/snippet infrastructure.\n- Consume native context-menu clipboard payloads without rereading the clipboard and report unsupported file-only formats explicitly.\n- Fix the webview host-menu focus race: restore the last connected focused input synchronously before native clipboard commands, without overriding an already focused input. Update the shell CSP hash.\n\nCompanion clipboard strategy: https://github.com/microsoft/vscode-packages/pull/363. Media support compiles against published editor types; complete context-menu behavior requires that package change to be published and adopted. Local file-linked development dependencies are deliberately excluded from this PR.\n\n## Validation\n- 10 focused Markdown media-paste extension tests and three native-media classification tests passed.\n- Three targeted webview shell tests passed, covering native command focus, disconnected/existing inputs, and CSP consistency.\n- Renderer type-check, extension compilation, webview bundle build, and targeted ESLint passed.\n- Actual Code OSS automated with dbgjs/CDP: keyboard image/video paste and actual context-menu Paste clicks insert correct image/video markup. The native command receives the editable Clipboard target rather than BODY; the proxy is cleaned up after insertion. Keyboard-pasted PNG/WebM SHA256 hashes match fixtures exactly.\n- Native clipboard payloads are controlled fixtures because terminal Win32 clipboard access is denied (error 5); physical OS clipboard file seeding remains unverified.\n\nThe first CI run's full ESLint process was killed with exit 137. Targeted lint passed; the focus follow-up starts a fresh CI run.",
+    "URL": "https://github.com/microsoft/vscode/pull/341552",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "hediet",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "51c6c26694e420939af9bbd1685e94f9905536d5",
+    "HeadRef": "hediet/markdown-media-paste",
+    "HeadSHA": "4067504e27bad71e7df14f30ea06e372a03ed184",
+    "CreatedAt": "2026-10-14T13:47:31Z",
+    "UpdatedAt": "2026-10-14T17:00:39Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-71F3BA994991",
+      "Focus": "performance-review",
+      "Path": "extensions/markdown-language-features/src/preview/markdownEditorMediaTransfer.ts",
+      "Side": "RIGHT",
+      "Line": 57,
+      "Severity": "high",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed allocation, newly accepted MIME types, materializeContents=true call path, and WorkspaceEdit retention are directly visible. Exact failure size varies by extension-host memory limits, but the linear unbounded mechanism and realistic large-video trigger are certain.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "A full-size Uint8Array for every pasted media file, retained in the WorkspaceEdit until it is applied, plus transient decoded chunk strings",
+      "PerformanceScaling": "Peak retained memory grows with the sum of all pasted file sizes because createEditForMediaFiles materializes files sequentially but keeps each completed Uint8Array in additionalEdits; a single realistic large video can consume hundreds of MiB.",
+      "PerformanceOutcome": "Large video/audio pastes can cause severe extension-host GC pressure or allocation failure/OOM before the workspace edit can write the files.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before the PR, clipboard filtering accepted images only, so video/audio files were not transferred or materialized in the extension host at all.",
+      "ChangedBehavior": "The PR newly accepts video/audio clipboard files and allocates `new Uint8Array(file.size)` for each without any per-file or aggregate bound.",
+      "CausalDiffEvidence": "RIGHT line 57 adds the unbounded full-file allocation used by the newly supported video/audio path; the PR also explicitly removes any additional file-size limit.",
+      "Title": "Bound media size before materializing the whole file",
+      "Impact": "Pasting a large native video or audio file into the Markdown editor now allocates the entire file in extension-host memory; multiple files accumulate until applyEdit, potentially freezing or crashing the extension host.",
+      "Evidence": "`getNativeClipboardMedia` now admits `video/` and `audio/`; `MarkdownEditorImagePaste` routes each accepted file to `readClipboardMediaContents`; this changed line eagerly allocates exactly `file.size` bytes. `createEditForMediaFiles(..., materializeContents=true)` awaits each `data()` and stores every result in one WorkspaceEdit, so completed arrays remain live. The added 25 MiB test explicitly documents no file-size cap, while native video files commonly exceed that by an order of magnitude.",
+      "Recommendation": "Validate both per-file and aggregate media size before allocating or requesting chunks, and reject oversized pastes with an actionable message; only remove that bound if the workspace-edit path can consume a file-backed/streaming source without retaining all bytes."
+    },
+    {
+      "ID": "PERF-1BE7247E7E1C",
+      "Focus": "performance-review",
+      "Path": "extensions/markdown-language-features/src/preview/markdownEditorMediaTransfer.ts",
+      "Side": "RIGHT",
+      "Line": 60,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The postMessage transport, sequential await, fixed chunk size, exact test cardinality, and critical-path applyEdit ordering are all explicit; only the per-hop duration varies by platform.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Authenticated webview postMessage request/response pairs carrying JSON/base64 chunks",
+      "PerformanceScaling": "The critical path performs sum(ceil(file.size / 256 KiB)) strictly sequential RPC requests across all pasted files; there is no cache, grouping, or overlap.",
+      "PerformanceOutcome": "Paste latency and IPC/serialization overhead increase linearly with media size, delaying both workspace file creation and markup insertion.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Image paste previously encoded each image once and sent all base64 data in the single `pasteImages` request, with no per-chunk reverse RPC round trips.",
+      "ChangedBehavior": "Each 256 KiB chunk is now awaited through `readClipboardMedia` before the next chunk is requested.",
+      "CausalDiffEvidence": "RIGHT line 60 introduces the awaited reverse-boundary call inside the 256 KiB loop, replacing the prior single-payload paste request.",
+      "Title": "Batch clipboard chunks to avoid sequential webview RPC fan-out",
+      "Impact": "A 25 MiB paste now waits for 101 sequential webview RPC round trips before applyEdit; even multi-megabyte images incur many extra process-boundary turns on the user-visible paste path.",
+      "Evidence": "The loop awaits `read` once per 256 KiB. The renderer callback resolves through MarkdownEditorRpcTransport, whose send envelope is `webview.postMessage`; the materialization loop in createEditForMediaFiles is also sequential. The added test asserts exactly 101 calls for 25 MiB and another test confirms peak request concurrency is 1.",
+      "Recommendation": "Keep cancellation and bounded transient memory, but transfer multiple chunks per RPC (or use a substantially larger bounded/adaptive chunk) so a normal large image/video requires a small bounded number of webview round trips rather than one per 256 KiB."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "serialization-allocation",
+      "cleanup-lifecycle",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Paste image, video, or audio into the Markdown custom editor using keyboard or native context menu",
+        "CriticalPath": "Clipboard classification and metadata collection precede the `pasteImages` host request. The extension host drains edits, resolves destination paths, materializes every file through chunk RPC, drains again, applies one WorkspaceEdit that creates files and inserts markup, then returns the caret; all chunk reads and file materialization are on the user-visible critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/markdown-language-features/markdown-editor-src/imagePasteController.ts:110",
+            "Operation": "Initial authenticated `pasteImages` metadata request and final response between webview and extension host",
+            "Cardinality": "One request/response pair per paste, carrying F metadata records.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Images already used one `pasteImages` request containing all base64 data; video/audio did not enter this path.",
+            "CriticalPathEffect": "Starts extension-host paste processing and must resolve before the editor can complete insertion."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/markdown-language-features/src/preview/markdownEditorMediaTransfer.ts:60",
+            "Operation": "Authenticated `readClipboardMedia` webview postMessage request and base64 response",
+            "Cardinality": "C strictly sequential request/response pairs; the added test establishes 101 for one 25 MiB file.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The prior image path sent all encoded bytes in the initial `pasteImages` request and made no reverse per-chunk RPC calls.",
+            "CriticalPathEffect": "Every pair must complete before file contents are available and before applyEdit can run."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/markdown-language-features/src/languageFeatures/copyFiles/dropOrPasteResource.ts:233-260",
+            "Operation": "Resolve collision-free destination paths and create media files through WorkspaceEdit",
+            "Cardinality": "Destination resolution and one create-file edit per accepted file, with additional collision probing dependent on existing names.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same operations existed for images; the diff newly routes video/audio files through them.",
+            "CriticalPathEffect": "Path resolution precedes snippet creation; the batched WorkspaceEdit must complete before paste returns."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "extensions/markdown-language-features/src/preview/markdownEditorMediaTransfer.ts:33-73",
+            "Operation": "Convert each File slice to base64 in the webview, validate/decode it in the extension host, and fill a full-file Uint8Array",
+            "Cardinality": "C base64 encode/decode operations and total byte-copy work linear in summed media size.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Images were encoded as one whole-file base64 payload and decoded once; video/audio were filtered out.",
+            "CriticalPathEffect": "Runs synchronously around each awaited chunk and must finish before the WorkspaceEdit is assembled."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is F pasted media files and C=sum(ceil(file.size / 256 KiB)) chunks after MIME filtering. No deduplication is performed beyond rejecting duplicate IDs; every accepted file is materialized once.",
+        "EffectiveConcurrency": "Chunk reads are strictly serial within each file, and `createEditForMediaFiles` materializes file entries in a sequential loop, so aggregate chunk concurrency is 1 even for multiple files. Destination-path discovery uses Promise.all across files, while WorkspaceEdit applies the resulting file creates as one edit.",
+        "CacheBehavior": "There is no byte or chunk cache and no request coalescing. Clipboard File handles live only for the current paste and are cleared on completion, replacement, or disposal. Cold and warm behavior are identical; cancellation/staleness prevents subsequent chunks but does not reduce a successful transfer.",
+        "MechanismConfidence": "High: fixed chunk size, serial awaits, postMessage transport, eager full-size allocation, sequential materialization, and apply ordering are all explicit in code and tests.",
+        "MagnitudeUncertainty": "Exact IPC latency and extension-host memory ceiling vary by platform and remote/local setup; file sizes and number of pasted files vary. The 25 MiB/101-call relationship is asserted by the PR's tests, and ordinary videos can be substantially larger.",
+        "Verdict": "Reportable: successful media paste introduces sequential boundary fan-out, and newly accepted video/audio can force unbounded retained allocation before filesystem application."
+      },
+      {
+        "Scenario": "Execute native copy, cut, or paste from a webview host context menu",
+        "CriticalPath": "The shell obtains the active frame; when focus has fallen to body/documentElement, it synchronously restores the last connected focused element with preventScroll, then immediately invokes `execCommand`. No asynchronous boundary is added.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One WeakMap lookup and at most one focus call per native clipboard command; focusin updates are one constant-time WeakMap write per focus transition.",
+        "EffectiveConcurrency": "Synchronous, one command at a time on the UI thread; no queue, fan-out, or background work.",
+        "CacheBehavior": "WeakMap stores at most one element per live content Document and entries are collectible with their Documents; there is no miss retry or persistent cache growth.",
+        "MechanismConfidence": "High for the constant-time mechanism and WeakMap lifecycle.",
+        "MagnitudeUncertainty": "Browser focus implementation cost varies, but the changed work is constant per command and uses preventScroll; no realistic scaling input or retained strong reference was found.",
+        "Verdict": "No reportable performance regression: the added synchronous work is bounded to native clipboard commands and does not create collection scaling, layout loops, or retention."
+      },
+      {
+        "Scenario": "Open and use a Markdown custom editor without pasting media",
+        "CriticalPath": "Editor setup stores the ImagePasteController reference and registers a renderer RPC handler. File slicing, base64 conversion, extension-host materialization, and filesystem work remain deferred until a media paste.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One controller reference and one handler per editor instance; no per-document-content or file-size scaling before paste.",
+        "EffectiveConcurrency": "No new asynchronous work is scheduled at startup; the handler executes only in response to extension-host chunk requests during an active paste.",
+        "CacheBehavior": "No media store exists until paste. A new paste disposes the prior store, and editor disposal clears the active store, so File handles are not retained across editor lifetime after completion.",
+        "MechanismConfidence": "High based on constructor/registration flow and media-store creation inside `#paste`.",
+        "MagnitudeUncertainty": "Editor instance count varies, but per-instance added startup work is constant and lazy.",
+        "Verdict": "No reportable startup or idle-memory regression; expensive work remains first-use lazy and cleanup ownership covers completion, replacement, and disposal."
+      },
+      {
+        "Scenario": "Run pull-request CI checks for Markdown editor manifests and clipboard transfer",
+        "CriticalPath": "The workflow now runs the existing manifest checks followed by one Node test-runner command covering two clipboard/media test files before Compile \u0026 Hygiene can begin.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": ".github/workflows/pr.yml:96",
+            "Operation": "Run `node --test` for clipboard and media-transfer tests",
+            "Cardinality": "One additional npm script/subprocess invocation per PR workflow run, executing two bounded test files.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "CI ran only the two manifest-related npm commands in this step.",
+            "CriticalPathEffect": "Adds bounded time to the manifest/clipboard workflow step before the Compile \u0026 Hygiene step."
+          }
+        ],
+        "ScalingInput": "A fixed two test files per CI run; one test allocates/transfers approximately 25 MiB and performs 101 in-process chunk calls.",
+        "EffectiveConcurrency": "The shell commands are sequential; Node's test runner owns test scheduling within the single added invocation.",
+        "CacheBehavior": "No product cache is involved. Dependency installation/cache behavior is unchanged by this workflow hunk apart from the package version update.",
+        "MechanismConfidence": "High for the added subprocess; low risk due to fixed cardinality.",
+        "MagnitudeUncertainty": "Exact CI duration depends on runner load, but the suite is fixed-size and the largest fixture is bounded.",
+        "Verdict": "No reportable performance regression: this is intentional bounded validation cost on CI rather than a product hot path."
+      }
+    ],
+    "Summary": "Reviewed all 18 changed files and traced Markdown media paste from browser clipboard through authenticated webview RPC, extension-host materialization, WorkspaceEdit application, and filesystem creation. Reported two diff-introduced regressions: unbounded whole-file retention for newly supported video/audio and one sequential webview RPC per 256 KiB. Also checked media-store disposal/cancellation, editor initialization, native-command focus restoration, and the added CI test command; no additional performance finding met the evidence threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-14T17:28:11.754033158Z",
+    "CompletedAt": "2026-10-14T17:30:06.904888011Z",
+    "WallClockMilliseconds": 115150,
+    "ModelCalls": 7,
+    "InputTokens": 208557,
+    "OutputTokens": 7188,
+    "TotalTokens": 215745,
+    "ReasoningTokens": 2633,
+    "CacheReadTokens": 164358,
+    "CacheWriteTokens": 44178,
+    "APIDurationMilliseconds": 97808,
+    "ToolCalls": 41,
+    "NanoAIUnits": 43047720000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 164358,
+      "cache_write": 44178,
+      "input": 21,
+      "output": 7188
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
