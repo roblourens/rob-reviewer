@@ -1,0 +1,177 @@
+{
+  "PullRequest": {
+    "Number": 341519,
+    "Title": "Add rebaseContinue git API",
+    "Body": "",
+    "URL": "https://github.com/microsoft/vscode/pull/341519",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexr00",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e07973c315092f913d34fd450b7d19b1e46b1287",
+    "HeadRef": "alexr00/brave-rhinoceros",
+    "HeadSHA": "8e58ca08bd13a9f31bad5a3625a2973ac55d3339",
+    "CreatedAt": "2026-10-14T10:48:19Z",
+    "UpdatedAt": "2026-10-14T10:52:37Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "An extension calls the new Repository.rebaseContinue API after resolving and staging a conflicted rebase.",
+        "CriticalPath": "ApiRepository.rebaseContinue delegates to Repository.rebaseContinue, which waits for one `git rebase --continue` subprocess and then the standard non-read-only repository model refresh before the promise resolves. This work is on the API call's critical path by design.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/git.ts:2152 Repository.rebaseContinue",
+            "Operation": "Executes `git rebase --continue` with GIT_EDITOR=true.",
+            "Cardinality": "Exactly one subprocess per API invocation; there is no loop or collection fan-out.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The low-level operation and internal commit-driven continue path already existed, but extensions had no direct public rebaseContinue entry point.",
+            "CriticalPathEffect": "Must complete before the rebaseContinue promise can resolve."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/repository.ts:2863 Repository.run / :3039 Repository._updateModelState",
+            "Operation": "Refreshes HEAD/branch information, status, and refs after the mutation; first use may also read the virtual-filesystem config.",
+            "Cardinality": "One standard refresh per invocation, with a bounded set of repository-wide Git commands; status and refs run in parallel after the initial state probes. Cardinality does not scale with conflict-file count at this layer.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "All existing non-read-only Repository.run operations, including the internal rebase-continue path, already performed the same refresh; only the public caller route is new.",
+            "CriticalPathEffect": "The API promise waits for the standard post-mutation refresh so exposed repository state is current."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/git/src/repository.ts:3039 Repository._updateModelState and :3287 Repository.getRebaseCommit",
+            "Operation": "Reads repository config/worktree metadata and probes REBASE_HEAD, rebase-apply, rebase-merge, MERGE_HEAD, and CHERRY_PICK_HEAD during model refresh.",
+            "Cardinality": "A bounded repository-wide set per refresh; the three rebase probes execute concurrently and do not scale with changed-file count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The refresh and probe count already existed; the diff only corrects the git-directory base path for linked worktrees and submodules.",
+            "CriticalPathEffect": "Runs in parallel with other initial state probes before status and refs are collected."
+          }
+        ],
+        "ScalingInput": "Number of explicit API invocations. Each invocation represents one logical rebase continuation and performs one continuation subprocess plus one existing repository-wide refresh; conflict-file count does not multiply boundary calls.",
+        "EffectiveConcurrency": "Within a refresh, independent state probes are intentionally parallel, followed by parallel status and refs reads. Repository operations are tracked but this method adds no loop, Promise.all fan-out, or new aggregate scheduler burst.",
+        "CacheBehavior": "Mutable Git state is refreshed rather than cached. The virtual-filesystem config probe is cached after first initialization; no new cache keys, negative-cache behavior, or cache retention is introduced.",
+        "MechanismConfidence": "High: the delegate, operation wrapper, subprocess call, and post-operation refresh are directly traced in the repository code.",
+        "MagnitudeUncertainty": "Git command duration depends on hooks, repository size, and the remaining rebase sequence, but those costs are inherent to the explicitly requested operation and existing refresh path.",
+        "Verdict": "No reportable regression. The new boundary is the single operation explicitly requested by the API caller, and the remaining work is the established bounded refresh with no changed fan-out or scheduling mechanism."
+      },
+      {
+        "Scenario": "Automatic or manual status refresh in a normal repository after file changes or Git operations.",
+        "CriticalPath": "Repository.status enters the existing throttled Repository.run path and refreshes model state. The changed marker probes remain part of the parallel initial-state phase before status and refs complete.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/git/src/repository.ts:3287 Repository.getRebaseCommit and :3308 state-marker helpers",
+            "Operation": "Per refresh, performs two existence checks and one REBASE_HEAD read plus MERGE_HEAD and CHERRY_PICK_HEAD existence checks.",
+            "Cardinality": "Five bounded marker probes per repository refresh, independent of file count; the rebase trio runs concurrently.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "For an ordinary non-bare repository, `\u003croot\u003e/.git` and `dotGit.path` identify the same directory, so both call count and target are unchanged.",
+            "CriticalPathEffect": "The probes are in the model-refresh critical path but overlap the HEAD, remotes, submodules, worktrees, template, and VFS probes."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/repository.ts:3039 Repository._updateModelState",
+            "Operation": "Runs the existing repository-wide Git status/refs and HEAD-related reads.",
+            "Cardinality": "A bounded set per throttled refresh; status processes the repository once rather than once per file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Unchanged by this pull request.",
+            "CriticalPathEffect": "Determines when updated SCM state is published."
+          }
+        ],
+        "ScalingInput": "Number of opened repositories and debounced/throttled refreshes, not number of files for the changed marker-path logic.",
+        "EffectiveConcurrency": "File-change refresh requests are debounced by 1 second and throttled with an additional 5-second wait; initial status across repositories uses the existing initial-status limiter. State probes within one repository are parallel.",
+        "CacheBehavior": "Marker state is intentionally read fresh because rebase/merge/cherry-pick state is mutable. No cache behavior changes for ordinary repositories.",
+        "MechanismConfidence": "High: both old and new path expressions resolve to the repository's `.git` directory in this scenario.",
+        "MagnitudeUncertainty": "Filesystem latency can vary, especially on remote filesystems, but the diff changes neither operation count nor paths for ordinary repositories.",
+        "Verdict": "No performance change for normal repositories."
+      },
+      {
+        "Scenario": "Status refresh for a linked worktree or submodule, including while a rebase is stopped on conflicts.",
+        "CriticalPath": "The standard refresh now probes the worktree/submodule-specific git directory. When REBASE_HEAD and a rebase state directory exist, getRebaseCommit additionally waits for one `git show -s` of the stopped commit so SCM state can expose rebaseCommit.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/git/src/repository.ts:3287 Repository.getRebaseCommit",
+            "Operation": "Probes rebase state in `repository.dotGit.path`, the per-worktree or submodule Git directory.",
+            "Cardinality": "Two existence checks and one small file read per refresh, in parallel; count is constant per repository.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same three probes existed but targeted `\u003croot\u003e/.git/...`, which is not the repository-specific Git directory for linked worktrees and can be a file. The diff changes their target, not their count.",
+            "CriticalPathEffect": "Correctly detects active rebase state during the initial parallel refresh phase."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/repository.ts:3299 Repository.getRebaseCommit -\u003e extensions/git/src/git.ts:3361 Repository.getCommit",
+            "Operation": "Runs one `git show -s` to obtain metadata for REBASE_HEAD when a linked-worktree or submodule rebase is active.",
+            "Cardinality": "At most one per refresh and only while valid rebase state is present; no per-conflict or per-commit fan-out.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The invalid old path caused linked-worktree/submodule rebase detection to return undefined, so this commit lookup was not reached in that case. Main repositories already performed it.",
+            "CriticalPathEffect": "Adds bounded latency to active-rebase refreshes in exchange for publishing the previously unavailable rebase commit state."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/git/src/repository.ts:3308 Repository.isMergeInProgress / :3313 Repository.isCherryPickInProgress",
+            "Operation": "Checks merge and cherry-pick marker files in the correct per-worktree/submodule Git directory.",
+            "Cardinality": "Two existence checks per refresh, constant per repository.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same checks existed at invalid `\u003croot\u003e/.git/...` paths for these repository kinds; only the target path changes.",
+            "CriticalPathEffect": "Runs in parallel with the other initial state probes."
+          }
+        ],
+        "ScalingInput": "Number of linked repositories being refreshed and refresh frequency. During an active rebase, each affected repository adds at most one commit-metadata subprocess per refresh, independent of conflict count and rebase history length.",
+        "EffectiveConcurrency": "Per-repository marker checks overlap through Promise.all; automatic refresh is debounced/throttled, and startup status uses the existing cross-repository limiter. No new per-item concurrency is introduced.",
+        "CacheBehavior": "No cache is used for active operation markers because they must reflect external Git changes. Cold and warm refreshes have the same bounded probes; commit metadata is read only after positive rebase-state detection.",
+        "MechanismConfidence": "High: the corrected dotGit path, positive-state branch, and single getCommit subprocess are explicit in the changed and surrounding code.",
+        "MagnitudeUncertainty": "A `git show -s` can vary with object storage and remote filesystem latency, but it is one bounded local Git read only during an active rebase. No evidence indicates a material latency regression relative to the required linked-worktree state reporting.",
+        "Verdict": "No reportable performance issue. The only newly reachable subprocess is bounded to one per active-rebase refresh and is necessary to provide the corrected rebase state; there is no multiplicative or unbounded mechanism."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and traced the new API, operation scheduler, Git subprocess, model refresh, status triggers, and worktree/submodule marker paths. No high-confidence actionable performance regression was introduced, and the pull request does not establish a shipped performance-regression fix requiring blame."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-14T12:26:37.528107167Z",
+    "CompletedAt": "2026-10-14T12:28:19.319243154Z",
+    "WallClockMilliseconds": 101791,
+    "ModelCalls": 11,
+    "InputTokens": 323681,
+    "OutputTokens": 6676,
+    "TotalTokens": 330357,
+    "ReasoningTokens": 2081,
+    "CacheReadTokens": 274817,
+    "CacheWriteTokens": 48831,
+    "APIDurationMilliseconds": 86389,
+    "ToolCalls": 65,
+    "NanoAIUnits": 48773380000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 274817,
+      "cache_write": 48831,
+      "input": 33,
+      "output": 6676
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
