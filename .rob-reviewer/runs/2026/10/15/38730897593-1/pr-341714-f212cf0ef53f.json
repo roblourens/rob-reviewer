@@ -1,0 +1,240 @@
+{
+  "PullRequest": {
+    "Number": 341714,
+    "Title": "agentHost: per-chat configuration (Block 3b)",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Summary\n\nBlock 3b of \"Move Chats\": **per-chat configuration**. In a session with several chats, changing approvals, mode, tool permissions, sandbox, Claude's permission mode, Codex's permission preset or Agent Merge's elevation in one chat now changes only that chat. Before, every chat of a session shared the session's values, so a change in one chat silently changed the others. This is also the groundwork for moving chats between sessions (a moved chat keeps its configuration); nothing moves between sessions in this PR.\n\nIt adopts the chat-level configuration of the Agent Host Protocol (microsoft/agent-host-protocol#527): `ChatState.config` (a chat's own overlay), `chatMutable` on session schema properties, and `chat/configChanged`.\n\n### Host\n- **Storage:** a chat's own values live in its own database under a new key (`agentHost.chatConfigValues`, tagged with the chat URI so a database copied for a fork is never read as the fork's own). The default chat's are in the session database under that separate key, so older builds keep reading `configValues` as the session's. Subagent chats store none.\n- **Effective chain:** a chat's effective value is its own value, then those of the chats that spawned it (recorded `Tool` origins, never the chat URI's shape), then the session's, then the host's. `IAgentConfigurationService` gains per-chat reads, updates and change events (the chat parameter is required everywhere); it replaces the URI-derived subagent chain.\n- **Publishing and validation:** the host publishes `ChatState.config` and validates `chat/configChanged`: a registered chat that is not a subagent, and only writable `chatMutable` properties.\n- **New chats:** a new chat (Cmd+T, a new peer) starts with the default chat's current effective values for the `chatMutable` properties: its own, else the session's. Read-only (host-reported) values and Agent Merge's elevation are not copied. Forks and side chats start with a copy of their source chat's own values. Both copies are written to the new chat's own database before creation resolves; subagents store none.\n- **Schemas:** `chatMutable` is set on approvals, mode, tool permissions, sandbox and the effective approval mode (Copilot), on Claude's permission mode, and on Codex's permission keys. Workspace properties stay session-level.\n- **Readers:** they use the chat's effective values:\n  - session permissions (\"Allow in this session\" applies to that chat);\n  - sandbox (the policy floor is per session; the applied state is per chat in the session's `_meta`, `vscode.sandboxState.chats[chat]`, with the top-level fields kept for older clients);\n  - Agent Merge (elevation per owning chat, matched on any of the chat's working directories; the folder lifecycle stays per session);\n  - Copilot, Claude and Codex readers and their SDK write-backs (which go to the chat);\n  - slash-command toggles;\n  - turn telemetry.\n- **Origin column:** `chats_v2` gains a host-only `origin_session_uri` column, written at chat creation (needed by Block 4).\n\n### Clients (Agents window and editor)\n- **Routing:** pickers read and write `chatMutable` properties on the chat's overlay and everything else on the session. A host without `chatMutable` properties behaves exactly as before.\n- **Loading state:** a chat's picker shows a resolving state until the chat's own values are known, instead of flipping from the session's value.\n- **Subagents:** a subagent shows the values of the chats that spawned it, and its writes change its nearest spawning chat that is not a subagent, as the host does.\n- **Subscriptions:**\n  - The active chat of a visible session keeps its config subscription.\n  - It only subscribes chats the session's catalog lists.\n  - A failed subscription falls back to the session's values and is retried once the session's catalog changes.\n- **Remembered defaults:** only the default chat's (or the new-session picker's) choices seed new sessions.\n\n## Decisions and known limitations\n\n- **D1, decided (seed):** a new non-fork chat starts from the default chat's current effective chat-settable values, as on `main` where a new chat followed the default chat through the session's values. Forks keep copying their source chat's. Tests cover Cmd+T after changing sandbox, approvals and mode in the default chat, a fork, and a new chat after a restart.\n- **Older clients (Q1):** an older client only knows `session/configChanged`, which keeps editing the session's values. Those reach every chat without its own value for the property; a chat with its own value (for example the default chat's own mode or approvals, once a newer client set them) keeps it, so the older client's change is shadowed in that chat. Pinned by a test on the real Copilot schema; documented in `src/vs/platform/agentHost/AGENTS.md` §3b.\n- **Main's managed sandbox bypass (#341671), merged per chat:**\n  - A client's sandbox `off` for a chat is kept while the policy allows bypass.\n  - A rejected selection is reported per chat (`rejectedSelection` in that chat's entry; the default chat's also at the top level) and survives the rollback until the chat's next selection.\n  - The `/sandbox … session` command path applies to the chat's runtime.\n- **Mixed writes (L10):** a patch touching both kinds of property is sent as two dispatches: `chat/configChanged` for the `chatMutable` part first, then `session/configChanged`. They are not atomic: if the second fails, the first stays applied. The halves are independent properties.\n- **Completions channel:** current clients send the session URI as `CompletionsParams.channel` (the protocol documents a chat URI). The host resolves the completing chat from recorded state (the channel if it is a registered chat, else the session's default chat), so in a peer chat the slash-command toggles follow the default chat's values. Sending the chat URI from the client would break older hosts' providers; a capability-gated client change is a possible follow-up.\n- **Downgrade:** older builds read only the session's `configValues`, so they lose per-chat values (accepted). The default chat's own values stay under a separate key and never overwrite the session's.\n- **Migration 17 (after #341721's 16):** this PR adds `agent-host.db` migration 17 (`chats_v2.origin_session_uri`, with an idempotent repair gate on open). #341721 (deferred worktree clean-up) merges first with migration 16 (its `pending_worktree_removals` table). The two compose:\n  - A database at 15 runs 16, then 17.\n  - Before this PR is rebased onto #341721, a database migrated by this branch alone (15 to 17) still gets #341721's table, because its repair on open re-creates it for any version from 16 up.\n  - A trial merge with #341721's branch, resolving the migration list in that order, passes typecheck and the `agent-host.db`, session state and worktree removal tests. Rebasing onto it once it merges resolves the same three files.\n- **Pre-existing, not changed here:**\n  - `setChangesets: unknown chat` warnings after a restart: the catalog refresh walks restored chats that are not loaded.\n  - A subagent chat spawned from a peer chat cannot be restored after a restart: the spawn edge is found only in hydrated chats. Its tab then logs `Resource not found`.\n\n## Testing\n\nUnit tests, mutation checks and the Agent Host E2E suite in strict replay cover each rule. A separate review chat did five passes, the last one ending with no high or medium findings. Separate chats checked perf (no listing regression, +0.5 ms startup) and live behaviour on a multi-chat session (approvals, mode and sandbox per chat; restart; fork; subagent; \"Allow in this session\"; editor).\n\nAll of the following ran on the final head, rebased onto `main`, with `COPILOT_*`, `AGENT_HOST_*` and `GITHUB_TOKEN` unset:\n\n| Command | Result |\n|---|---|\n| `npm run typecheck-client` | Passed (0 errors) |\n| `npm run eslint -- \u003c148 changed .ts files\u003e` | Passed |\n| `npm run valid-layers-check` | Passed |\n| `./scripts/test.sh --runGlob \"**/platform/agentHost/test/**/*.test.js\"` | 13,003 passing, 0 failing |\n| `./scripts/test.sh --runGlob \"**/sessions/**/*.test.js\"` | 6,881 passing, 0 failing |\n| `./scripts/test.sh --runGlob \"**/workbench/contrib/chat/test/browser/agentSessions/**/*.test.js\"` | 2,535 passing, 0 failing |\n| `npm run test-agent-host-e2e -- --jobs 2` (strict replay) | 950 passing, 0 failing (Copilot, Claude, Codex) |\n\nEarlier in development:\n- A slow-I/O sweep (injected delays in the SQLite primitives) ran over the agent-host unit tests.\n- `npm run smoketest-no-compile -- -g \"Agents Window\"` passed (5 tests).\n\nNot run on the final head:\n- The Agents window and Chat smoke tests.\n- Live Claude and Codex turns (the live check drove Copilot only).\n- Agent Merge elevation in a live session (covered by unit tests).\n- The downgrade round trip with an older build.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341714",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "640a33ebdea00ea726190677c98d5ee7b725243e",
+    "HeadRef": "agents/move-chats-per-chat-config-implementation",
+    "HeadSHA": "f212cf0ef53f355d808675812b34b6bc2ba460e4",
+    "CreatedAt": "2026-10-15T08:22:36Z",
+    "UpdatedAt": "2026-10-15T10:05:37Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-D2A5E847C5E6",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts",
+      "Side": "RIGHT",
+      "Line": 5686,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The insertion and all map deletion/clear sites are directly enumerated, and session removal is traced to omit this map. Failure prevalence affects severity, but retained reachability and lifetime are deterministic once the error path occurs.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "Retained backend chat keys and SessionState.chats catalog arrays",
+      "PerformanceScaling": "Each failed chat-state subscription inserts another entry keyed by backend chat and retains that session's full chats array; entries accumulate with distinct failed chats/sessions over the provider's lifetime until the entire connection is replaced.",
+      "PerformanceOutcome": "Unbounded retained memory in long-lived windows that encounter subscription failures across many chats or sessions.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "There was no failed per-chat configuration cache, so failed chat subscriptions could not retain catalog arrays after sessions were removed.",
+      "ChangedBehavior": "The new error handler stores the backend chat and current catalog in _failedChatConfigs, but successful session removal/list eviction only clears session state/config structures; this map is cleared only on a later retry caused by a changed catalog or when a new connection is attached.",
+      "CausalDiffEvidence": "Added line 5686 inserts every failed backend chat into the new _failedChatConfigs map, while the PR's session-removal paths do not delete corresponding entries.",
+      "Title": "Evict failed chat-config entries with their session",
+      "Impact": "Transient failures for chats that are subsequently closed or whose sessions are deleted leave their catalog arrays reachable indefinitely. Repeating this across sessions steadily grows provider memory until reconnect/reload.",
+      "Evidence": "The added onDidError path sets _failedChatConfigs at line 5686 and immediately disposes the subscription. Search shows deletion only when _keepChatConfigAlive observes a different catalog, plus a whole-map clear in _attachConnectionListeners. _removeSessionState deletes _lastSessionStates and all existing session subscription/config maps but never removes failed chat-config entries, so there is no session-lifecycle cleanup for this cache.",
+      "Recommendation": "Track failed entries by session (or store the session ID with each entry) and remove all of that session's failures from both authoritative-list eviction and _removeSessionState; also clear an entry when its chat disappears from a catalog."
+    },
+    {
+      "ID": "PERF-0C19ABE939C4",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/chatContributions/chatConfig/chatConfigContribution.ts",
+      "Side": "RIGHT",
+      "Line": 50,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed call, per-chat catalog loop, awaited critical path, SQLite metadata operation, and session-wide sequencer are all directly traced in repository code. Storage speed and typical catalog size affect magnitude, but not the linear added boundary cost.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "SQLite database metadata queries and database reference opens",
+      "PerformanceScaling": "Adds one awaited chat-database metadata read for every restored catalog chat; AgentService hydrates all peer chats before registering the catalog, and AgentHostChatRowStore routes each read through the session-wide runExclusive sequencer, so effective concurrency is one and latency grows linearly with chat count.",
+      "PerformanceOutcome": "Increased session restore and catalog-opening latency, especially for long-lived sessions with many peer chats or slower storage.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Catalog hydration already restored title/draft data, but did not query agentHost.chatConfigValues. A session with N peer chats therefore avoided these N additional metadata queries.",
+      "ChangedBehavior": "The new contribution awaits getChatConfig during every chat's eager onHydrateChat pass, before the restored chat catalog can be registered.",
+      "CausalDiffEvidence": "Added line 50 awaits this._sessionStateStore.chatRows.getChatConfig(...) in the eager per-chat hydration hook; no corresponding config metadata read existed before the PR.",
+      "Title": "Batch chat config into the existing hydration read",
+      "Impact": "Opening a session with a large chat catalog now waits for an additional serialized SQLite metadata lookup per chat. The repository's hydration tests exercise 100 peer chats, so this is a realistic linear critical-path cost rather than a single-chat micro-optimization.",
+      "Evidence": "AgentService._restorePeerChatsFromCatalog awaits Promise.all of hydrateChat for every catalog entry before registerRestoredChatSummary. This added line calls AgentHostChatRowStore.getChatConfig; _read opens/leases the chat database, runs getMetadata, and is wrapped by _runExclusive(session), which serializes all peer reads despite the outer Promise.all. The immediately preceding ChatDraftContribution already performs a row-store database read for the same chat, so config can be fetched in that existing lease rather than adding another boundary crossing.",
+      "Recommendation": "Extend the existing chat-row hydration/read used for drafts to return draft and config from one database lease/query batch (or prefetch config with the existing session-state load), while preserving per-chat ownership validation."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "cache-lifecycle",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Restore/open an existing multi-chat agent session and publish its chat catalog",
+        "CriticalPath": "The session cannot finish restoring and register peer chat summaries until AgentService._restorePeerChatsFromCatalog's Promise.all of hydrateChat calls completes. The new chat-config metadata read is therefore on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/chatConfig/chatConfigContribution.ts:45-50 via AgentHostChatRowStore.getChatConfig",
+            "Operation": "Read agentHost.chatConfigValues from each chat's SQLite database metadata",
+            "Cardinality": "One added metadata read for the default chat plus one for every restored peer chat; a repository test constructs 100 peers. Reads are not grouped with existing title/draft hydration.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Titles and drafts were hydrated, but agentHost.chatConfigValues was not read; these N additional metadata queries did not exist.",
+            "CriticalPathEffect": "All reads must finish before summaries are registered. AgentHostChatRowStore._read uses the per-session runExclusive sequencer, so the outer Promise.all does not provide database concurrency."
+          }
+        ],
+        "ScalingInput": "Number of restored chats in the session catalog after excluding tool chats; no deduplication because each chat has distinct storage/config identity.",
+        "EffectiveConcurrency": "Effective chat-row read concurrency is one per session due to runExclusive/SequencerByKey, despite Promise.all at the catalog layer.",
+        "CacheBehavior": "Warm SQLite/page caches may lower each query's duration, but every restore still performs the metadata lookup. Missing config is not negatively cached across restores.",
+        "MechanismConfidence": "High: changed call, database implementation, catalog multiplicity, and serialization are directly traced.",
+        "MagnitudeUncertainty": "Typical production chat counts and storage latency vary, but the added serialized linear I/O and critical-path placement are explicit.",
+        "Verdict": "Reportable boundary fan-out: batch config with the existing chat hydration database read."
+      },
+      {
+        "Scenario": "Keep the active chat's per-chat configuration live in visible Agents-window sessions",
+        "CriticalPath": "A visible session's picker resolves only after its active chat and any recorded spawning-chat ancestors have chat-state subscriptions. Once resolved, reads are in-memory and updates drive picker rendering.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_keepChatConfigAlive/_syncActiveChatConfigPins",
+            "Operation": "Subscribe to Chat state for the active backend chat and each chat in its config ancestry",
+            "Cardinality": "Normally one subscription per visible active chat; a subagent adds one per unique ancestry member. Connection reference counting shares an already-open subscription.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only session-state configuration was subscribed; no per-chat state subscription was needed.",
+            "CriticalPathEffect": "Cold subscription snapshots gate chatMutable picker resolution; warm pinned subscriptions are off the interaction critical path."
+          }
+        ],
+        "ScalingInput": "Count of visible sessions times effective unique active-chat ancestry depth, not total catalog size.",
+        "EffectiveConcurrency": "Subscriptions for visible sessions may be acquired together by the autorun; the connection handles them independently with no new explicit global limiter, but cardinality is bounded by visible sessions and ancestry.",
+        "CacheBehavior": "Successful subscriptions are pinned while visible and otherwise released after SESSION_STATE_SUBSCRIPTION_IDLE_MS. Failed subscriptions are negative-cached until the catalog identity changes, but the negative cache lacks session cleanup and retains catalog arrays.",
+        "MechanismConfidence": "High: all insertion, retry deletion, connection clear, idle disposal, and session-removal paths were inspected.",
+        "MagnitudeUncertainty": "Subscription failures are environment-dependent; retention after a failure is deterministic and accumulates until reconnect.",
+        "Verdict": "Subscription fan-out is intentionally bounded for successful paths, but failed entries create a reportable unbounded-retention lifecycle bug."
+      },
+      {
+        "Scenario": "Change approvals, mode, permissions, or sandbox for one chat",
+        "CriticalPath": "The client dispatches chat/configChanged for chatMutable properties; host validation/reduction and broadcast are synchronous, runtime listeners update only the matching/effectively dependent chats, and persistence runs in the background except initial chat creation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/applyAgentHostSessionConfig.ts:dispatchAgentHostConfigChange and protocolServerHandler.ts",
+            "Operation": "Dispatch and broadcast chat/configChanged",
+            "Cardinality": "One IPC action for a single-property picker write; a mixed patch can produce one chat and one session action.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same picker change used session/configChanged, affecting the session rather than a chat.",
+            "CriticalPathEffect": "Required to reconcile UI/runtime state; not multiplied by all catalog chats at the transport boundary."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/chatConfig/chatConfigContribution.ts:onDidDispatchAction",
+            "Operation": "Persist the chat's full own-config values to chat metadata",
+            "Cardinality": "One background SQLite metadata write per accepted chat config action, sequenced per owning session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only session config persistence existed; there was no per-chat config metadata write.",
+            "CriticalPathEffect": "Off the immediate picker critical path because the promise is not awaited; initial chat seed persistence is awaited separately before creation resolves."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionSandbox.ts and copilotAgentSession.ts",
+            "Operation": "Apply Copilot sandbox/permission changes through SDK runtime RPC when relevant",
+            "Cardinality": "One matching live runtime per affected chat event; session changes fan out in-process only to chats that do not override the key.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Provider runtime updates already occurred for session-level changes; the diff reroutes them to chat-effective events.",
+            "CriticalPathEffect": "Sandbox selection waits for the matching runtime operation; unrelated chats' listeners filter by chat and do not issue RPC."
+          }
+        ],
+        "ScalingInput": "Number of registered chats affected by inherited session changes and number of active matching runtimes; direct chat writes normally affect one chat plus descendants.",
+        "EffectiveConcurrency": "State-event fan-out is synchronous in process. Persistence is serialized per session. Provider runtime updates use their existing runtime sequencing; no aggregate per-chat boundary burst was proven for ordinary direct writes.",
+        "CacheBehavior": "Effective chat values are cached by input object identity and invalidated through state replacement/unregistration. Persistence has no write coalescing, but setting changes are low-frequency user/runtime events.",
+        "MechanismConfidence": "High for routing and cardinality; lower magnitude for CPU fan-out, so no additional finding.",
+        "MagnitudeUncertainty": "Sessions with very deep subagent ancestry or many registered chats increase in-process fan-out, but no realistic hot event frequency established a separate reportable regression.",
+        "Verdict": "No additional reportable regression beyond the restore I/O and failed-subscription retention findings."
+      },
+      {
+        "Scenario": "Create, fork, or open a new peer chat",
+        "CriticalPath": "Before creation resolves, a non-empty initial per-chat config seed is persisted; then the chat is registered and published. Forks/side chats copy source own values; ordinary peers copy effective chatMutable defaults.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:5928-5936 via AgentHostChatRowStore.setChatConfig",
+            "Operation": "Write initial chat config metadata to the new chat's database",
+            "Cardinality": "At most one added write per created non-subagent chat with non-empty seeded values.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No per-chat config seed was persisted because configuration was session-level.",
+            "CriticalPathEffect": "Awaited before chat creation resolves to preserve durability and publication ordering."
+          }
+        ],
+        "ScalingInput": "One operation per user-created chat, independent of existing catalog size after in-memory seed calculation.",
+        "EffectiveConcurrency": "Creation is already queued by the per-session chat catalog mutation sequencer; writes for concurrent creations are serialized consistently.",
+        "CacheBehavior": "No cache is used; empty seeds skip the write. Fork/source values are read from the in-memory effective-config cache.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Single SQLite metadata write latency varies by storage, but cardinality is bounded and required for the new durability semantics.",
+        "Verdict": "No finding: bounded one-per-creation I/O with explicit durability ordering."
+      },
+      {
+        "Scenario": "Start or resume a Copilot, Claude, or Codex turn with per-chat configuration",
+        "CriticalPath": "Turn startup reads effective config in memory, then follows the providers' existing SDK/network/subprocess launch path. The diff changes the value source from session to chat without adding a boundary read.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts, claude/claudeAgentSession.ts, codex/codexAgent.ts",
+            "Operation": "Provider runtime/session launch or resume",
+            "Cardinality": "One existing provider runtime operation per started/resumed turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider operation ran using session-effective configuration.",
+            "CriticalPathEffect": "Remains on turn startup; the diff only computes chat-effective values before the existing call."
+          }
+        ],
+        "ScalingInput": "Turns and active provider sessions, unchanged by the diff.",
+        "EffectiveConcurrency": "Provider-specific existing runtime controls remain in place; no new Promise fan-out or process burst was introduced.",
+        "CacheBehavior": "Chat-effective config is cached by session/config-layer object identities; repeated turn reads reuse the same object until a relevant config layer changes.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Provider operation duration is external, but the diff does not increase its count.",
+        "Verdict": "No reportable performance regression."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 134 changed files, with deep tracing of restore persistence, client subscriptions, config event fan-out, provider runtime updates, chat creation, and turn startup. Submitted two findings: serialized per-chat restore I/O and missing cleanup for failed chat-config subscription cache entries."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-15T12:13:14.022651464Z",
+    "CompletedAt": "2026-10-15T12:15:29.58783612Z",
+    "WallClockMilliseconds": 135565,
+    "ModelCalls": 13,
+    "InputTokens": 1170638,
+    "OutputTokens": 9379,
+    "TotalTokens": 1180017,
+    "ReasoningTokens": 2521,
+    "CacheReadTokens": 1029452,
+    "CacheWriteTokens": 141147,
+    "APIDurationMilliseconds": 117213,
+    "ToolCalls": 90,
+    "NanoAIUnits": 130525180000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1029452,
+      "cache_write": 141147,
+      "input": 39,
+      "output": 9379
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
