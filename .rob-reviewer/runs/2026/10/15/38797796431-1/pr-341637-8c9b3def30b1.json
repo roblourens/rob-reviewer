@@ -1,0 +1,130 @@
+{
+  "PullRequest": {
+    "Number": 341637,
+    "Title": "Remove wall-clock throttle from PromptInputModel sync",
+    "Body": "Resolves: https://github.com/microsoft/vscode/issues/339672\n\n- Remove `@throttle(0)` from [`PromptInputModel._sync`](https://github.com/microsoft/vscode/blob/f770144247addc066b9e5cb34fa96f4a5fe74ae6/src/vs/platform/terminal/common/capabilities/commandDetection/promptInputModel.ts#L273-L280), so each xterm write, cursor move, or data event syncs the model immediately.\n- [`throttle`](https://github.com/microsoft/vscode/blob/f770144247addc066b9e5cb34fa96f4a5fe74ae6/src/vs/base/common/decorators.ts#L113-L126) compares against `Date.now()`, which moves backwards when the system clock is adjusted. On Windows, Chromium also [periodically resyncs its wall clock to the system time](https://github.com/chromium/chromium/blob/fcfd8f37188d64b88c6cb509009d8fc78a736eda/base/time/time_win.cc#L205-L219). After a backwards step, `throttle(0)` deferred the sync until the wall clock caught up, leaving the model on its previous value.\n- That is the flaky Fish ghost text failure: the test asserts after a single `timeout(0)`, so a deferred sync left it reading `find . -name|`. Outside tests, the prompt input model stalled for as long as the clock moved back.\n- Keep normal behavior unchanged: on a non-decreasing clock `throttle(0)` never defers, because the next allowed run time is the last run time.\n- Leave the shared `throttle` decorator as it is.\n- Add a test that moves only `Date` back between two writes.\n\nTesting:\n\n- Bundled this branch's `promptInputModel.test.ts` and `decorators.test.ts` and ran them in Node with the repo's mocha 10.8.2 and sinon 12.0.1: 50 passing, 1 pending. With main's `PromptInputModel`, the new test fails with `'foo|' !== 'foo bar|'`.\n- Replaying the Fish ghost text test with `Date.now()` stepped back 5 ms or 16 ms between the second and third writes reproduced the CI failure 199/200 times on main and 0/200 times on this branch.\n\n-----------------------------------------\nInspirations from:\n\n- Faking only `Date` with `useFakeTimers({ now, toFake: ['Date'] })` follows [`codexSkuTelemetry.test.ts`](https://github.com/microsoft/vscode/blob/f770144247addc066b9e5cb34fa96f4a5fe74ae6/src/vs/platform/agentHost/test/node/codex/codexSkuTelemetry.test.ts#L447).\n- The test shape follows the neighboring [`should clear value when command finishes`](https://github.com/microsoft/vscode/blob/f770144247addc066b9e5cb34fa96f4a5fe74ae6/src/vs/platform/terminal/test/common/capabilities/commandDetection/promptInputModel.test.ts#L147-L160) test.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341637",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "anthonykim1",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "4151cab3426363841bb813f768795b2d614502f0",
+    "HeadRef": "anthonykim1/monotonic-throttle",
+    "HeadSHA": "8c9b3def30b1a746f21d376db348f4d442825a37",
+    "CreatedAt": "2026-10-14T20:59:57Z",
+    "UpdatedAt": "2026-10-15T18:52:16Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "missing-coalescing",
+      "synchronous-ui-work",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Typing, editing, or receiving echoed input at a shell prompt with command detection active",
+        "CriticalPath": "Each xterm onData/onCursorMove/onWriteParsed event synchronously enters PromptInputModel._sync, scans the relevant local xterm buffer lines and cells, and emits onDidChangeInput only when value/cursor/ghost text changed. This scan must complete before prompt-model consumers observe the new state; asynchronous completion-provider results are downstream and not required for the model update itself.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/terminal/common/capabilities/commandDetection/promptInputModel.ts:120-124 PromptInputModel constructor subscriptions",
+            "Operation": "Terminal process output/input is delivered through the existing pty/xterm pipeline and surfaces as parsed write, cursor, and data events.",
+            "Cardinality": "One or more local xterm events per pty write/input chunk; Event.any does not itself coalesce them, while unchanged reconstructed state suppresses downstream model-change events.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same xterm events and pty boundary drove _sync before the diff. With a nondecreasing clock, throttle(0) invoked _sync immediately on every event, including multiple events in the same millisecond.",
+            "CriticalPathEffect": "The upstream pty delivery precedes the synchronous local model scan; no new IPC call is made by _sync."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/terminalContrib/suggest/browser/terminalSuggestAddon.ts:522 _sync -\u003e terminalCompletionService.ts:136 provideCompletions",
+            "Operation": "When terminal suggestions are enabled and a prompt change meets quick-suggestion or trigger-character rules, enabled completion providers may be invoked, including extension-host providers.",
+            "Cardinality": "At most one request initiated by each effective prompt-state change, fan-out across enabled providers; duplicate xterm events with unchanged model state do not request completions, and newer requests cancel the prior token.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same prompt changes initiated the same provider requests before the diff whenever the wall clock was nondecreasing; the removed zero-delay throttle provided no normal-path batching.",
+            "CriticalPathEffect": "Provider work is asynchronous and off the prompt-model update critical path, though request initiation occurs from the synchronous change listener."
+          }
+        ],
+        "ScalingInput": "CPU work scales with the number and width of command lines between the command-start marker and cursor, visible rows below the cursor, and cells inspected for ghost text. Event frequency follows xterm write/cursor/data events, but duplicate triggers that produce identical state do not fan out onDidChangeInput.",
+        "EffectiveConcurrency": "Buffer reconstruction and local listeners run synchronously and serially on the renderer/UI thread. Optional completion providers fan out asynchronously across enabled providers; a newer request cancels the prior token, although provider implementations determine how promptly cancellation stops boundary work.",
+        "CacheBehavior": "There is no cache for buffer reconstruction. State comparison suppresses downstream events for unchanged results. Completion requests keep current prompt state and cancel the prior token; no new cache behavior is introduced.",
+        "MechanismConfidence": "High. The decorator implementation compares lastRun + 0 with Date.now using \u003c=, so every call runs immediately for equal or increasing timestamps. The removed wrapper only changes behavior after a backward wall-clock step.",
+        "MagnitudeUncertainty": "Exact command length, row count, xterm event multiplicity, and enabled completion-provider count vary, but the before/after call cardinality is established for normal clocks: it is unchanged.",
+        "Verdict": "No reportable regression. The synchronous scan is a pre-existing hot-path cost, and removing throttle(0) does not increase its normal-path frequency or downstream fan-out."
+      },
+      {
+        "Scenario": "Continuing to type or receive prompt updates after the system wall clock moves backward",
+        "CriticalPath": "The changed code immediately performs the same synchronous xterm-buffer reconstruction and state notification used during ordinary input. Before the diff, throttle(0) scheduled a timer for the wall-clock gap and suppressed subsequent calls behind its pending flag, so prompt-model progress waited for the clock to catch up.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/terminal/common/capabilities/commandDetection/promptInputModel.ts:120-124",
+            "Operation": "Existing pty/xterm events deliver shell echo and parsed terminal writes that trigger local prompt reconstruction.",
+            "Cardinality": "One or more trigger events per write/input chunk; during clock rollback the diff restores immediate handling for each event, while unchanged-state checks bound downstream notifications to effective state changes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "After a backward clock step, the first call created a timer for the rollback gap and the pending flag suppressed subsequent sync calls. This was the stale-model failure the change removes; outside rollback, behavior was already immediate per event.",
+            "CriticalPathEffect": "The local synchronous scan now runs before each affected event returns instead of being deferred until the wall clock catches up."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/terminalContrib/suggest/browser/terminalSuggestAddon.ts:522 -\u003e terminalCompletionService.ts:194 provider.provideCompletions",
+            "Operation": "A restored prompt-state change can conditionally initiate existing terminal completion providers, including extension-host providers.",
+            "Cardinality": "Conditional on suggest settings and input shape; one request per effective model change can fan out across enabled providers, with prior request tokens canceled on replacement.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "During the erroneous rollback stall these requests were likewise delayed because no current prompt-state event was emitted; under ordinary clocks the same requests already occurred at the same effective input cadence.",
+            "CriticalPathEffect": "Request initiation follows model notification, while provider completion is asynchronous and not required for prompt-model progress."
+          }
+        ],
+        "ScalingInput": "During the rollback interval, work now scales normally with effective xterm input changes and command/viewport size rather than collapsing all changes into one delayed scan. Downstream model-change events occur only for distinct reconstructed states.",
+        "EffectiveConcurrency": "Model scans remain synchronous and serialized. Optional completion requests can overlap only according to existing provider cancellation behavior; the diff restores the same scheduling used before and after the rollback interval under ordinary clock progression.",
+        "CacheBehavior": "No buffer cache is added or removed. State equality still suppresses duplicate notifications. Optional suggestion requests retain their existing cancellation behavior; there is no new persistent or negative cache.",
+        "MechanismConfidence": "High. The decorator's pending branch and wall-clock arithmetic directly explain the rollback-only difference, and the new test exercises that path.",
+        "MagnitudeUncertainty": "Backward clock adjustments are uncommon and their duration varies. High-throughput writes while the model remains in PromptInputState.Input could perform more immediate CPU work than the stalled pre-diff state, but this is restoration of established normal behavior rather than a new multiplicity or unbounded mechanism.",
+        "Verdict": "No reportable performance regression. The extra rollback-interval work is required to eliminate a correctness-only stale-model stall and matches the existing non-rollback scheduling; retaining the accidental suppression would reintroduce the bug."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and traced prompt synchronization through xterm events, buffer reconstruction, UI listeners, and optional completion-provider boundaries. No high-confidence diff-introduced performance issue was found. The removed zero-delay wall-clock throttle was not a coalescer on normal clocks; it only suppressed work after backward clock movement. The PR fixes stale state rather than a qualifying shipped performance regression, so no regression-fix record was submitted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-15T20:04:22.234260363Z",
+    "CompletedAt": "2026-10-15T20:06:09.582814799Z",
+    "WallClockMilliseconds": 107348,
+    "ModelCalls": 10,
+    "InputTokens": 314102,
+    "OutputTokens": 5796,
+    "TotalTokens": 319898,
+    "ReasoningTokens": 2267,
+    "CacheReadTokens": 261264,
+    "CacheWriteTokens": 52808,
+    "APIDurationMilliseconds": 87320,
+    "ToolCalls": 43,
+    "NanoAIUnits": 48458560000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 261264,
+      "cache_write": 52808,
+      "input": 30,
+      "output": 5796
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
