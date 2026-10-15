@@ -1,0 +1,164 @@
+{
+  "PullRequest": {
+    "Number": 160946,
+    "Title": "Compress streams in notebook outputs",
+    "Body": "Fixes https://github.com/microsoft/vscode/issues/161023",
+    "URL": "https://github.com/microsoft/vscode/pull/160946",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "DonJayamanne",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "4322170fd89b442f9d24d3b43e8e1ec48707a4b4",
+    "HeadRef": "donjayamanne/nbOutputHandling",
+    "HeadSHA": "42522fdedbd9343ab26610bc52e98422a2028f9b",
+    "CreatedAt": "2022-09-14T23:02:04Z",
+    "UpdatedAt": "2022-11-25T23:24:40Z",
+    "MergedAt": "2022-10-11T21:43:47Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-6952AE3EA43B",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/api/common/extHostNotebookDocument.ts",
+      "Side": "RIGHT",
+      "Line": 132,
+      "Severity": "high",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The append call path, per-update execution despite IPC batching, duplicate main/extension-host invocation, and full-buffer allocation in VSBuffer.concat are explicit in the repository. Exact output sizes vary by kernel, but long streams with many appendOutputItems calls are a normal notebook workload; that uncertainty affects prevalence, not the quadratic mechanism.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "cumulative stream bytes copied, scanned, decoded, and transient contiguous buffers allocated in both the main process and extension host",
+      "PerformanceScaling": "For k appended chunks of size s, each invocation combines the previous cumulative buffer with the new chunk, so total copying/scanning is s*(1+...+k), or O(k²*s), rather than O(k*s). The 10 ms collector only batches IPC: each update is still converted to a separate edit and applied sequentially.",
+      "PerformanceOutcome": "increased execution-output latency, synchronous main-thread/extension-host CPU usage, and allocation/GC pressure that can make notebooks with long-running verbose output progressively stall",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Output-item updates appended their new item references in the notebook model and extension-host mirror. Stream concatenation happened only at consumption boundaries such as rendering or ipynb serialization, so a hidden/background output append did not copy all prior bytes in both model mirrors.",
+      "ChangedBehavior": "Every all-stream output-item event now groups the existing items and calls compressOutputItemStreams. Since the preceding event already replaced history with one contiguous item, the next event concatenates that entire accumulated buffer again. The main-thread model independently does the same at notebookCellTextModel.ts:318 before forwarding the event to this extension-host path.",
+      "CausalDiffEvidence": "The added call `const compressed = notebookCommon.compressOutputItemStreams(mimeOutputs.get(mime)!);` at line 132 replaces the accumulated extension-host items after every append; the same PR adds the equivalent hot-path call at notebookCellTextModel.ts:318. Before these additions both paths only pushed the new item references.",
+      "Title": "Avoid rebuilding the complete stream on every append",
+      "Impact": "A realistic kernel that emits thousands of stdout/stderr updates (logs, training progress, build output) performs progressively larger synchronous copies on each update in two processes; large cells can freeze output processing and drive heavy GC even when the cell is collapsed or has no active renderer.",
+      "Evidence": "NotebookCellExecutionTask batches calls for 10 ms but sends every update; CellExecution.update maps each update to an edit, and NotebookTextModel applies each OutputItems edit synchronously. The main model invokes the new compressor at notebookCellTextModel.ts:318, emits the original append event, and ExtHostNotebookDocument invokes it again here. compressOutputItemStreams uses VSBuffer.concat, whose implementation allocates totalLength bytes and copies every input, then formatStreamText scans the resulting cumulative buffer for backspace and carriage-return bytes (and may decode it).",
+      "Recommendation": "Keep stream chunks in an internal incremental representation and compact only at a bounded consumer/flush boundary (render, serialize, or execution completion), or use an amortized-growth buffer while applying control-character state incrementally. At minimum coalesce all append updates before one compaction and avoid recompressing independently in both model mirrors."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A kernel repeatedly appends stdout/stderr while a notebook cell executes",
+        "CriticalPath": "The kernel extension calls appendOutputItems; after the 10 ms collector flush, extension-host-to-main IPC must complete, then the main thread synchronously applies every OutputItems edit and now compacts the cumulative stream before the model event can finish. Main-to-extension-host document-change IPC then updates the API mirror, which compacts the same cumulative stream again before extension listeners receive the change.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostNotebookKernels.ts:455 and src/vs/workbench/api/browser/mainThreadNotebookKernels.ts:269",
+            "Operation": "Send collected cell execution updates from extension host to main thread",
+            "Cardinality": "Approximately one IPC per active execution per collector flush, carrying all updates accumulated for about 10 ms; each carried update remains a distinct edit.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC and batching existed, but applying each append pushed item references instead of copying all prior stream bytes.",
+            "CriticalPathEffect": "The main model cannot apply/render the updates until this existing IPC arrives; the new cumulative compaction then runs synchronously after arrival."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadNotebookDocuments.ts:109 and src/vs/workbench/api/common/extHostNotebookDocument.ts:256",
+            "Operation": "Forward notebook OutputItem model changes from main thread back to the extension-host notebook document mirror",
+            "Cardinality": "One model change per applied OutputItems edit; a collector batch with n appends produces n forwarded changes rather than one coalesced stream update.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The boundary and event count existed, but the extension-host mirror only appended the newly transferred item references.",
+            "CriticalPathEffect": "Extension API change delivery waits for the mirror update; the diff adds a second cumulative compaction on this path."
+          }
+        ],
+        "ScalingInput": "The effective cardinality is the number of appendOutputItems updates, not merely IPC batches: a batch containing n updates is mapped to n edits and each is applied separately. With k chunks and B final bytes, cumulative bytes copied/scanned are proportional to the sum of all intermediate stream sizes (O(k*B), or O(k²*s) for equal chunks). Concurrent executing cells each run this mechanism; there is no global limiter, though each execution has its own 10 ms collector.",
+        "EffectiveConcurrency": "Calls for one execution are collected for roughly 10 ms and sent in one IPC payload, but updates within that payload are processed synchronously and serially without coalescing. Different cell executions can flush independently and aggregate work on the single main/extension-host event loops.",
+        "CacheBehavior": "There is no cache. Every append consumes the prior contiguous result and creates a new one; warm history makes each later update more expensive. Empty/failure caching is not applicable.",
+        "MechanismConfidence": "High: the collector, edit mapping, synchronous model apply, both new compressor calls, and VSBuffer.concat full allocation/copy are directly traced.",
+        "MagnitudeUncertainty": "Chunk count and size depend on the kernel, but verbose logs and progress output plausibly produce thousands of appends. The exact stall threshold is environment-dependent; the quadratic byte-copy mechanism and duplicate process-local work are certain.",
+        "Verdict": "Reportable high-severity repeated-work regression: cumulative stream history is synchronously rebuilt for every logical append in both main and extension-host processes."
+      },
+      {
+        "Scenario": "A visible cell renders or updates streamed output in the notebook webview",
+        "CriticalPath": "After the same synchronous main-model append/compaction, output rendering selects the already-compacted first buffer and sends render content to the notebook webview. Rendering remains downstream of model update; for visible output, the PR largely moves the old concatenation from the renderer into the model but also makes compaction unconditional and duplicates it in the extension host.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/notebook/browser/view/renderers/backLayerWebView.ts:1276",
+            "Operation": "Send output creation/update content, including valueBytes, to the notebook webview",
+            "Cardinality": "Existing render/update cadence, typically once for each output change that reaches a visible renderer; hidden/collapsed outputs may avoid this boundary.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The renderer concatenated stream items when preparing visible content. The diff reads the first pre-compacted item instead, moving that work earlier and making it occur even without a renderer.",
+            "CriticalPathEffect": "Visible output waits for model compaction before webview delivery. The diff removes renderer-side stream concatenation, so this boundary itself is not newly fanned out."
+          }
+        ],
+        "ScalingInput": "Stream byte length and append-event count control cost. The renderer now receives one item per stream MIME, but the model has already paid cumulative-copy cost per append. Output visibility can reduce downstream webview work but does not suppress the new model/mirror compactions.",
+        "EffectiveConcurrency": "Model edits and render preparation are synchronous on the main thread; webview messages follow model events. Multiple visible cells serialize main-thread preparation, while extension-host mirror processing runs on its separate event loop.",
+        "CacheBehavior": "The output cache/webview inset lifecycle is pre-existing. The changed code does not add a cache; each append replaces the model's contiguous buffer, so previous compaction cannot be reused without copying.",
+        "MechanismConfidence": "High for the changed render preparation and upstream compaction; medium for exact per-event webview message frequency because visibility/cache controls it.",
+        "MagnitudeUncertainty": "The exact webview update suppression behavior varies with visibility and editor state. This does not weaken the unconditional upstream model and extension-host repeated work; it only means visible rendering may offset one old renderer-side concatenation.",
+        "Verdict": "The renderer change alone is not separately reportable because it removes an old concatenation, but it does not offset the unconditional repeated compaction for collapsed, hidden, or background outputs or the new extension-host copy."
+      },
+      {
+        "Scenario": "Save a notebook with stream outputs through the ipynb serializer",
+        "CriticalPath": "The ipynb serializer converts each stream output to text before the existing notebook-save filesystem write. The changed serializer decodes each stdout/stderr item and joins line fragments; because live model updates now compact each MIME, common live outputs arrive with low item cardinality.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/ipynb/src/serializers.ts (serializer save path downstream of convertStreamOutput)",
+            "Operation": "Persist serialized ipynb notebook data",
+            "Cardinality": "One existing notebook write per save, with one conversion per stream output; the diff does not add writes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Save used a serializer-local stream compressor before decoding; it still performed one conversion and the same eventual notebook write.",
+            "CriticalPathEffect": "Stream conversion remains before the save write. The changed conversion alters in-memory decoding/line assembly but does not introduce an additional filesystem boundary."
+          }
+        ],
+        "ScalingInput": "Final stream bytes and number of persisted output items determine synchronous serialization work. For already-compacted live output this is linear in final bytes; imported/mixed output may contain multiple items, still decoded once each during save.",
+        "EffectiveConcurrency": "Serialization is synchronous within the save request before the existing filesystem write; outputs/cells are processed according to the existing serializer flow. No new parallel fan-out or limiter is introduced.",
+        "CacheBehavior": "No serialization cache is present. Cold and warm saves both reconvert output; the diff neither adds nor invalidates a cache.",
+        "MechanismConfidence": "High that no new filesystem/network/subprocess fan-out is introduced; high that conversion remains linear per save.",
+        "MagnitudeUncertainty": "Exact notebook size and serializer caller implementation are outside the changed hunk, but there is no evidence of added I/O or collection-wide repeated conversion in this path.",
+        "Verdict": "No separate performance finding: the serializer change does not establish increased boundary count or superlinear save work."
+      }
+    ],
+    "Summary": "Completed the performance pass over all nine changed files and all diff pages. One high-confidence regression was submitted: per-append full-history stream compaction creates quadratic copying/scanning and GC pressure in both main and extension-host models. Rendering and save paths were traced; their IPC/filesystem boundaries are pre-existing and do not add separate reportable regressions."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "/responses"
+    ],
+    "StartedAt": "2026-10-15T23:09:41.130331292Z",
+    "CompletedAt": "2026-10-15T23:17:11.699647797Z",
+    "WallClockMilliseconds": 450569,
+    "ModelCalls": 11,
+    "InputTokens": 334848,
+    "OutputTokens": 8402,
+    "TotalTokens": 343250,
+    "ReasoningTokens": 3727,
+    "CacheReadTokens": 292864,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 135809,
+    "ToolCalls": 55,
+    "NanoAIUnits": 45312160000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 292864,
+      "cache_write": 0,
+      "input": 41984,
+      "output": 8402
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
