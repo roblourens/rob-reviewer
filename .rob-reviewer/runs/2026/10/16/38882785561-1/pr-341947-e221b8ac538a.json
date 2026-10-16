@@ -1,0 +1,198 @@
+{
+  "PullRequest": {
+    "Number": 341947,
+    "Title": "Agent Host: add optional sandbox trusted CA management",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nFixes #341946\r\n\r\n## Why this PR is needed\r\n\r\nSome tools inside an Agent Host sandbox use the host operating system's certificate trust store rather than the per-process CA bundle supplied by the Copilot credential proxy. When that proxy's CA is not trusted, these tools can encounter certificate failures without a discoverable VS Code workflow explaining the problem or identifying the correct host to configure.\r\n\r\nThe CLI/runtime already owns the CA lifecycle. This PR brings that capability into VS Code by reusing the installed SDK APIs, rather than duplicating certificate generation, platform trust-store commands, or manual certificate-file deletion. The operation must target the agent host owning the selected chat: installing a certificate on the client computer is not a substitute for configuring a remote host.\r\n\r\n**This is optional sandbox credential-proxy CA trust, not a required sandbox dependency, general corporate-CA management, or a TLS-verification bypass.** Checks and missing trust do not block chat startup or sending. Opening a chat never installs, rotates, or removes a certificate. Existing sandbox policy enforcement is unchanged.\r\n\r\nRelated: #337535 covers guided installation of required sandbox prerequisites. This change deliberately keeps optional CA compatibility guidance separate from that warning.\r\n\r\n## User experience\r\n\r\n- Show a dismissible informational notice in the focused eligible chat: **Sandbox trusted CA is not installed**.\r\n- The description is **Some tools running in this session's sandbox may need a trusted certificate on the agent host. Install**, with Install as a keyboard-accessible inline link.\r\n- Required dependency warnings retain priority; missing CA trust does not add a Disable Sandboxing action.\r\n- Add one Command Palette entry: **Sandbox: Manage Trusted CA** → **Install / Rotate / Remove**. Individual operation IDs remain registered but are not separate palette entries.\r\n- Capture the last-focused chat before opening the picker. Focus changes during selection/confirmation cannot redirect an operation to another chat or host.\r\n- Keep management available after notice dismissal.\r\n- Use brief host-naming confirmations, operation progress, a duplicate-invocation guard, and explicit failure dialogs.\r\n- Show **No agent host detected.** when the command has no applicable connection/live controller.\r\n- Document the notice, picker, keyboard controls, cancellation, and operation consequences in Chat Accessibility Help.\r\n- Preserve AI-disabled visibility through the existing Agent Host enablement context and entitlement checks. No new setting or enterprise policy is introduced.\r\n\r\n### What the operations do\r\n\r\n| Operation | SDK behavior and success criteria |\r\n| --- | --- |\r\n| Install | Recheck the runtime/configuration. A compatible installed CA is a no-op. Otherwise create and trust the CA, or rotate an incompatible CA before trusting it. Require an installed, compatible result. |\r\n| Rotate | Explicitly replace the installed CA/private key. If rotation leaves the replacement untrusted, follow with trust. Require an installed, compatible result. The UI requires an installed CA. |\r\n| Remove | Call `proxyCa.remove()` with **no arguments**. Require a `notInstalled` result. Remove OS trust only; retain the stored CA and private key. |\r\n\r\nRunning tools can retain the previous CA until restarted. Removal can affect tools relying on OS trust. The SDK has no stored-CA delete/purge operation, and this PR does not delete those files.\r\n\r\n## Architecture\r\n\r\n```mermaid\r\nflowchart TD\r\n    UI[\"Renderer: notice / Manage Trusted CA\"] --\u003e Consent[\"Capture chat + host, confirm, revalidate runtime scope\"]\r\n    Consent --\u003e Local[\"LocalAgentHostService → Management IPC\"]\r\n    Consent --\u003e Remote[\"Remote AHP client → negotiated VS Code extension request\"]\r\n    Local --\u003e Host[\"Agent host service → owning provider → live chat\"]\r\n    Remote --\u003e Host\r\n    Host --\u003e SDK[\"Copilot SDK client → separate Copilot runtime\"]\r\n    SDK --\u003e CA[\"SDK-owned CA and host OS trust store\"]\r\n    SDK --\u003e Checks[\"Cached asynchronous certificate diagnostics\"]\r\n    Checks --\u003e Meta[\"Session metadata / SessionMetaChanged\"]\r\n    Meta --\u003e UI\r\n```\r\n\r\n### Background status and caching\r\n\r\n- The provider owns the CA coordinator. An existing session's diagnostics starts the check without awaiting it in startup or message sending; checks never start an SDK runtime.\r\n- A weak map keyed by the runtime's `proxyCa` RPC object shares in-flight/completed reads. Cache keys include `auth.git`, `auth.gh`, and credentials, not differing filesystem roots.\r\n- Each SDK read has a five-second timeout. Failures are logged and cached as explicit `error` observations rather than causing retry storms or masquerading as missing trust.\r\n- Disabled/irrelevant chats omit certificate metadata. Generation/disposal guards prevent late results from overwriting newer state; ownership is resolved after the asynchronous read.\r\n- Optional versioned `_meta['vscode.sandboxCertificate']` carries per-chat observations keyed by the exact advertised chat URI: `scopeId`, `state`, `canInstall`, `requiresRotation`, and optional detail.\r\n- Initial snapshots and ordinary `SessionMetaChanged` updates deliver status through the existing subscription path. No additional polling transport is introduced.\r\n\r\n### Why local IPC and remote AHP differ\r\n\r\nThe local desktop host runs with `allowExtensionMethods: false` for host-control extensions. Routing local certificate changes through those AHP requests would fail or require weakening that boundary. Local changes therefore use the existing trusted Management IPC channel.\r\n\r\nRemote hosts opt in independently to:\r\n\r\n| Request | Capability |\r\n| --- | --- |\r\n| `vscode/installSandboxCertificate` | `vscode.sandboxCertificate.install` |\r\n| `vscode/rotateSandboxCertificate` | `vscode.sandboxCertificate.rotate` |\r\n| `vscode/removeSandboxCertificate` | `vscode.sandboxCertificate.remove` |\r\n\r\nThese are VS Code-specific host-control extensions, not standard AHP operations or Marketplace extension APIs. Requests validate `{ chat, scopeId }`; capability values must be explicitly `true`. Installation support never implies rotation/removal support. Existing host-control/relay restrictions and chat ownership checks remain intact, and opaque host-advertised identities are preserved.\r\n\r\n### Mutation safety and refresh\r\n\r\n- Serialize mutations per runtime; keep the queue held while the SDK/OS operation is active.\r\n- Do not apply the short read timeout to trust-store mutations, which can involve OS authorization.\r\n- Revalidate connection identity, advertised chat URI, and runtime scope after user confirmation; reject stale targets rather than silently restoring/starting a different runtime.\r\n- Invalidate cached status/support before and after operations, including failures. Refresh all live chats after each mutation attempt.\r\n- Validate returned SDK state instead of treating an RPC resolution as proof of success.\r\n- Render internally authored localized guidance; do not turn SDK detail text into trusted command markdown.\r\n\r\n## Testing\r\n\r\nFinal validation used Windows and the declared SDK `1.0.23-preview.1` (including its matching platform runtime package), refreshed with `npm run install-fast` after the upstream merge. The manifest declares Copilot runtime `1.0.99-1`. The CA feature introduces no dependency changes relative to `main`.\r\n\r\n**3,123 tests passed, 17 pending** after merging `origin/main` at `e1d1376d342` and refreshing dependencies, running the complete 11 relevant test files without a name filter:\r\n\r\n```powershell\r\n.\\scripts\\test.bat --run src\\vs\\platform\\agentHost\\test\\common\\agentSandboxCertificate.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\copilotSandboxCertificate.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\copilotSandboxCertificateDiagnostics.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\copilotSandboxDiagnostics.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\copilotAgentSession.test.ts --run src\\vs\\platform\\agentHost\\test\\electron-browser\\agentHostProtocolClient.test.ts --run src\\vs\\platform\\agentHost\\test\\electron-browser\\localAgentHostService.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\agentService.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\protocolServerHandler.test.ts --run src\\vs\\workbench\\contrib\\chat\\test\\browser\\agentSessions\\agentHostSandboxNotification.test.ts --run src\\vs\\workbench\\contrib\\chat\\test\\browser\\accessibility\\chatAccessibilityHelp.test.ts --reporter dot\r\n```\r\n\r\nAdditional post-merge validation:\r\n\r\n| Command | Result |\r\n| --- | --- |\r\n| `npm run install-fast` | Passed on retry after the author closed Code OSS dev windows holding a native runtime file lock. No manifest/lockfile edits beyond upstream changes. |\r\n| `npm run typecheck-client` | Passed. |\r\n| `npm run transpile-client` | Passed; refreshed all client output after the upstream merge. |\r\n| `git diff --cached --check` | Passed. |\r\n| `git commit` → configured `npm run -s precommit` hygiene hook | Passed on all three commits: 29 feature files, 411 checked files for the first upstream merge, and 312 for the newer upstream merge. All commits have good signatures; no signing or verification hooks were bypassed. |\r\n\r\nTargeted ESLint passed for all 29 TypeScript files in the PR delta after conflict resolution:\r\n\r\n```powershell\r\n$files = @(git diff --name-only origin/main -- '*.ts') | ForEach-Object { $_.Replace('/', '\\') }\r\nnpm run eslint -- $files\r\n```\r\n\r\nThe final full-file run supersedes earlier overlapping runs. The old installed SDK initially caused type errors when newer upstream code began using `imageGeneration` and `toolUsage`; refreshing to the declared SDK resolved those errors without compatibility casts or source changes. The first dependency refresh hit a Windows file lock in Copilot extension postinstall; the complete retry succeeded after the author closed the dev windows.\r\n\r\nCoverage includes shared caches/timeouts, asynchronous publication, metadata validation, opaque chat identities, independent capabilities, local Management IPC, protocol request validation, ownership, SDK arguments/outcomes, serialization, stale scopes, cancellation/disposal/disconnection, command registration, the unified picker, informational priority, keyboard-accessible links, and help content.\r\n\r\nTwo supporting test adjustments are included: use Windows directory junctions for the existing unauthenticated config-discovery path-escape tests (preserving denial assertions), and scope an on-device-model \"Manage\" absence assertion to that model's help paragraph so the new CA command does not invalidate unrelated help coverage.\r\n\r\n## Demo\r\n\r\n**Recorded locally; attachment pending author upload**, as requested. Drag `sandbox-trusted-ca-demo-verified.webm` into this PR's description or a comment.\r\n\r\nThe 20-second recording shows the real **Code OSS Dev 1.143.0** workbench on **Windows**, using an isolated authenticated profile and an empty demo workspace. It was captured at feature commit `74c3d0c6cc8`, before upstream synchronization; the recorded notice/picker/confirmation implementation was unchanged by conflict resolution:\r\n\r\n1. Missing-CA notice with the final wording and inline Install link.\r\n2. Install confirmation naming the **Local** host; Escape cancels.\r\n3. **Sandbox: Manage Trusted CA** showing Install, Rotate, and Remove.\r\n4. Remove confirmation explicitly retaining the stored certificate/private key; Escape cancels.\r\n5. Notice dismissal followed by reopening the management picker; Escape cancels.\r\n\r\nAll five steps were checked against DOM text/state, not merely screenshots. **No certificate mutation was confirmed.** Rotation confirmation requires an installed CA and was not exercised. The final video is uncaptioned: standalone FFmpeg/FFprobe were unavailable, and Playwright's chapter overlay was blocked by the workbench's TrustedHTML policy. The successful final recording uses the bundled recorder without weakening that policy.\r\n\r\n## Manual validation / remaining work\r\n\r\n1. Start a Copilot agent-host chat with sandboxing enabled and a credential configuration the SDK considers CA-relevant.\r\n2. Verify missing, installable trust produces the optional notice without blocking a response; required dependency warnings still take priority.\r\n3. Open management via Ctrl+Shift+P. Check keyboard selection/cancellation, host identity in confirmation, and continued availability after notice dismissal.\r\n4. On a disposable test host, approve Install, then Rotate, then Remove; verify actual OS trust state and that removal retains the certificate/private key. Restart dependent tools where needed.\r\n5. Repeat with a supported remote host; verify changes affect that host, not the client machine.\r\n6. Check absent independent capabilities, stale runtime scope, disconnects during confirmation, and disabled AI.\r\n\r\nActual OS authorization, successful live trust-store mutation, remote end-to-end flows, macOS/Linux execution, and full integration/smoke suites were **not** exercised. This draft does not claim those are validated.\r\n\r\n## Upstream synchronization\r\n\r\nMerged `origin/main` at `8de137e15f1` in signed merge commit `c0231abd26a98849878a9a5a996a04cb1bae7d9b`. Main advanced during validation, so the branch also merges `e1d1376d3424a7ad2562665c8436ae663de5bd52` in signed commit `45a796f427cc0bf012628c1240e67e962b5cd75f`. Rebuilt, refreshed dependencies with author approval, type-checked, linted, and ran the full test selection above against the final merged sources.\r\n\r\nResolved three conflicts while preserving both sides' behavior:\r\n\r\n- Initialization metadata retains the independent sandbox CA capabilities in the authorized non-relay branch alongside upstream AHP log-directory metadata.\r\n- The Copilot session test helper retains both upstream managed-settings injection and the CA RPC fake.\r\n- Chat Accessibility Help retains both the new CA test and upstream managed/read-only model-option coverage.\r\n- The follow-up initialization conflict preserves upstream chat-move capability advertisement as well as the independent CA capabilities.\r\n\r\nNo upstream manifest changes were reverted. Remote/platform trust-store validation and CI remain separate from the successful local checks.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341947",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dileepyavan",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e1d1376d3424a7ad2562665c8436ae663de5bd52",
+    "HeadRef": "DileepY/sandbox_certificate",
+    "HeadSHA": "e221b8ac538ae6202bd4b7f7de8dec89207a590d",
+    "CreatedAt": "2026-10-16T05:35:09Z",
+    "UpdatedAt": "2026-10-16T08:45:33Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-EF6AFE18B869",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts",
+      "Side": "RIGHT",
+      "Line": 3898,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The changed await, full live-session enumeration, SDK RPC chain, per-read timeout, and UI awaiting of the connection operation are all directly traced. Exact live-session/config counts and normal RPC duration vary, which affects severity but not the mechanism.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "SDK/runtime IPC calls for certificate relevance, installation support, and status, plus per-session metadata publications",
+      "PerformanceScaling": "The Promise.all visits every live session. Reads coalesce only for sessions sharing the same proxyCa RPC object and auth configuration, so effective IPC cardinality grows with distinct live runtimes/configuration groups while metadata publication still grows with live-session count.",
+      "PerformanceOutcome": "Certificate commands and their success/error dialogs remain blocked after the OS trust mutation has already completed, adding up to a five-second timeout for a hung read stage (and potentially longer when multiple stages are each slow).",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR there was no certificate mutation command and therefore no post-mutation global SDK status sweep on this management IPC/remote-request path; within the new operation, the SDK mutation result itself is already validated before reaching this finally block.",
+      "ChangedBehavior": "Every install, rotate, or remove attempt now awaits refreshSandboxCertificate for all live sessions in a finally block, including failed attempts, before returning the operation result to the UI.",
+      "CausalDiffEvidence": "The added RIGHT line `await Promise.all(this._allLiveSessions().map(live =\u003e live.refreshSandboxCertificate()));` explicitly joins every live-session status refresh to the newly added mutation request before it can return.",
+      "Title": "Move the all-session certificate refresh off the mutation critical path",
+      "Impact": "On a slow or partially unresponsive Copilot runtime, Install/Rotate/Remove keeps the progress notice active and delays both completion and failure feedback even though the trust-store mutation has already resolved. Multiple distinct live runtime/config groups also issue their refresh IPC chains concurrently.",
+      "Evidence": "_withSandboxCertificateRefresh awaits operation(session), whose install/rotate/remove implementations validate the SDK mutation outcome, then line 3898 awaits Promise.all over _allLiveSessions(). Each refresh reaches CopilotSandboxCertificateDiagnostics.update -\u003e CopilotSandboxCertificate.getStatus -\u003e _check, which performs checkRelevance, checkInstallationSupport, and getStatus across SDK IPC with a separate 5,000 ms raceTimeout per read. The cache groups reads by proxyCa RPC and auth configuration, so this is bounded per group but remains on the user-visible command critical path and fans out across distinct groups.",
+      "Recommendation": "After the validated mutation settles, schedule refreshes without awaiting the global sweep (for example, await only the target refresh if immediate metadata is required and run the remaining deduplicated runtime/config refreshes in the background with explicit error logging). Preserve the existing per-runtime mutation sequencer and cache invalidation."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "eager-work",
+      "cleanup-lifecycle",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open or resume a sandbox-enabled Copilot agent-host chat, then send turns while certificate diagnostics is available",
+        "CriticalPath": "Existing sandbox host-support diagnostics remains awaited during initialization/config application. The new certificate diagnostic is started by updateDiagnostics without awaiting it, so certificate status does not block initialization or sending; completion only publishes metadata asynchronously.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSandboxCertificate.ts:_check",
+            "Operation": "Call runtime proxyCa.checkRelevance, checkInstallationSupport, and getStatus",
+            "Cardinality": "Cold cache: one relevance and one status call per proxyCa RPC/auth configuration, plus one installation-support call shared by all configurations for that runtime. Production auth has two booleans, so at most four auth groups per runtime; sessions sharing a group coalesce to one in-flight/completed promise. Warm cache, cached errors, and cached notRequired results add no calls.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No certificate-status SDK IPC occurred; only the pre-existing sandbox getHostSupport diagnostic was awaited.",
+            "CriticalPathEffect": "Introduced certificate reads run off the session startup/send critical path. Each read is bounded by a five-second timeout."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostStateManager.ts:setSessionMeta via CopilotSandboxCertificateDiagnostics._update",
+            "Operation": "Publish SessionMetaChanged through the existing AHP subscription transport",
+            "Cardinality": "At most one publication per chat when the observed certificate status changes; unchanged cached results are suppressed. Each subscribed client receives the existing action envelope.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No certificate metadata action was emitted.",
+            "CriticalPathEffect": "Off startup/send critical path; publication occurs after the background read completes."
+          }
+        ],
+        "ScalingInput": "Number of distinct live proxyCa runtime objects and effective auth configurations after cache grouping, plus subscribed chats whose status actually changes.",
+        "EffectiveConcurrency": "Identical runtime/config reads share one promise. Distinct runtime/config groups may execute concurrently; no polling or per-turn retry occurs, and failures are cached.",
+        "CacheBehavior": "WeakMap ownership follows the SDK RPC lifetime. Positive, notRequired, and error results are cached; in-flight requests are coalesced; filesystem-root-only differences are deliberately excluded from the key; mutation invalidates all groups for the affected runtime.",
+        "MechanismConfidence": "High: call placement, cache key, timeout, and non-awaited certificate update are explicit in the changed code and tests.",
+        "MagnitudeUncertainty": "Runtime IPC duration and the number of simultaneously live client generations vary, but default sessions normally share one auth group.",
+        "Verdict": "No reportable startup/send regression: the new boundary work is bounded, coalesced, negatively cached, and off the important critical path."
+      },
+      {
+        "Scenario": "Install, rotate, or remove sandbox CA trust from a local or remote focused chat",
+        "CriticalPath": "After confirmation, the renderer awaits one local management IPC call or one remote AHP extension request. The agent host serializes and validates the SDK/OS mutation per runtime. The changed finally block then awaits certificate refresh for every live session before the command can show completion or failure.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/electron-browser/localAgentHostService.ts and src/vs/platform/agentHost/browser/agentHostProtocolClient.ts",
+            "Operation": "Send one management IPC call locally or one negotiated extension request remotely",
+            "Cardinality": "Exactly one request per confirmed user operation; duplicate UI invocation is guarded.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No sandbox-certificate management request existed.",
+            "CriticalPathEffect": "Required mutation request on the command critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSandboxCertificate.ts:install/rotate/remove",
+            "Operation": "Recheck status and invoke SDK create, rotate, trust, or remove, which performs the requested host trust-store mutation",
+            "Cardinality": "One serialized operation per runtime. Install/rotate first performs one status chain, then at most rotate plus trust or create plus trust; remove performs one remove call. Concurrent requests for the same runtime queue behind SequencerByKey.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No certificate trust-store mutation path existed.",
+            "CriticalPathEffect": "Required and intentionally awaited so the SDK result can be validated."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:3898",
+            "Operation": "Refresh certificate diagnostics for every live session after either success or failure",
+            "Cardinality": "Promise.all visits every live session. SDK reads coalesce by proxyCa RPC/auth configuration, while metadata work remains per changed session; distinct runtime/config groups fan out concurrently.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No post-mutation global refresh was joined to this path.",
+            "CriticalPathEffect": "Introduced after the validated mutation but still awaited before UI completion/error feedback; a hung read stage can add its five-second timeout, and sequential slow stages can add more."
+          }
+        ],
+        "ScalingInput": "All live Copilot sessions, reduced for SDK reads to distinct proxyCa runtime/auth groups; metadata publications scale with sessions whose status changes.",
+        "EffectiveConcurrency": "Mutations are serialized per runtime, not globally. The post-operation refresh launches all live-session refreshes with Promise.all; cache coalescing limits identical groups but distinct groups remain concurrent.",
+        "CacheBehavior": "Mutation invalidates status/support before and after the SDK call, including failures. The refresh is therefore cold for affected runtime groups; later reads are warm and shared.",
+        "MechanismConfidence": "Very high: the global enumeration, await, cache invalidation, SDK read chain, and UI await are direct.",
+        "MagnitudeUncertainty": "Most sessions may share one runtime/config and healthy reads may be fast, but slow or partially unresponsive runtimes are explicitly anticipated by the five-second per-read timeout.",
+        "Verdict": "Reportable medium latency/boundary-fan-out regression: the global refresh is unnecessarily joined to the user-visible mutation result."
+      },
+      {
+        "Scenario": "Receive certificate metadata and show, dismiss, or manage the focused chat notice",
+        "CriticalPath": "SessionMetaChanged flows through the existing subscription. Each live chat controller reevaluates on its subscription, focus/visibility, entitlement, and capability changes; only the focused visible matching chat constructs or updates a notification. Opening the picker performs no host boundary work until an operation is confirmed.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of live AgentHostChatSession controllers on focus/visibility events and number of certificate status changes; only one focused controller renders the notice.",
+        "EffectiveConcurrency": "Synchronous renderer event handling; duplicate notification updates are suppressed by scope/input/capability equality, and certificate operations share a per-controller busy guard.",
+        "CacheBehavior": "Dismissal is cached by connection authority plus runtime scope for the notification service lifetime. Controller instances are removed from the static ResourceMap on disposal; notices and command registrations are also disposed.",
+        "MechanismConfidence": "High: listener registration, equality guards, focus gating, static-map cleanup, and disposal are explicit.",
+        "MagnitudeUncertainty": "The number of simultaneously retained chat-session controllers depends on workbench usage, but per-controller checks are small and only the focused chat allocates notification content.",
+        "Verdict": "No reportable rendering, listener, or retention regression; work scales linearly with live controllers but the per-event work is bounded and cleanup is present."
+      },
+      {
+        "Scenario": "Negotiate remote certificate capabilities and propagate status over reconnect/snapshot paths",
+        "CriticalPath": "Capabilities are added to the existing initialize handshake. Certificate status is carried in existing session snapshots/actions and recovered by the existing reconnect replay/snapshot flow; no new polling request is introduced.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts initialize/action transport",
+            "Operation": "Carry three boolean capabilities in initialize metadata and optional certificate status in session metadata",
+            "Cardinality": "One initialize payload per connection; status bytes are sent only with initial snapshots or changed SessionMetaChanged actions to existing subscribers.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same boundaries existed without these fields.",
+            "CriticalPathEffect": "Adds small bounded metadata to existing handshake/subscription boundaries; no extra round trip."
+          }
+        ],
+        "ScalingInput": "Number of connected/subscribed clients and chats represented in a session's certificate metadata.",
+        "EffectiveConcurrency": "Uses existing connection and subscription sequencing; no added worker, poller, or burst scheduler.",
+        "CacheBehavior": "Remote clients consume host-published snapshots/actions; reconnect obtains current state through existing recovery and does not bypass host-side diagnostic caching.",
+        "MechanismConfidence": "High: protocol additions are metadata-only and tests demonstrate zero extra requests for status updates.",
+        "MagnitudeUncertainty": "Session metadata can contain multiple chat entries, but entries are added only for live applicable chats and removed when irrelevant/disabled.",
+        "Verdict": "No reportable network or serialization regression; payload growth is bounded and piggybacks on existing transport."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 33 changed files and every diff page. Traced startup/send diagnostics, local and remote mutation paths, SDK IPC/cache grouping, metadata publication, UI listener/disposal ownership, and reconnect transport. Submitted one medium finding for awaiting the all-live-session post-mutation refresh; no regression-fix learning record applies."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-16T09:55:54.445798879Z",
+    "CompletedAt": "2026-10-16T09:58:02.92255047Z",
+    "WallClockMilliseconds": 128476,
+    "ModelCalls": 8,
+    "InputTokens": 661347,
+    "OutputTokens": 9848,
+    "TotalTokens": 671195,
+    "ReasoningTokens": 3999,
+    "CacheReadTokens": 535683,
+    "CacheWriteTokens": 125640,
+    "APIDurationMilliseconds": 110153,
+    "ToolCalls": 76,
+    "NanoAIUnits": 103952920000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 535683,
+      "cache_write": 125640,
+      "input": 24,
+      "output": 9848
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

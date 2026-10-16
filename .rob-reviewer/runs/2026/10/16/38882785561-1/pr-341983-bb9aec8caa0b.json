@@ -1,0 +1,160 @@
+{
+  "PullRequest": {
+    "Number": 341983,
+    "Title": "chat: fix flaky Draw atlas tests leaking into later suites",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #341973\n\n## Why\n\nThe Windows \"Run unit tests (Browser, Chromium)\" step in build 485112 failed. One `ChatWorkingLogoAtlas` test hit its 15 s timeout, then six `undisposed disposables` failures followed. The build's own commits aren't the cause (the agentHost HydraFusion tests all pass). The failure comes from the Draw atlas tests added in #340995:\n\n- Several tests rasterize all 320 atlas frames for real. On a slow agent this exceeded their explicit `.timeout(15000)`, which is *below* the runner's 30 s CI default.\n- Mocha doesn't stop a test body that has timed out. The abandoned test's `retry()` polling kept creating cancelable timeouts with token listeners. The leak check blamed them on whichever test ran next, so later suites failed in their `after each` hook, and the rest of each affected suite was skipped.\n\n## Changes (tests only)\n\n- `cancelOnTeardown()` returns a token that is cancelled at test teardown. A new `waitFor()` helper uses it in place of `retry()`, and the direct `createChatWorkingLogoAtlas` / `loadChatWorkingLogoAtlasImage` calls use it instead of `CancellationToken.None`. A timed-out test now stops rather than leaking into later tests.\n- The live-atlas test passes its own `ChatWorkingLogoAtlasCache` through the `acquireAtlas` option. Hiding and remounting now reuse the cached atlas instead of rasterizing it three times (about 1.5 s down to 0.4 s locally). The DPR and theme tests still go through the production shared cache.\n- The four tests that generate real atlases now share a 60 s timeout. Before, three had 15 s and one used the runner default.\n\nNotes for reviewers:\n\n- `waitFor()` loops until its condition holds or the test is torn down. If a short wait genuinely regresses, it now shows up as a Mocha timeout instead of `retry()`'s last assertion error.\n- No product code changes.\n\n## How to test\n\nTo reproduce the CI failure locally, I temporarily throttled the test page's CPU in `test/unit/browser/index.js`, right after `const page = await context.newPage();`. This hack is not part of the PR:\n\n```js\nconst cdp = await context.newCDPSession(page);\nawait cdp.send('Emulation.setCPUThrottlingRate', { rate: 10 }); // or 20\n```\n\nWith the throttle in place, I ran the atlas suite followed by the chat input widget suites:\n\n```\nnode test/unit/browser/index.js --browser chromium --runGlob \"**/chat/test/browser/widget/{chatWorkingLogoAtlas.test.js,input/**/*.test.js}\" --reporter spec\n```\n\n| Run | Result |\n| --- | --- |\n| 10× throttle, before | 593 passing, 14 failing: 3 atlas timeouts, then 11 `after each` leak failures (1 in the atlas suite, 10 in later suites such as `ChatInputModelUtils` and `ChatInputNoticeHost`) |\n| 10× throttle, cancellation and cache changes with the old timeouts | 956 passing, 0 failing |\n| 20× throttle, cancellation and cache changes with the old timeouts | 4 atlas timeouts, **0** leak failures in later suites. The cascade is gone even when a test does time out. |\n| 20× throttle, final (60 s timeouts) | 956 passing, 0 failing, 0 leaks (slowest atlas test about 31 s) |\n\nChecks without throttling (all passed):\n\n- `node test/unit/browser/index.js --browser chromium --runGlob \"**/chat/test/browser/widget/chatWorking*.test.js\" --reporter dot`: 29 passing\n- `./scripts/test.sh --reporter dot --run src/vs/workbench/contrib/chat/test/browser/widget/chatWorkingLogoAtlas.test.ts --run src/vs/workbench/contrib/chat/test/browser/widget/chatWorkingLogo.test.ts` (Electron): 30 passing\n- `npm run eslint -- src/vs/workbench/contrib/chat/test/browser/widget/chatWorkingLogoAtlas.test.ts`: passed\n- `npm run typecheck-client`: passed\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341983",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "justschen",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6656582b5fba31b383d1e47f222795b51008629d",
+    "HeadRef": "agents/investigate-disposable-leaks-issue",
+    "HeadSHA": "bb9aec8caa0b132236e6d85bf48bf71f8ae39b61",
+    "CreatedAt": "2026-10-16T08:57:35Z",
+    "UpdatedAt": "2026-10-16T09:33:44Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/test/browser/widget/chatWorkingLogoAtlas.test.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 220,
+      "BasePath": "src/vs/workbench/contrib/chat/test/browser/widget/chatWorkingLogoAtlas.test.ts",
+      "BaseLine": 192,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/test/browser/widget/chatWorkingLogoAtlas.test.ts",
+      "IntroducingCommit": "e142434610b3bae70cfcbac5d9404909f94cad16",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "The live-atlas remount test released the production shared cache at zero references and then reacquired the same atlas key, forcing serial SVG decode, canvas rasterization, and blob encoding repeatedly in one test.",
+      "Symptom": "Repeated full-atlas generation made the browser test slow enough to exceed its 15-second timeout on throttled or slow CI agents.",
+      "FixedBehavior": "The added test-local cache survives zero-reference intervals for the test lifetime, so hide/remount cycles reuse the first decoded atlas rather than repeating the 320-frame rasterization for each reacquire.",
+      "Evidence": "The base test constructed ChatWorkingLogo without an acquireAtlas override, so each remount used acquireChatWorkingLogoAtlas. That shared wrapper disposes its per-window cache when the last reference is released (chatWorkingLogoAtlas.ts:119-151), while hiding/removing the logo clears its atlas request; the same test then hides and remounts the logo repeatedly. Each resulting cold acquire calls createChatWorkingLogoAtlas, whose serial loop decodes and rasterizes 320 frames (chatWorkingLogoAtlas.ts:203-275). The changed test instead owns one ChatWorkingLogoAtlasCache and routes every reacquire through it, whose released completed entries remain reusable until cache teardown.",
+      "Confidence": 0.96
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "cleanup-lifecycle",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Real atlas generation and native-tile validation in the browser test",
+        "CriticalPath": "The test cannot assert tile pixels until full atlas generation, atlas image loading, and frame-by-frame expected-image decoding complete.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatWorkingLogoAtlas.ts:createChatWorkingLogoAtlas and src/vs/workbench/contrib/chat/test/browser/widget/chatWorkingLogoAtlas.test.ts:139-207",
+            "Operation": "Serialize SVG frames, decode them through HTMLImageElement, rasterize to canvas, encode an atlas blob, and read pixels for comparison.",
+            "Cardinality": "Up to 320 SVG image decodes during generation and another 320 serial SVG image decodes during validation for one test run.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same real generation and validation work already occurred; the diff only supplies a teardown-cancelled token and raises the Mocha timeout.",
+            "CriticalPathEffect": "All decoding and canvas pixel reads must finish before the test completes."
+          }
+        ],
+        "ScalingInput": "Fixed 320 atlas frames plus 320 validation frames; physical tile size controls pixel work.",
+        "EffectiveConcurrency": "Generation and validation are serial: the generator loops over 320 frames with periodic yields, then the test validates frames one at a time. No limiter is needed because there is no fan-out.",
+        "CacheBehavior": "No atlas cache is used for the direct generator call; every run is cold. Blob URLs and canvases are disposed at test teardown or per-frame finally blocks.",
+        "MechanismConfidence": "High: the 320-frame loops, awaits, and canvas/image operations are directly visible.",
+        "MagnitudeUncertainty": "Frame decode duration varies substantially by browser host and CPU speed, but cardinality and serial critical-path placement are explicit.",
+        "Verdict": "No regression finding: the diff adds cancellation without increasing successful-path work and bounds abandoned work at teardown."
+      },
+      {
+        "Scenario": "Live Draw logo hide, resume, remove, and remount test",
+        "CriticalPath": "The test waits for the first atlas to be generated and decoded before checking animation state; later remounts can proceed from the retained cached atlas.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatWorkingLogoAtlas.ts:createChatWorkingLogoAtlas",
+            "Operation": "Decode and rasterize all atlas frames and encode the resulting canvas to a blob.",
+            "Cardinality": "After the diff, one generation with up to 320 serial SVG decodes and one canvas blob encoding serves all remounts; before the diff, the same full generation could repeat for each of roughly three acquisitions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Each zero-reference release disposed the production shared cache, so later remounts regenerated the same atlas.",
+            "CriticalPathEffect": "The first generation blocks initial readiness; warm remounts avoid repeated generation on the test critical path."
+          }
+        ],
+        "ScalingInput": "Number of hide/remount reacquisitions; effective atlas-key cardinality is one.",
+        "EffectiveConcurrency": "One atlas generation runs at a time. Reacquisitions for the same key share or reuse the single cache entry rather than creating a burst.",
+        "CacheBehavior": "The new per-test ChatWorkingLogoAtlasCache has one cold generation for the size/color key, then warm reuse across zero-reference hide/remount intervals; it is disposed after the test. Before the diff, the production wrapper disposed its cache whenever references reached zero, making each reacquire cold.",
+        "MechanismConfidence": "High: cache reference teardown and completed-entry retention are explicit, and the test performs repeated remove/remount transitions.",
+        "MagnitudeUncertainty": "Exact elapsed savings vary by CI CPU and browser throttling, but the removed multiplicity is established.",
+        "Verdict": "This is a performance fix, not a regression; it was recorded through report_regression_fix."
+      },
+      {
+        "Scenario": "DPR and theme changes replace a Draw atlas in browser tests",
+        "CriticalPath": "Each test waits for the initial atlas and one replacement atlas before reading dimensions or pixels. Polling observes completion but does not initiate additional generations.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/browser/widget/chatWorkingLogoAtlas.ts:createChatWorkingLogoAtlas",
+            "Operation": "Rasterize and encode an atlas for each distinct size/color key.",
+            "Cardinality": "Two distinct atlas generations per test, each with up to 320 serial SVG decodes and one blob encode; effective key cardinality is two.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two atlas keys and generation calls were awaited through the bounded retry helper.",
+            "CriticalPathEffect": "Both generations are required before assertions can complete."
+          }
+        ],
+        "ScalingInput": "Two distinct cache keys per test and a fixed 320 frames per key.",
+        "EffectiveConcurrency": "Replacement is sequenced by logo request cancellation; polling uses one outstanding 10 ms timer at a time and does not add atlas concurrency.",
+        "CacheBehavior": "Each distinct DPR or color creates a different key. The production shared cache handles the requests; there is no new cache behavior in this diff. Cancellation tokens created by polling are released at test teardown.",
+        "MechanismConfidence": "High: changed lines replace only polling/cancellation and timeout controls around unchanged product operations.",
+        "MagnitudeUncertainty": "Browser decode time varies; no changed generation cardinality or concurrency was found.",
+        "Verdict": "No performance regression: successful-path expensive work is unchanged, while teardown cancellation prevents timed-out polling and generation from spilling into later suites."
+      },
+      {
+        "Scenario": "Polling and cancellation during test failure or teardown",
+        "CriticalPath": "On success, conditions are checked every 10 ms. If a condition never becomes true, the Mocha timeout triggers teardown, which cancels the outstanding timer and atlas work.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of sequential wait conditions in a test; each has one timer and one cancellation source.",
+        "EffectiveConcurrency": "Each awaited waitFor loop has at most one timer outstanding; calls are sequential in every changed test.",
+        "CacheBehavior": "Each wait allocates a cancellation source retained only until that test's teardown; there is no cross-test cache or retained failure state.",
+        "MechanismConfidence": "High for timer lifecycle and bounds: the loop, cancellation source, teardown disposal, and test timeouts are explicit.",
+        "MagnitudeUncertainty": "A failing assertion can now be detected at the enclosing 30 or 60 second Mocha timeout rather than the prior 1-3 second retry cap, but this is a bounded failure-only CI latency tradeoff and does not affect product execution.",
+        "Verdict": "No reportable product performance regression. The bounded failure-path delay is paired with cancellation that eliminates the prior cross-suite disposable/timer spillover."
+      }
+    ],
+    "Summary": "Reviewed the sole changed test file and traced atlas generation, image decoding, canvas encoding, cache ownership, polling, cancellation, and teardown. No diff-introduced performance finding met the reporting bar. The PR removes repeated full-atlas generation in the remount test and bounds abandoned asynchronous work; the repeated-work fix was recorded with its introducing commit."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-16T09:58:14.264273451Z",
+    "CompletedAt": "2026-10-16T09:59:39.464954587Z",
+    "WallClockMilliseconds": 85200,
+    "ModelCalls": 8,
+    "InputTokens": 205532,
+    "OutputTokens": 5334,
+    "TotalTokens": 210866,
+    "ReasoningTokens": 2423,
+    "CacheReadTokens": 168905,
+    "CacheWriteTokens": 36603,
+    "APIDurationMilliseconds": 69098,
+    "ToolCalls": 22,
+    "NanoAIUnits": 35735300000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 168905,
+      "cache_write": 36603,
+      "input": 24,
+      "output": 5334
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
