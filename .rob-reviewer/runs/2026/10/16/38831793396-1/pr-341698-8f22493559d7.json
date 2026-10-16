@@ -1,0 +1,303 @@
+{
+  "PullRequest": {
+    "Number": 341698,
+    "Title": "Agent Host: pre-warm Copilot sessions before the first send (experimental)",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFirst PR of the \"pre-warmed Copilot sessions\" plan: the Agent Host starts a new Copilot draft's SDK session and MCP servers **before the first message**, so connectors and plugins come up while the user is still composing. Copilot harness only; Claude and Codex are unchanged.\n\nEverything is behind the new experiment-controlled setting **`chat.agentHost.experimental.prewarmSessions`** (boolean, **off by default**, `experiment: { mode: 'auto' }`, mirrored to the host as root config `prewarmSessions`). With it off, drafts behave as today: their launch starts on the first send. Client-side sign-in before Send (plan §7.4) is a **follow-up PR**. In this PR, a connector that needs sign-in shows as \"auth required\" but VS Code still only prompts during the first turn, as it does today.\n\n## What changed\n\n- **Setting + experiment trigger.** `AgentHostPrewarmSessionsSettingId` / `AgentHostPrewarmSessionsConfigKey`, registered like `chat.agentHost.experimental.overlapProviderPreparation`. The trigger (`logSettingExperimentTrigger`) fires once every other gate has passed and **before** the setting is read, so both arms report the same moment. It stays pending until the workbench forwards the assignment context. The pending logic moved out of `AgentSideEffects` into the shared `AgentHostSettingExperimentTrigger`, which both features now use.\n- **`CopilotAgent`: start the draft's launch early, complete it on send.** `_materializeProvisional` is split into `_launchProvisional` (create + register the SDK session, nothing persisted) and `_completeProvisionalMaterialization` (metadata, execution marker, agent metadata, baseline checkpoint, `onDidMaterializeChat`).\n  - `IAgentChats.warmChat` starts the same launch early and keeps it on `IProvisionalSession.earlyLaunch`, rather than in a separate warm-session map. It runs through the per-chat queue, like `_prepareTurn`, so a Send arriving mid-launch waits for and reuses it, and disposal cannot interleave with registration.\n  - After the launch it calls `rpc.mcp.list()` outside the chat queue, because creating a session alone doesn't start MCP servers and a Send must not wait behind slow MCP startup.\n  - The first send completes the early launch if it still matches. Otherwise it discards it and launches cold. The check compares the primary working directory and the full model/agent selections, then reuses `_sessionRefreshReason` for client tools, plugins, root MCP definitions, additional roots, disabled servers, runtime refresh requirements and chat ownership.\n  - There is **no background revalidation or automatic re-warm** after changes, and no live application of draft model/agent selections to the early launch. Those selections stay on the reservation; any mismatch is handled at the first send. This favors a simpler lifecycle over maximizing warm hits.\n  - An unsent early launch is **never** `_resumeSession`'d. Discard destroys it and deletes its SDK state.\n  - A repeated create for a warm draft keeps it provisional. A runtime torn down by client restart, closed-connection recovery or release is detected lazily through `isDisposed`; the draft keeps its reservation, and leftover SDK state is deleted before the next launch or on disposal.\n  - A timer on the early-launch record discards it after 5 unsent minutes. Closing the draft also discards it.\n  - `startMcpServer` can address an early launch without materializing the draft. The regression where it rejected every provisional chat is fixed and covered by a test.\n  - `localModelProvider.onAutoSessionStarted()` and `agentHost.copilotSdkSessionError` are deferred to claim (held errors are dropped on discard).\n  - `[warm]` info lines log start, claim and discard, including discard reasons and session IDs.\n- **`AgentService` gating (`AgentHostSessionPrewarmer`).** Idle, non-ephemeral, non-imported drafts, including workspace-less (\"Quick Chat\") ones, warm only once an active client has arrived, customization enablement has resolved, and every launch folder, including additional multi-root folders, is trusted. A missing trust configuration fails closed for folder drafts. Workspace-less drafts run in a scratch folder with no workspace content, so they skip the trust check. Copilot never needs a cold SDK download.\n- **Worktree drafts.** Drafts whose worktree is pending do **not** warm, because their customization enablement is pending. The throwaway folder-draft path has been removed. In the Agents window, isolation only reaches the host at Send: its ordinary folder draft can still warm, but a worktree send discards that launch and starts cold in the worktree.\n- **Telemetry.** `usedPrewarmedSession` remains on `agentHost.turnCompleted` / `agentHost.turnFailed` (boolean, `isMeasurement: true`) when the turn uses an early launch. If the send instead discards one and starts cold, `prewarmedSessionDiscardReason` records the code-defined reason, such as `modelChanged`, `agentChanged`, `clientToolsChanged` or `workingDirectoryChanged`. Both fields are absent when no early launch is found. Discards outside the send path, such as expiry or closing a draft, are logged rather than emitted as turn discard reasons.\n\n## Key decisions (from the implementation edge-case log)\n\n1. **Telemetry plumbing differs from the plan.** The provider turn context is captured and frozen at turn start, before the provider knows whether it will use an early launch. `IAgentChatContext.reportPrewarmedSession(discardReason?)` reports that dispatch fact back to the turn tracker: no reason means the launch was used; a reason means it was discarded. The tracker merges it into the provider context, following the existing `reportCodexModelProvider` pattern.\n2. **No throwaway worktree session.** A draft with pending worktree enablement stays cold. This removes the extra hidden session and its create/dispose lifecycle. Folder drafts that become worktree chats only at Send retain any shared plugin/package cache benefit from their earlier launch.\n3. **Gates:** trust uses the forwarded workspace-trust root config. The host relies on clients not creating drafts when policy or \"disable AI features\" prevents their use.\n4. **Time limit:** 5 minutes, implemented as a disposable timer on the early-launch record. Closed or crashed windows are already handled by the host's 30 s draft GC.\n5. **`startMcpServer` on a warm draft doesn't claim it.** Claiming would persist and announce an unsent draft. `mcp.list()` runs outside the chat queue so a Send never waits on slow MCP startup.\n6. **Eligible drafts:** workspace-less drafts warm too. Their enablement resolves, and user-level MCP servers and connectors still load. Ephemeral and imported drafts are excluded; pending-worktree drafts fail the enablement gate.\n7. **Conservative invalidation at send.** Any model or agent selection change, including a model-option change, starts the send cold. A TODO retains the follow-up to compare actual model-dependent launch inputs and apply compatible changes live; this PR does not implement that optimization.\n\n## Validation\n\n- `npm run typecheck-client`: **passed** for the refactor and MCP-start fix.\n- `npm run build-fast -- --client-only`: **passed**, producing fresh client output.\n- Changed-TypeScript ESLint: **passed**, no warnings. Executed before committing with:\n\n  ```bash\n  npm run eslint -- $(git diff --name-only -- '*.ts')\n  ```\n\n- Pre-commit hygiene: **passed**, 12 files checked for the refactor commit.\n- Focused tests: **33 passing**, re-run on the final commit with:\n\n  ```bash\n  ./scripts/test.sh --reporter dot \\\n    --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts \\\n    --run src/vs/platform/agentHost/test/node/agentService.test.ts \\\n    --run src/vs/platform/agentHost/test/node/agentSideEffects.test.ts \\\n    --run src/vs/platform/agentHost/test/node/agentHostTelemetryReporter.test.ts \\\n    --grep \"pre-warmed sessions|session prewarming|pre-warmed session|overlap\"\n  ```\n\n  Coverage includes setting off/on and trigger timing in both arms; active-client arrival and draft disposal while waiting; untrusted and partially trusted multi-root folders; workspace-less and ephemeral drafts; skipping pending-worktree drafts; claim, immediate Send, disposal and stale-tool replacement; cold replacement after model-option/model-id changes; repeated create; client restart, closed-connection recovery and release; worktree send; starting an MCP server without claiming the draft; and used/discarded/absent telemetry through the reporter and `AgentSideEffects`. The MCP-start regression test was also verified to fail without its production fix.\n\n- Full affected suites: **3,364 passing, 14 failing** on the final refactor code, with:\n\n  ```bash\n  ./scripts/test.sh --reporter json \\\n    --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts \\\n    --run src/vs/platform/agentHost/test/node/agentService.test.ts \\\n    --run src/vs/platform/agentHost/test/node/agentSideEffects.test.ts \\\n    --run src/vs/platform/agentHost/test/node/agentHostTelemetryReporter.test.ts \\\n    --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts \\\n    --run src/vs/platform/agentHost/test/node/agentHostTurnTelemetry.test.ts \\\n    --run src/vs/platform/agentHost/test/node/agentHostTurnHangTelemetry.test.ts \\\n    --run src/vs/platform/agentHost/test/node/agentHostToolCallTelemetry.test.ts \\\n    --run src/vs/platform/agentHost/test/node/chatContributions.test.ts\n  ```\n\n  The same 14 `CopilotAgent` failures were reproduced without the PR's review fixes earlier in this branch: external chat discovery, state/plan-file resolution and persisted debug-log collection. They remain local environment-dependent failures; the full run is not claimed as green.\n\n- **Earlier manual validation, before this refactor** (Code OSS Agents window, `--log trace`, test folder with a stdio `everything` MCP server and a `sessionStart` hook):\n  - **Control** (setting off): the draft stayed deferred, with no `[warm]` lines and no MCP process.\n  - **Treatment:** the draft logged `[warm] Started`, and `server-everything` ran before Send while the hook had not run.\n  - Send logged `[warm] Claimed` with no second SDK create, the hook ran exactly once, and `agentHost.turnCompleted` had `usedPrewarmedSession`.\n  - Abandoning a draft logged `[warm] Discarded ... reason=chatDisposed` and its MCP process exited.\n  - A worktree send logged `[warm] Discarded ... reason=workingDirectoryChanged`, then materialized normally in the worktree.\n  - **Not re-run after the refactor:** live manual flows. The former immediate discard/re-warm after changing MCP definitions is intentionally gone; send-time invalidation is covered by unit tests. Control-arm Send, the editor-window variant, a relaunch to re-check listing after abandoning a draft, and real remote/connector flows were not exercised in this validation.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341698",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "vritant24",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d771f022bcfb75286ef6d01fa09d9ff00b2c88e1",
+    "HeadRef": "agents/prewarm-copilot-sessions-pr1-implementation",
+    "HeadSHA": "8f22493559d7e7fff5a7766ada7d51dacbac5aee",
+    "CreatedAt": "2026-10-15T07:08:58Z",
+    "UpdatedAt": "2026-10-15T22:46:37Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-39D6E85BD3D0",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts",
+      "Side": "RIGHT",
+      "Line": 5815,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The sequential awaits and boundary implementations are explicit, and the PR's own tests prove common invalidation triggers cause two creates plus deletion. Only the absolute disconnect duration varies by MCP implementation.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "SDK IPC calls, MCP subprocess shutdown, session deletion, and duplicated session-launch work",
+      "PerformanceScaling": "Added first-send latency grows with teardown time of the stale session and its configured MCP servers; every invalidated warm draft pays one full disconnect/delete plus a second launch, and delete failure can add a metadata IPC round trip.",
+      "PerformanceOutcome": "Increased first-send latency on the critical path, especially with slow or stuck MCP servers.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before prewarming, the first Send launched the requested configuration once and did not have an obsolete live SDK session or MCP process set to disconnect and delete first.",
+      "ChangedBehavior": "When the first Send finds that the prewarmed launch is stale, it now synchronously awaits _discardEarlyLaunch before launching the requested session. That cleanup awaits SDK disconnect (including MCP shutdown) and client.deleteSession, after which _materializeProvisional performs a fresh SDK launch.",
+      "CausalDiffEvidence": "The added await at line 5815 serializes disposal/deletion of the speculative launch ahead of the cold launch on Send. No equivalent speculative resource or cleanup existed in the prior first-send path.",
+      "Title": "Move stale warm-session teardown off the first-send path",
+      "Impact": "A user who changes model, agent, tools, MCP/plugin configuration, roots, or worktree choice while composing gets a slower first Send than before the feature: Send waits for all stale-session/MCP teardown and SDK deletion before the correctly configured session can even begin launching.",
+      "Evidence": "_materializeProvisional awaits _takeEarlyLaunch before calling _launchProvisional. At this added line, _takeEarlyLaunch awaits _discardEarlyLaunch; _discardEarlyLaunch awaits _destroyLiveSession and _deleteSdkSession. _destroyLiveSession awaits CopilotAgentSession.destroySession(), which awaits wrapper.disconnect(), and _deleteSdkSession awaits CopilotClient.deleteSession (and may additionally query metadata on failure). Added tests demonstrate realistic pre-send invalidations for model/model-option, client-tool, and worktree changes, each producing two creates and deletion of the first session.",
+      "Recommendation": "Invalidate and tear down warm launches when launch-affecting draft state changes, before Send, or use a generation-specific speculative session identity so stale cleanup can run asynchronously while the requested launch starts; Send should not synchronously wait for obsolete MCP/session teardown."
+    },
+    {
+      "ID": "PERF-3FF050D95455",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostSessionPrewarmer.ts",
+      "Side": "RIGHT",
+      "Line": 140,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed call path, unbounded per-draft dispatch, MCP-start boundary, and UI cardinality are directly established in code. Exact impact depends on how many drafts and MCP servers users keep open, so severity is medium rather than high.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "SDK sessions plus MCP subprocesses and their startup filesystem/network I/O",
+      "PerformanceScaling": "For N simultaneously open eligible drafts and M configured MCP servers, the host can retain N SDK sessions and start up to N×M server processes concurrently for five minutes; per-chat sequencing does not reduce aggregate concurrency.",
+      "PerformanceOutcome": "Burst CPU/I/O and retained process memory, with reduced responsiveness and throughput during multi-draft creation or restore.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this change, an unsent provisional draft created no SDK session and started no MCP servers; only a draft that reached first Send paid one launch.",
+      "ChangedBehavior": "Every eligible provisional draft independently invokes warmChat, which creates an SDK session and then calls session.mcp.list() to start all configured MCP servers before Send; there is no shared limiter or one-warm-per-client/window policy.",
+      "CausalDiffEvidence": "The added line 140 dispatches warmChat for each independently tracked candidate; the new warmChat implementation then launches the runtime and starts MCP servers. Previously AgentService did not dispatch any provider work for idle drafts.",
+      "Title": "Bound concurrent prewarming across drafts",
+      "Impact": "Opening or restoring several unsent Copilot chat tabs while the experiment is enabled can launch duplicate sets of MCP subprocesses concurrently, causing CPU, memory, filesystem/network startup bursts and contention that slows the workbench even though none of the drafts has been sent.",
+      "Evidence": "AgentService calls onProvisionalSessionCreated for every idle non-ephemeral provisional session; this line awaits warmChat independently per session. CopilotAgent._warmChat creates/registers the SDK session and line 5784 calls startMcpServers(), whose implementation awaits rpc.mcp.list() and explicitly documents that listing starts MCP servers. The workbench provisional service keeps one backend per untitled UI resource, and each input picker eagerly calls getOrCreate, so multiple open untitled chats produce multiple candidates. Neither AgentHostSessionPrewarmer nor CopilotAgent has an aggregate prewarm limiter; per-chat queues only serialize one chat.",
+      "Recommendation": "Put warmChat launches behind a small shared limiter and cap live unclaimed warm sessions per client/window (evict or skip older drafts), while preserving each chat's queue and TTL cleanup."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "cleanup-lifecycle",
+      "eager-work",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Creating or restoring eligible unsent Copilot drafts with prewarming enabled",
+        "CriticalPath": "Backend provisional creation returns after registering the candidate; prewarming then runs asynchronously, so SDK/MCP startup is off the individual draft-creation critical path but competes for shared CPU, memory, I/O, and process capacity.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCustomizationEnablementService.ts:_loadSessionEnablement",
+            "Operation": "Read per-session customization enablement metadata",
+            "Cardinality": "At most one coalesced read per provisional session key; N reads for N new drafts.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The enablement service already initializes sessions from state envelopes; the prewarmer additionally awaits that coalesced load.",
+            "CriticalPathEffect": "Eligibility awaits the read before warming, but it is off UI draft-creation progress and is often already initiated by session-state events."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_launchProvisional/_acquireExtensionLaunchAdmission",
+            "Operation": "Canonicalize launch roots and discover/snapshot launch customizations",
+            "Cardinality": "Once per warmed draft across its primary and additional roots; N draft launches.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Unsent drafts did not perform this launch work; it ran only at first Send.",
+            "CriticalPathEffect": "Off the draft creation critical path, but contributes aggregate filesystem contention."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_warmChat/_launchProvisional",
+            "Operation": "Create and initialize a Copilot SDK session",
+            "Cardinality": "One per eligible warmed draft, with independent launches across drafts.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No SDK session was created for an unsent draft.",
+            "CriticalPathEffect": "Off individual draft creation, but concurrent launches consume shared host/SDK capacity."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5784 and copilotAgentSession.ts:startMcpServers",
+            "Operation": "rpc.mcp.list starts all configured MCP servers for the warmed session",
+            "Cardinality": "Up to M server starts per draft, N×M across N eligible drafts, with no host-wide limiter.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "MCP servers started only after the user sent the first message.",
+            "CriticalPathEffect": "Deliberately outside the per-chat queue, so Send does not await listing, but the startup burst competes with interactive work."
+          }
+        ],
+        "ScalingInput": "Number N of simultaneously open/restored untitled drafts after per-resource getOrCreate deduplication, multiplied by M configured MCP servers per session.",
+        "EffectiveConcurrency": "Each chat has a sequencer, but different drafts run independently with no shared prewarm limiter or live-warm cap; aggregate concurrency is N launches and up to N×M MCP starts.",
+        "CacheBehavior": "Customization enablement loads are coalesced per session key, and each UI resource has one provisional generation. SDK sessions and MCP process sets are not shared between drafts; warm state expires after five unsent minutes.",
+        "MechanismConfidence": "High: every eligible candidate reaches warmChat independently, warmChat creates a session and calls the MCP-starting list API, and no aggregate limiter exists.",
+        "MagnitudeUncertainty": "Typical simultaneous draft count and configured MCP-server count vary, and downstream SDK internals may provide some unknown throttling; the host-level unbounded fan-out and retained sessions are explicit.",
+        "Verdict": "Reportable concurrency-burst regression: multiple unsent drafts can eagerly launch duplicate SDK/MCP process sets."
+      },
+      {
+        "Scenario": "First Send claims an unchanged prewarmed session",
+        "CriticalPath": "Send waits for launch-state revalidation and any pending connector refresh, then completes persistence/checkpoint metadata and sends through the already-created SDK session. The earlier rpc.mcp.list call is outside the chat queue and may still be running.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_earlyLaunchStaleReason/_sessionRefreshReason",
+            "Operation": "Revalidate customization anchors and launch inputs",
+            "Cardinality": "One validation per first Send, across the chat's effective roots.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The cold first-send launch discovered launch inputs while creating the session; there was no separate warm-cache validation.",
+            "CriticalPathEffect": "Must finish before the warm launch can be claimed."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_takeEarlyLaunch/_completeProvisionalMaterialization",
+            "Operation": "Refresh connectors if pending, persist materialization metadata, and send the first message",
+            "Cardinality": "At most one claim and first send per draft.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Cold Send also performed persistence and message dispatch, plus SDK creation.",
+            "CriticalPathEffect": "Connector refresh and persistence remain on Send's path; SDK creation is removed on a warm hit."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5784",
+            "Operation": "MCP startup initiated by the earlier rpc.mcp.list",
+            "Cardinality": "One configured server set for this session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "MCP startup began during/after first Send rather than composition.",
+            "CriticalPathEffect": "Off the chat queue, so Send does not directly await slow MCP startup."
+          }
+        ],
+        "ScalingInput": "One first Send per warmed draft; revalidation scales with launch roots and customization state, while MCP readiness scales with configured servers.",
+        "EffectiveConcurrency": "The chat sequencer serializes materialization and Send. MCP listing is intentionally concurrent outside that queue.",
+        "CacheBehavior": "The early launch is a positive one-shot cache keyed by the provisional reservation plus model, agent, roots, tools, plugins/MCP state, and ownership. A valid hit is consumed once; there is no automatic rewarm.",
+        "MechanismConfidence": "High: queue placement, one-shot claim, and boundary ordering are explicit.",
+        "MagnitudeUncertainty": "The net latency win depends on SDK creation, customization validation, connector refresh, and MCP startup durations.",
+        "Verdict": "No additional finding for the valid-hit path; moving SDK/MCP startup earlier is the intended bounded latency tradeoff for one draft."
+      },
+      {
+        "Scenario": "First Send after model, agent, tools, roots, MCP/plugin state, ownership, or worktree changed",
+        "CriticalPath": "Send validates the early launch, then synchronously disconnects the stale session, stops its MCP processes, deletes SDK state, creates a replacement SDK session, persists it, and only then sends the message.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_earlyLaunchStaleReason",
+            "Operation": "Revalidate launch configuration/customization state",
+            "Cardinality": "Once per first Send before deciding the cache is stale.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Cold Send performed launch discovery once without first validating a speculative runtime.",
+            "CriticalPathEffect": "Blocks Send before cleanup starts."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_discardEarlyLaunch/_deleteSdkSession",
+            "Operation": "Disconnect the stale SDK session and delete its session state, with metadata confirmation on delete failure",
+            "Cardinality": "One disconnect and delete per stale warm launch; failure adds one getSessionMetadata call.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no speculative SDK session to disconnect or delete before first Send.",
+            "CriticalPathEffect": "Fully awaited before replacement creation can begin."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:destroySession",
+            "Operation": "Stop stale MCP servers during SDK disconnect",
+            "Cardinality": "One stale configured MCP process set per invalidated draft.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No stale MCP processes existed on first Send.",
+            "CriticalPathEffect": "Shutdown is part of the awaited disconnect and can dominate first-send latency for slow servers."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_materializeProvisional/_launchProvisional",
+            "Operation": "Create and initialize the correctly configured replacement SDK session",
+            "Cardinality": "One replacement launch after cleanup, making two total creates for this draft.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "First Send performed only this single launch.",
+            "CriticalPathEffect": "Begins only after stale cleanup and remains on Send's critical path."
+          }
+        ],
+        "ScalingInput": "One stale speculative session per invalidated draft; cleanup latency scales with the number and shutdown behavior of that session's MCP servers.",
+        "EffectiveConcurrency": "All stale cleanup and replacement launch steps are serialized by the chat queue. MCP listing may have been concurrent before invalidation, but replacement cannot start until awaited discard/delete finishes.",
+        "CacheBehavior": "Any mismatch is a negative warm-cache outcome. There is no background invalidation or rewarm, so stale state is discovered at Send and the warm work is discarded.",
+        "MechanismConfidence": "Very high: the await chain and two-create/delete behavior are explicit and covered by changed tests for model, client-tool, and worktree invalidation.",
+        "MagnitudeUncertainty": "Absolute delay depends on MCP shutdown and SDK deletion duration, but the added serialized boundaries occur deterministically for every stale warm launch.",
+        "Verdict": "Reportable first-send latency regression caused by cleanup placement."
+      },
+      {
+        "Scenario": "Abandoning or expiring an unsent warmed draft",
+        "CriticalPath": "Closing a draft queues provider disposal; otherwise a five-minute timer queues discard. No message-send path is waiting unless disposal races with Send on the same chat queue.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_discardEarlyLaunch",
+            "Operation": "Disconnect and delete the unclaimed SDK session",
+            "Cardinality": "Once per abandoned/expired warmed draft.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Abandoned unsent drafts had no SDK state to clean up.",
+            "CriticalPathEffect": "Off user message progress for timer expiry; closing/disposal may await it."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:destroySession",
+            "Operation": "Terminate MCP servers owned by the discarded SDK session",
+            "Cardinality": "One configured process set per discarded draft.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No MCP subprocesses existed for abandoned unsent drafts.",
+            "CriticalPathEffect": "Off Send unless racing on the same queue."
+          }
+        ],
+        "ScalingInput": "One live early session and timer per warmed draft until claimed, disposed, or expired.",
+        "EffectiveConcurrency": "Cleanup is serialized per chat; different draft expirations/disposals can run concurrently with no aggregate limiter.",
+        "CacheBehavior": "The one-shot warm entry has a five-minute TTL. Draft disposal and agent shutdown clear timers and destroy sessions; torn-down runtime state is deleted on later send/disposal.",
+        "MechanismConfidence": "High: TTL, disposal hooks, queueing, and disconnect/delete ownership are explicit.",
+        "MagnitudeUncertainty": "Cleanup duration and overlap depend on server shutdown behavior and how many drafts are abandoned together.",
+        "Verdict": "No separate cleanup-leak finding: the PR provides bounded TTL, close, and shutdown cleanup; aggregate creation concurrency is covered by the reported burst finding."
+      },
+      {
+        "Scenario": "Creating a draft with prewarming disabled (default/control arm)",
+        "CriticalPath": "The prewarmer waits for active-client arrival, awaits the session's coalesced customization-enablement initialization, checks pending/trust state, reports the experiment trigger, then exits before warmChat. This work is asynchronous relative to createSession completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCustomizationEnablementService.ts:_loadSessionEnablement",
+            "Operation": "Read session customization-enablement metadata",
+            "Cardinality": "At most one read per new session key and often already initiated by the existing state-envelope listener.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The enablement service already initialized sessions from emitted state envelopes; the new prewarmer awaits the same coalesced promise.",
+            "CriticalPathEffect": "Awaited only by the asynchronous gate evaluation, not by draft creation or Send."
+          }
+        ],
+        "ScalingInput": "One gate evaluation per provisional draft after per-resource deduplication.",
+        "EffectiveConcurrency": "Evaluations are independent across drafts; no SDK/MCP work occurs because the setting check rejects treatment.",
+        "CacheBehavior": "Session-enablement initialization is cached/coalesced by session key in _sessionLoads; trust and root configuration are in-memory reads.",
+        "MechanismConfidence": "High for absence of SDK/MCP treatment work and per-session read coalescing.",
+        "MagnitudeUncertainty": "Whether the prewarmer observes an already-started load depends on event ordering, but duplicate reads are prevented by _sessionLoads.",
+        "Verdict": "No reportable regression in the default-off arm after accounting for existing/coalesced enablement initialization."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 18 changed files and traced draft creation, warm-hit Send, stale Send, abandonment/expiry, and default-off behavior. Submitted two findings: unbounded aggregate SDK/MCP prewarming across drafts and serialized stale-session teardown on first Send."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-16T00:55:56.681607111Z",
+    "CompletedAt": "2026-10-16T00:58:48.33775561Z",
+    "WallClockMilliseconds": 171656,
+    "ModelCalls": 15,
+    "InputTokens": 1236984,
+    "OutputTokens": 12830,
+    "TotalTokens": 1249814,
+    "ReasoningTokens": 4790,
+    "CacheReadTokens": 1117781,
+    "CacheWriteTokens": 119158,
+    "APIDurationMilliseconds": 149837,
+    "ToolCalls": 97,
+    "NanoAIUnits": 129968240000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1117781,
+      "cache_write": 119158,
+      "input": 45,
+      "output": 12830
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

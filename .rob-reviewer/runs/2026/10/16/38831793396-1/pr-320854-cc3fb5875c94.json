@@ -1,0 +1,295 @@
+{
+  "PullRequest": {
+    "Number": 320854,
+    "Title": "MCP server integration for agent-host sessions",
+    "Body": "When a Copilot CLI (or any agent-host) session is running MCP servers, those servers are now visible and controllable from the workbench. They show up in **MCP: List Servers** and run through VS Code's standard MCP UI, alongside locally-configured servers.\n\n### What this changes\n\n- **`MCP: List Servers`** now defaults to the focused agent-host session's MCP servers when one is open. Each server shows its live status (Starting / Running / Error / etc.) and can be enabled or disabled in place. A trailing **`Show locally configured servers…`** entry switches back to the existing local picker.\n- **MCP over the Agent Host Protocol**: `CopilotAgentSession` advertises the standard MCP app capabilities (sampling + resources) and routes server notifications by channel scheme. The inventory is seeded from `rpc.mcp.list` at subscription time so restored sessions and eagerly-configured servers populate immediately.\n- **MCP-only plugins** (plugins that contribute only MCP servers, no prompt files) are now included in the customization refs sent to the harness, so their servers reach the session.\n- **Per-nonce plugin caching**: agent plugins are now cached under per-revision subdirectories so multiple plugin versions can coexist on disk. Fixes `EBUSY` failures when a long-running session was holding files open from an older revision. Stale revisions are evicted opportunistically once their locks release.\n- **Active-client claim** is deferred to the first turn (rather than on session open) so simply browsing a session doesn't dispossess another client that's mid-turn elsewhere.\n\n### Tests\n118 → 119 in `CopilotAgentSession` (MCP seed success + failure paths). Added 3 plugin-manager tests (per-nonce materialization, locked-dir retention, startup-time eviction), 4 `resolveCustomizationRefs` tests (MCP-only plugin inclusion + dedup), and refreshed 2 active-client tests for the new `claim on first turn` semantics.",
+    "URL": "https://github.com/microsoft/vscode/pull/320854",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "connor4312",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0d37724d229adcf22c76f3be3b96152122b45f3f",
+    "HeadRef": "connor4312/agent-host-mcp-integration",
+    "HeadSHA": "cc3fb5875c94f9a9bedd114e1d1c58c5b660edfe",
+    "CreatedAt": "2026-06-10T22:33:45Z",
+    "UpdatedAt": "2026-07-26T23:40:10Z",
+    "MergedAt": "2026-06-10T23:59:48Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-08C0F81E841E",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentPluginManager.ts",
+      "Side": "RIGHT",
+      "Line": 278,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed await, serial recursive-delete implementation, and first-turn call path are explicit. Exact milliseconds depend on stale revision size and filesystem speed, so severity is medium rather than high.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "recursive filesystem deletion operations and the subsequent cache-file write",
+      "PerformanceScaling": "The delay grows with the number of retained stale nonce entries (normally up to the 20-entry cache cap, but explicitly allowed to exceed it when revisions are locked) and with the file count/size of each plugin directory; all stale revisions are deleted sequentially.",
+      "PerformanceOutcome": "increased first-turn latency while stale plugin trees are removed",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The first sync loaded the small cache JSON and proceeded directly to checking/copying the requested customizations; it did not recursively delete old plugin directories before sync could start.",
+      "ChangedBehavior": "After loading cache metadata, the first sync now awaits `_cleanupStaleNonces()`, which iterates every tracked plugin and awaits recursive deletion of every stale revision before any requested plugin is checked.",
+      "CausalDiffEvidence": "RIGHT line 278 newly places `await this._cleanupStaleNonces()` inside `_ensureCacheLoaded()`, ahead of the existing per-request sync scheduling; the base path only loaded cache metadata here.",
+      "Title": "Move stale plugin deletion off the first-sync critical path",
+      "Impact": "After an older plugin revision was retained because a long-running session locked it, the next agent-host process blocks the first active-client customization sync—and therefore the first Copilot turn/session resume—while it recursively removes all released stale revision trees. Large plugins or several retained revisions make the user wait before the turn reaches the SDK.",
+      "Evidence": "`syncCustomizations()` awaits `_ensureCacheLoaded()` before scheduling any plugin sync. The added line 278 awaits `_cleanupStaleNonces()`; that helper serially awaits `_tryDeleteDir()` for each stale entry, and `_tryDeleteDir()` calls `IFileService.del(..., { recursive: true })`. On first turn, `SessionActiveClientChanged` starts `pluginController.sync`; `sendMessage()` then waits the same `_clientSync` through `retryFailedClientSyncIfNeeded()`/snapshot resolution before resuming or sending the turn.",
+      "Recommendation": "Load the cache metadata and let the requested sync proceed first; run stale-revision cleanup afterward/off the turn critical path under a single serialized cleanup task, retaining failed entries and persisting the resulting LRU once cleanup settles."
+    },
+    {
+      "ID": "PERF-5E2B1764BBF6",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts",
+      "Side": "RIGHT",
+      "Line": 1159,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The before/after placement and awaited host call chain are explicit, and the updated tests confirm restored sessions no longer claim until first turn. Magnitude varies with plugin count/cache state, so severity is medium.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceResource": "filesystem existence/copy operations and plugin parsing CPU performed by active-client customization synchronization",
+      "PerformanceScaling": "First-turn delay grows with the number and size of active-client plugins: warm revisions still perform one filesystem existence check and parse each plugin, while cold or changed revisions recursively copy and then parse each directory.",
+      "PerformanceOutcome": "blocked first-turn critical path and increased time to the first agent response",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "Opening a restored session immediately dispatched `SessionActiveClientChanged`, so plugin synchronization began while the user was browsing the session and generally completed before the first message was sent.",
+      "ChangedBehavior": "The claim and its plugin synchronization are now initiated only immediately before `SessionTurnStarted`; host-side `sendMessage()` waits the resulting `_clientSync` before snapshot comparison, resume/materialization, and SDK send.",
+      "CausalDiffEvidence": "The diff removes the prior claim from restored-session open and adds it at RIGHT line 1159 immediately before turn dispatch, moving the same scaling filesystem/parsing work onto the user-input critical path.",
+      "Title": "Keep restored-session plugin sync off the first turn",
+      "Impact": "For a restored session whose current active client differs or whose customization snapshot is stale—the exact cases covered by the updated tests—the first submitted prompt now waits for all client plugins to be validated/copied and parsed. A session with several or large plugins shows avoidable first-response latency that was previously hidden during session open.",
+      "Evidence": "RIGHT line 1159 calls `_ensureActiveClientForMessage()` on the input path immediately before dispatching the turn. That action invokes `setClientCustomizations()` and `pluginController.sync()`. Although the action side effect does not await it, the immediately following turn reaches `CopilotAgent.sendMessage()`, whose `retryFailedClientSyncIfNeeded()` and active-client snapshot paths await `_clientSync`; `sync()` awaits `AgentPluginManager.syncCustomizations()` and then parses every resolved plugin.",
+      "Recommendation": "Preserve the no-dispossession behavior only while another client actually has an active turn; when the restored session is idle, pre-claim/pre-sync on open as before, or otherwise prewarm customization materialization without changing active ownership so the eventual claim can reuse settled plugin results."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostLocalCustomizations.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 164,
+      "BasePath": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostLocalCustomizations.ts",
+      "BaseLine": 164,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostLocalCustomizations.ts",
+      "IntroducingCommit": "150d40b6323c916a0e1a558b0dea3e8fe8417a83",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "io",
+      "Mechanism": "Client plugin references previously omitted a nonce, while `AgentPluginManager` only takes its cache-hit path when `ref.nonce` is present. Every active-client customization sync therefore recursively recopied unchanged plugin directories and reparsed their contents.",
+      "Symptom": "Repeated customization claims/refreshes performed avoidable full plugin-directory I/O, delaying first-turn plugin setup and increasing filesystem work; overwriting an in-use revision could also encounter the EBUSY symptom described by the change.",
+      "FixedBehavior": "The plugin directory mtime is now sent as `nonce`, allowing unchanged revisions to hit the existing cache check and skip the recursive copy while changed revisions materialize separately.",
+      "Evidence": "RIGHT line 164 adds the mtime-derived nonce to every resolved plugin ref. The downstream cache guard is `if (ref.nonce \u0026\u0026 ... \u0026\u0026 await fileService.exists(destDir)) return destDir`; without this field the guard was always false and execution reached `fileService.copy(pluginUri, destDir, true)`. Active-client synchronization invokes this path and is awaited when the session snapshot/first turn is prepared.",
+      "Confidence": 0.95
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "synchronous-ui-work",
+      "cache-lifecycle",
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First prompt in a restored agent-host session with client plugins",
+        "CriticalPath": "The workbench dispatches the newly deferred active-client claim immediately before `SessionTurnStarted`. Host handling starts client customization sync; the turn then enters `CopilotAgent.sendMessage`, which waits `_clientSync` during retry/snapshot/restart resolution before SDK resume/send can progress. Plugin cache load, newly added stale cleanup, cache checks/copies, and plugin parsing can therefore block the first response.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostLocalCustomizations.ts:154",
+            "Operation": "Stat each included plugin root to derive a nonce.",
+            "Cardinality": "P concurrent stats per customization recomputation, deduplicated to one per plugin URI.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No plugin-root stat and no nonce were emitted, so downstream sync could not take its nonce cache hit.",
+            "CriticalPathEffect": "Usually completed while active-client refs are prepared; if refs are already available it is off the immediate turn path. It enables the downstream warm-cache optimization."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts:1159",
+            "Operation": "Dispatch active-client ownership/customizations and then the turn to the agent host.",
+            "Cardinality": "One active-client action when state differs, followed by one turn action.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same active-client action was sent on restored-session open, normally allowing plugin work to settle before user input.",
+            "CriticalPathEffect": "The active-client call is newly moved immediately before the turn, causing its transitive plugin work to overlap and be awaited by host turn preparation."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentPluginManager.ts:84 and src/vs/platform/agentHost/node/copilot/copilotAgent.ts:2546",
+            "Operation": "Load cache JSON, recursively delete stale nonce directories, check warm revision directories, copy cold revisions, persist cache, and parse plugin files.",
+            "Cardinality": "One cache read; K serial stale recursive deletes; P warm existence checks or P cold recursive copies; one parse per resolved plugin; cache writes for startup cleanup and fresh copies.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Cache loading read metadata and immediately began requested syncs; stale recursive deletion was not performed there. Plugin refs also lacked nonces, so unchanged plugins were recopied rather than hitting the warm cache.",
+            "CriticalPathEffect": "Host first-turn preparation waits the client sync. The stale cleanup added at line 278 blocks all P requested syncs before they can start."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:1173",
+            "Operation": "Resume/create the Copilot SDK session and send the prompt.",
+            "Cardinality": "One SDK resume/create as needed and one send per turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "For restored sessions the open-time claim commonly settled plugin sync before this turn path.",
+            "CriticalPathEffect": "This existing boundary cannot begin until plugin synchronization and snapshot comparison settle."
+          }
+        ],
+        "ScalingInput": "Number of enabled client plugins P, files/bytes per plugin, and retained stale revisions K. Effective cardinality is one sync per distinct plugin URI; warm cache performs P existence checks plus P parses, cold/changed cache performs up to P recursive copies plus parses, and startup cleanup performs K serial recursive deletes.",
+        "EffectiveConcurrency": "Workbench plugin root stats are launched together through `Promise.all`. Host plugin syncs run in parallel across distinct URIs and are serialized per URI by `SequencerByKey`. The new startup stale cleanup runs before that parallelism and deletes stale entries sequentially across plugins/revisions.",
+        "CacheBehavior": "Warm and cold behavior differ materially as described; same-nonce work is coalesced per URI by the sequencer, but stale cleanup is globally awaited before those queues start.",
+        "MechanismConfidence": "High: the moved claim, `_clientSync` awaits, recursive filesystem boundaries, cache branches, and serial cleanup are explicit in the traced call path.",
+        "MagnitudeUncertainty": "Plugin count and directory size vary, and many users have few plugins. Recursive deletion/copy on slower or remote-backed filesystems can dominate, which supports medium rather than high severity.",
+        "Verdict": "Reportable: one finding for moving plugin synchronization onto the restored first-turn path and one for serial stale cleanup newly blocking the first sync. The nonce addition separately fixes prior repeated copies and was recorded as a regression fix."
+      },
+      {
+        "Scenario": "Opening or browsing a restored session without sending a turn",
+        "CriticalPath": "Session content and state subscriptions load, but the PR removes the eager active-client claim. No client plugin materialization is initiated merely by browsing; snapshot/history loading remains the progress path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts:708",
+            "Operation": "Subscribe to and restore agent-host session state/history.",
+            "Cardinality": "One session subscription/open flow.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Opening also dispatched active-client ownership, triggering asynchronous plugin sync even if no turn followed.",
+            "CriticalPathEffect": "Required for displaying the restored session; plugin sync is removed from this browse-only path."
+          }
+        ],
+        "ScalingInput": "Session history/state size; plugin count no longer contributes until a turn or another explicit customization query.",
+        "EffectiveConcurrency": "Normal session state/history loading; no added plugin filesystem burst.",
+        "CacheBehavior": "Plugin cache remains untouched during browse-only use. Existing session-state subscription caches provide in-memory snapshots.",
+        "MechanismConfidence": "High that plugin work is removed from open and deferred; no performance bug is reported for browse-only use because this path gets cheaper.",
+        "MagnitudeUncertainty": "Benefit depends on how often users browse without interacting.",
+        "Verdict": "No regression on browse-only startup; the tradeoff becomes reportable only on the first-turn scenario where the deferred work is awaited."
+      },
+      {
+        "Scenario": "MCP server inventory initialization and status changes for a Copilot session",
+        "CriticalPath": "SDK event listeners attach during session subscription, and a one-shot `rpc.mcp.list` seed is launched without awaiting it. Session initialization and turns do not wait for the seed. Each returned/reported server emits an in-memory state action that is reduced and broadcast to subscribed clients.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:2204",
+            "Operation": "Fetch the current MCP server list from the Copilot SDK RPC surface.",
+            "Cardinality": "One `mcp.list` call per initialized session, independent of S.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No MCP inventory seed RPC was issued.",
+            "CriticalPathEffect": "Off the initialization/turn critical path because the promise is not awaited."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/shared/mcpCustomizationController.ts:157",
+            "Operation": "Broadcast per-server customization state actions to relevant connected clients.",
+            "Cardinality": "S actions for an inventory list and one per status event; protocol relevance filtering applies to normal state actions.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "MCP servers were not projected into agent-host session customization state.",
+            "CriticalPathEffect": "Asynchronous inventory/UI convergence; not required before session turns progress."
+          }
+        ],
+        "ScalingInput": "Number of MCP servers S and number of server lifecycle events E. Initial seed/list processing is O(S), with one action per server; status updates are O(1) per event plus state-list scanning.",
+        "EffectiveConcurrency": "The seed RPC is fire-and-forget. Server list mapping/action emission is synchronous; there is no limiter, but no expensive per-server external call follows from the controller itself.",
+        "CacheBehavior": "The controller retains the current live server map for the session. There is no cross-session or persistent inventory cache; repeated identical SDK lists are not deduplicated before actions, but evidence did not establish a hot enough event frequency for a finding.",
+        "MechanismConfidence": "High for O(S) actions and off-path RPC placement, but insufficient evidence of costly frequency or user-visible degradation.",
+        "MagnitudeUncertainty": "Real-world S and duplicate-list event frequency are unknown; typical server counts are modest.",
+        "Verdict": "No finding: the new one-shot boundary is off critical path, and per-server in-memory/action work lacks a realistic high-cost trigger in the inspected tree."
+      },
+      {
+        "Scenario": "MCP App request and server notification routing over an agent-host connection",
+        "CriticalPath": "An App JSON-RPC request with an `mcp://` channel is parsed and routed to exactly one provider/session/server, then awaits one Copilot SDK MCP operation before the response is sent. Tool-update notifications fan one small message per ready server to every connected protocol client, where channels can be demultiplexed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:1188",
+            "Operation": "Receive an MCP JSON-RPC request over AHP and send its response.",
+            "Cardinality": "One inbound and one outbound transport operation per App request.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Such `mcp://` methods were rejected as unknown.",
+            "CriticalPathEffect": "The App request waits for the routed SDK operation by design."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:1071",
+            "Operation": "Invoke `apps.listTools`, `apps.callTool`, `apps.readResource`, or sampling RPC on the Copilot SDK.",
+            "Cardinality": "One SDK call per supported incoming method; list-resource fallbacks perform no boundary call.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No MCP App proxy operation existed.",
+            "CriticalPathEffect": "Direct critical path of that App request, with no collection fan-out introduced by routing."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:1264",
+            "Operation": "Broadcast a tools-list-changed notification to connected AHP clients.",
+            "Cardinality": "S*C small sends per coarse SDK tools-updated event.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No agent-owned MCP notifications were broadcast.",
+            "CriticalPathEffect": "Notification delivery is not on a chat turn or App request response path."
+          }
+        ],
+        "ScalingInput": "Incoming App request rate R, ready servers S for a session, and connected clients C. Requests are one-to-one (R SDK calls); one coarse tools-updated event sends S*C transport messages.",
+        "EffectiveConcurrency": "Independent inbound requests may execute concurrently with no new shared limiter. Notification fan-out is synchronous across ready servers and connected clients. No in-repository consumer of `onMcpNotification` was found that proves each message triggers a `tools/list` refetch.",
+        "CacheBehavior": "No request-result cache or coalescing is added. Server/channel lookup uses in-memory maps; notification channel lists are rebuilt from the in-memory live map.",
+        "MechanismConfidence": "High for routing cardinality and broadcast shape; low evidence for material user-visible cost at realistic S and C.",
+        "MagnitudeUncertainty": "The frequency of the SDK's coarse tools-updated event and maximum simultaneous clients are not established. Without a proven downstream refetch in this repository, only small transport-message fan-out is certain.",
+        "Verdict": "No finding: request boundaries are demand-driven and one-to-one; notification fan-out is concrete but not shown to be expensive enough."
+      },
+      {
+        "Scenario": "MCP: List Servers quick-pick for the focused agent-host session",
+        "CriticalPath": "The command reads already-subscribed in-memory session customizations, creates quick-pick items, and refreshes them when session state changes. Selecting a server opens an in-memory options picker and dispatches one toggle action.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/mcp/browser/mcpCommands.ts:307",
+            "Operation": "Dispatch a session customization toggle to the agent host.",
+            "Cardinality": "One action per explicit user toggle.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Agent-host MCP servers were not available in the local MCP server picker.",
+            "CriticalPathEffect": "Only affects completion of the chosen toggle; listing itself is in-memory."
+          }
+        ],
+        "ScalingInput": "Number of exposed MCP servers S and session-state change frequency while the picker is open. Refresh allocation/mapping is O(S).",
+        "EffectiveConcurrency": "UI refreshes are synchronous event callbacks; toggles dispatch one action at a time. There is no added external concurrency.",
+        "CacheBehavior": "Uses the current session subscription snapshot; no filesystem/network cache or fetch is involved.",
+        "MechanismConfidence": "High that listing is in-memory O(S) and has no hidden external boundary in the traced service/provider implementations.",
+        "MagnitudeUncertainty": "S is expected to be modest; state changes while the picker remains open are user/session dependent.",
+        "Verdict": "No finding: the new UI work scales linearly with a realistically small inventory and performs no expensive boundary during refresh."
+      }
+    ],
+    "Summary": "Reviewed all 33 changed files and traced session-open/first-turn scheduling, plugin nonce/cache lifecycle, MCP inventory projection, App request/notification routing, and MCP picker rendering. Submitted two medium first-turn latency findings, and recorded the nonce propagation as a fix for the prior repeated full-plugin-copy regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-16T01:06:55.931251193Z",
+    "CompletedAt": "2026-10-16T01:10:27.623372774Z",
+    "WallClockMilliseconds": 211692,
+    "ModelCalls": 14,
+    "InputTokens": 1128354,
+    "OutputTokens": 14349,
+    "TotalTokens": 1142703,
+    "ReasoningTokens": 5721,
+    "CacheReadTokens": 1017856,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 193485,
+    "ToolCalls": 98,
+    "NanoAIUnits": 113611440000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1017856,
+      "cache_write": 0,
+      "input": 110498,
+      "output": 14349
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
