@@ -1,0 +1,148 @@
+{
+  "PullRequest": {
+    "Number": 342270,
+    "Title": "agentHost: don't fail createSession when the sessions_v2 import registers its catalog first",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## What\n\n`createSession` could throw `Failed to register normalized chat catalog for \u003csession\u003e: conflict` even though the session was fine.\n\nWhen a provider registers, the agent host runs a background `sessions_v2` import. If that import picks up a session that is still being created, it can record the session's verified catalog source between two steps of `_registerNewChatCatalog`:\n\n1. the check \"is there already a verified source or a catalog header?\" (no, so continue), and\n2. `registerChatCatalogV2`, whose transaction runs the same check again and now reports `conflict`.\n\n`conflict` from `registerChatCatalogV2` means exactly what step 1 tests for, so it now gets the same outcome as step 1 (note the catalog as normalized and return) instead of failing session creation.\n\nFound while making `agentService.test.ts` deterministic under CPU load (it surfaced once the chat-promotion tests stopped sharing one session database; see the follow-up PR). It can also happen for real users who create a session while that startup import is still running.\n\n## How to test\n\nNew regression test: `createSession › creates a session whose chat catalog a concurrent synchronization recorded while it was being registered`. It stubs `registerChatCatalogV2` to return `conflict`. Without the fix it fails with the error above; with it, it passes.\n\n- `npm run test-node -- --run src/vs/platform/agentHost/test/node/agentService.test.ts`: 1123 passing, 16 pending\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/agentService.test.ts`: 1123 passing, 16 pending\n- `npm run eslint -- \u003cchanged files\u003e`: clean\n- `npm run typecheck-client`: passed\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342270",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "065609095f6f68bc91bfc00c8f8f200fa29539a4",
+    "HeadRef": "agents/agenthost-create-session-catalog-conflict",
+    "HeadSHA": "a230571262d10c74b1db7899098e641df153fbc6",
+    "CreatedAt": "2026-10-17T12:11:47Z",
+    "UpdatedAt": "2026-10-17T13:14:41Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create a normal non-provisional agent session when no concurrent catalog import wins the race",
+        "CriticalPath": "Provider session creation completes first, then _registerNewChatCatalog synchronously reads the central catalog, checks sessions_v2, registers one catalog transaction, and notes normalized authority before SessionReady. The changed status predicate does not alter the applied/replayed/alreadyNormalized paths.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_registerNewChatCatalog",
+            "Operation": "Read one selected catalog snapshot and, if absent, one sessions_v2 record from the orchestrator SQLite database.",
+            "Cardinality": "At most one snapshot read and one keyed sessions_v2 read per newly created non-ephemeral session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same keyed reads occurred before the predicate change.",
+            "CriticalPathEffect": "Both reads must complete before catalog registration and SessionReady."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostDatabase.ts:registerChatCatalogV2",
+            "Operation": "Run one BEGIN IMMEDIATE transaction that checks catalog availability/source/header and inserts the initial catalog.",
+            "Cardinality": "One serialized transaction per newly created non-provisional session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The identical transaction and successful-result handling occurred before the diff.",
+            "CriticalPathEffect": "The transaction is awaited by createSession."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:noteCatalogNormalized",
+            "Operation": "Refresh a loaded legacy-authority state record, potentially flushing its mirror and reading central session state.",
+            "Cardinality": "At most one refresh for the created session, and zero when the record is absent or already non-legacy.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "All ordinary successful registration statuses already reached this same refresh.",
+            "CriticalPathEffect": "When required, the refresh is awaited before creation continues."
+          }
+        ],
+        "ScalingInput": "One catalog registration per newly created non-provisional session; the candidate contains only the default chat, so work does not scale with historical session or chat count on this path.",
+        "EffectiveConcurrency": "Each central database operation is serialized by AgentHostDatabase._transactionSequencer; session-state work is serialized per session. No concurrency, batching, or coalescing behavior changes in this scenario.",
+        "CacheBehavior": "A cold or unloaded session-state record makes noteCatalogNormalized return immediately. A warm loaded legacy-authority record performs one refresh and changes to authority 2; there is no repeated miss or new retained cache entry.",
+        "MechanismConfidence": "High: the changed predicate is reached after the existing transaction and is behaviorally identical for applied, replayed, and alreadyNormalized.",
+        "MagnitudeUncertainty": "Provider-specific creation latency and SQLite contention vary, but the diff changes none of those operations for ordinary successful creation.",
+        "Verdict": "No performance regression: the normal creation critical path, boundary count, cardinality, caching, and concurrency are unchanged."
+      },
+      {
+        "Scenario": "Create a session while background sessions_v2/catalog reconciliation records a verified source between the initial check and catalog registration",
+        "CriticalPath": "The background migration runs off the creation path, but its central transaction races with createSession's registerChatCatalogV2 transaction. The transaction sequencer serializes them; when registration observes conflict, the changed branch now performs at most one authority refresh and allows creation to continue instead of throwing.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogReconciliationService.ts:_migrateSessions and src/vs/platform/agentHost/node/agentHostChatCatalogMigration.ts:migrateChatCatalogV2",
+            "Operation": "Background reconciliation reads central catalog/session rows and may open session/chat databases to migrate metadata.",
+            "Cardinality": "A bounded reconciliation batch with at most 4 sessions concurrently; per migrating session, chat metadata reads are limited to 4 concurrently.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same startup migration and bounded concurrency could race with creation before the diff.",
+            "CriticalPathEffect": "Migration is background work, but its central transaction can briefly precede the serialized createSession registration transaction."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostDatabase.ts:registerChatCatalogV2",
+            "Operation": "Run one serialized registration transaction that sees the verified sessions_v2 source or catalog header and returns conflict.",
+            "Cardinality": "One transaction for the raced newly created session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Before the diff, the same transaction returned conflict and createSession threw.",
+            "CriticalPathEffect": "The transaction is awaited by createSession; the diff does not add or retry it."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:noteCatalogNormalized",
+            "Operation": "On the newly accepted conflict result, inspect the session-state cache and, only for a loaded legacy-authority record, read the normalized catalog, flush pending legacy mirror state, and read central state once.",
+            "Cardinality": "Zero operations for a cold/unloaded or already-normalized cache; otherwise one coalesced per-session refresh for this raced creation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Conflict threw immediately, so no authority refresh ran and the user received no successfully created session.",
+            "CriticalPathEffect": "The refresh is awaited before successful createSession completion; previously this raced request terminated with an error instead of succeeding."
+          }
+        ],
+        "ScalingInput": "Cost is bounded to the single newly created session whose registration overlaps migration; it does not fan out over all registered sessions. Background migration scale and limits are unchanged.",
+        "EffectiveConcurrency": "Catalog reconciliation admits up to 4 session migrations, while each migration's chat metadata work is limited to 4; all central SQLite transactions remain serialized. The session-state refresh uses a per-session sequencer. The diff adds no burst or parallel fan-out.",
+        "CacheBehavior": "Cold/unloaded state makes the newly reached noteCatalogNormalized call a no-op. Warm legacy state incurs one authoritative refresh, then authority 2 suppresses future refreshes. Failed refreshes are recorded for the next locked load rather than retried in a loop.",
+        "MechanismConfidence": "High: the database implementation returns conflict only after observing an existing verified source/header in this registration method, and the changed line only admits that status to the existing normalized-authority refresh.",
+        "MagnitudeUncertainty": "The overlap frequency and warm-cache probability are uncertain, but the changed work is strictly bounded and replaces a failed user operation with a successful one.",
+        "Verdict": "No reportable regression: the only new work is a single bounded cache-authority refresh required to complete a formerly failing raced creation; it introduces no repeated work, fan-out, retention, or concurrency burst."
+      }
+    ],
+    "Summary": "Reviewed the complete two-file diff and traced normal and raced session creation through the orchestrator SQLite transaction, startup catalog migration, session-state cache refresh, batching, and concurrency limits. The change only treats a serialized registration conflict as an already-recorded catalog and reaches the existing one-time authority refresh; no actionable performance regression or performance regression fix was identified."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-17T13:55:51.24062401Z",
+    "CompletedAt": "2026-10-17T13:57:15.538898881Z",
+    "WallClockMilliseconds": 84298,
+    "ModelCalls": 12,
+    "InputTokens": 416028,
+    "OutputTokens": 4877,
+    "TotalTokens": 420905,
+    "ReasoningTokens": 1241,
+    "CacheReadTokens": 359424,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 65994,
+    "ToolCalls": 49,
+    "NanoAIUnits": 46772560000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 359424,
+      "cache_write": 0,
+      "input": 56604,
+      "output": 4877
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
