@@ -1,0 +1,170 @@
+{
+  "PullRequest": {
+    "Number": 342300,
+    "Title": "agentHost: undo the central adoption of a cancelled catalog synchronization",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFound while running the unit tests in parallel worker processes (#342237).\n\n## Problem\n\n`AgentService (node dispatcher) › restoreSession › does not persist or replay a restored subagent receipt after its owner is reloaded during local receipt commit` failed on a busy Windows runner ([CI](https://github.com/microsoft/vscode/actions/runs/39019267871/job/117357801847)):\n\n```\n-  \"localTitle\": \"Old Owner\"\n+  \"localTitle\": \"Original title\"\n```\n\nThe test checks that a catalog synchronization that is superseded mid-write, because the session's owner was reloaded during the local receipt commit, **persists nothing**: the local receipt and session.db's title must stay as they were. That only fails on a slow machine because the stale title reaches session.db through a debounced write that the test usually outruns.\n\n## Root cause\n\n`AgentHostCatalogSyncService._writeThroughCentral` writes a synchronization's old-format values in two steps:\n\n1. It **adopts** them into central session state (`exclusive.writeLegacyMetadata`).\n2. It writes them to session.db together with the catalog sync receipt, guarded by the `writeValidator`.\n\nWhen step 2 returns `'cancelled'` (the validator reports the synchronization was superseded), step 1 is not undone. The adopted values (here the reloaded owner's previous title, `'Old Owner'`) stay in central state as unmirrored entries. The session state store's **debounced mirror flush** (`SESSION_STATE_MIRROR_FLUSH_DELAY`, 250 ms) then writes them to session.db anyway, which defeats the cancellation.\n\n## Fix\n\n`_writeThroughCentral` records the values central state renders for the request's keys before adopting (`legacyMetadata`, inside the same exclusive section, so nothing interleaves). When the session.db write is cancelled, it writes them back; keys that had no value are removed again. Applied and replayed writes are unchanged.\n\nThe test now settles the session state store (`whenIdle`) before it reads session.db, so it checks what session.db ends up with, not what it holds before the mirror flushes.\n\n## Proof\n\nWithout the product fix, the settled test fails **deterministically**, with exactly the CI diff:\n\n| | Electron runner | node.js runner |\n|---|---|---|\n| `main` + the settled test (before) | **3/3 failing**: `localTitle: 'Old Owner'` | **failing**, same diff |\n| This PR (after) | **3/3 passing** | passing |\n\n## Validation\n\nSince this touches core catalog synchronization, all agentHost unit tests were run:\n\n| Command | Result |\n|---|---|\n| `./scripts/test.sh --runGlob '**/platform/agentHost/test/**/*.test.js'` | 14106 passing, 76 pending, 1 failing\\* |\n| `npm run test-node -- --runGlob 'vs/platform/agentHost/test/{common,node}/**/*.test.js'` | 13504 passing, 75 pending, 1 failing\\* |\n| `npm run eslint -- src/vs/platform/agentHost/node/agentHostCatalogSyncService.ts src/vs/platform/agentHost/test/node/agentService.test.ts` | Passed |\n| `npm run typecheck-client` | Passed |\n\n\\* `CopilotAgent › scoped credentials › isolates peer runtimes, preserves local adoption identity and refuses revoked prepared work` also fails on unchanged `main` on my machine. It passes in CI and is unrelated.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342300",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "fb0e4c601bed105b7fbf8209f8cf2fd691aec4db",
+    "HeadRef": "agents/catalog-sync-roll-back-cancelled-adoption",
+    "HeadSHA": "3dddab2b2d36087b31716c2cfd0aa3ac00fb3dc6",
+    "CreatedAt": "2026-10-17T16:10:26Z",
+    "UpdatedAt": "2026-10-17T21:29:47Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "missing-coalescing",
+      "serialization-allocation",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Normal catalog synchronization for an imported/loaded session after list-visible metadata, discovery, passive metadata, or reconciliation changes",
+        "CriticalPath": "The request is built, the per-session catalog queue and session-state exclusive section are acquired, central session state is adopted, session.db receives the metadata plus receipt transaction, and the central catalog is upserted before synchronization completes. The new `legacyMetadata` snapshot runs synchronously immediately before adoption and is therefore on this path, but it is an in-memory render with no boundary crossing.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:_writeCentral",
+            "Operation": "Write adopted legacy metadata to central session state in agent-host.db",
+            "Cardinality": "At most one adoption write for each local receipt write attempt, with no-op patches short-circuited; retries remain bounded by existing generation retry limits.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same adoption transaction occurred before this PR.",
+            "CriticalPathEffect": "This write must complete before the local receipt transaction."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogSyncService.ts:_synchronizeWithDatabaseLocked/_storePending",
+            "Operation": "Set or transition metadata values and catalog synchronization receipt in session.db",
+            "Cardinality": "One set or transition per synchronization attempt; existing generation retries are bounded.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same local database transaction occurred before this PR.",
+            "CriticalPathEffect": "The receipt transaction is on the synchronization critical path."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogSyncService.ts:_synchronizeWithDatabaseLocked",
+            "Operation": "Read/upsert the sessions_v2 central catalog row and acknowledge the local receipt",
+            "Cardinality": "Existing bounded reads/writes per synchronization attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Call count and placement are unchanged.",
+            "CriticalPathEffect": "These operations remain on the synchronization critical path after the local receipt applies."
+          }
+        ],
+        "ScalingInput": "The new snapshot scales with `Object.keys(request.legacyMetadata)`; most requests carry a bounded set of session keys, while map-shaped Git/GitHub metadata can scale with the session's working-directory set and chat-specific overrides can scale with changed chat metadata. It does not scan all sessions. Reconciliation selects at most 50 sessions per batch and limits cross-session work to 4.",
+        "EffectiveConcurrency": "Catalog synchronization and session-state operations are serialized per session/storage key. Reconciliation permits up to 4 independent sessions concurrently; the diff does not change either limiter or create new aggregate parallelism.",
+        "CacheBehavior": "The session state must already be loaded in `_records` when the new `legacyMetadata` call executes; cold loading remains owned by the enclosing exclusive section. The snapshot reads the loaded model and introduces no cache key, miss, retry, negative cache, or coalescing change. Existing mirror writes remain scheduled/coalesced on a 250 ms window.",
+        "MechanismConfidence": "High: the new call is synchronous against an already-loaded record, and the implementation shows only rendering/allocation rather than filesystem, IPC, or database access.",
+        "MagnitudeUncertainty": "Exact metadata-map sizes and render duration vary by session, but the changed steady-state mechanism is a single in-memory pass and does not add an expensive boundary. There is no evidence that realistic key cardinality turns it into user-visible latency.",
+        "Verdict": "No reportable regression. The diff adds a bounded in-memory pre-adoption snapshot; it neither fans out boundary calls nor changes scheduling, retention, or concurrency."
+      },
+      {
+        "Scenario": "A catalog synchronization is superseded while its session.db receipt write is in flight, such as owner reload during restored-subagent admission or a stale passive metadata continuation",
+        "CriticalPath": "After the local receipt write returns `cancelled`, the new rollback writes the previously rendered values back to central state before returning the pending/cancelled result. The coalesced mirror may later settle to session.db; it is not needed before the cancelled result unless an explicit idle drain runs.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogSyncService.ts:695",
+            "Operation": "Restore the pre-adoption metadata in agent-host.db via `writeLegacyMetadata`",
+            "Cardinality": "One central-state transaction for one cancelled local receipt attempt; empty patches short-circuit in `_writeCentral`.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Before the diff there was no rollback transaction; stale adopted values remained and were later mirrored.",
+            "CriticalPathEffect": "Introduced on the cancellation result's critical path so stale adopted state cannot escape the exclusive section."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:runExclusive mirror scheduler",
+            "Operation": "Flush dirty legacy metadata to session.db through the coalesced mirror",
+            "Cardinality": "At most one coalesced flush for the dirty session after the 250 ms window (or an explicit idle drain), not one per metadata key or per adoption/undo write.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The cancelled adoption already scheduled a coalesced mirror before the PR; the diff changes the value ultimately mirrored back to the prior value, not the flush fan-out.",
+            "CriticalPathEffect": "Normally off the cancellation critical path; explicit `whenIdle` drains it before proceeding."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCatalogSyncService.ts:_writeThroughCentral callback",
+            "Operation": "Attempt the guarded metadata-and-receipt transaction in session.db",
+            "Cardinality": "One guarded attempt that returns `cancelled`.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same guarded transaction returned `cancelled`, but central adoption was left in place.",
+            "CriticalPathEffect": "Existing boundary whose cancellation triggers the new rollback."
+          }
+        ],
+        "ScalingInput": "Rollback work scales with the metadata keys in the single cancelled request and occurs once for that cancelled receipt attempt. It does not loop over sessions or history. Cancellation is caused by the per-operation validator becoming stale.",
+        "EffectiveConcurrency": "The rollback executes inside the existing per-session session-state exclusive section and catalog queue, so it is serialized with other work for that session. Different reconciliation sessions remain bounded at concurrency 4; no new burst is introduced.",
+        "CacheBehavior": "The previous values are captured from the loaded session-state model before adoption. No cache is introduced. The adoption and undo both use the existing coalesced mirror scheduler, so multiple dirty entries still produce one delayed mirror flush rather than one flush per key.",
+        "MechanismConfidence": "High: the call path and database write are explicit, the per-session sequencer is established, and the test exercises both set and transition cancellation paths.",
+        "MagnitudeUncertainty": "Database latency varies by platform and load, but the additional transaction is exactly one per superseded write, is serialized rather than bursty, and cancellation is exceptional. The transaction is intentional cleanup necessary to preserve cancellation semantics.",
+        "Verdict": "No reportable performance regression. The one added database write is bounded to cancellation cleanup and prevents a stale mirror write; there is no unbounded repetition, fan-out, or concurrency amplification."
+      },
+      {
+        "Scenario": "Unit test settles session-state mirrors before asserting the final session.db title",
+        "CriticalPath": "After reconciliation, the added `whenIdle(undefined)` waits for queued session-state work and actively flushes loaded records before the test reads session.db. This affects test execution only, not a product workflow.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/test/node/agentService.test.ts:27299",
+            "Operation": "Flush pending legacy mirrors for loaded test session-state records",
+            "Cardinality": "One global idle drain in each of the two test cases, over records loaded by that isolated test service.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The test read session.db without waiting for pending mirror work.",
+            "CriticalPathEffect": "On the test's assertion path only; it replaces a race against the 250 ms scheduler with an immediate drain."
+          }
+        ],
+        "ScalingInput": "The drain scales with loaded test-store records and sequencer keys in this isolated service instance; the test invokes it once per receipt-path case.",
+        "EffectiveConcurrency": "The drain waits queued work and flushes records with `Promise.all`; it does not change product concurrency.",
+        "CacheBehavior": "It drains existing loaded records and scheduled mirrors; it creates no cache or retained state.",
+        "MechanismConfidence": "High: `whenIdle(undefined)` explicitly waits sequencers and flushes every loaded record.",
+        "MagnitudeUncertainty": "The isolated store may hold several records, but the test fixture bounds them and the drain cancels scheduler delays before flushing. No product latency is affected.",
+        "Verdict": "No reportable product performance issue; the added test-only drain is bounded and necessary to assert settled persistence deterministically."
+      }
+    ],
+    "Summary": "Completed the performance pass over all changed hunks and traced normal synchronization, superseded-write rollback, reconciliation concurrency, session-state mirroring, database boundaries, and the test drain. No high-confidence actionable performance regression was introduced, and the PR is a correctness fix rather than a demonstrated performance-regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-17T23:05:30.736033608Z",
+    "CompletedAt": "2026-10-17T23:07:09.54537281Z",
+    "WallClockMilliseconds": 98809,
+    "ModelCalls": 10,
+    "InputTokens": 380651,
+    "OutputTokens": 6215,
+    "TotalTokens": 386866,
+    "ReasoningTokens": 2079,
+    "CacheReadTokens": 303616,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 82966,
+    "ToolCalls": 49,
+    "NanoAIUnits": 55388640000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 303616,
+      "cache_write": 0,
+      "input": 77035,
+      "output": 6215
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
