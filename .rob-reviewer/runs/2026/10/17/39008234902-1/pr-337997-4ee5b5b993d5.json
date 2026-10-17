@@ -1,0 +1,122 @@
+{
+  "PullRequest": {
+    "Number": 337997,
+    "Title": "Log telemetry when the closed-chat promo pip is armed",
+    "Body": "Adds a `chatPromoWidgetArmed` event the first time a promo's status-bar pip is shown. Together with the existing events, this gives a funnel for the closed-chat promo:\n\n| Stage | Event |\n|---|---|\n| Cohort (both arms) | `tasClientReadTreatmentComplete` for `config.chat.closedPromoNotification` |\n| Pip armed | `chatPromoWidgetArmed` (new) |\n| Card shown | `chatPromoWidgetShown` |\n| CTA clicked | `chatPromoWidgetAction` with `action: \"tryModel\"` |\n\nThe event fires once per promo id per session. It doesn't fire if the promo was already seen, because the pip isn't shown then.\n\n## Proof: real ExP assignment\nI ran Code OSS from this branch against the real TAS endpoint. For each arm, I started a temporary one-device stage on the existing Copilot closed-chat promo progression. The sale metadata was faked by a localhost proxy in front of the real Copilot API. Both stages are now stopped.\n\n**Treatment** (`closed-promo-popup:31590781`): the pip shows, the card opens, and **Try GPT-5.3-Codex** opens Chat. Event counts: armed, shown and action each fired exactly once.\n\nhttps://github.com/user-attachments/assets/15b47e5a-06ef-47dc-978a-8f111c9ca3c0\n\n![Armed event in the Telemetry output](https://github.com/user-attachments/assets/ffeb7275-21b2-4ce7-a0a6-ad277a5bbb06)\n![Treatment cohort event](https://github.com/user-attachments/assets/fbf47e0d-d874-4e9a-9c0d-af4c5f12c1cc)\n\n**Control** (`closed-promo-control:31590798`): no pip, and the Copilot status hover has no offer. The cohort event shows `treatmentValue: \"none\"`, and no promo events fired.\n\nhttps://github.com/user-attachments/assets/42a57c67-c117-4a4f-8f23-5a83206d7b95\n\n![Control cohort event](https://github.com/user-attachments/assets/6ca84e93-869d-4001-849e-38e030a4534e)\n\n## Tests\n`chatStatusPromo.test.ts`: 37 passing. I updated the two expectations for the emitted event sequence.",
+    "URL": "https://github.com/microsoft/vscode/pull/337997",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "rfeltis",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e97039dd9293ef2b9df8876d0bc8c0c8ff87f871",
+    "HeadRef": "rfeltis-promo-pip-armed-telemetry",
+    "HeadSHA": "4ee5b5b993d5dac7fa049b0038e661892807af61",
+    "CreatedAt": "2026-09-25T16:45:04Z",
+    "UpdatedAt": "2026-10-17T01:19:00Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "repeated-work",
+      "unbounded-retention",
+      "cache-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "An eligible closed-chat promo first arms its status-bar pip after workbench restoration or a promo/treatment change.",
+        "CriticalPath": "The status-bar update synchronously selects one eligible promo and resolves cached/configured treatment; on the first eligible result, the added Set insertion and telemetry logging run before entry props return. A cold experiment assignment is asynchronous and already existed; the status entry makes progress only after that treatment resolves. Telemetry transport is fire-and-forget and does not await IPC or network completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatStatus/chatStatusPromo.ts:210 resolveExperiment",
+            "Operation": "Fetch experiment treatment through IWorkbenchAssignmentService when no explicit configuration or cached treatment exists.",
+            "Cardinality": "At most one in-flight treatment request, coalesced by pending; refetch invalidation can intentionally cause another request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same treatment fetch and wait occurred before this change.",
+            "CriticalPathEffect": "An uncached treatment must resolve before the promo can arm; configured or cached treatment has no request. This behavior predates the diff."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatStatus/chatStatusPromo.ts:160 getEntryProps -\u003e TelemetryAppenderClient.log",
+            "Operation": "On desktop, enqueue the new chatPromoWidgetArmed telemetry event to the shared-process telemetry appender.",
+            "Cardinality": "Exactly once per distinct promo ID per ChatStatusPromo session instance due armedPromos; not per status update or per model.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Arming the pip emitted no telemetry IPC; telemetry was emitted only if the hover was later shown or its action used.",
+            "CriticalPathEffect": "The renderer synchronously sanitizes the small payload and initiates a fire-and-forget channel call before returning props, but does not wait for IPC completion."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatStatus/chatStatusPromo.ts:160 getEntryProps -\u003e web/remote telemetry appender",
+            "Operation": "Queue the new usage telemetry event for the configured OneDS or remote telemetry transport.",
+            "Cardinality": "One small event per distinct promo ID per session; repeated render/update events are deduplicated before transport.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No armed event was queued; only later shown/action events used telemetry transport.",
+            "CriticalPathEffect": "Network delivery is asynchronous and off the status-bar critical path; only small local serialization/queueing occurs synchronously."
+          }
+        ],
+        "ScalingInput": "Language-model metadata may contain multiple models, but getOpportunity returns the first eligible promo, so one update arms at most one promo. Across a session, added telemetry cardinality is one event per distinct promo ID encountered, normally one active campaign at a time.",
+        "EffectiveConcurrency": "UI updates execute serially on the renderer event loop. Existing pending treatment state coalesces assignment lookup to one in-flight request. The telemetry call is not awaited; desktop enqueues one IPC call and web hands one event to the appender without creating a concurrent per-model burst.",
+        "CacheBehavior": "Configured treatment bypasses assignment lookup. Cold uncached experiment treatment starts one request; warm/repeated updates reuse treatment, and pending prevents duplicate requests. armedPromos is a positive session cache: repeated updates for the same ID perform only Set lookups and no telemetry boundary call. A new session intentionally emits once again; ineligible/previously seen persisted promos do not reach the added event.",
+        "MechanismConfidence": "High confidence in the call path, deduplication, one-active-promo cardinality, and asynchronous telemetry transport based on the changed code, caller, telemetry service, and appenders.",
+        "MagnitudeUncertainty": "Exact telemetry sanitizer/appender duration and number of campaign IDs encountered in unusually long sessions are unmeasured, but realistic cardinality is tiny and transport is asynchronous.",
+        "Verdict": "No reportable performance regression. The diff adds bounded constant-size work and one asynchronous telemetry boundary per promo ID, not per refresh or model; the session Set retains only encountered campaign IDs and does not plausibly create meaningful memory growth."
+      },
+      {
+        "Scenario": "The status bar refreshes repeatedly while the same promo remains eligible, including model metadata refreshes and hover transitions.",
+        "CriticalPath": "Each refresh still scans the pre-existing model list and reads pre-existing promo state. The diff adds O(1) Set checks; after the initial arm, it skips telemetry entirely. Hover display continues its existing storage write and shown-event path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Frequency is status/entitlement/editor/configuration/model/view events, while effective armed-event cardinality remains one for the stable promo ID regardless of refresh count.",
+        "EffectiveConcurrency": "Refresh callbacks are synchronous and serialized. No timers, promises, subprocesses, IPC calls, or network calls are added after the first arm for the same ID.",
+        "CacheBehavior": "armedPromos remains warm for the lifetime of ChatStatusPromo. shownPromos suppresses the pip after display, and persisted seen state prevents a previously seen promo from being re-offered after restart. Promo metadata text changes with the same ID rebuild the tooltip but do not emit another armed event.",
+        "MechanismConfidence": "High confidence from getEntryProps and tests that invoke update/metadata refresh while expecting only one armed event.",
+        "MagnitudeUncertainty": "The raw refresh rate varies with user activity, but the added steady-state work is two bounded Set lookups on a very small session set.",
+        "Verdict": "No repeated boundary work or rendering regression is introduced; deduplication occurs before telemetry logging."
+      }
+    ],
+    "Summary": "Reviewed both changed files and traced the added event through status-bar callers, treatment caching, telemetry sanitization, desktop IPC, web/remote transport, and session lifecycle. No high-confidence actionable performance issue was found; the only added boundary is asynchronous and session-deduplicated per promo ID."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-17T06:03:16.08919422Z",
+    "CompletedAt": "2026-10-17T06:04:26.761127304Z",
+    "WallClockMilliseconds": 70671,
+    "ModelCalls": 9,
+    "InputTokens": 197560,
+    "OutputTokens": 3764,
+    "TotalTokens": 201324,
+    "ReasoningTokens": 970,
+    "CacheReadTokens": 159744,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 53282,
+    "ToolCalls": 36,
+    "NanoAIUnits": 29044160000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 159744,
+      "cache_write": 0,
+      "input": 37816,
+      "output": 3764
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
