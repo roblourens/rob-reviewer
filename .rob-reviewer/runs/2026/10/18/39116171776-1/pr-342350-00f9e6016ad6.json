@@ -1,0 +1,90 @@
+{
+  "PullRequest": {
+    "Number": 342350,
+    "Title": "agentHost: fix flaky subagent restore test in Session storage identity compatibility (Windows SQLITE_BUSY)",
+    "Body": "cc @sandy081\r\n\r\n---\r\n\r\n\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nFixes #341747 (closed, but the flake recurs on `main`).\r\n\r\nThis PR contains only the test fix (one commit, `sessionStorageIdentity.test.ts`). The temporary Windows stress and probe commits that produced the evidence below were run on this branch and then dropped. The diagnostic baseline branch is the draft #342349 (do not merge).\r\n\r\n## Status on `main`\r\n| Test | History | Current status |\r\n|---|---|---|\r\n| `cold central receipt translation does not depend on the bounded hash cache` | Skipped in #341500. Re-enabled by 59e0b8222b4 (Oct 14 17:13 UTC), which cut its durable writes. | **No failures after 59e0b8222b4.** The last one was ADO 484132, queued Oct 14 09:15 UTC. Not changed here. |\r\n| `restoring a compatibility session registers its subagent chat in memory with its origin, without a catalog admission` | Skipped in #341749. Un-skipped by 811e884bc22 (Oct 15 14:06 UTC), which made teardown await `close()` and retry `rm`. | **Still flaky.** The teardown `EBUSY` changed into `SQLITE_BUSY: database is locked` inside the test body. Both Oct 16 failures ran on PR merges that contain 811e884bc22. |\r\n\r\n59e0b8222b4 fixed the *cold receipt* timeouts (too many durable writes on slow Windows disks). It is unrelated to this remaining failure.\r\n\r\n## CI failures\r\nGitHub, Windows / Electron-Unit, step `.\\scripts\\test.bat --tfs \"Unit Tests\"`:\r\n- Oct 16 22:57, `SQLITE_BUSY: database is locked` (contains 811e884bc22): https://github.com/microsoft/vscode/actions/runs/38977420862/job/117230318893\r\n- Oct 16 19:31, `SQLITE_BUSY: database is locked` (contains 811e884bc22): https://github.com/microsoft/vscode/actions/runs/38953164693/job/117149351794\r\n- Oct 15 09:02, `\"after each\" hook` `EBUSY … unlink …\\agent-host.db-journal` (before 811e884bc22): https://github.com/microsoft/vscode/actions/runs/38709064333/job/116336014348\r\n- Cold receipt test (before 59e0b8222b4): https://github.com/microsoft/vscode/actions/runs/38291618747/job/114952819319 · https://github.com/microsoft/vscode/actions/runs/38426224725/job/115396958345 · https://github.com/microsoft/vscode/actions/runs/38421326029/job/115379107576\r\n\r\nAzure DevOps `main` builds:\r\n- `restoring …` `\"after each\"` `EBUSY … agent-host.db` (Windows, node.js): https://dev.azure.com/monacotools/Monaco/_build/results?buildId=484679\u0026view=results\r\n- Cold receipt test, 30 s timeout and/or `EBUSY` on `agent-host.db[-journal]`: [484132](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=484132\u0026view=results) · [484073](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=484073\u0026view=results) (Linux) · [483766](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=483766\u0026view=results) · [483726](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=483726\u0026view=results) · [483680](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=483680\u0026view=results) · [483424](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=483424\u0026view=results)\r\n\r\n## Root cause\r\nThe test simulates three agent-host restarts (create → restore → restore again) on the same `agent-host.db` and per-session `session.db` files. Between \"processes\" it only called `db.close()` on the central database. The previous `AgentService` graph stayed alive until suite teardown.\r\n\r\n`createSession`/`restoreSession` queue *coalesced* old-format session-state mirror writes in `AgentHostSessionStateStore`, flushed by a `RunOnceScheduler` after `SESSION_STATE_MIRROR_FLUSH_DELAY` (250 ms). On a failed flush it retries after 5 s. So while the next host restores the session, the previous host's flush still fires:\r\n1. It writes `session.db` through the previous host's own `SessionDataService` connection.\r\n2. It then updates `session_state.legacy_mirrored_revision` in the central DB the test already closed.\r\n\r\nThe agent-host databases set no `busy_timeout`. Any overlap between those connections and the new host's on the same file fails immediately with `SQLITE_BUSY: database is locked`. On Windows CI this test takes about 0.9 s, so the 250 ms timers fire mid-test. On fast machines the test usually finishes, and teardown disposes the timers, first. Before 811e884bc22, the same in-flight write could leave `agent-host.db-journal` open during teardown, which matches the earlier `EBUSY … unlink` failures.\r\n\r\n**Evidence that the race exists on Windows.** I ran a temporary probe (not part of this PR) in the Windows / Electron-Unit job. It inserts a gap of 0–400 ms (steps of 20 ms) between the simulated restarts and wraps each host's `SessionDataService` to record any `session.db` call a host makes after the next host has started. Each of the 21 gaps ran 30 times (630 executions):\r\n\r\n| Gap between restarts | Without fix ([job](https://github.com/microsoft/vscode/actions/runs/39085445997/job/117550896229)): replaced host still writes `session.db` | With fix ([job](https://github.com/microsoft/vscode/actions/runs/39083355206/job/117544721335)) |\r\n|---|---|---|\r\n| 0 ms | 30/30 | 0/30 |\r\n| 20 ms | 30/30 | 0/30 |\r\n| 40 ms | 29/30 | 0/30 |\r\n| 60 ms | 26/30 | 0/30 |\r\n| 80 ms | 13/30 | 0/30 |\r\n| 100 ms | 5/30 | 0/30 |\r\n| 120 ms | 7/30 | 0/30 |\r\n| 140–400 ms | 0/30 each | 0/30 each |\r\n| **Total** | **140/630** | **0/630** |\r\n\r\nEvery one of the 140 calls was `host2.applyMetadataChanges` (the coalesced mirror flush), about 1.0 s into the test (965–1213 ms), while host 3 was restoring the same session. With no busy timeout, such an overlapping write is exactly what returns `SQLITE_BUSY` when the two connections' locks collide. In an earlier run of the same probe, [without fix](https://github.com/microsoft/vscode/actions/runs/39083335326/job/117544660165) the SQLite layer reported 4 errors and [with fix](https://github.com/microsoft/vscode/actions/runs/39083355206/job/117544721335) 0; their text was not captured.\r\n\r\nOn macOS, the same probe showed the phase-1 host's flush also writing the central DB after `db.close()`: `SQLITE_MISUSE: Database handle is closed` on `UPDATE session_state SET legacy_mirrored_revision`, in 3 of 4 instrumented runs. It showed 0 such writes with the fix.\r\n\r\n## Fix\r\nStop each simulated host with `AgentService.shutdown()` before starting the next one, and stop the last host before the assertions. `shutdown()` is what a real host runs before exiting. It drains dispatch and catalog-reconciliation work, flushes the session-state store (including pending mirror writes), and closes the orchestrator database. No host can then touch the files the next host is using. The other restart tests in this suite already retire their previous host (`creating.dispose(); await modern.whenIdle(); await db.close();`); this test was the outlier. No production code changes. No test in the file is skipped any more.\r\n\r\n## Validation\r\n- `npm run eslint -- src/vs/platform/agentHost/test/node/sessionStorageIdentity.test.ts`: **passed**\r\n- `./scripts/test.sh --timeout 30000 --run src/vs/platform/agentHost/test/node/sessionStorageIdentity.test.ts` (macOS): **passed**, 69 passing, 0 pending\r\n- macOS stress, `./scripts/test.sh --timeout 30000 --run src/vs/platform/agentHost/test/node/sessionStorageIdentity.test.ts --grep \"restoring a compatibility session registers its subagent chat\"` ×20: **passed 20/20** with the fix (baseline also 20/20; macOS does not reproduce the flake)\r\n- Windows CI stress, `.\\scripts\\test.bat --run src/vs/platform/agentHost/test/node/sessionStorageIdentity.test.ts` ×100 (whole file, 69 tests) with the fix: **passed 100/100**, [job](https://github.com/microsoft/vscode/actions/runs/39080216733/job/117535466360)\r\n- The same Windows stress without the fix, #342349: **also passed 100/100**, [job](https://github.com/microsoft/vscode/actions/runs/39080134997/job/117535230903). The SQLite collision is rare: two failures across all PR CI runs on Oct 16. So plain repetition does not reproduce the failure; the probe table above shows the overlapping writes it depends on instead.\r\n- Windows CI amplified probe (21 gaps × 30) with the fix: **630/630 passed, 0 stale-host writes**; without the fix: 630/630 passed, **140 stale-host writes** (table above)\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342350",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "09d2db6c2f68d373a46463bf28a8dee157cd31f3",
+    "HeadRef": "agents/fix-flaky-session-storage-test",
+    "HeadSHA": "00f9e6016ad6f69417bc8df56b168724d170b503",
+    "CreatedAt": "2026-10-17T23:45:09Z",
+    "UpdatedAt": "2026-10-18T09:02:47Z",
+    "MergedAt": null,
+    "Labels": [
+      "flaky-test-fix"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Compatibility-session create/restore test simulating three successive agent-host processes",
+        "CriticalPath": "Each phase creates or restores one session, then the newly added awaited AgentService.shutdown() drains dispatch and catalog work, shuts down the mock provider, flushes pending compatibility/session-state writes, and closes the central SQLite database before the next phase opens it. This cleanup is intentionally on the test's critical path and does not affect a production product workflow because the changed file is test-only.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/test/node/sessionStorageIdentity.test.ts:1378, 1402, 1413 via AgentService.shutdown in src/vs/platform/agentHost/node/agentService.ts:13371",
+            "Operation": "Open, read, write, flush, and close the central agent-host.db and per-session session.db SQLite files in the temporary test directory.",
+            "Cardinality": "Fixed test cardinality: three host instances over one session, one default chat, and one discovered subagent chat. Each shutdown flushes only that phase's loaded session and closes its one central database; there is no collection-scale fan-out.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The first two phases directly closed only agent-host.db while leaving queued per-session mirror work alive; the last phase remained open until shared teardown. The same pending mirror writes could fire concurrently with the next phase and contend on SQLite. Database cleanup still occurred, but incompletely and later.",
+            "CriticalPathEffect": "The shutdown must finish before the next simulated restart, eliminating concurrent old-host and new-host SQLite access. The final shutdown completes before assertions instead of during suite teardown."
+          }
+        ],
+        "ScalingInput": "The test data is constant-size and does not depend on workspace, repository, history, or user collection size. Effective cardinality remains one session and one pending coalesced mirror per phase.",
+        "EffectiveConcurrency": "All three phases and their shutdowns are explicitly awaited and serialized. Before the diff, stale-host scheduled writes could overlap a later host's restore; after the diff, effective SQLite writer concurrency across phases is one.",
+        "CacheBehavior": "Each simulated host starts cold against the same on-disk files and builds a fresh in-memory service graph. Within a phase, session state is loaded once. Shutdown cancels the 250 ms scheduler and flushes pending state immediately; there is no persistent cache growth or repeated miss loop.",
+        "MechanismConfidence": "High: the changed calls reach AgentService.shutdown(), whose implementation drains queues, flushes the session-state store, and closes the orchestrator database; the fixture uses disk-backed SQLite files and a no-op MockAgent shutdown.",
+        "MagnitudeUncertainty": "Exact test runtime added by immediate flushing depends on disk speed, but work is fixed-size, was already pending or deferred to teardown, and is limited to this single test.",
+        "Verdict": "No reportable performance regression. The diff moves bounded cleanup onto the correct serialized test boundary, replaces direct database closes for the first two phases, and prevents overlapping I/O; it changes no production code or product scenario."
+      }
+    ],
+    "Summary": "Reviewed the complete one-file diff and traced the added shutdown calls through provider shutdown, queue draining, session-state mirror flushing, and SQLite close. The only touched scenario is a fixed-cardinality restart compatibility test. The change serializes cleanup and removes cross-host I/O contention; no actionable diff-introduced performance issue or qualifying shipped performance regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-18T09:42:43.032061042Z",
+    "CompletedAt": "2026-10-18T09:43:40.858219088Z",
+    "WallClockMilliseconds": 57826,
+    "ModelCalls": 8,
+    "InputTokens": 195035,
+    "OutputTokens": 2899,
+    "TotalTokens": 197934,
+    "ReasoningTokens": 808,
+    "CacheReadTokens": 154624,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 39147,
+    "ToolCalls": 31,
+    "NanoAIUnits": 28147360000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 154624,
+      "cache_write": 0,
+      "input": 40411,
+      "output": 2899
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

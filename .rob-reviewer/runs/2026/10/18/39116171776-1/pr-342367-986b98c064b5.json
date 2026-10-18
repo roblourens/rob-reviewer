@@ -1,0 +1,208 @@
+{
+  "PullRequest": {
+    "Number": 342367,
+    "Title": "github: migrate browser plugin downloads to shared clients",
+    "Body": "Refs https://github.com/microsoft/vscode-internalbacklog/issues/9678\r\n\r\n- Materialize browser plugin repositories through typed ref, tree and blob APIs, using explicit authorization grants without passing tokens into the plugin fetcher.\r\n- Preserve the install authentication sequence, non-interactive updates/checkouts, binary contents, pinned revisions and cached SHAs. Failed extraction drains pending work before removing staging files; successful extraction replaces the target.\r\n- Raise shared active-request limits to 12 overall, 12 per host, 10 per account and 8 per caller, without raising retained-request limits.\r\n- Restore browser support for renamed repositories through an opt-in native-follow fallback for opaque, bodyless repository GET/HEAD redirects. Follow attempts omit cookies, referrers, cached validators, integration IDs and identification headers. Validate the final URL before accepting its body or quota hints; keep Node, mutation and explicit manual-redirect behavior unchanged.\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342367",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "dc811b77cd1e0753d306b0c6f819a7311bcf49b5",
+    "HeadRef": "dev/dmitriv/browser-plugin-api-migration",
+    "HeadSHA": "986b98c064b59effd5638af86111dc78cba1f74a",
+    "CreatedAt": "2026-10-18T05:45:40Z",
+    "UpdatedAt": "2026-10-18T09:16:12Z",
+    "MergedAt": null,
+    "Labels": [
+      "network",
+      "agent-plugins"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-60429D847DC9",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/githubRepoFetcher.ts",
+      "Side": "RIGHT",
+      "Line": 97,
+      "Severity": "high",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The changed loop, full credential call path, uncached AuthenticationService.getSessions implementation, and extension-host RPC are all directly visible. Repository file count and the old single-token behavior are explicit; only the exact per-call provider duration varies by environment.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "authentication-provider calls and workbench-to-extension-host RPC messages",
+      "PerformanceScaling": "For a repository with F supported blob entries, the extraction now performs F credential lookups (up to 10 concurrently) in addition to the initial session/client lookups; the cost grows linearly with repository file count even when the GitHub credential generation is already resolved.",
+      "PerformanceOutcome": "increased install latency and extension-host IPC/CPU pressure",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The browser plugin service called getExistingGitHubAuthenticationToken once, then passed that captured token through resolveGitHubRefToSha, fetchGitHubTree, and every fetchGitHubBlob request, so repository size did not increase authentication-provider calls.",
+      "ChangedBehavior": "Each added content.getBlob call now goes through ContentClient -\u003e LocalApiRequestProvider.execute -\u003e credentials.getCredential. GitHubCredentialService.getCredential invokes credentialProvider.getToken before reusing its current generation; WorkbenchGitHubCredentialProvider.getToken calls authenticationService.getSessions, which delegates to the registered provider and, for the GitHub extension provider, crosses MainThreadAuthenticationProvider.$getSessions RPC.",
+      "CausalDiffEvidence": "The added per-entry call at githubRepoFetcher.ts:97 replaces fetchGitHubBlob(..., authToken, ...), while pluginGitCommandService.ts changed from capturing one access token to acquiring an account API client. This places credential-provider resolution inside the existing blobsToFetch.map loop.",
+      "Title": "Reuse the authenticated credential across blob downloads",
+      "Impact": "Installing or updating an authenticated browser plugin repository with tens or hundreds of files repeatedly invokes the GitHub authentication provider on the install critical path, increasing latency and potentially saturating the web extension host; larger repositories amplify the overhead one call per file.",
+      "Evidence": "fetchAndExtractGitHubRepo queues one content.getBlob at this line for every blob entry. LocalApiRequestProvider.execute always awaits credentials.getCredential; GitHubCredentialService.getCredential always calls its token provider even when _current already holds the same token; WorkbenchGitHubCredentialProvider.getToken resolves the session via AuthenticationService.getSessions, and MainThreadAuthenticationProvider.getSessions calls the extension-host $getSessions RPC. The limiter permits 10 such lookups concurrently. The deleted implementation passed one authToken directly to all blob requests.",
+      "Recommendation": "Keep credentials broker-owned but resolve/cache one validated credential for the account-client lease (invalidating it on onDidChangeToken/onDidInvalidate), so ref/tree/blob requests reuse it. Alternatively add an operation-scoped credential lease; do not invoke the authentication provider separately for each blob."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Install, update, or check out a browser plugin from GitHub using an existing authenticated session",
+        "CriticalPath": "Session discovery and explicit client acquisition must complete, then the first credential use resolves account identity through /user; ref resolution (unless an already-current full SHA), recursive tree fetch, every blob fetch, every file write, and the final staging move all complete before the plugin is available. Authentication-provider lookup is on this path for every typed request.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/githubRepoFetcher.ts:97 via LocalApiRequestProvider.execute -\u003e GitHubCredentialService.getCredential -\u003e WorkbenchGitHubCredentialProvider.getToken",
+            "Operation": "Resolve GitHub authentication sessions through the registered authentication provider; extension-backed providers cross the main-thread/extension-host $getSessions RPC.",
+            "Cardinality": "One provider lookup for each blob entry, up to 10 concurrently, plus constant lookups for initial session/client/ref/tree work.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The plugin fetched one session token before the operation and passed it to ref, tree, and every blob request; file count did not multiply authentication-provider calls.",
+            "CriticalPathEffect": "Every blob task waits for this lookup before entering the GitHub queue, so all lookups delay completion of extraction."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/pluginGitCommandService.ts:_withContentClient and src/vs/workbench/contrib/chat/browser/githubRepoFetcher.ts:48,97",
+            "Operation": "Resolve account identity, ref, recursive tree, and each blob from GitHub.",
+            "Cardinality": "One /user request for the first credential generation, normally one ref request, one tree request, and F blob requests; duplicate simultaneous blob URLs may coalesce.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Ref/tree/F-blob GitHub requests already existed through IRequestService; the shared client adds the first-use /user identity request and queueing.",
+            "CriticalPathEffect": "All successful reads must finish before the staging directory replaces the target."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/githubRepoFetcher.ts:61-116",
+            "Operation": "Create staging/directories, write decoded blobs, replace the target, and delete staging after failure.",
+            "Cardinality": "One staging directory, directory creation per discovered directory/parent, one write per supported blob, one move on success, and at most one recursive cleanup on failure.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The previous extractor used the same staged per-file write and final replacement shape; the diff improves failure draining.",
+            "CriticalPathEffect": "Writes and final move are on the install path; failure cleanup drains active tasks before deletion/retry."
+          }
+        ],
+        "ScalingInput": "The recursive tree's supported blob-entry count F; realistic plugin repositories contain tens to hundreds of files. Credential-provider calls scale as F plus constant ref/tree/client lookups, filesystem writes scale as F, and GitHub blob calls scale with blob entries after in-flight URL coalescing.",
+        "EffectiveConcurrency": "The extraction Limiter starts up to 10 tasks. Credential lookups occur before GitHub queue admission and can therefore reach 10 concurrent authentication-provider calls; GitHub wire requests are additionally bounded to 8 for caller pluginGit.blob, 10 per account, and 12 globally. Directory creation is sequential; file writes follow each bounded blob fetch.",
+        "CacheBehavior": "Persisted target SHA avoids extraction on a warm pull when the resolved SHA is unchanged. Ref responses use normal ETag behavior. Tree and blob reads set noCache, bypassing response-cache reads/writes while retaining compatible in-flight coalescing; there is no negative cache. Authenticated account identity is retained by GitHubCredentialService, but getCredential still calls the token provider before reusing it.",
+        "MechanismConfidence": "High: the changed per-entry call and the full uncached credential/provider/RPC path are explicit in repository code.",
+        "MagnitudeUncertainty": "Authentication-provider latency varies by host and provider, but the extension-host RPC boundary and linear F multiplier are established. Repository file counts determine exact impact.",
+        "Verdict": "Reportable high-severity boundary fan-out: authenticated extraction changes one session-token lookup into repository-size-proportional provider IPC on the user-awaited install path."
+      },
+      {
+        "Scenario": "Existing batched GitHub reads such as Agent Host issue enrichment and Mission Control batches",
+        "CriticalPath": "Each scenario submits typed reads to the shared queue; network responses are required before enrichment or task results progress. Queue admission and any shared rate-limit cooldown are on the path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/requestQueue.ts:31-34",
+            "Operation": "Execute batched GitHub REST requests.",
+            "Cardinality": "Logical request count is unchanged, but up to 8 requests from one caller and 10 from one account can now be in flight instead of 2 and 1 respectively.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The prior account cap serialized requests, and global/caller caps allowed at most 4/2 active.",
+            "CriticalPathEffect": "Higher parallelism reduces healthy-batch latency; during an initially unknown throttle, several requests can reach the wire before the first response installs cooldown state."
+          }
+        ],
+        "ScalingInput": "Up to ten issue references per title generation, potentially across two concurrent generations; Mission Control and other clients can submit retained batches up to existing 64-account/caller caps.",
+        "EffectiveConcurrency": "Defaults change from 4 global/2 host/1 account/2 caller to 12 global/12 host/10 account/8 caller. Tests establish eight active same-caller issue reads and eight simultaneous same-account rate-limit responses.",
+        "CacheBehavior": "Equivalent reads still coalesce and ETag-cache under existing limits; cooldown state is shared after a response establishes it. Cold independent URLs do not coalesce; warm ETag reads still perform conditional network requests.",
+        "MechanismConfidence": "High for changed concurrency and wire cardinality, but insufficient evidence of net user-visible degradation under normal workloads.",
+        "MagnitudeUncertainty": "The frequency and server impact of simultaneous throttle responses are deployment-dependent; healthy-path latency improves and all limits remain bounded.",
+        "Verdict": "No separate finding: this is an explicit bounded scheduling tradeoff with direct healthy-path latency benefit; the diff does not establish a distinct user-visible regression beyond the reported credential fan-out."
+      },
+      {
+        "Scenario": "Browser read of a renamed GitHub repository through an opaque redirect",
+        "CriticalPath": "On a cold old repository URL, the manual browser fetch returns opaqueredirect and a sanitized native-follow fetch must complete and validate its final URL before body processing. A remembered canonical URL lets later reads make one normal manual fetch.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubTransport.ts:881-899",
+            "Operation": "Manual fetch followed by one browser-native redirect-follow fetch for an opaque repository redirect.",
+            "Cardinality": "Two fetch attempts on the first opaque redirect; subsequent reads use the canonical URL and normally issue one fetch.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Browser opaque redirects failed after the manual attempt, so the newly added second fetch enables a previously unsuccessful scenario rather than slowing a successful one.",
+            "CriticalPathEffect": "Both cold attempts are required before a renamed repository read succeeds."
+          }
+        ],
+        "ScalingInput": "One fallback per distinct redirected initial URL per transport lifetime; browser-internal hop count is bounded by the browser and response size remains capped at 16 MiB.",
+        "EffectiveConcurrency": "Both attempts occupy the same admitted request task sequentially; retries remain at most one transient retry per attempt, and queue limits apply to the logical request.",
+        "CacheBehavior": "The final URL is memoized in the transport redirect map and normal ETag caching resumes at that URL. Transport disposal clears redirects; authenticated per-operation plugin clients are disposed after use.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Renamed-repository prevalence is unknown, but cold/warm request counts and lifetime are explicit.",
+        "Verdict": "No finding: the extra cold request is necessary to make the previously failing browser scenario work and is memoized for warm reads."
+      },
+      {
+        "Scenario": "Typed noCache tree/blob and Mission Control reads through local or IPC providers",
+        "CriticalPath": "Request parsing, provider forwarding, queue admission, network response, bounded body parsing, and IPC return must finish before the typed read completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/github/common/client/request.ts:175 and local providers",
+            "Operation": "Validate and forward ApiRequestOptions.noCache through local/IPC request providers.",
+            "Cardinality": "Once per typed request.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Typed requests always used normal ETag policy.",
+            "CriticalPathEffect": "Small bounded option parsing is on the request path; body serialization/parsing was already required."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/client/localApiRequestProvider.ts:73",
+            "Operation": "Fetch without conditional validators when noCache is true.",
+            "Cardinality": "One network call per cache-bypassing logical read after compatible in-flight coalescing.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Shared typed clients normally revalidated cached responses, while the migrated plugin's old direct request path did not use this shared ETag body cache.",
+            "CriticalPathEffect": "Avoids cache body retention while preserving the network work the prior plugin IRequestService implementation already performed."
+          }
+        ],
+        "ScalingInput": "One operation per typed call after in-flight coalescing; plugin tree/blob count follows repository size.",
+        "EffectiveConcurrency": "Same shared queue limits apply. noCache calls coalesce only with compatible noCache calls, preventing cache-policy mixing.",
+        "CacheBehavior": "noCache=true omits validators and prevents response-cache writes without clearing an existing representation; false/undefined preserves ETag reads and writes. Blob/tree noCache avoids retaining large encoded bodies.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Exact encoded blob sizes vary, but response size is bounded and avoiding retention is favorable.",
+        "Verdict": "No finding: the policy deliberately prevents large tree/blob response retention and preserves compatible coalescing; it does not add network cardinality relative to the old plugin path."
+      }
+    ],
+    "Summary": "Reviewed all 32 changed files and the performance-sensitive transitive paths. Submitted one high-confidence boundary-fanout finding for per-blob authentication-provider RPC. Queue parallelism, redirect fallback, noCache behavior, extraction cleanup, filesystem work, and client lifecycle were traced and did not yield another actionable diff-caused performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-18T09:43:45.643383126Z",
+    "CompletedAt": "2026-10-18T09:46:25.511218503Z",
+    "WallClockMilliseconds": 159867,
+    "ModelCalls": 10,
+    "InputTokens": 907844,
+    "OutputTokens": 12258,
+    "TotalTokens": 920102,
+    "ReasoningTokens": 5620,
+    "CacheReadTokens": 761344,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 142337,
+    "ToolCalls": 96,
+    "NanoAIUnits": 113569760000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 761344,
+      "cache_write": 0,
+      "input": 146500,
+      "output": 12258
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
