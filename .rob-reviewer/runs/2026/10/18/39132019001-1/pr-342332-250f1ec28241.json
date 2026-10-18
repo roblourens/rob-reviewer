@@ -1,0 +1,113 @@
+{
+  "PullRequest": {
+    "Number": 342332,
+    "Title": "configuration: restore the configuration registry after the tests that empty it",
+    "Body": "cc @sandy081\r\n\r\n---\r\n\r\n\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nOne of a series of small, independent fixes for tests that leak global state. They were found by running all unit test files from last to first, a stress test for #342237, which runs the unit tests in parallel worker processes.\r\n\r\n## Problem\r\n\r\nThree suites empty the **global** configuration registry and never restore it:\r\n\r\n- `src/vs/platform/configuration/test/common/configurations.test.ts`\r\n- `src/vs/platform/configuration/test/common/configurationRegistry.test.ts`\r\n- `src/vs/workbench/services/configuration/test/browser/configuration.test.ts`\r\n\r\nEvery test that runs after them in the same process misses the settings that modules register when they are loaded. Running the test files from last to first shows this: `AgentHostConfigurationSync` no longer finds the `http.proxy` settings that it mirrors to Agent Hosts, under both Electron and node.js ([Linux](https://github.com/microsoft/vscode/actions/runs/39061901103/job/117481403031), [macOS](https://github.com/microsoft/vscode/actions/runs/39061901103/job/117481402858), [Windows](https://github.com/microsoft/vscode/actions/runs/39061901103/job/117481403096)):\r\n\r\n```\r\n1) AgentHostConfigurationSync\r\n     mirrors HTTP proxy settings only to ambient Agent Hosts:\r\nAssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\r\n```\r\n\r\n## Root cause\r\n\r\nThe suites start (and end) their tests with an empty registry, which is fine. But they deregister everything with\r\n\r\n```ts\r\nconfigurationRegistry.deregisterConfigurations(configurationRegistry.getConfigurations());\r\n```\r\n\r\nand nothing registers it again afterwards.\r\n\r\nThere is a second, quieter problem in that line. `getConfigurations()` returns the registry's own array, and `deregisterConfigurations` removes each node from that same array while it iterates it. So every other node was skipped, and the registry was only about half emptied.\r\n\r\n## Fix\r\n\r\nA small test helper, `restoreConfigurationRegistryAfterSuite()`:\r\n\r\n- records the registry's configurations and default configurations in `suiteSetup`;\r\n- empties the registry and registers them again in `suiteTeardown`;\r\n- returns the function that the suites use to empty the registry between tests. It deregisters a copy of the array, so the registry really is empty.\r\n\r\nThe tests of the three suites are unchanged. The recorded configurations are registered again without validating them a second time, because they were validated when they were first registered.\r\n\r\nRestoring keeps two things that the registry would otherwise lose (found in review):\r\n\r\n- **Declared defaults.** The registry writes an overridden default into the setting's `default`. The helper therefore deregisters the default overrides *before* the settings, while it can still reset their defaults. Otherwise, re-registering would record the overridden value as the declared default.\r\n- **Hidden settings.** Registration removes settings hidden with `included: false` from their node, and deregistering the node forgets the ones mirrored to Agent Hosts and the experimental ones. The helper records those and puts them back into the node that registered them before registering the nodes again. The registry doesn't expose which node registered a setting, so the node is found by the section the registry records on each setting.\r\n\r\nA round-trip test in `configurationRegistry.test.ts` covers both. It registers a setting with a default override, a hidden mirrored setting and a hidden experimental setting, then records, empties and restores the registry. Each part of the fix is needed:\r\n\r\n| Helper | Round-trip test |\r\n|---|---|\r\n| Before the review fixes | **Fails**: hidden settings missing, overridden default kept |\r\n| Only the order fix | **Fails**: hidden mirrored and experimental settings are `undefined` |\r\n| Only the hidden settings fix | **Fails**: after the override is removed, the default is `true` instead of the declared `false` |\r\n| Both fixes | Passes |\r\n\r\n### A leak that the emptying was hiding\r\n\r\nThe first CI run of this PR failed 3 tests in every unit test job ([Linux](https://github.com/microsoft/vscode/actions/runs/39068158188/job/117500022125), [Linux Browser](https://github.com/microsoft/vscode/actions/runs/39068158188/job/117500022316)):\r\n\r\n```\r\nAccountPolicyService › should initialize with default account and preview features disabled\r\nMultiplexPolicyService › policy from default account only\r\nMultiplexPolicyService › policy from file and default account\r\nAssertionError: \"undefined\" === \"[\\\"policyValueC1\\\",\\\"policyValueC2\\\"]\"\r\n```\r\n\r\n`PolicyConfiguration › change: when policy setting is registered` (in `policyConfiguration.test.ts`) registers a **clone** of its configuration, which adds `policy.settingC` with the policy `PolicySettingC`, and never deregisters it. The suite's teardown deregisters the original configuration. That removes the setting, but the clone itself stays registered.\r\n\r\nOn `main`, the workbench configuration suite then empties the registry, which removes the clone. With this PR, that suite restores what it found, including the clone. `PolicySettingC` is then registered again, and the policy service tests, which register their own `PolicySettingC`, read `undefined`. The test now deregisters the clone it registers.\r\n\r\n| Run with Electron | Result |\r\n|---|---|\r\n| `policyConfiguration.test.ts`, workbench `configuration.test.ts`, `accountPolicyService.test.ts`, `multiplexPolicyService.test.ts`, with only the first commit of this PR | 98 passing, **3 failing** |\r\n| The same, with both commits | **101 passing** |\r\n\r\n## Proof\r\n\r\nDeterministic reproduction: run one of the three suites and then `agentHostConfigurationSync.test.ts` in the same process.\r\n\r\n```bash\r\nnpm run test-node -- --run src/vs/platform/configuration/test/common/configurations.test.ts \\\r\n                     --run src/vs/platform/agentHost/test/common/agentHostConfigurationSync.test.ts\r\n```\r\n\r\n| Runs first | Runner | `main` (before) | This PR (after) |\r\n|---|---|---|---|\r\n| `configurations.test.ts` | node.js | 30 passing, **2 failing** | **32 passing** |\r\n| `configurationRegistry.test.ts` | node.js | 36 passing, **2 failing** | **39 passing** (38 + the round-trip test) |\r\n| `configurations.test.ts` | Electron | 30 passing, **2 failing** | **32 passing** |\r\n| `configurationRegistry.test.ts` | Electron | 36 passing, **2 failing** | **39 passing** (38 + the round-trip test) |\r\n| workbench `configuration.test.ts` | Electron | 24 passing, **2 failing** | **26 passing** |\r\n\r\nTo find the culprit, I bisected the files that ran before `AgentHostConfigurationSync` in the reverse run. The bisection found `configurations.test.ts`. The other two suites do the same thing and reproduce the failure on their own.\r\n\r\n## Validation\r\n\r\n| Command | Result |\r\n|---|---|\r\n| The reproductions above | Passed |\r\n| `npm run test-node -- --runGlob 'vs/platform/configuration/test/common/*.test.js'` | 202 passing (`main`'s 201 plus the round-trip test) |\r\n| `./scripts/test.sh --runGlob '**/{configuration,policies,policy}/test/**/*.test.js'` | 741 passing, 7 pending (740 plus the round-trip test) |\r\n| The policy reproduction above, with Electron | 101 passing |\r\n| `./scripts/test.sh` (all Electron unit tests), before the review fixes | 58022 passing, 547 pending, 1 failing (`CopilotAgent › scoped credentials › isolates peer runtimes…`), which also fails on `main` on this machine |\r\n| `npm run test-node`, before the review fixes | 26487 passing, 240 pending, 1 failing (the same `CopilotAgent` test) |\r\n| `npm run eslint -- \u003cthe changed files\u003e` | Passed |\r\n\r\nThe full unit test runs for the review fixes are this PR's CI runs.\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342332",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "df0e73a65974f9a9b049317e6ca7978ecb7ffa48",
+    "HeadRef": "agents/configuration-tests-restore-registry",
+    "HeadSHA": "250f1ec28241271fc0137bebf31393414611800b",
+    "CreatedAt": "2026-10-17T20:46:45Z",
+    "UpdatedAt": "2026-10-18T11:57:49Z",
+    "MergedAt": null,
+    "Labels": [
+      "flaky-test-fix"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Node configuration-registry and default-configuration test suites isolate the global registry for each test and restore module-registered settings after the suite.",
+        "CriticalPath": "At suite setup, the helper snapshots configuration nodes/default overrides and scans hidden settings; each test setup/teardown synchronously empties the current registry; suite teardown synchronously restores the original registry. All work must finish before the corresponding test or subsequent suite proceeds.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "The one-time snapshot/restore scales with loaded configuration nodes, nested allOf nodes, hidden settings, and default overrides. Per-test emptying scales with only the nodes/defaults registered by that test because the initial setup has already emptied the global registry.",
+        "EffectiveConcurrency": "All registry operations and event notifications are synchronous and serialized by Mocha hooks; no promises, queues, limiters, or concurrent boundary operations are introduced.",
+        "CacheBehavior": "No cache is added or bypassed. The helper retains references to the original registry state for the suite lifetime and restores that exact state once; warm versus cold cache behavior is not involved.",
+        "MechanismConfidence": "High: the changed hooks and registry implementations show bounded synchronous collection scans and schema/event updates, with no transitive external boundary.",
+        "MagnitudeUncertainty": "The number of settings loaded before these suites varies with the test bundle, and getForgettableHiddenSettings can compare each relevant hidden setting against the node list. This occurs only once per affected suite and has no evidence of material test latency.",
+        "Verdict": "No reportable regression. The diff replaces incomplete mutation-while-iterating cleanup with complete cleanup and adds one bounded suite-level restoration; it does not place full-registry restoration on every test path."
+      },
+      {
+        "Scenario": "Workbench browser DefaultConfiguration tests register a small test setting per case, clear it after each case, then restore the pre-suite global registry.",
+        "CriticalPath": "Per-test teardown synchronously deregisters the current test configuration before the next test. The complete pre-suite registry is re-registered only during suite teardown, after per-test disposable listeners have been cleaned up.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Per-test cost scales with one or two test configuration nodes and their properties. The final restore scales once with the configuration registry present when the suite began.",
+        "EffectiveConcurrency": "Mocha hooks serialize all changed work. Registry events fire synchronously; no aggregate concurrency or fan-out across external services is introduced.",
+        "CacheBehavior": "The tests' ConfigurationCache is an in-memory Map recreated per test. Existing cache reads/writes and localStorage accesses are unchanged; the new registry helper neither reads nor invalidates that cache.",
+        "MechanismConfidence": "High: the changed teardown directly calls only in-memory registry deregistration, and the final restore is suite-scoped.",
+        "MagnitudeUncertainty": "The pre-suite registry size depends on the browser test bundle, but restoration occurs once and no persistent listener remains to turn it into repeated cache work.",
+        "Verdict": "No reportable regression. The changed cleanup is bounded and test-only, and does not add I/O, serialization proportional to user data, or hot-path work."
+      },
+      {
+        "Scenario": "PolicyConfiguration test registering a cloned policy node now deregisters that exact node during per-test disposal.",
+        "CriticalPath": "Registration remains on the existing test assertion path. The new deregistration runs during the test DisposableStore teardown after DefaultConfiguration, FileService/provider, FilePolicyService, and PolicyConfiguration were added earlier and therefore disposed first in insertion order.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/configuration/test/common/policyConfiguration.test.ts setup and policy test body",
+            "Operation": "Policy fixture reads and writes through FileService backed by InMemoryFileSystemProvider during existing test initialization and assertions.",
+            "Cardinality": "A bounded number of in-memory file operations per policy test; the changed disposal adds zero operations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same in-memory policy file operations occurred before the diff; the cloned configuration node was left registered afterward.",
+            "CriticalPathEffect": "Existing fixture I/O remains on test initialization/assertion paths; it is not reached by the new deregistration after listeners/services are disposed."
+          }
+        ],
+        "ScalingInput": "Cleanup handles one cloned node with the fixed set of policy properties in the fixture; cost does not grow across tests because each clone is removed.",
+        "EffectiveConcurrency": "DisposableStore cleanup and registry deregistration are synchronous and serialized. No asynchronous policy update remains reachable from the cleanup after the configuration listeners are disposed.",
+        "CacheBehavior": "No cache participates in the changed cleanup. Policy definition deduplication is unchanged and the clone is no longer retained in the global registry after the test.",
+        "MechanismConfidence": "High: DisposableStore uses insertion-order disposal, placing the newly added cleanup after the previously added configuration and policy objects, and registry deregistration itself is in-memory.",
+        "MagnitudeUncertainty": "None material: the cleanup target is a single fixed-size test node.",
+        "Verdict": "No reportable regression. The new cleanup removes retained global test state with fixed synchronous work and no added expensive boundary."
+      }
+    ],
+    "Summary": "Completed the performance pass over all five changed files and all diff pages. Traced suite hook frequency, registry registration/deregistration complexity and event fan-out, disposable ordering, cache behavior, and policy fixture boundaries. No high-confidence diff-introduced performance issue or qualifying regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-18T13:36:22.548895656Z",
+    "CompletedAt": "2026-10-18T13:37:46.076984308Z",
+    "WallClockMilliseconds": 83528,
+    "ModelCalls": 10,
+    "InputTokens": 284512,
+    "OutputTokens": 4662,
+    "TotalTokens": 289174,
+    "ReasoningTokens": 1870,
+    "CacheReadTokens": 240128,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 67355,
+    "ToolCalls": 40,
+    "NanoAIUnits": 36682720000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 240128,
+      "cache_write": 0,
+      "input": 44384,
+      "output": 4662
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
