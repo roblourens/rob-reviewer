@@ -1,0 +1,220 @@
+{
+  "PullRequest": {
+    "Number": 342373,
+    "Title": "Run late steering messages as the next turn instead of dropping them",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nRefs #339869\nRefs #334023\n\n## Problem\n\nIn an Agent Host chat with the Copilot agent (the chat view or the Agents window), a steering message sent just as the agent finishes its turn is lost in one of two ways:\n\n- **It disappears without being sent.** The \"Steering\" row vanishes, the agent never sees the message, and no error appears.\n- **It is stuck.** The chat goes idle with the \"Steering\" row still showing. Nothing ever sends it, and messages queued behind it never run either.\n\n## Root cause\n\n1. **Silent drop.** `CopilotAgentSession.sendSteering` awaits MCP reconciliation and attachment conversion before it sends ([copilotAgentSession.ts#L5597-L5598](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L5597-L5598)). If the turn ends in that window, `_canSendTurn` logs `Turn changed during preparation; dropping send` and skips the send ([#L4868-L4872](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L4868-L4872)). `sendSteering` then fires `steering_consumed`, which removes the pending row, although nothing was sent ([#L5616-L5618](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L5616-L5618)).\n2. **Stuck on an idle chat.** `CopilotAgent.sendSteeringMessage` returns `false` when the agent has no running turn, even though the host's turn has not completed yet ([copilotAgent.ts#L6888-L6894](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgent.ts#L6888-L6894)). The queue drain retries a deferred handoff only while the chat has an active turn ([queueDrainContribution.ts#L107-L114](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts#L107-L114), [#L179-L181](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts#L179-L181)). When the turn ends, `_tryConsumeNextQueuedMessage` stops as soon as any steering message is pending and only ever starts queued messages ([#L195-L217](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts#L195-L217)). The steering message is never sent, and it also blocks every queued message behind it.\n\n## Fix\n\nA steering message that arrives too late to steer the active turn now runs as the next request, the same way a queued message does.\n\n- **Copilot session.** When the turn ends while a steering message is still being prepared, `sendSteering` no longer fires `steering_consumed`. It resolves `false` to hand the message back unsent. Aborts and send failures still clear the message, as before.\n- **Provider contract.** `IAgent.sendSteeringMessage` may now return a promise. If it resolves `false`, the provider has handed the message back. `CopilotAgent.sendSteeringMessage` returns that promise. Codex and Claude are unchanged.\n- **Queue drain.**\n  - When a message is handed back, the queue drain steers the turn that is now running with it. If the chat is idle, it starts the message as the next turn.\n  - When no turn is running, a pending steering message that the agent does not hold runs next, ahead of queued messages. Queued messages then follow in their original order on later turn ends.\n  - A steering message the agent still holds keeps the queue waiting, as it does today. The agent may still deliver that message as its own turn, so the host does not start it a second time.\n  - When the agent finishes with a message it held (it sent it, or dropped it because sending failed) and the chat is idle with steering still pending, the queue drain tries again. Otherwise a message handed back while the agent still held another one would stay pending if sending that other one failed. Cancel clears pending steering first, so this never starts queued work after a cancel.\n- **Legacy single-slot steering path.** The `setPendingMessages` path, which the host no longer calls, has no host queue to return a message to. It keeps today's behavior and clears the row.\n\nThe following behavior is unchanged: normal mid-turn steering, queued-message order, attachments and sender identity on the message, and cancel, which still clears all pending steering without running queued work. Multiple pending steering messages are still delivered one by one: when several arrive late, the first runs as the next turn and the agent takes the rest as steering for that turn, as it would for messages sent during the turn.\n\n### About the referenced issues\n\nThe tests cover the two mechanisms above. They do not reproduce the exact sequences reported in the issues, so this PR uses \"Refs\" instead of \"Fixes\":\n\n- **#339869** (side-chat steering stuck on an idle chat). This PR fixes the cases where the agent never accepted the steering message, or handed it back. It does not cover a message the Copilot SDK already accepted and then never delivered after the turn ended. That needs a real runtime to confirm.\n- **#334023** (steering sent during an SDK session refresh). Since #340669, a steering message that arrives while the live session is missing is retried on agent progress. This PR also guarantees that the message runs as the next turn if the turn ends before that retry succeeds. The refresh sequence in that issue was not reproduced.\n\n## Before / after\n\nNo GIFs. Recording the real Copilot agent was not possible because the test GitHub sign-in kept being revoked, so the agent could not run a turn. The proof is the deterministic tests below. They drive the same code paths with the existing fake SDK session and fake providers.\n\n## How to test\n\nManual check, signed in, with the Copilot agent in the chat view or the Agents window:\n\n1. Ask for something short, for example \"Say hello, then stop.\"\n2. As the reply finishes, type \"Also say BANANA\" and press Enter to send it as a steering message. Repeat a few times to hit the end of the turn.\n3. Expected: the \"Steering\" row never vanishes unanswered and never stays on an idle chat. A message that was too late runs as its own request (\"Also say BANANA\" appears and gets a reply). The agent host log shows `Turn ended before steering message was sent; handing it back` when the first race occurs.\n\nAutomated:\n\n```\nscripts\\test.bat --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --run src/vs/platform/agentHost/test/node/chatContributions.test.ts --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts --grep \"handed back instead of dropped|queue drain runs steering|queue drain runs handed-back steering|queue drain steers the running turn|runs late steering before queued|keeps queued work waiting while the agent still holds|does not start queued work when steering the agent held|runs leftover steering before queued work|independent steering defers through preparation|first of several late steering\"\n```\n\n### What the tests check\n\n| Test | On `main` | With this PR |\n|------|-----------|--------------|\n| Copilot session: *a steering message whose turn ends while it is being prepared is handed back instead of dropped* | The session clears the pending row (`steering_consumed`) and sends nothing, so the message disappears. | Nothing is sent and the row stays. The session reports the message as handed back. |\n| Queue drain: *runs steering sent as the turn ends as the next turn instead of leaving it stuck* | The agent cannot take the message, so after the turn ends it stays pending with nothing running. | The message runs as the next turn from the same sender, and the queue is empty. |\n| Queue drain: *runs steering the agent hands back unsent as the next turn instead of dropping it* | The handed-back message is never started and stays pending. | While the agent holds the message, nothing else starts. Once the agent hands it back, it runs as the next turn. |\n| Queue drain: *steers the running turn with steering the agent hands back after an earlier turn ended* | The message is never offered again. | The message is offered to the turn that is now running. |\n| Queue drain: *runs late steering before queued messages, then the queued messages in order* | Nothing runs: the pending steering message blocks both queued messages. | The steering message runs, then \"First queued\", then \"Second queued\". |\n| Queue drain: *runs the first of several late steering messages as the next turn and steers it with the rest* | Nothing runs. Both messages stay pending. | \"First late\" runs as the next turn, and the agent receives \"Second late\" as steering for that turn. |\n| Queue drain: *keeps queued work waiting while the agent still holds steering after its turn ends* (guard) | Passes. | Passes: the host does not start a message the agent may still deliver, and the queued message runs after the agent's steering turn. |\n| Queue drain: *runs handed-back steering as the next turn once another held steering message fails to send* | Nothing runs. Both steering messages block the queue. | The agent hands the first message back while it still holds the second, then sending the second fails. The first message runs as the next turn, and the queued message waits behind it. |\n| Queue drain: *does not start queued work when steering the agent held settles after the turn was cancelled* (guard) | Passes. | Passes: after a cancel, the agent finishing with its held messages does not start the queued message. |\n| Queue drain: *skips active and empty chats, and runs leftover steering before queued work* (updated) | Expected nothing to run for a chat with a leftover steering message, which is the stuck state. | Expects the leftover steering message to run. The active-chat and empty-chat cases are unchanged. |\n\n`copilotAgent.test.ts` (*independent steering defers through preparation…*) and one `copilotAgentSession.test.ts` table entry now await the promise that `sendSteeringMessage` and `sendSteering` return. Their expected values are unchanged.\n\n## Validation\n\n| Check | Command | Result |\n|-------|---------|--------|\n| New and updated tests on `main` @ `dc811b77cd1` (fix reverted, tests kept) | the `scripts\\test.bat ... --grep` command above | ❌ 8 failing, as expected: the message is dropped or left pending in each scenario. The two guard tests and the awaited Copilot agent test pass. |\n| Same tests with this PR | same | ✅ 11 passing |\n| All Agent Host unit tests | `scripts\\test.bat --runGlob \"vs/platform/agentHost/test/**/*.test.js\"` | ✅ 14308 passing, 82 pending, 0 failing |\n| Type check | `npm run typecheck-client` | ✅ no errors |\n| Lint | `npm run eslint -- \u003cthe 8 changed .ts files\u003e` | ✅ no problems |\n| Real-model check | — | ⏭️ skipped: the test GitHub sign-in kept being revoked |\n\nThe Agent Host test run unsets `COPILOT_HOME`. One existing test (*isolates peer runtimes, preserves local adoption identity and refuses revoked prepared work*) compares the SDK storage path against `process.env`, so it fails whenever `COPILOT_HOME` is set, as it is inside a Copilot CLI session. That test does not involve steering.\n\nThis PR and #342370, which withdraws removed steering messages, both touch `sendSteering` and the queue drain contribution. Whichever merges second needs a small rebase.\n\n---\n\u003csub\u003eFound with automated exploratory testing and code reading; fixed with deterministic unit tests. Draft until reviewed by a human.\u003c/sub\u003e\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342373",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "dc811b77cd1e0753d306b0c6f819a7311bcf49b5",
+    "HeadRef": "karthiknadig/bug-swarm/run-late-steering-next",
+    "HeadSHA": "34bca32983ac4f4c0ce118a6e39dd8dfea312cdd",
+    "CreatedAt": "2026-10-18T07:39:28Z",
+    "UpdatedAt": "2026-10-18T21:26:04Z",
+    "MergedAt": null,
+    "Labels": [
+      "copilot-cli-agent"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst",
+      "cleanup-lifecycle",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Normal mid-turn Copilot steering while the addressed turn remains active",
+        "CriticalPath": "The host synchronizes the pending message, Copilot reconciles MCP enablement, converts attachments, and calls the SDK session send operation before steering is accepted. The diff only propagates and observes the existing promise; these operations were already on this path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_reconcileMcpServerEnablement",
+            "Operation": "List and, when necessary, reconcile configured MCP servers through Copilot SDK RPC.",
+            "Cardinality": "One reconciliation per steering handoff; server enable/disable calls occur only for divergent desired state. This cardinality is unchanged by the diff for normal steering.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same reconciliation ran before every Copilot steering send.",
+            "CriticalPathEffect": "MCP reconciliation must finish before attachment conversion and SDK steering send."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_toSdkAttachments/_readSelectedText",
+            "Operation": "Read each resource attachment carrying a text selection and convert it to SDK attachment data.",
+            "Cardinality": "At most one file read per selected-resource attachment, in parallel within a message. Unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same attachment reads and conversions occurred before steering send.",
+            "CriticalPathEffect": "All attachment conversions complete before SDK steering send."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:sendSteering",
+            "Operation": "Send the immediate steering prompt and attachments through the Copilot SDK session.",
+            "Cardinality": "One SDK send per accepted steering message. Unchanged when the original turn remains active.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same SDK send occurred, but its promise was not returned to queue drain.",
+            "CriticalPathEffect": "This is the authoritative steering-delivery boundary."
+          }
+        ],
+        "ScalingInput": "Number of pending steering messages and selected-resource attachments per message; realistic cardinality is usually one message with few attachments.",
+        "EffectiveConcurrency": "All pending steering entries may begin handoff from the existing loop, while MCP reconciliation is serialized by the existing MCP enablement sequencer and SDK marker/dispatch is serialized by the existing execution sequencer. The PR does not increase this concurrency.",
+        "CacheBehavior": "No new cache is introduced. The live Copilot session is reused; MCP reconciliation remains uncached and sequenced exactly as before, and attachments remain converted per message.",
+        "MechanismConfidence": "High: the changed return value and callback path can be traced directly through queue drain to the unchanged Copilot preparation and SDK send operations.",
+        "MagnitudeUncertainty": "SDK RPC, filesystem, and model-service durations vary by environment, but their placement and cardinality on this normal path are unchanged.",
+        "Verdict": "No performance regression: normal steering performs the same expensive work at the same effective cardinality; the PR only observes asynchronous completion."
+      },
+      {
+        "Scenario": "A steering message finishes preparation after its target turn has ended and is recovered as the next turn",
+        "CriticalPath": "The original attempt completes its existing MCP reconciliation and attachment conversion, detects the turn change before SDK dispatch, resolves false, and queue drain admits the pending message as a normal next turn. Normal turn admission then resolves the workspace, captures any enabled checkpoint, resolves attachments/contributions, and sends the message to the provider.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:sendSteering",
+            "Operation": "Perform the initial Copilot MCP reconciliation before discovering that the targeted turn ended.",
+            "Cardinality": "One initial reconciliation per handed-off steering message; this work already occurred before the PR even when the message was dropped.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same preparation ran, then the message was consumed/dropped when the turn-change check skipped SDK dispatch.",
+            "CriticalPathEffect": "It delays the false handback and therefore the recovered turn, but was already on the original steering path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_toSdkAttachments",
+            "Operation": "Convert selected-resource attachments during the original steering preparation.",
+            "Cardinality": "At most one read per selected-resource attachment on the original attempt. The normal-turn path can resolve the message attachments again after handback.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The initial conversion occurred before the message was dropped; no recovery turn followed.",
+            "CriticalPathEffect": "The initial conversion must settle before handback; normal turn attachment resolution is then part of standard admission."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentSideEffects.ts:_sendTurnMessage",
+            "Operation": "Resolve the working directory and capture the standard turn-start checkpoint for a recovered non-ephemeral turn.",
+            "Cardinality": "One workspace resolution and at most one checkpoint capture for the single recovered turn.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No next turn was admitted, so these normal-turn operations did not run for the lost/stuck message.",
+            "CriticalPathEffect": "Workspace resolution, attachment/contribution resolution, and checkpoint completion precede provider dispatch, with checkpoint work overlapped where supported."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentSideEffects.ts:_sendTurnMessage",
+            "Operation": "Send the recovered message as a normal provider turn.",
+            "Cardinality": "Exactly one normal provider send for the first late steering message; subsequent pending steering is delivered into that active turn.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The message was dropped or remained pending indefinitely, so no provider request was made.",
+            "CriticalPathEffect": "This is the user-requested recovery operation and dominates time to a response."
+          }
+        ],
+        "ScalingInput": "The number of steering messages arriving in the narrow end-of-turn race. One message starts the recovered turn; remaining messages are coalesced into steering for that turn rather than causing per-message full-turn fan-out.",
+        "EffectiveConcurrency": "Only one recovered turn is admitted because _tryConsumeNextQueuedMessage returns while any turn is active. Additional late steering messages are handed to the newly active turn rather than each starting a full turn. Checkpoint capture may overlap normal provider preparation, as on every ordinary turn.",
+        "CacheBehavior": "The existing live session and provider state are reused when warm. There is no negative cache for a missed turn; instead, the false result is an explicit ownership handback. Submitted-steering mementos are cleared for the returned ID and centrally evicted with the chat.",
+        "MechanismConfidence": "High: tests and call flow establish the false handback, active-turn guard, one admission, and steering of remaining messages into the new turn.",
+        "MagnitudeUncertainty": "The race is timing-dependent, and workspace/checkpoint/provider latency varies with repository size and environment. These costs are real but occur only to execute a user message that previously never ran.",
+        "Verdict": "No reportable performance regression: the newly reached turn setup and provider request are necessary work for the corrected behavior, bounded to one active turn per chat, and coalesced for additional late steering."
+      },
+      {
+        "Scenario": "A message is handed back after another turn has already started",
+        "CriticalPath": "The promise callback removes the message ID from the submitted set and synchronizes pending messages. Because a turn is active, the same pending message is offered to that turn and follows the normal steering preparation path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:sendSteering",
+            "Operation": "Repeat Copilot MCP reconciliation for the retry against the newer active turn.",
+            "Cardinality": "One additional attempt for the handed-back message per intervening active turn that wins the race; duplicate dispatch within the same held attempt is suppressed by submitted and in-flight sets.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The original attempt's skipped result was ignored and the message was consumed, so it was not retried.",
+            "CriticalPathEffect": "The retry must prepare before it can steer the newer turn."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_toSdkAttachments",
+            "Operation": "Reconvert selected-resource attachments for the retry.",
+            "Cardinality": "At most one read per selected-resource attachment on each actual retry.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No retry conversion occurred because the message was dropped.",
+            "CriticalPathEffect": "Attachment conversion precedes the retried SDK send."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:sendSteering",
+            "Operation": "Send the handed-back message as immediate steering to the newer active Copilot turn.",
+            "Cardinality": "One SDK send when the retry's turn remains current.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No second delivery attempt occurred.",
+            "CriticalPathEffect": "This delivers the pending user request without creating another full turn."
+          }
+        ],
+        "ScalingInput": "Number of end-of-turn races a single pending message encounters before reaching a stable active turn; normally zero or one because only one turn can be active per chat.",
+        "EffectiveConcurrency": "The submitted-ID memento prevents duplicate handoff while an attempt is held. A returned message is retried once against the currently active turn; any concurrent pending messages retain their own existing handoff state, and MCP reconciliation remains sequenced.",
+        "CacheBehavior": "No preparation cache is added; attachment and MCP preparation are repeated because the authoritative target turn changed. Submitted and in-flight sets provide deduplication and are pruned when queue state changes or the chat is disposed.",
+        "MechanismConfidence": "High for the retry mechanism and boundaries; lower prevalence does not affect the traced path.",
+        "MagnitudeUncertainty": "Repeated races are possible but require successive turns to end during preparation; practical frequency and attachment sizes are uncertain.",
+        "Verdict": "No actionable performance issue: the retry is bounded by turn transitions, deduplicated while held, and is required to deliver the message rather than silently discard it."
+      },
+      {
+        "Scenario": "Held steering settles while the chat is idle, including cancellation and another handed-back message waiting",
+        "CriticalPath": "A successful settlement checks current chat state and only invokes queue draining if steering is still pending. Queue drain waits while any pending steering ID is still held; after the last held item settles, it admits the first unheld steering message. Cancellation removes pending steering and the submitted memento first, so later promise callbacks do no expensive work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts:_onSteeringHandoffSettled/_tryConsumeNextQueuedMessage",
+            "Operation": "Scan pending steering and submitted IDs, then optionally admit one recovered turn.",
+            "Cardinality": "One bounded state check per settling handoff; at most one admission when no held steering remains.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Asynchronous handoff settlement was not observed, so no follow-up drain occurred.",
+            "CriticalPathEffect": "The state scan is synchronous and small; any admitted turn follows the normal expensive boundaries described above."
+          }
+        ],
+        "ScalingInput": "Number of simultaneously pending steering handoffs in one chat; state checks scan that collection, which is driven by explicit user messages and normally small.",
+        "EffectiveConcurrency": "Settlement callbacks may arrive independently, but the submitted-set check and active-turn guard serialize actual turn admission. Cancellation prevents post-cancel admission.",
+        "CacheBehavior": "Submitted IDs are pruned against current pending IDs, deleted on cancellation, and all chat mementos are centrally evicted on chat/session disposal. No stale negative state is cached.",
+        "MechanismConfidence": "High: cleanup, cancellation, and admission guards are explicit in the changed code and surrounding memento lifecycle.",
+        "MagnitudeUncertainty": "Very large pending sets are not evidenced by the product workflow. Exact callback ordering varies, but admission remains guarded.",
+        "Verdict": "No performance regression: callbacks add small per-handoff state scans, preserve cleanup, and do not create concurrent turn bursts or unbounded retained state."
+      }
+    ],
+    "Summary": "Completed the performance review over all nine changed files. The PR adds ownership handback and queue-drain scheduling for late steering. It newly reaches normal turn setup and provider-send boundaries only to execute messages that were previously dropped or stuck; one-active-turn gating, submitted-ID deduplication, MCP sequencing, cancellation cleanup, and chat-scoped memento eviction bound the work. No high-confidence actionable performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-18T21:35:50.584184652Z",
+    "CompletedAt": "2026-10-18T21:37:36.564483944Z",
+    "WallClockMilliseconds": 105980,
+    "ModelCalls": 8,
+    "InputTokens": 279828,
+    "OutputTokens": 7133,
+    "TotalTokens": 286961,
+    "ReasoningTokens": 2617,
+    "CacheReadTokens": 222720,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 90025,
+    "ToolCalls": 42,
+    "NanoAIUnits": 46018000000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 222720,
+      "cache_write": 0,
+      "input": 57108,
+      "output": 7133
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

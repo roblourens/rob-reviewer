@@ -1,0 +1,166 @@
+{
+  "PullRequest": {
+    "Number": 342370,
+    "Title": "Stop delivering steering messages the user removed from the queue",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nRefs #336466\n\n## Problem\n\nIn an Agent Host chat with the Copilot agent (the chat view or the Agents window), you can send a steering message while the agent works, then remove it with **Remove from Queue**. The removal does not stick: the agent still receives the message, and it appears in the transcript as its own request.\n\n## Root cause\n\nTwo layers let a removed steering message through.\n\n1. **The host refuses the removal.** Since #340669, `AgentService` rejects a client's `ChatPendingMessageRemoved` for a steering message while a turn is active (\"Cannot change a steering message while it is being processed\"). No provider could take back a message it had already been given, so the message stays queued on the host: [agentService.ts#L11101-L11107](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/agentService.ts#L11101-L11107).\n2. **Nothing withdraws the message from the SDK.** The queue drain hands each steering message to the provider as soon as it is set ([queueDrainContribution.ts#L161-L193](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts#L161-L193)). On removal it only clears its own bookkeeping ([#L136-L141](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/chatContributions/queueDrain/queueDrainContribution.ts#L136-L141)). `CopilotAgentSession.sendSteering` sends the message with `mode: 'immediate'` and discards the message ID that `send()` returns. It also keeps the entry it uses to recognize the SDK's `user.message` echo ([copilotAgentSession.ts#L5587-L5627](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L5587-L5627)). When the echo arrives, `_takeMatchingPendingSteering` still matches the text and starts a turn for it ([#L7853-L7855](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L7853-L7855), [#L2320-L2340](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L2320-L2340)). The SDK provides `session.rpc.queue.withdrawMessage({ messageId, expectedPrompt })` for this case, but nothing calls it.\n\n## Fix\n\n- **Provider contract.** `IAgent` gets an optional `withdrawSteeringMessage(chat, messageId)`. The host accepts removal of an in-flight steering message only when the session's provider implements it. Codex and Claude do not implement it, so they keep today's rejection. Editing an in-flight steering message is still rejected for every provider.\n- **Queue drain.** When a client removes a steering message that was already handed to the provider, the queue drain calls `withdrawSteeringMessage`. Removals the host makes itself, after the agent consumed a message or on cancel, do not trigger a withdrawal.\n- **Copilot session.** `CopilotAgentSession` keeps the SDK message ID and the exact prompt it sent. `withdrawSteering`:\n  - drops a message that is still being prepared (MCP reconciliation or attachments), so it is never sent;\n  - otherwise calls `rpc.queue.withdrawMessage` and forgets the message only when the SDK confirms that it removed it;\n  - keeps today's behavior if the model already received the message (`removed: false`). The message still appears as its own turn, so the transcript matches what the model saw, and the agent host logs that it could not be withdrawn.\n- **Matching the SDK echo.** The SDK's `user.message` echo carries the message ID that `send()` returned. The Copilot session now matches the echo to a pending steering message by that ID first, and falls back to matching by text only when the echo or the pending message has no ID yet. Without this, two identical steering messages could be mixed up while one of them was being withdrawn: the removed one showed as a turn and the delivered one stayed pending.\n\nWithdrawing a steering message that the runtime already took for the running turn returns `removed: false` and does not interrupt that turn. The SDK interrupts a turn only to withdraw the message that started it.\n\nThis PR covers the first scenario in #336466, where a removed message is still sent. It does not cover the second scenario, where a message is sent while it is being edited. #336895 addresses that scenario by disabling editing of pending steering messages, so this PR uses \"Refs\" instead of \"Fixes\".\n\n## Before / after\n\nNo GIFs. Recording the real Copilot agent was not possible because the test GitHub sign-in kept being revoked, so the agent could not run a turn. The proof is the deterministic tests below. They drive the same code paths with the existing fake SDK session and fake providers.\n\n## How to test\n\nManual check, signed in, with the Copilot agent in the chat view or the Agents window:\n\n1. Ask for something slow, for example \"Run `Start-Sleep 40` in the terminal, then say DONE.\"\n2. While it runs, type \"Also say BANANA\" and press Enter to send it as a steering message.\n3. Hover the steering row and select **Remove from Queue**.\n4. Expected: the row disappears and stays gone, no \"Also say BANANA\" request appears, and the reply does not mention BANANA. The agent host log shows `Withdrew steering message`.\n\nAutomated:\n\n```\nscripts\\test.bat --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --run src/vs/platform/agentHost/test/node/chatContributions.test.ts --run src/vs/platform/agentHost/test/node/agentService.test.ts --grep \"withdraw|the user removes|removed steering|remove a steering message mid-turn\"\n```\n\n### What the new tests check\n\n| Test | On `main` | With this PR |\n|------|-----------|--------------|\n| `AgentService`: *a user can remove a steering message mid-turn when the provider can withdraw it* | The host rejects the removal with \"Cannot change a steering message while it is being processed\", and the message stays queued. | The removal is accepted, the queue is empty, and the provider is asked to withdraw the message. |\n| Queue drain: *withdraws steering the user removes mid-turn, but not steering the agent consumed* | The provider is never asked to withdraw anything. | Only the message the user removed is withdrawn. A message the agent already consumed is not. |\n| Copilot session: *a steering message the user removes before the model reads it is withdrawn and never becomes a turn* | No way to withdraw exists (`withdrawSteering is not a function`). The fake SDK then delivers the message, as the real runtime would. | The SDK receives `withdrawMessage` with the ID and prompt it was sent, and no turn starts for the message. |\n| Copilot session: *a steering message the user removes while it is still being prepared is never sent* | Same as above. | Nothing is sent to the SDK, and no turn starts. |\n| Copilot session: *a removed steering message the model already received still shows as its own turn* | Same as above. | When the SDK reports that it could not remove the message, the echo still opens a turn, so the transcript matches what the model saw. |\n| Copilot session: *an identical steering message delivered while another is being withdrawn becomes its own turn* | Same as above. | Two steering messages have the same text. While the first one's withdrawal is still waiting for the SDK, the SDK delivers the second one. The second one becomes the turn, and nothing is left pending. |\n\n## Validation\n\n| Check | Command | Result |\n|-------|---------|--------|\n| New tests on `main` @ `dc811b77cd1` (fix reverted, tests kept) | the `scripts\\test.bat ... --grep` command above | ❌ 6 failing, as expected. The host rejects the removal and the message stays queued; the queue drain never withdraws; the Copilot session has no withdraw path. |\n| New tests with this PR | same | ✅ 6 passing |\n| All Agent Host unit tests | `scripts\\test.bat --runGlob \"vs/platform/agentHost/test/**/*.test.js\"` | ✅ 14305 passing, 82 pending, 0 failing |\n| Type check | `npm run typecheck-client` | ✅ no errors |\n| Lint | `npm run eslint -- \u003cthe 9 changed .ts files\u003e` | ✅ no problems |\n| Real-model check | — | ⏭️ skipped: the test GitHub sign-in kept being revoked |\n\nThe Agent Host test run unsets `COPILOT_HOME`. One existing test (*isolates peer runtimes, preserves local adoption identity and refuses revoked prepared work*) compares the SDK storage path against `process.env`, so it fails whenever `COPILOT_HOME` is set, as it is inside a Copilot CLI session. That test does not involve steering.\n\nThis PR and #342373, which runs late steering messages as the next turn, both touch `sendSteering` and the queue drain contribution. Whichever merges second needs a small rebase.\n\n---\n\u003csub\u003eFound with automated exploratory testing and code reading; fixed with deterministic unit tests. Draft until reviewed by a human.\u003c/sub\u003e\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342370",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "dc811b77cd1e0753d306b0c6f819a7311bcf49b5",
+    "HeadRef": "karthiknadig/bug-swarm/withdraw-removed-steering",
+    "HeadSHA": "7b8604efbdea35799c93720a31a2a9ec3a33f0d0",
+    "CreatedAt": "2026-10-18T07:12:10Z",
+    "UpdatedAt": "2026-10-18T21:26:03Z",
+    "MergedAt": null,
+    "Labels": [
+      "copilot-cli-agent"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "cleanup-lifecycle",
+      "serialization-allocation",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A user removes a Copilot steering message after it was sent to the SDK but before the model consumes it.",
+        "CriticalPath": "The host accepts and reduces the removal synchronously; queue-drain calls the provider without awaiting it, so the queue-row removal does not wait for SDK withdrawal. The asynchronous withdrawal awaits the existing send result and then one queue RPC.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:5675, CopilotAgentSession.withdrawSteering",
+            "Operation": "Calls the Copilot SDK runtime queue withdrawal RPC with the SDK message ID and expected prompt.",
+            "Cardinality": "Exactly one RPC for one removed steering message that has reached session.send; zero if it is still being prepared or no longer pending.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No withdrawal RPC existed; removal was rejected while the turn was active and the already-sent steering remained queued for delivery.",
+            "CriticalPathEffect": "Off the UI/state-removal critical path because the provider hook discards the returned promise."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is the number of distinct handed-off steering messages the user removes. Each removed ID causes at most one withdrawal attempt; normal interactive use is a small manually generated set.",
+        "EffectiveConcurrency": "Withdrawals for different IDs or sessions can overlap because the provider hook is fire-and-forget. There is no shared limiter, but each operation is ID-specific and user-action bounded; no loop newly fans one removal into multiple RPCs.",
+        "CacheBehavior": "No cache participates. Submitted IDs and pending SDK IDs are in-memory lifecycle state; successful withdrawal deletes the pending entry, while abort/disposal drains remaining entries.",
+        "MechanismConfidence": "High confidence in the one-RPC-per-removed-ID mechanism and off-critical-path placement from the traced queue-drain, provider, and session call chain.",
+        "MagnitudeUncertainty": "SDK RPC duration and unusually large prompt sizes are not measured, but operation count is directly bounded by accepted removals and is normally low.",
+        "Verdict": "No reportable regression. The new boundary is necessary, off the interaction critical path, and has no realistic high-cardinality fan-out or retained-resource growth."
+      },
+      {
+        "Scenario": "A user removes steering while MCP reconciliation or attachment preparation is still running.",
+        "CriticalPath": "Removal immediately deletes the pending steering entry. Preparation already in progress can finish, after which the new identity check prevents session.send; the user-facing removal does not await preparation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:6153, _reconcileMcpServerEnablement",
+            "Operation": "Lists configured MCP servers and, when desired state differs, enables or disables affected servers.",
+            "Cardinality": "One list RPC per steering preparation; zero or one sequential control RPC per MCP server requiring a state change.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same reconciliation ran before every steering send and then the message was sent.",
+            "CriticalPathEffect": "Already in flight before removal and not awaited by removal; it remains on the steering-send preparation path only."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:5461 and 5550, _toSdkAttachments/_readSelectedText",
+            "Operation": "Reads selected resource contents while converting steering attachments.",
+            "Cardinality": "At most one file read per resource attachment carrying a selection; conversions are launched together with Promise.all.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same parallel attachment conversion and reads occurred before the SDK send.",
+            "CriticalPathEffect": "Already-started reads may finish after removal, but removal does not wait for them and the later SDK send is skipped."
+          }
+        ],
+        "ScalingInput": "One MCP reconciliation per steering send attempt, plus one conversion per attachment. Only resource selections perform file reads, scaling with the number and size of selected resources.",
+        "EffectiveConcurrency": "MCP reconciliation is serialized by _mcpEnablementSequencer and server enable/disable changes run sequentially. Attachment conversions use Promise.all, so selected-resource reads can run concurrently per message; this behavior predates the diff.",
+        "CacheBehavior": "MCP reconciliation reads current SDK state rather than using a new cache. The new pending-map deletion acts as a cancellation marker before SDK send; no negative-cache or coalescing behavior changes.",
+        "MechanismConfidence": "High confidence: the changed cancellation check is after unchanged preparation, and the new removal path only deletes map state.",
+        "MagnitudeUncertainty": "The number and size of selected attachments vary, but the diff neither introduces nor increases this preparation work.",
+        "Verdict": "No reportable regression. Some pre-existing preparation can continue after removal, but the PR does not add, amplify, or move that work onto the removal critical path and prevents the subsequent SDK send."
+      },
+      {
+        "Scenario": "The SDK reports that removed steering was already delivered, or emits an identical steering message while another withdrawal is pending.",
+        "CriticalPath": "One withdrawal RPC completes with removed:false or overlaps an SDK user.message echo. Echo matching scans pending steering by SDK ID first and falls back to content; turn projection then follows the existing event path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:5675, CopilotAgentSession.withdrawSteering",
+            "Operation": "Attempts the same ID-specific SDK queue withdrawal and receives removed:false when delivery already occurred.",
+            "Cardinality": "One attempt per accepted removal.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No withdrawal attempt occurred; the delivered message was matched by content and promoted.",
+            "CriticalPathEffect": "Off the removal and echo critical paths except for local map matching; the RPC is asynchronous and the SDK event arrives independently."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:7927, user.message handler",
+            "Operation": "Persists the SDK event ID for the projected turn through the existing _withDatabase call.",
+            "Cardinality": "One existing asynchronous database update per relevant root user.message event.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same event handler persisted the turn event ID after content-based steering matching.",
+            "CriticalPathEffect": "Fire-and-forget and unchanged by the diff."
+          }
+        ],
+        "ScalingInput": "CPU matching is linear in currently pending steering entries and can make two passes only when an ID is present but has no exact match. The effective set is the small number of handed-off, not-yet-echoed steering messages.",
+        "EffectiveConcurrency": "A withdrawal may overlap an echo by design. Map identity checks prevent the completed withdrawal from deleting a different or already-promoted entry; no repeated RPC is scheduled by the echo.",
+        "CacheBehavior": "The pending map is cleared on successful withdrawal, matching echo, abort, or disposal. A removed:false result intentionally retains the entry until its authoritative echo or lifecycle cleanup.",
+        "MechanismConfidence": "High confidence in map lifecycle, event ordering, and unchanged database boundary from implementation and deterministic overlap tests.",
+        "MagnitudeUncertainty": "Pending-map size is not hard-capped, but interactive steering production and SDK echo consumption keep realistic cardinality small; no evidence supports material CPU or memory impact from the additional ID pass.",
+        "Verdict": "No reportable regression. The extra bounded map pass disambiguates identical messages, while cleanup and boundary cardinality remain controlled."
+      },
+      {
+        "Scenario": "A session provider without steering-withdraw support receives a mid-turn removal request.",
+        "CriticalPath": "AgentService rejects the action before state mutation or queue-drain handling.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One constant-time provider capability lookup and queued-message lookup per client action; queued-message lookup behavior predates this capability branch.",
+        "EffectiveConcurrency": "No asynchronous provider work is launched.",
+        "CacheBehavior": "No cache or retained state changes.",
+        "MechanismConfidence": "High confidence from the AgentService branch and optional provider contract.",
+        "MagnitudeUncertainty": "None material for performance; this is a local capability check.",
+        "Verdict": "No performance regression; unsupported providers preserve the previous rejection behavior and introduce no new boundary."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 10 changed files. The PR adds one asynchronous, ID-specific SDK withdrawal RPC only for steering already handed off, prevents SDK send when removal occurs during preparation, and bounds pending state through echo, abort, and disposal cleanup. No high-confidence actionable performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "/responses",
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-18T21:28:35.532458208Z",
+    "CompletedAt": "2026-10-18T21:35:45.561320108Z",
+    "WallClockMilliseconds": 430028,
+    "ModelCalls": 10,
+    "InputTokens": 374078,
+    "OutputTokens": 7029,
+    "TotalTokens": 381107,
+    "ReasoningTokens": 2838,
+    "CacheReadTokens": 322560,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 90807,
+    "ToolCalls": 53,
+    "NanoAIUnits": 47567600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 322560,
+      "cache_write": 0,
+      "input": 51518,
+      "output": 7029
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
