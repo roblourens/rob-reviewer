@@ -1,0 +1,190 @@
+{
+  "PullRequest": {
+    "Number": 342546,
+    "Title": "agentHost: move never-run nested sessions and sessions not yet loaded",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. --\u003e\n\nFixes two ways a nested session could not be moved with the Move Chats feature (behind `chat.agentHost.moveChats.enabled`, default off).\n\n**F4: a never-run peer chat could not be moved.** A peer chat created by \"New Nested Session\" that never ran a turn has a legacy `session_chats.is_read` of NULL (peer creation writes no read state), while the verified per-chat aggregate says `isRead: true` (new chats are created idle and read). The catalog normalizer compared them strictly and refused the move with `sessionNotReady` (\"Legacy peer state differs from verified per-chat source\"). A NULL legacy `is_read` now reads as read; a real divergence (aggregate says unread) is still refused.\n\n**Sessions the host has not loaded could not be nested.** The host publishes `vscode.movable` only for sessions it has loaded, so after a restart a single-chat session reported `canMoveSessionUnder=false` until opened, and `moveSession` did not restore its source (only `moveChat` restored its target). Design is \"load at move time\":\n- Client (`canMoveSessionUnder`): offers the nest for any unarchived single-chat session when the host supports `vscode.sessionMove`, from list data alone. It no longer reads `vscode.movable` (which can only be `true` or absent, so it cannot say \"not movable\"); no loading, no per-row subscriptions.\n- Host: `moveSession` (and the AHP `moveChat` source) restores an unloaded session inside the move sequencer via the existing `restoreSession`, then runs the normal checks, so the usual `AgentChatMoveRefusedError` reaches the user. A session that can't be restored is refused (`notMovable` / `sessionNotReady`) with nothing changed. Host publishing of `vscode.movable` is unchanged.\n\n## How to test\nUnit tests (all passing together, 1820 tests):\n- `scripts/test.sh --run src/vs/platform/agentHost/test/node/agentService.test.ts --run src/vs/platform/agentHost/test/node/agentHostDatabase.test.ts --run src/vs/sessions/contrib/providers/agentHost/test/browser/localAgentHostSessionsProvider.test.ts` → 1820 passing\n- `npm run eslint -- \u003cchanged .ts files\u003e` → clean\n- `npm run typecheck-client` → clean (no errors)\n- Hygiene ran in the pre-commit hook → passed\n\nNot run: Azure pipeline 111 e2e at the time of writing (queued after PR creation).\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342546",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "22308219d39a7140e699f31aafbad9ca8000673b",
+    "HeadRef": "agents/fix-bug-f4-move-chats-feature",
+    "HeadSHA": "99f5f4e9f6da389096b59a5fc55817d2a4eedf8d",
+    "CreatedAt": "2026-10-19T13:36:43Z",
+    "UpdatedAt": "2026-10-19T13:43:56Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "eager-work",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Evaluating whether a session-list row can be nested under another session",
+        "CriticalPath": "The provider resolves the cached adapter and synchronously reads connection capability, archived state, and the cached chat-array length. No asynchronous work or boundary must complete.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One constant-time lookup per eligibility query; even if queried across a session list, cost scales linearly with visible rows and performs no per-row I/O.",
+        "EffectiveConcurrency": "Synchronous local reads only; no queue, IPC, filesystem, database, or network concurrency.",
+        "CacheBehavior": "Uses already-hydrated _sessionCache data. Cold sessions are not loaded and no negative-cache retry is created; warm behavior is the same constant-time observable read.",
+        "MechanismConfidence": "High: the changed method and repository-wide callers show only Map/observable reads, and the test explicitly checks that answering eligibility adds no wire operations.",
+        "MagnitudeUncertainty": "The generic UI may query eligibility at different frequencies, but each query is bounded O(1) local work.",
+        "Verdict": "No regression. The diff replaces one constant-time metadata read with two constant-time cached observable reads and does not add subscriptions, allocations proportional to chat count, or boundary calls."
+      },
+      {
+        "Scenario": "Moving a single-chat session whose source has not been loaded since host restart",
+        "CriticalPath": "One existing renderer-to-host moveSession request enters the global chat-move sequencer. The newly added source restore must finish, then the existing destination restore/catalog preparation/database validation and move commit complete before the user-visible move returns.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:moveSession",
+            "Operation": "Send vscode/moveSession over the existing extension request/data plane.",
+            "Cardinality": "One request per explicit move.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC request was sent, but an unloaded source was refused by the host before a successful move path.",
+            "CriticalPathEffect": "The request/response brackets the whole move and is on the critical path."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_restoreForMove -\u003e restoreSession",
+            "Operation": "Read registry, catalog, session metadata, chat state, and annotations while restoring the source.",
+            "Cardinality": "One coalesced restore for the cold source; fixed per-session database reads, with existing per-chat hydration inside restore.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The unloaded source was not restored and the operation returned NotMovable.",
+            "CriticalPathEffect": "Newly required before an unloaded source can proceed."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_getSessionMetadataForRestore/_restoreSessionState",
+            "Operation": "Resolve provider chat metadata/backing and materialize the restored source; on a metadata miss the provider catalog may be enumerated.",
+            "Cardinality": "One per cold source restore; full provider-catalog enumeration only on the existing cold metadata-miss path and shared provider initialization.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No source provider restoration occurred because the move was refused.",
+            "CriticalPathEffect": "Blocks the explicit move when source state is cold."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_moveChat",
+            "Operation": "Restore the destination if cold, prepare both catalogs, read their revision snapshots, and commit the move.",
+            "Cardinality": "At most one destination restore plus fixed grouped reads for the source/target pair per move.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Destination restoration and grouped catalog work already occurred once a move reached this path.",
+            "CriticalPathEffect": "Existing critical-path work for a successful move."
+          }
+        ],
+        "ScalingInput": "Exactly one source and one destination per explicit drag/drop. The added work is one source-session restore on a cold source; it does not scale with the number of rows. A provider metadata miss can trigger the existing provider-catalog enumeration, whose cost scales with that provider's catalog size.",
+        "EffectiveConcurrency": "All chat/session moves are serialized by _chatMoveSequencer. Restore work is coalesced per session by _restoreSessionInFlight, and resident sessions bypass restoration. Session residency is bounded by the default limit of 10 and reconciliation/eviction.",
+        "CacheBehavior": "Warm source and target states skip restore. Concurrent restores of the same cold session join one promise. Successful restores become resident but are governed by AgentSessionResidency; failed metadata lookup may warm the existing provider catalog rather than repeating independent work per row.",
+        "MechanismConfidence": "High: the added await is directly on the explicit move path, and restore's database/provider boundaries, per-session coalescing, resident fast path, global move sequencer, and residency cap are all explicit in code.",
+        "MagnitudeUncertainty": "Cold provider restore duration varies; a large legacy provider catalog can be slow on a metadata miss. The feature is default-off and the path is one explicit move, not list rendering or startup.",
+        "Verdict": "No reportable regression. The extra cold restore is the bounded work required to turn a previously immediate refusal into a successful operation; it is deferred until move time, coalesced, cached by residency, and does not fan out by session-list size."
+      },
+      {
+        "Scenario": "Moving a chat whose source session is not resident",
+        "CriticalPath": "The explicit moveChat request enters the same global sequencer. For a session destination, the newly added source restore completes before existing validation, target restore, catalog snapshot reads, folder/worktree preparation, and commit. Promotion to a new session returns before the new restore call and is unchanged.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_moveChat/_restoreForMove",
+            "Operation": "Hydrate source registry/catalog/session state before validating and moving its chat.",
+            "Cardinality": "One coalesced restore for one cold source per explicit move.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The move validation read absent state and refused; it did not hydrate the source.",
+            "CriticalPathEffect": "Added to the critical path only when the source is not resident."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_restoreSessionState",
+            "Operation": "Provider metadata lookup/materialization during cold source restore.",
+            "Cardinality": "One provider lookup/materialization for the cold source, with existing catalog fallback on a miss.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No source provider restore occurred on this previously refused path.",
+            "CriticalPathEffect": "Blocks that explicit cold-source move."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_moveChat",
+            "Operation": "Existing target restore, grouped catalog snapshot reads, and move persistence.",
+            "Cardinality": "One target and one grouped source/target operation per move, plus existing moved-subtree persistence.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Already performed for successful moves with resident sources.",
+            "CriticalPathEffect": "Existing successful-move critical path."
+          }
+        ],
+        "ScalingInput": "One source restore per cold source session and at most one target restore per explicit move; existing subtree/folder work scales with the moved chat subtree, not with all listed sessions.",
+        "EffectiveConcurrency": "Globally serialized moves; per-session restore coalescing prevents duplicate concurrent source hydration. No new parallel burst is introduced.",
+        "CacheBehavior": "Resident sources skip the added restore. Cold successful restores are retained within the bounded residency cache; in-flight restores are joined. Promotion-to-new-session does not invoke the new source restore branch.",
+        "MechanismConfidence": "High: branch placement proves new-session promotion is unaffected and cold session-destination moves add exactly one guarded source restore.",
+        "MagnitudeUncertainty": "The UI prevalence of stale/unloaded source requests and provider restore duration are not measured.",
+        "Verdict": "No reportable regression. This is deferred, bounded first-use work that enables a previously unsupported cold-source operation, with no per-row or per-chat fan-out beyond existing restore semantics."
+      },
+      {
+        "Scenario": "Normalizing a legacy chat catalog where a peer has no recorded read state",
+        "CriticalPath": "The existing catalog-normalization transaction performs its existing session_chats SELECT and per-chat validation. The changed expression only treats null is_read as read during an in-memory scalar comparison.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostDatabase.ts:ensureChatCatalogV2",
+            "Operation": "Read legacy session_chats and write/apply the normalized catalog.",
+            "Cardinality": "One existing grouped SELECT for the session plus existing normalization writes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same query and normalization pass ran, but null versus aggregate-read caused a conflict.",
+            "CriticalPathEffect": "Existing reconciliation/normalization path; the changed null comparison adds no boundary operation."
+          }
+        ],
+        "ScalingInput": "Existing normalization remains linear in the session's chat count. The diff adds no loop, query, allocation proportional to input, or serialization.",
+        "EffectiveConcurrency": "Unchanged database transaction/sequencing; no new concurrency or boundary burst.",
+        "CacheBehavior": "No cache behavior changes; the same already-read legacy row and aggregate chat objects are compared.",
+        "MechanismConfidence": "High: the complete changed hunk is a null-coalescing/scalar comparison inside the existing per-chat normalization function.",
+        "MagnitudeUncertainty": "Session chat counts vary, but the asymptotic and boundary behavior are unchanged.",
+        "Verdict": "No performance regression; the change only alters comparison semantics in already-executed work."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files and traced eligibility, move-time restoration, protocol dispatch, provider/session restoration, catalog normalization, restore coalescing, global move serialization, and residency eviction. No high-confidence diff-introduced performance issue was found, and the PR does not itself establish a shipped performance-regression fix requiring blame."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-19T14:05:08.246912913Z",
+    "CompletedAt": "2026-10-19T14:06:52.348003994Z",
+    "WallClockMilliseconds": 104101,
+    "ModelCalls": 11,
+    "InputTokens": 456352,
+    "OutputTokens": 6929,
+    "TotalTokens": 463281,
+    "ReasoningTokens": 2290,
+    "CacheReadTokens": 385356,
+    "CacheWriteTokens": 70963,
+    "APIDurationMilliseconds": 83675,
+    "ToolCalls": 61,
+    "NanoAIUnits": 64766940000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 385356,
+      "cache_write": 70963,
+      "input": 33,
+      "output": 6929
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
