@@ -1,0 +1,198 @@
+{
+  "PullRequest": {
+    "Number": 342450,
+    "Title": "agentHost: resolve tool name conflicts",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFix conflicting tool registrations when multiple clients connect to the Copilot Agent Host. A connected client can contribute a tool with the same name as a host-owned tool but a different input schema, causing model-facing metadata, SDK handler selection, and client dispatch to disagree.\n\n- Reserve names of host tools registered for the current launch before registering and attributing client tools. Preserve same-name client tools when the host tool is absent from that session, including ephemeral sessions.\n- Prefer the message sender when choosing between client tools with the same name, scoped to exact chat membership.\n- Refresh changed tool definitions at send/resume boundaries and route calls only to clients whose live definition matches the advertised snapshot. Identical reconnects remain eligible; incompatible mid-turn updates fail explicitly.\n- Add regression coverage for host/client `create_session` collisions, omitted host tools and their permission routing, sender changes, chat membership, and incompatible live definitions.\n\nNo linked issue. Reviewed with Opus 5.5; its test-fixture and per-launch tool reservation findings were fixed, and follow-up reviews confirmed no remaining actionable findings. Latest main was merged without conflicts.\n\nValidation:\n\n- `npm run build-fast -- --client-only` — passed.\n- `env -u COPILOT_HOME ./scripts/test.sh --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --run src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts --reporter dot` — passed (2,217 tests; 1 pending).\n- `npm run typecheck-client` — passed.\n- `npm run eslint -- src/vs/platform/agentHost/node/activeClientState.ts src/vs/platform/agentHost/node/copilot/copilotAgent.ts src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts src/vs/platform/agentHost/test/node/copilotAgent.test.ts src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts` — passed.\n- `git diff --check` — passed.\n\nNo live Mission Control replay was performed.\n\n(Written by Copilot)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342450",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "2843190635498cb955750ddbcc718d2768477ffb",
+    "HeadRef": "roblou/agents/session-tool-conflict-investigation",
+    "HeadSHA": "e1129e65239747ae33646e058465f03f096c4cbf",
+    "CreatedAt": "2026-10-18T23:42:49Z",
+    "UpdatedAt": "2026-10-19T00:51:13Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-AEE61C6F1CD7",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts",
+      "Side": "RIGHT",
+      "Line": 6739,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed call order, refresh comparison, destroy/resume implementation, and new test's exact create-then-resume sequence are all directly evidenced. Only prevalence of multiple clients contributing incompatible same-name definitions is uncertain, so severity is bounded rather than mechanism confidence.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "SDK session destruction, session resume calls, and replacement runtime/configuration objects",
+      "PerformanceScaling": "One redundant destroy/resume is added to a prepared first send whenever sender preference selects a structurally different same-name tool; thereafter the same lifecycle cost can recur once per sender/schema switch because chat turns are serialized.",
+      "PerformanceOutcome": "Blocked prompt critical path and increased turn-start latency",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "`prepareTurn` created the deferred SDK session once and `sendMessage` retained the insertion-order client-tool snapshot, so this scenario proceeded directly to the SDK send without immediately destroying and resuming the new runtime.",
+      "ChangedBehavior": "A prepared first turn is launched using insertion-order tool definitions, then the new sender preference changes the selected definition during `sendMessage`; `_refreshSessionConfiguration` detects `clientToolsChanged`, destroys that newly launched runtime, and resumes the same SDK session with the sender's schema before sending.",
+      "CausalDiffEvidence": "The added call at `copilotAgent.ts:6739` changes the preferred tool contributor only inside `sendMessage`, after `prepareTurn` may already have launched the SDK session. The added regression test explicitly records `[create(toolA), resume(toolB)]` for one prepared first send from client B, proving that this line invalidates the just-created snapshot and invokes the existing refresh/restart path.",
+      "Title": "Select the sender before prelaunching the SDK session",
+      "Impact": "When two connected clients expose the same tool name with different schemas and the first sender is not the insertion-order winner, the first prompt waits for two SDK session startups instead of one. The overlap from `prepareTurn` is discarded, increasing time-to-model-response; alternating senders can repeat the destroy/resume cost at later turn boundaries.",
+      "Evidence": "`prepareTurn` calls `_ensureResolvedChatSession` without knowing or setting `senderClientId`. On the subsequent serialized send, line 6739 updates the preferred client; `toolsForChat` now picks that client's definition, `getRestartReason` returns `clientToolsChanged`, and `_refreshSessionConfigurationWithAnchor` awaits `_destroyLiveSession` followed by `_resumeSession` on the prompt critical path. The added `send and resume refresh conflicting client schemas...` test demonstrates one logical first send producing `create(toolA)` immediately followed by `resume(toolB)`.",
+      "Recommendation": "Make preparation sender-aware: pass `senderClientId` through the existing `prepareTurn` boundary and set the preferred client before `_ensureResolvedChatSession`. If that boundary cannot carry sender identity, skip speculative prelaunch when incompatible duplicate tool definitions make the launch winner ambiguous. Either approach launches the required sender schema once and preserves the new routing semantics."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "cleanup-lifecycle",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Send or resume a chat turn when multiple exact-chat clients contribute incompatible definitions for the same tool name.",
+        "CriticalPath": "`prepareTurn` may create the runtime concurrently with attachment/checkpoint work. `sendMessage` then sets sender preference and synchronously awaits snapshot comparison, live-session destruction, and SDK resume before it can call `session.send`; the redundant resume is therefore directly on the prompt critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/SDK session lifecycle",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_sendMessageOnce and _refreshSessionConfigurationWithAnchor; src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_resumeSession",
+            "Operation": "Destroy the live Copilot SDK session and invoke `client.resumeSession` with the newly preferred tool schema.",
+            "Cardinality": "For a deferred prepared first turn with two clients contributing one incompatible duplicate name, changed behavior performs one SDK create plus one SDK resume; before the diff it performed only the create. Each later sender/schema switch can add one resume.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Insertion-order tool selection remained stable between prepare and send, so the prepared runtime was reused and no configuration-driven resume occurred.",
+            "CriticalPathEffect": "Preparation's create may overlap host work, but the added destroy/resume must finish in `sendMessage` before SDK send and time-to-model-response."
+          },
+          {
+            "Kind": "filesystem/state snapshot",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_sessionRefreshReasonWithAnchor",
+            "Operation": "Read stored working directory and build client/plugin/MCP snapshot.",
+            "Cardinality": "One stored-working-directory read and one active-client snapshot per refresh check, unchanged for each send/resume.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same refresh checks ran, but sender identity did not alter the tool snapshot.",
+            "CriticalPathEffect": "These existing checks must complete before deciding whether to reuse or restart the runtime; the diff changes their result, not their call count."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is the number of turn boundaries at which the sender-selected definition differs structurally from the currently applied definition, after duplicate names are deduplicated. One extra resume occurs per such boundary.",
+        "EffectiveConcurrency": "Operations for one chat are serialized by `_queueChatTurn`. The create and subsequent resume are sequential, not parallel; alternating sender/schema changes produce at most one restart per turn but cannot overlap it with that turn's model request.",
+        "CacheBehavior": "The applied snapshot acts as the warm-session state. Structural equality avoids refreshes for identical reconnects and repeated sends from a sender whose selected schema matches the applied one; a sender selecting a different same-name schema is a deliberate cache miss and restarts the runtime. No coalescing is needed because each chat queue is serialized.",
+        "MechanismConfidence": "Very high: changed ordering, restart comparison, destroy/resume call path, serialization, and the test's `[create(A), resume(B)]` sequence directly establish the mechanism.",
+        "MagnitudeUncertainty": "The duration of SDK resume and prevalence of exact-chat multi-client incompatible name collisions are environment/product dependent. The extra lifecycle is nevertheless explicit and covered by a regression test, so uncertainty affects severity rather than mechanism confidence.",
+        "Verdict": "Reportable repeated-work regression. The sender preference is first applied after speculative preparation, so one logical first send can pay two SDK startups; passing sender identity into preparation or skipping ambiguous prelaunch avoids the redundant lifecycle while preserving sender-selected registration."
+      },
+      {
+        "Scenario": "Create or resume a session where a client tool collides with an eligible host-owned tool, including ephemeral sessions where that host tool is omitted.",
+        "CriticalPath": "Tool arrays and the host-name set are built synchronously during SDK session configuration, before the existing create/resume call. The local work is linear in a small launch catalogue and does not add an expensive boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/SDK session lifecycle",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:launch",
+            "Operation": "Create or resume the Copilot SDK session with the assembled tool definitions.",
+            "Cardinality": "Exactly one SDK create or resume per ordinary launch, unchanged by host/client name filtering.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single SDK call occurred with client, server, and extension tools assembled without reserving host names.",
+            "CriticalPathEffect": "The SDK lifecycle remains on launch critical path, but the diff only changes the tool list passed into the existing call."
+          }
+        ],
+        "ScalingInput": "Number of shell, eligible server, extension, and deduplicated client tools in one session launch.",
+        "EffectiveConcurrency": "Single synchronous configuration build per session launch/resume; no fan-out or burst.",
+        "CacheBehavior": "Server definitions are recomputed from in-memory state for the launch and filtered for ephemeral eligibility. Client names are filtered once into the session's `_clientToolNames`; there is no cold/warm boundary difference beyond the normal SDK create/resume, and no new negative-cache behavior.",
+        "MechanismConfidence": "High that no boundary multiplicity changed: server and extension factories are each still invoked once, and the host-name set adds only local linear allocation.",
+        "MagnitudeUncertainty": "Actual catalogue sizes vary, but server, shell, extension, and deduplicated client tool collections are bounded by registered features and connected clients.",
+        "Verdict": "No additional reportable regression. The diff performs bounded local filtering and preserves one SDK lifecycle call; it prevents duplicate registration without adding I/O or repeated launch work."
+      },
+      {
+        "Scenario": "Route an SDK client-tool invocation after reconnects or mid-turn live definition changes.",
+        "CriticalPath": "On each SDK tool-start event, owner resolution scans exact-chat clients and deep-compares only same-name live definitions to the applied definition before emitting the existing client tool-call action. This is local synchronous work; client execution remains the dominant boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_resolveClientToolOwner and client tool-call action handling",
+            "Operation": "Dispatch a client tool invocation to the selected connected client and await completion.",
+            "Cardinality": "At most one Agent Host-to-client tool dispatch per invocation after membership, name, and structural matching; zero when no live definition matches. This cardinality is unchanged or reduced from the prior one-owner dispatch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A same-name live contributor could be selected without checking structural compatibility, but still only one client received the invocation.",
+            "CriticalPathEffect": "The selected client must execute and return the tool result for the model turn to proceed, as before. The new local comparison precedes this existing boundary."
+          }
+        ],
+        "ScalingInput": "Number of exact-chat clients that expose the invoked name, multiplied by the size of that tool's input schema; unrelated tool names are checked by name and skipped.",
+        "EffectiveConcurrency": "Tool events may occur within a turn, but owner selection itself is synchronous. Each invocation dispatches to at most one matching client; incompatible definitions dispatch to none, so the diff creates no boundary fan-out.",
+        "CacheBehavior": "The applied snapshot is the authoritative advertised contract. Identical live definitions remain eligible without rebuilding the SDK session; incompatible live updates are rejected until the next send/resume refresh. Structural comparisons are not memoized but operate on the already-held definitions.",
+        "MechanismConfidence": "High: the changed loop and structural comparator are visible, and dispatch remains single-owner.",
+        "MagnitudeUncertainty": "Client count and schema depth vary, though exact-chat active clients and tool schemas are expected to be modest. No evidence shows this local comparison dominating tool execution latency.",
+        "Verdict": "No reportable performance regression. The added bounded local comparison prevents incompatible IPC dispatch and does not increase boundary cardinality or retain additional per-call state."
+      },
+      {
+        "Scenario": "Maintain sender priority and produce chat-scoped active-client snapshots.",
+        "CriticalPath": "Selecting and merging definitions is synchronous during snapshot generation. With a preferred client it allocates a client-id array and deduplicates names; no subprocess, IPC, filesystem, database, or network call is reached by this merge itself.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Current connected clients plus their contributed tools after exact-chat membership filtering and name deduplication.",
+        "EffectiveConcurrency": "Snapshots are taken within serialized chat operations; shared session membership reads do not launch parallel work.",
+        "CacheBehavior": "Preferred client identity is one replaceable map entry per chat and is removed with the chat. Snapshots are generated from current in-memory membership; there is no growing per-sender history or retained schema cache.",
+        "MechanismConfidence": "High: map lifecycle and merge implementation are directly visible.",
+        "MagnitudeUncertainty": "The number of simultaneously connected clients and contributed tools can vary, but cost is linear and bounded by current membership rather than session lifetime.",
+        "Verdict": "No reportable retention or allocation regression. State is bounded to one preferred client ID per live chat and cleaned on chat removal; merge allocations are linear in current membership."
+      },
+      {
+        "Scenario": "Classify same-name server/client tools during custom-tool permission routing.",
+        "CriticalPath": "The definition lookup and `.some` scan execute synchronously before choosing server-versus-client permission routing. Any confirmation/client IPC is pre-existing and occurs only after classification.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:permission request handling",
+            "Operation": "Route confirmation for the classified server or client tool.",
+            "Cardinality": "At most one existing confirmation/client protocol interaction per custom-tool permission request; classification does not add another boundary call.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same permission request path ran after classification against the broader server tool-name array.",
+            "CriticalPathEffect": "Existing permission handling can block invocation, but the changed eligibility lookup is in-process and bounded."
+          }
+        ],
+        "ScalingInput": "Number of registered server-tool groups and definitions per permission request.",
+        "EffectiveConcurrency": "One local classification per permission request; no newly parallel work or fan-out.",
+        "CacheBehavior": "Eligible server-tool definitions are derived from current in-memory session state on each custom-tool permission check rather than using the broader `toolNames` projection. There is no external cache or negative-cache change.",
+        "MechanismConfidence": "High that `getDefinitionsForSession` is local state/filter work and adds no transitive I/O.",
+        "MagnitudeUncertainty": "Dynamic server-tool groups may vary in count, but current implementations derive a small registered catalogue from in-memory state.",
+        "Verdict": "No reportable performance regression. The new lookup is bounded local work comparable to the previous generated `toolNames` scan and does not change IPC cardinality."
+      }
+    ],
+    "Summary": "Completed the performance pass over all seven changed files. One medium-severity repeated SDK lifecycle regression was reported: sender preference is applied after `prepareTurn`, causing a just-created session to be destroyed and resumed before first send when duplicate client schemas conflict. Host-name reservation, live-definition routing, snapshot retention, and permission classification add only bounded local work and no new boundary fan-out."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-19T01:35:32.013226816Z",
+    "CompletedAt": "2026-10-19T01:37:46.438911096Z",
+    "WallClockMilliseconds": 134425,
+    "ModelCalls": 10,
+    "InputTokens": 400366,
+    "OutputTokens": 8176,
+    "TotalTokens": 408542,
+    "ReasoningTokens": 3177,
+    "CacheReadTokens": 336896,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 117380,
+    "ToolCalls": 46,
+    "NanoAIUnits": 55215840000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 336896,
+      "cache_write": 0,
+      "input": 63470,
+      "output": 8176
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

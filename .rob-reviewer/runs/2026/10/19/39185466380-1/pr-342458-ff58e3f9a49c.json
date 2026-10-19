@@ -1,0 +1,133 @@
+{
+  "PullRequest": {
+    "Number": 342458,
+    "Title": "sessions: fix cloud read state for recorded conversations",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes microsoft/vscode-internalbacklog#10109.\n\nA cloud environment can be connected without hosting a recorded conversation. Marking that conversation read currently takes the live-host path and fails because no backend chat is advertised. Use the existing persisted local read-state path when the chat has no backend resource, while retaining host dispatch for advertised live chats.\n\nAdds regression coverage for read/unread changes with a connected environment but no matching chat, persistence across provider recreation, and live-chat routing with an opaque advertised URI.\n\n### Validation\n\n- `npm run build-fast -- --client-only` — passed.\n- `./scripts/test.sh --run src/vs/sessions/contrib/providers/remoteAgentHost/test/browser/remoteAgentHostSessionsProvider.test.ts --grep 'CloudSandboxSessionsProvider archiving|marks the default chat read with protocol' --reporter dot` — 25 passed. The new missing-chat regression failed before the production fix.\n- `npm run typecheck-client` — passed.\n- `npm run eslint -- src/vs/sessions/contrib/providers/remoteAgentHost/browser/cloudSandboxSessionsProvider.ts src/vs/sessions/contrib/providers/remoteAgentHost/test/browser/remoteAgentHostSessionsProvider.test.ts` — passed.\n- `git diff --check` — passed.\n\nManual verification: open a recorded cloud conversation whose environment is connected but no longer advertises that chat; confirm opening it or using Mark as Read clears unread state, and Mark as Unread and window reload preserve the chosen state. Live cloud chats should continue syncing through the host. Manual UI verification was not run.\n\n(Written by Copilot)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342458",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "75fa8b80754b42928f94a8b9e524ee5025d28eb6",
+    "HeadRef": "roblou/agents/fix-claude-session-red-state",
+    "HeadSHA": "ff58e3f9a49cb48876be1d74653816979013ae0a",
+    "CreatedAt": "2026-10-19T00:50:28Z",
+    "UpdatedAt": "2026-10-19T01:10:31Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open or explicitly mark a recorded cloud conversation read/unread while its environment is connected but no longer advertises that chat",
+        "CriticalPath": "The UI read-state request performs an in-memory session/map lookup and backend-chat lookup, updates the cached chat observable, and fires one session-change event. The later cache serialization/storage write occurs on the storage service's onWillSaveState event and is off the interaction's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_onDidChangeSessionsImmediately/onWillSaveState listeners (lines 4432-4463)",
+            "Operation": "Serialize and persist the dirty session-cache snapshot on the next storage save/flush",
+            "Cardinality": "At most one coalesced cache persistence pass per storage save interval after one or more actual read-state changes; repeated requests for the already-current state return before firing the change event",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "With a connection present, the old branch entered the host path and failed backend-chat resolution before changing state, so this connected-missing-chat case did not dirty or persist the local cache; disconnected recorded chats already used this deferred persistence path",
+            "CriticalPathEffect": "Deferred until storage save/flush, so it does not block the read-state interaction"
+          }
+        ],
+        "ScalingInput": "One main-chat lookup and one changed-session event per actual state transition. The main chat uses the default-chat branch, so backend resolution does not scan the chat collection; persistence is coalesced across changes and scales with the existing cached-session snapshot only at save time.",
+        "EffectiveConcurrency": "Each request runs synchronously through local mutation; there is no network concurrency. Multiple cache changes are coalesced by the dirty flag into the next storage save.",
+        "CacheBehavior": "Warm connected state consults _lastSessionStates and sees no advertised default chat; if no authoritative state exists, lookup falls back to the session cache. Persisted local state is restored when the provider is recreated. Repeating the same read value is a no-op and does not dirty the cache.",
+        "MechanismConfidence": "High: the changed guard, constant-time main-chat lookup, local event path, and deferred persistence listener are directly visible in the traced code.",
+        "MagnitudeUncertainty": "The number of cached sessions serialized at save time varies by user, but this work is deferred, coalesced, and already the provider's normal offline persistence mechanism.",
+        "Verdict": "No reportable regression. The diff intentionally replaces a failing remote route with bounded local work and coalesced persistence; it adds no boundary fan-out or critical-path I/O."
+      },
+      {
+        "Scenario": "Mark a live cloud chat read/unread while the connected host advertises its opaque backend URI",
+        "CriticalPath": "The request first resolves the advertised backend resource, then the existing superclass path validates state, resolves it again, updates the local observable optimistically, and dispatches one action to the connected host. Dispatch remains the interaction's only expensive boundary and is not awaited for confirmation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:setChatReadState (lines 7014-7048)",
+            "Operation": "Dispatch one ChatIsReadChanged protocol action to the connected cloud agent host",
+            "Cardinality": "One dispatch per accepted chat read-state request; no collection-wide fan-out is added by this diff",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Before the diff, every connected read-state request entered the same superclass path and issued the same single dispatch when the backend chat existed",
+            "CriticalPathEffect": "The dispatch call is synchronous/optimistic and does not await a remote response"
+          }
+        ],
+        "ScalingInput": "One user/open-triggered state request. For the default main chat, backend resolution returns the advertised default directly; peer-chat lookup can scan that session's chat summaries, but the diff adds only one such lookup per request and does not multiply requests.",
+        "EffectiveConcurrency": "One fire-and-forget protocol dispatch per request; the diff adds no Promise.all, queue, retry, or concurrent burst.",
+        "CacheBehavior": "The authoritative connected session snapshot supplies the backend URI. The local adapter is updated optimistically and marked dirty for the existing deferred cache persistence. No new cache key or negative cache is introduced.",
+        "MechanismConfidence": "High: both the new guard and unchanged superclass dispatch path are explicit, and the regression tests confirm two requests produce exactly two actions.",
+        "MagnitudeUncertainty": "Peer-chat catalog size may vary, but normal main-chat read marking takes the constant-time default path and the extra URI parse is bounded per interaction.",
+        "Verdict": "No reportable regression. Existing network cardinality and concurrency are unchanged; the extra in-memory lookup/URI parse is bounded and not a realistic performance issue."
+      },
+      {
+        "Scenario": "Mark a recorded cloud conversation read/unread while disconnected, including provider recreation from persisted state",
+        "CriticalPath": "The existing local path looks up the session/chat, updates state, and emits one change event. Cache persistence remains deferred to storage save; provider recreation synchronously hydrates the existing persisted cache without a network call.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_enableSessionCachePersistence/_loadCachedSessions and onWillSaveState",
+            "Operation": "Persist or reload the existing session-cache snapshot through the storage service",
+            "Cardinality": "One coalesced save per storage save interval and one cache load per provider construction",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old condition already selected this exact local persistence path whenever no connection existed",
+            "CriticalPathEffect": "Saving is deferred; loading is part of provider construction as before the diff"
+          }
+        ],
+        "ScalingInput": "One map/session lookup per read-state request; provider hydration scales with the pre-existing number of persisted session summaries, unchanged by the diff.",
+        "EffectiveConcurrency": "Local requests are synchronous; storage saving is coalesced by the existing dirty flag, with no new parallel boundary operations.",
+        "CacheBehavior": "Cold construction reads the persisted summary cache; warm repeated same-state requests return early. No remote negative-cache retry behavior is added.",
+        "MechanismConfidence": "High: connection short-circuiting means the new backend lookup is not evaluated in the disconnected case, leaving behavior unchanged.",
+        "MagnitudeUncertainty": "Persisted session count varies, but neither load cardinality nor serialization placement changes for this scenario.",
+        "Verdict": "No performance change: short-circuit evaluation preserves the previous disconnected path exactly."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and traced read-state routing, backend-resource resolution, session-change persistence, and remote dispatch. No high-confidence actionable performance regression was introduced, and the PR is a correctness fix rather than a demonstrated performance-regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-19T01:39:43.123569515Z",
+    "CompletedAt": "2026-10-19T01:40:58.007326966Z",
+    "WallClockMilliseconds": 74883,
+    "ModelCalls": 9,
+    "InputTokens": 235184,
+    "OutputTokens": 4050,
+    "TotalTokens": 239234,
+    "ReasoningTokens": 949,
+    "CacheReadTokens": 190976,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 58132,
+    "ToolCalls": 36,
+    "NanoAIUnits": 33422240000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 190976,
+      "cache_write": 0,
+      "input": 44208,
+      "output": 4050
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
