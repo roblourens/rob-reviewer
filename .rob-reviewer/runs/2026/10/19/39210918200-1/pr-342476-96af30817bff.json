@@ -1,0 +1,185 @@
+{
+  "PullRequest": {
+    "Number": 342476,
+    "Title": "chat: stop Copilot connector connect polling on declined or failed consent",
+    "Body": "## Problem\n\nAfter `CopilotConnectorsService.connect()` sends the connection PUT and opens the consent link, it polls the connectors catalog every 2 seconds for up to 5 minutes. It only stopped on `connected`. If the user denied consent (the server reports `not_connected`) or consent ended in `error` (`retryable_error`, `review_required`, …), the card kept showing **Cancel** for the full 5 minutes and made about 150 catalog requests. It then showed \"Connector authorization did not finish in time. Complete authorization in the browser, then try again.\", which is the wrong message for both cases.\n\n## Fix\n\nThe poll loop now checks the connector's status on every refresh:\n\n- **`connected`:** succeeds, as before.\n- **`error`:** fails immediately. If the connector was already in `error` before the user clicked Connect, it must first be seen as `pending` so a stale state right after the PUT isn't mistaken for the result.\n- **`not_connected`:** fails as declined, but only after this connect has been seen as `pending`. Right after the PUT the catalog can still show the old `not_connected`, and the user may spend a long time on the consent page, so I chose this over a grace period. If the server goes straight back to `not_connected` without ever reporting `pending`, the connect still waits for the 5-minute timeout.\n- **Still `pending`:** keeps the existing 5-minute timeout and message.\n\nA new `createConnectionFailedError()` returns a localized `CopilotConnectorsError` with a message that matches the status labels in `connectorPresentation`:\n\n- Declined: \"Authorization for {0} was declined.\"\n- `review_required`: \"Review required: {0} needs to be reviewed before it can be connected.\"\n- `reconnect_required`: \"Reconnect required: authorization for {0} did not complete. Reconnect to try again.\"\n- `retryable_error`, `sign_in_required` and `unavailable` each have their own message; any other error gets \"{0} reported an error.\"\n- The server's `errorMessage` is appended when present.\n\n## Not included\n\nIn Browse, connect errors are already stored per connector and shown on each card's action hover. The status line under the results shows only one stored error (`installErrors.values().next().value`). Showing every error there is a separate UI change and could be a follow-up.\n\n## Testing\n\nNine new cases in `copilotConnectorsService.test.ts`, using `runWithFakedTimers`, cover:\n\n- declined after `pending`, without failing on the stale `not_connected` right after the PUT\n- five `error` variants, with and without a detail and server message\n- an existing error that later becomes `review_required`\n- a successful reconnect from an existing error\n- a connection that stays `pending` and still times out\n\nSeven of the new cases fail against the previous code; the other two check that existing behaviour is kept.\n\n- `./scripts/test.sh --grep CopilotConnectorsService`: passed (70 tests)\n- `npm run eslint -- \u003cchanged files\u003e`: passed\n- `npm run typecheck-client`: passed\n\nI did not run the manual end-to-end check with the connector test bed (`connect-failures` scenario).\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342476",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "vritant24",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "341e0fa9346520e7a6a09803a80c5ecd3027f3cb",
+    "HeadRef": "agents/fix-copilot-connector-consent-error",
+    "HeadSHA": "96af30817bffb575a88cb5fffa4d33525cf0a629",
+    "CreatedAt": "2026-10-19T04:39:51Z",
+    "UpdatedAt": "2026-10-19T06:42:09Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/browser/aiCustomization/copilotConnectorsService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 437,
+      "BasePath": "src/vs/workbench/contrib/chat/browser/aiCustomization/copilotConnectorsService.ts",
+      "BaseLine": 419,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/browser/aiCustomization/copilotConnectorsService.ts",
+      "IntroducingCommit": "4ffbb26a9fe3a00f5cf7107f3f108f7469b56ffd",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "network",
+      "Mechanism": "A terminal connector authorization failure remained inside a five-minute polling loop, issuing one full cache-disabled catalog HTTP GET every two seconds even though no future poll could make that attempt succeed.",
+      "Symptom": "Declined or failed consent kept the UI action pending for five minutes and generated roughly 150 unnecessary catalog requests per attempt.",
+      "FixedBehavior": "The new status switch throws as soon as an authoritative `error` is observed (and after `pending` transitions to `not_connected`), ending the connection action and preventing all subsequent two-second catalog refreshes for the remainder of the five-minute window.",
+      "Evidence": "Before the PR, connect() entered a five-minute loop after the connection PUT and only returned when a refreshed catalog showed `connected`; every iteration awaited refresh(), whose request({ type: 'query' }) crosses the connectors IPC channel and performs a cache-disabled HTTP GET /plugins. connectionPollInterval is 2 seconds and connectionTimeout is 5 minutes, so an already-terminal error/decline still performed about 150 serialized GETs. The added tests establish the cardinality directly: a still-pending attempt reaches 152 total requests, while terminal errors now stop at 3 total requests and a pending-to-declined transition stops at 5.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Successful connector authorization from the embedded connector detail or marketplace install action",
+        "CriticalPath": "Authorization/session lookup, an initial catalog refresh, the connection PUT, opening the consent URL, and serialized catalog refreshes must complete before the action resolves; when the successful refresh changes connected membership, the existing awaited Agent Host session refresh also remains on the critical path. The diff adds only in-memory status selection/switching and does not add a boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/copilotConnectors/common/copilotConnectorsIpc.ts:33 CopilotConnectorsRequestChannelClient.request",
+            "Operation": "Each connector query/connect request crosses to the shared-process request service.",
+            "Cardinality": "One IPC call for the initial GET, one for the PUT, and one per two-second poll until connected.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC call sequence and cardinality occurred before the diff.",
+            "CriticalPathEffect": "Each call is awaited serially by connect(), so response latency directly delays completion."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/copilotConnectors/common/copilotConnectorsRequestService.ts:71 CopilotConnectorsRequestService.doRequest",
+            "Operation": "Performs cache-disabled HTTPS GET /plugins for each refresh and PUT /connectors/managed/{name}/connection.",
+            "Cardinality": "One initial GET, one PUT, then one GET per poll; the first connected response ends polling.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Successful attempts issued the same GET/PUT/poll requests and stopped on connected.",
+            "CriticalPathEffect": "All requests are awaited serially and are on the connection action's critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/copilotConnectorsService.ts:734 refreshAgentHostConnectorSessions",
+            "Operation": "Refreshes live Agent Host connector sessions after connected membership changes.",
+            "Cardinality": "At most once for the transition observed by a successful catalog refresh in this scenario.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Connected membership changes already triggered the same Agent Host refresh.",
+            "CriticalPathEffect": "The refresh is awaited by refresh(), as it was before the diff."
+          }
+        ],
+        "ScalingInput": "Poll count scales with consent completion time at one catalog request every two seconds, independent of catalog size for boundary count; local parse/find work scales with the bounded catalog size of at most 1,000 connectors.",
+        "EffectiveConcurrency": "Polling within one action is strictly serial: refresh completes, then a two-second timeout runs. The detail view cancels its prior action; marketplace operations for distinct resources can overlap because there is no global sequencer, but the diff does not change aggregate concurrency.",
+        "CacheBehavior": "connect() calls refresh() directly, bypassing the 60-second getConnectors cache, and the HTTP adapter sets disableCache=true. Cold and warm behavior therefore have the same polling boundary count; no coalescing was added or removed.",
+        "MechanismConfidence": "High: the full call path from connect() through IPC to cache-disabled HTTPS and its serial loop is explicit.",
+        "MagnitudeUncertainty": "Actual network latency and number of concurrent user-initiated connector operations vary, but successful-path request cardinality is unchanged.",
+        "Verdict": "No regression: successful connection performs the same expensive work as before, with only bounded in-memory status inspection added."
+      },
+      {
+        "Scenario": "Consent fails with `error`, or transitions from observed `pending` to `not_connected` after a decline",
+        "CriticalPath": "The initial catalog GET, connection PUT, consent-page open, and catalog polls run until the terminal status is observed. The added branch now rejects immediately instead of holding the action open for the remaining five-minute timeout.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/copilotConnectors/common/copilotConnectorsIpc.ts:33 CopilotConnectorsRequestChannelClient.request",
+            "Operation": "Forwards each initial, connect, and polling request to the shared process.",
+            "Cardinality": "A new error stops at 3 total service requests in the tests; stale not_connected -\u003e pending -\u003e declined stops at 5. Before the diff both terminal cases continued toward roughly 152 total requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The boundary already existed, but the old loop repeated it every two seconds for up to five minutes after terminal failure.",
+            "CriticalPathEffect": "The added terminal branch removes subsequent IPC calls and resolves the failed action immediately."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/copilotConnectors/common/copilotConnectorsRequestService.ts:71 CopilotConnectorsRequestService.doRequest",
+            "Operation": "Performs cache-disabled catalog GETs and the connection PUT.",
+            "Cardinality": "After the diff, one authoritative error poll ends the attempt; a decline ends after the pending-to-not_connected poll. Previously terminal attempts made about 150 polling GETs through timeout.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The request loop did not distinguish terminal failure from pending and continued until timeout.",
+            "CriticalPathEffect": "The diff removes network requests and up to five minutes of failed-action latency after an authoritative terminal state."
+          }
+        ],
+        "ScalingInput": "Savings scale with remaining timeout after the terminal state: up to about 150 catalog GETs per failed attempt at the two-second interval. Catalog parsing per removed GET is bounded to 1,000 connectors and responses to 5 MiB.",
+        "EffectiveConcurrency": "Requests remain serialized within each action. Multiple independently initiated connector operations may overlap, but each terminal attempt now releases its polling activity early; no new burst or limiter change is introduced.",
+        "CacheBehavior": "Polling deliberately bypasses the service freshness cache and network cache, so every avoided iteration is a real IPC/network request. There is no negative-cache state; terminal status itself now ends this operation.",
+        "MechanismConfidence": "Very high: terminal branches, timers, cache settings, request path, and request-count tests all agree.",
+        "MagnitudeUncertainty": "Prevalence of consent failures and response payload sizes is unknown, but the removed request count and five-minute latency are directly established by constants and tests.",
+        "Verdict": "This PR fixes a concrete repeated-network-work regression; it introduces no reportable performance problem."
+      },
+      {
+        "Scenario": "Authorization remains pending, or the server returns directly to not_connected without first exposing pending",
+        "CriticalPath": "The action continues serialized cache-disabled catalog polling every two seconds until connected, cancellation, or the five-minute deadline. A direct not_connected response is intentionally not terminal until pending has been observed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/copilotConnectors/common/copilotConnectorsIpc.ts:33 CopilotConnectorsRequestChannelClient.request",
+            "Operation": "Crosses the shared-process channel for every polling refresh.",
+            "Cardinality": "Approximately 150 poll IPC calls, plus the initial GET and PUT; the added timeout test establishes 152 total requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same polling loop and timeout cardinality existed before the diff.",
+            "CriticalPathEffect": "Each serialized response gates the next delay and eventual timeout."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/copilotConnectors/common/copilotConnectorsRequestService.ts:71 CopilotConnectorsRequestService.doRequest",
+            "Operation": "Issues a cache-disabled HTTPS catalog GET on every poll.",
+            "Cardinality": "Approximately 150 GET polls over five minutes, unchanged for persistently pending or never-observed-pending states.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical five-minute polling occurred before the diff.",
+            "CriticalPathEffect": "Network latency and two-second waits keep the action pending until timeout."
+          }
+        ],
+        "ScalingInput": "Work scales linearly with timeout duration at one request per two seconds; local per-response processing scales with the catalog's bounded connector count.",
+        "EffectiveConcurrency": "One attempt performs one request at a time with a two-second delay. Independent attempts can overlap under unchanged caller behavior; cancellation from the detail action, source disablement, account changes, or disposal propagates to the active request and timeout.",
+        "CacheBehavior": "Every loop iteration forces refresh() and the HTTP request disables cache, so warm service state does not reduce calls. This behavior is unchanged; no coalescing exists across simultaneous attempts.",
+        "MechanismConfidence": "High: constants, serial loop, cache bypass, cancellation, and the 152-request timeout test are explicit.",
+        "MagnitudeUncertainty": "The frequency with which servers never expose pending is unknown, but this branch is deliberately preserved and not worsened by the PR.",
+        "Verdict": "No introduced regression: worst-case pending polling remains expensive but is pre-existing and intentionally unchanged, so it is outside finding scope."
+      }
+    ],
+    "Summary": "Completed the performance pass over all changed hunks and transitive polling boundaries. No diff-introduced performance finding was found. The PR instead removes repeated cache-disabled IPC/network catalog requests and five-minute latency for authoritative declined/error outcomes; that regression fix was recorded against its blamed introducing commit."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-19T06:44:44.728930611Z",
+    "CompletedAt": "2026-10-19T06:46:16.075404942Z",
+    "WallClockMilliseconds": 91346,
+    "ModelCalls": 9,
+    "InputTokens": 250396,
+    "OutputTokens": 5600,
+    "TotalTokens": 255996,
+    "ReasoningTokens": 1767,
+    "CacheReadTokens": 207466,
+    "CacheWriteTokens": 42903,
+    "APIDurationMilliseconds": 72827,
+    "ToolCalls": 31,
+    "NanoAIUnits": 40960940000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 207466,
+      "cache_write": 42903,
+      "input": 27,
+      "output": 5600
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

@@ -1,0 +1,197 @@
+{
+  "PullRequest": {
+    "Number": 342374,
+    "Title": "Keep tool results when a steering message starts a new turn",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nFixes #342375\r\n\r\n## Problem\r\n\r\nWhen you send a steering message while the Copilot agent is working, a file edit or command that finished just before the message can show as cancelled in the chat, and its result (the diff, the command output) is missing. A background agent's edit or command that finishes at that moment never completes in that agent's chat and ends up shown as cancelled too. This makes it look as if steering stopped the agent's work.\r\n\r\nThe agents themselves keep running. VS Code does not stop or cancel them when you steer, and the runtime does not either: it waits until the current round of tools has finished, and moves a foreground agent to the background instead of stopping it. What goes wrong is that the chat loses those tools' results.\r\n\r\n## Root cause\r\n\r\nWhen the runtime echoes the steering message, the session ends the running turn at once and starts a new turn for the steering message ([`_beginSteeringTurn`](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L2231-L2233), [`_completeActiveTurn`](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L3082-L3095)).\r\n\r\nThe runtime only echoes steering once the round's tools have finished, but the session records some results asynchronously after the runtime reports a tool as done: file edits, shell output, and results that contain resources ([tool completion](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L8492-L8559)). The steering echo usually arrives while that work is still in progress, which causes two problems:\r\n\r\n1. Ending a turn marks every tool call that is still open in it as cancelled ([`endTurn`](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts#L159-L195)). Updates to a turn that has ended are ignored ([`updateToolCallInParts`](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/common/state/protocol/channels-chat/reducer.ts#L255-L262)). The late completion also fails its [`isCurrent()` check](https://github.com/microsoft/vscode/blob/dc811b77cd1e0753d306b0c6f819a7311bcf49b5/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L8466) and is dropped.\r\n2. The same `isCurrent()` check also applies to a background agent's tools, and it requires the main chat's turn to be unchanged. Any new turn in the main chat, such as a steering turn or the user's next message, drops the background agent's pending result. The background agent's chat has its own turn, so its tool call stays open until that turn ends, and is then shown as cancelled.\r\n\r\n## Fix\r\n\r\n- When steering ends a turn whose tool results are still being recorded, the session holds the chat's other updates, such as the end of the old turn, the new steering turn, and its streamed reply. Once those results are recorded, it releases the held updates in their original order. The old turn's tools then complete normally before it ends. The wait is capped at 5 seconds, and it applies only when results are still pending. This change is local to the session; the reducer, which is generated from the protocol, is unchanged.\r\n- If the chat is stopped during that wait, one rule applies to everything held: a turn that started during the wait and is still running is dropped, with all of its updates. The chat never saw it start, and stopping ends it without telling the chat, so showing it would leave it running for good. This covers the steering turn, a request an extension starts through the SDK, and a subagent that starts or resumes during the wait. A dropped steering turn's message is cleared from the pending list. Turns that finished during the wait, including a subagent's, are kept with their results.\r\n- A background agent's tool result is no longer tied to the main chat's current turn. It belongs to the agent's own chat, so it still lands after steering or a new message. Aborting still drops it, as before.\r\n\r\nSteering otherwise behaves as before: the steering message still starts its own turn, and foreground work that has not finished is still handled by the runtime.\r\n\r\n## Before / after\r\n\r\nNot shown. I could not record before/after GIFs with a real model because the test account's sign-in kept being revoked during the run. The deterministic tests below are the proof: each replays the runtime's event order for one case, and six of the eight fail on `main`.\r\n\r\n## How to test\r\n\r\n1. In a dev build, open the Chat view and pick the Copilot agent (Agent Host).\r\n2. Ask it to make several small edits to a file, one at a time.\r\n3. While it is editing, type a steering message and press Enter.\r\n4. On `main`, the edit that finished just before your message can show as cancelled, with no diff. With this PR, it shows as completed with its diff, followed by your steering message as a new request.\r\n5. Ask it to start a background agent that edits files, then steer while that agent works. With this PR, every edit in the background agent's chat completes and none is shown as cancelled.\r\n\r\nThe new unit tests in the `sendSteering › work started before steering` suite of `copilotAgentSession.test.ts` cover these steps:\r\n\r\n- **The agent keeps running after steering.** A background agent started before the steering message keeps reporting to its own chat, and finishes without being cancelled. This test also passes on `main`.\r\n- **A file edit finishes just before steering.** A real edit is recorded through the edit hooks and steering arrives while it is still being saved. The chat sees nothing of the steering turn until the save finishes. Then the edit is reported as completed, with its diff, before its turn ends, and the saved before and after content is checked. The steering turn and its reply follow in order.\r\n- **A background agent's edit finishes as steering arrives.** The edit's completion still reaches the agent's chat.\r\n- **A background agent's edit finishes as the user sends the next message.** The edit's completion still reaches the agent's chat.\r\n- **The chat is aborted while results are being recorded.** The steering turn the chat never saw is dropped, and its pending steering message is cleared.\r\n- **A steering turn finished before the abort.** Aborting keeps it.\r\n- **Stop after an extension starts its own request during the wait.** Stop goes through the host, as the client sends it. The steering turn that finished is kept, and the extension's request, which the chat never saw, is not left running.\r\n- **Stop while subagents are resumed during the wait.** Stop goes through the host. A subagent that resumed and finished during the wait keeps its new turn and result. One that resumed and is still running is not reopened, so its chat is not left running.\r\n\r\n## Validation\r\n\r\n| Check | Command | Result |\r\n|-------|---------|--------|\r\n| New tests on `main` @ `dc811b77cd1` | `scripts\\test.bat --run src\\vs\\platform\\agentHost\\test\\node\\copilotAgentSession.test.ts --grep \"work started before steering\"` | ❌ 6 of 8 fail as expected. The edit is reported as cancelled. The background agent's edit never completes, in both cases. The unseen steering turn is left running after an abort. After Stop, the extension's request and the resumed subagent are left running. The 2 tests that pass show that the background agent keeps running and that a finished steering turn is kept. |\r\n| New tests on this PR's first version @ `8ebdfbe52ee` | same | ❌ 2 of 8 fail: the two Stop tests. The extension's request and the resumed subagent are left running. |\r\n| New tests with this PR | same | ✅ 8 of 8 pass |\r\n| Copilot agent session suite | `scripts\\test.bat --run src\\vs\\platform\\agentHost\\test\\node\\copilotAgentSession.test.ts` | ✅ 1224 passing |\r\n| Copilot agent and host side effects suites | `scripts\\test.bat --run src\\vs\\platform\\agentHost\\test\\node\\agentSideEffects.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\copilotAgent.test.ts` | ⚠️ 1104 passing, 1 failing: `scoped credentials › isolates peer runtimes…`. It fails the same way on `main` and is unrelated. |\r\n| Type check | `npm run typecheck-client` | ✅ no errors |\r\n| Lint | `npm run eslint -- src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts` | ✅ no problems |\r\n\r\n---\r\n\u003csub\u003eFound and fixed with automated exploratory testing. Draft until reviewed by a human.\u003c/sub\u003e\r\n\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342374",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "dc811b77cd1e0753d306b0c6f819a7311bcf49b5",
+    "HeadRef": "karthiknadig/bug-swarm/steering-keeps-background-agents",
+    "HeadSHA": "9b840ad07393c666e026e3c4c44770136e5e5968",
+    "CreatedAt": "2026-10-18T07:41:39Z",
+    "UpdatedAt": "2026-10-19T02:44:24Z",
+    "MergedAt": null,
+    "Labels": [
+      "copilot-cli-agent"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-C322DF5EE98C",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts",
+      "Side": "RIGHT",
+      "Line": 2397,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The buffering, five-second bound, one-signal-per-delta mapping, synchronous emitter/reducer chain, and one-message-per-envelope transport are directly traced in repository code and the gated-write test proves the changed critical path. Exact chunk counts and hitch duration vary by model and filesystem speed, which affects severity but not the mechanism.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "missing-coalescing",
+      "PerformanceResource": "Per-delta state reductions, string/object allocations, emitter fan-out, and protocol notifications",
+      "PerformanceScaling": "The synchronous drain grows with every root or subagent signal produced while an edit/resource/shell-output completion is pending, up to the five-second hold; assistant.message_delta maps one-for-one to ChatDelta signals, so a streaming response can contribute dozens or hundreds of entries.",
+      "PerformanceOutcome": "A concentrated CPU and IPC burst that blocks the agent-host event loop and makes the chat update in a visible stall/jump instead of streaming smoothly.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, each signal was forwarded immediately to `onDidSessionProgress`; model deltas and subagent progress were reduced and broadcast incrementally as they arrived, with no backlog replay in one event-loop turn.",
+      "ChangedBehavior": "While a pre-steering tool completion is being persisted, the session now buffers all unrelated signals for up to five seconds and then fires the full backlog synchronously without coalescing or yielding.",
+      "CausalDiffEvidence": "The PR adds `hold.signals.push(signal)` for every non-preempted-turn-result and then replays the entire array in the added `for (const signal of hold.signals)` loop at line 2395, calling `_onDidSessionProgress.fire(signal)` synchronously at line 2397.",
+      "Title": "Drain held streaming deltas without a synchronous IPC burst",
+      "Impact": "If a user steers just as a file edit, resource persistence, or spilled shell-output capture is slow (common on remote or busy filesystems), the steering response and concurrent subagent streaming can accumulate for as long as five seconds. Release then performs all reductions and sends all client messages back-to-back, causing an agent-host/UI hitch and a burst of IPC exactly when the delayed response finally becomes visible.",
+      "Evidence": "`_beginSteeringTurn` starts a hold whenever `preempted.hasPendingToolCompletions` and caps it at 5 seconds. `_emitMarkdownDelta` converts each SDK `assistant.message_delta` into a distinct ChatDelta signal. The added release loop synchronously fires every buffered signal. The traced consumer in `AgentSideEffects` synchronously calls `dispatchServerAction` per signal; the chat reducer appends each delta with `part.content + action.content`, and `ProtocolServerHandler._broadcastAction` sends each resulting envelope as a separate top-level transport message to every relevant client. The new test `completes a file edit whose result is still being recorded when steering preempts the turn` explicitly confirms that even the steering response remains absent until the gated write releases.",
+      "Recommendation": "Preserve ordering with a draining queue that yields between bounded batches, and coalesce adjacent ChatDelta/ChatReasoning entries for the same chat/turn/part before dispatch. Keep new arrivals queued until the drain completes so they cannot overtake held lifecycle boundaries."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "missing-coalescing",
+      "synchronous-ui-work",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Steer the main chat while a root tool result is still recording file-edit snapshots, embedded resources, or spilled shell output",
+        "CriticalPath": "Before the PR, the steering turn start and response were emitted immediately when the runtime echoed steering, while the late root result was dropped. After the PR, all steering lifecycle and response signals wait for the tracked completion or the 5-second timeout; the result-recording filesystem/database work is therefore newly on the steering UI critical path. Releasing the hold then synchronously drains every queued signal.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts tool completion handler around lines 8649-8688",
+            "Operation": "Read spilled shell output and capture completed file-edit snapshots.",
+            "Cardinality": "At most one shell-output read per relevant tool completion plus one edit capture per effective file path, with edit captures grouped in Promise.all for that tool.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The operations already existed, but steering did not wait to publish its new turn and response; changing the current turn caused the late result to be dropped.",
+            "CriticalPathEffect": "These pre-existing asynchronous operations now gate visibility of the steering turn and all unrelated signals for up to five seconds."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts tool completion handler around lines 8644-8700",
+            "Operation": "Persist embedded resources, terminal output, and edit metadata/snapshots, then dispose the completion database handle.",
+            "Cardinality": "One opened database handle per resource/shell-output completion, with writes proportional to relevant resources/output and edited files.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The writes were attempted for the old tool result but did not hold subsequent chat signals.",
+            "CriticalPathEffect": "Settlement of these writes now releases the steering hold, so their latency is newly inherited by steering until the timeout."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts _releaseSteeringHold line 2397 -\u003e protocolServerHandler.ts _broadcastAction",
+            "Operation": "Synchronously reduce each held action and send one protocol action notification per relevant connected client.",
+            "Cardinality": "One dispatch and one transport send per held action per relevant client; no coalescing, with effective count equal to all deltas/signals accumulated during the hold.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same actions were reduced and sent incrementally as generated, spreading cost across streaming time.",
+            "CriticalPathEffect": "All sends occur back-to-back during release, blocking the host event loop before later work can progress and presenting clients with a burst."
+          }
+        ],
+        "ScalingInput": "Number of SDK signals produced during the hold. Each assistant.message_delta becomes one ChatDelta; concurrent root/subagent lifecycle and tool signals add to the same global queue. Effective cardinality is all signals in up to five seconds, not merely the number of tools.",
+        "EffectiveConcurrency": "Existing tool completions remain asynchronous; file snapshots for one completed tool are claimed together and awaited with Promise.all. The hold globally serializes delivery behind their settlement, and the eventual drain has no batch size, yield, limiter, or backpressure.",
+        "CacheBehavior": "There is no cache or coalescing for held signals. File/resource persistence uses existing storage paths and an output database per relevant completion; warm state can make the hold short, while slow remote/busy storage or a cold database can extend it to the timeout.",
+        "MechanismConfidence": "High: the gated-write test proves signals are absent until settlement, source tracing proves one queued signal per model delta, and the downstream reducer and protocol transport process each synchronously and independently.",
+        "MagnitudeUncertainty": "The exact backlog depends on model chunk cadence and storage latency, but a multi-second remote or busy-filesystem delay and dozens to hundreds of streaming deltas are realistic. The five-second cap bounds retention but not synchronous drain size within that interval.",
+        "Verdict": "Reportable medium-severity performance regression: bounded retention prevents unbounded memory growth, but missing coalescing/yielding converts incremental streaming work into a synchronous CPU/IPC burst."
+      },
+      {
+        "Scenario": "A background subagent completes an edit while steering or a later root message changes the main chat turn",
+        "CriticalPath": "The changed isCurrent predicate lets the already-started child completion continue independently of the root turn, so the child chat receives its result after existing persistence finishes. If a root steering hold is active, child signals also enter that hold and are delayed until release; otherwise they flow immediately.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts isCurrent and completion path around lines 8610-8688",
+            "Operation": "Capture child edit snapshots and read any spilled output after the main turn has changed.",
+            "Cardinality": "One operation per actual child tool/file or output, not per root turn change.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old main-turn equality check returned before child edit capture/publication after any root turn change, so the child result disappeared.",
+            "CriticalPathEffect": "Required for the background child result and normally off the root chat critical path; when a steering hold exists, its emitted result joins the globally delayed queue."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts completion persistence around lines 8644-8700",
+            "Operation": "Persist child resources, terminal output, and edit records.",
+            "Cardinality": "Per actual child completion and associated resources/files.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Some pre-check persistence could begin, but later child snapshot/publication work was abandoned when the root turn changed.",
+            "CriticalPathEffect": "Gates that child result; it does not block the root runtime itself, except that an active global steering hold delays all signal delivery until the root tracked completion settles."
+          }
+        ],
+        "ScalingInput": "Number of concurrently finishing background-agent tools and their effective edited-file/resource counts; root-turn changes themselves do not multiply work beyond those actual completions.",
+        "EffectiveConcurrency": "Each child completion runs through the existing async completion path; per-tool file captures use Promise.all and there is no new aggregate limiter. Main-turn changes no longer cancel publication eligibility for all child completions.",
+        "CacheBehavior": "No new result cache is added. Existing database and edit-tracker state determine completion latency; repeat turn changes do not restart the same promise because each completion is tracked once.",
+        "MechanismConfidence": "High: parentToolCallId now bypasses root-turn equality, and tests cover child edits finishing during steering and a new root turn.",
+        "MagnitudeUncertainty": "Concurrent background agents and edited-file counts vary. The added work is semantically necessary to retain completed results, so the performance concern is the global hold/replay scheduling rather than the existence of this I/O.",
+        "Verdict": "No separate finding: allowing the child result to finish is required behavior and scales with real child completions. Its contribution to the global synchronous replay is covered by the reported batching issue."
+      },
+      {
+        "Scenario": "Abort, stop, or dispose while steering signals are held",
+        "CriticalPath": "Abort computes which newly started turns remain unfinished, drops those signals, and synchronously releases the rest before beginning the provider abort. Dispose synchronously releases the entire hold before teardown. Thus the queued scan/replay is on stop/disposal latency.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts abort/dispose calls and _releaseSteeringHold line 2397",
+            "Operation": "Dispatch and broadcast each retained releasable action while stopping or disposing.",
+            "Cardinality": "One state reduction and protocol send per retained releasable action per relevant client; unfinished-turn signals are filtered on abort but all signals are replayed on dispose.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no steering backlog to scan or synchronously flush during abort/disposal.",
+            "CriticalPathEffect": "Runs synchronously before abort proceeds and before disposal teardown, so a full backlog directly lengthens stop/close latency."
+          }
+        ],
+        "ScalingInput": "Number of signals accumulated during the active hold and number of turn boundaries represented in them.",
+        "EffectiveConcurrency": "Abort performs two linear passes to classify and release signals; release invokes synchronous listeners serially. There is no yield or coalescing before provider abort or disposal continues.",
+        "CacheBehavior": "No cache is involved. The queue is bounded by the five-second timeout and is cleared once, while the timeout's later callback becomes a no-op after release.",
+        "MechanismConfidence": "High: both new lifecycle calls synchronously invoke the added release loop; downstream action processing is synchronous.",
+        "MagnitudeUncertainty": "Abort during the short hold is less frequent than normal release, and filtering can reduce the backlog. Dispose may still flush all queued deltas, so the same burst mechanism remains possible.",
+        "Verdict": "No additional finding beyond the reported missing-coalescing issue because it is the same queue-drain mechanism and fix direction."
+      },
+      {
+        "Scenario": "Normal chat streaming and steering when no asynchronous tool completion remains",
+        "CriticalPath": "The new emitter wrapper performs a hold check and forwards immediately. _beginSteeringTurn creates no hold when the preempted turn has no pending completion, so normal response streaming and steering remain incremental.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "All normal session signals, one constant-time conditional per signal.",
+        "EffectiveConcurrency": "Unchanged; no queue, timeout, or serialization is activated without pending completion work.",
+        "CacheBehavior": "Not cache-dependent; the condition reads the pending-completion set size.",
+        "MechanismConfidence": "High from the explicit conditional in the wrapper and _beginSteeringTurn.",
+        "MagnitudeUncertainty": "None material; the added branch and closure call are negligible relative to existing signal dispatch.",
+        "Verdict": "No reportable regression on the no-hold path."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and all diff hunks. The only actionable regression is the uncoalesced synchronous replay of up to five seconds of streaming and subagent signals, which concentrates reducer, allocation, and per-action IPC work. Result persistence itself is existing required work; the PR changes its publication eligibility and critical-path placement rather than adding unbounded I/O or retention."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-19T06:41:35.224575395Z",
+    "CompletedAt": "2026-10-19T06:44:39.874703931Z",
+    "WallClockMilliseconds": 184650,
+    "ModelCalls": 16,
+    "InputTokens": 1142777,
+    "OutputTokens": 10166,
+    "TotalTokens": 1152943,
+    "ReasoningTokens": 3582,
+    "CacheReadTokens": 1021440,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 166613,
+    "ToolCalls": 81,
+    "NanoAIUnits": 109724400000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1021440,
+      "cache_write": 0,
+      "input": 121337,
+      "output": 10166
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
