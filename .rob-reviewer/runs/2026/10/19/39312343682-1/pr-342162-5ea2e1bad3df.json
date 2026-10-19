@@ -1,0 +1,279 @@
+{
+  "PullRequest": {
+    "Number": 342162,
+    "Title": "agentHost: track Codex edits from turn diffs",
+    "Body": "Codex's native patch edits currently leave Agent Host's per-turn/session changes and file checkpoints empty. Persist `turn/diff/updated` notifications into the existing file-edit store, and resolve checkpoint contents from the same turn changesets used by the Changes view. Existing native file-change completion notifications provide per-path ordering; no MCP interception or synthetic edit-tool calls are introduced.\n\nKeep independent checkpoints across steering, cancellation, and subagents, including shared-file edits and replacement sends. Persist native/host turn identity at start and steering, preserve host-local commands during truncation and reload, and remove discarded snapshots after restoring native history. Truncating within a steered native turn also removes its later host checkpoints. Use Codex's cwd-relative diff format for nested Git workspaces and prefetch every crossed checkpoint before writing files. Providers opt into the native persistence barrier so other harnesses retain their existing changeset scheduling.\n\nValidation:\n- 784 Codex unit tests and 1,381 shared AgentService/changeset/coordinator tests pass locally (46 cases in existing skipped suites remain pending).\n- The focused real-provider integration run passes on macOS, including steering truncation and retained local commands before and after reload. It uses the bundled Codex runtime, real Agent Host server, real filesystem, and AHP with a synthetic model. Local-history cases use host-side `/rename` and verify retained acknowledgements across reload without PTY dependencies. The Bash-heredoc shell variant is POSIX-only; native patch coverage remains enabled on Windows.\n- Client type checking, targeted ESLint, and whitespace checks pass.\n- Launched Code OSS verification uses real CAPI-backed native patches with explicit native-tool model capabilities. Turn/session diffs, checkpoint restoration, Redo, and Start Over were checked against actual disk contents, with native before/after snapshots inspected through dbgjs.\n\nCross-platform validation at `5ea2e1bad3d`: Electron unit tests and packaged integration tests pass on Windows, Linux, and macOS in [run 486042](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=486042), including the Windows Codex local-history regressions. Agent Host E2E tasks pass twice on all three platforms across that run and [run 486040](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=486040). The latter's Windows integration job needs a retry after an Electron artifact download returned HTTP 429. [GitHub CI](https://github.com/microsoft/vscode/actions/runs/39273397992) passed the reported Electron regressions and Windows integration tests; its Windows Node job is being retried after a local-model timeout, while the same test and full Windows Node suite already pass unchanged in Azure.\n\nCodex diffs can omit same-content renames, and arbitrary filesystem writes that emit no native diff remain outside this tracking path. Keep this draft until the remaining CI checks complete.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342162",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "Giuspepe",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "113947563a3837013dbff0095e2bf29880b5d354",
+    "HeadRef": "gcianci/agents/codex-turn-diff-tracking",
+    "HeadSHA": "5ea2e1bad3df8c3131ecc63d060ea016304627ba",
+    "CreatedAt": "2026-10-16T20:10:44Z",
+    "UpdatedAt": "2026-10-19T18:02:49Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-033D7D0F395E",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSnapshotController.ts",
+      "Side": "RIGHT",
+      "Line": 249,
+      "Severity": "high",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The restore callers, crossed-checkpoint cardinality, client refresh IPC, and per-turn server sequencing are all directly traced. Only the exact chat length and per-refresh duration vary by user, affecting magnitude rather than mechanism.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "one changeset subscription/refresh IPC and server-side database diff computation per crossed chat turn",
+      "PerformanceScaling": "The burst grows linearly with the number of checkpoints crossed; restoring or retrying an early request in a long Codex chat launches all N distinct turn refreshes concurrently.",
+      "PerformanceOutcome": "blocked checkpoint-restore latency plus an unbounded IPC/database/CPU burst in the agent host",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Checkpoint navigation used the already-hydrated tool-call edits and immediately began applying crossed checkpoints; it did not fetch every crossed turn from the agent host.",
+      "ChangedBehavior": "The added Promise.all resolves every crossed checkpoint at once. For Codex, each resolve opens a distinct Changeset subscription and explicitly refreshes it; server computations are sequenced only by (session, turnId), so different turns execute independently rather than through a shared limit.",
+      "CausalDiffEvidence": "RIGHT line 249 adds `await Promise.all(crossed.map(checkpoint =\u003e this._resolveCheckpointEdits(checkpoint)))`, placing all per-turn changeset refreshes on the restore critical path concurrently.",
+      "Title": "Bound checkpoint refreshes before restoring long chats",
+      "Impact": "Using Restore Checkpoint, Retry, or Start Over on an older request in a chat with tens or hundreds of later turns blocks until every turn changeset has been refreshed and can saturate the agent-host IPC and SQLite work concurrently.",
+      "Evidence": "`_navigateToCheckpointIndex` builds `crossed` from every checkpoint between the current and target indices and the added line passes all of them to `Promise.all`. `_resolveTurnFileEdits` calls `getSubscription` and `refreshSubscription(resource)` for each request. `AgentSubscriptionManager` coalesces only refreshes of the same resource, while `AgentHostChangesetService._queueTurnChangeset` uses a separate sequencer key containing each turnId, so this N-way fan-out is not globally bounded.",
+      "Recommendation": "Preserve the prefetch-before-write failure guarantee, but resolve crossed checkpoints through a small shared concurrency limiter or a single batched changeset request instead of issuing all turn refreshes at once."
+    },
+    {
+      "ID": "PERF-E83E8387817A",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostChatRowStore.ts",
+      "Side": "RIGHT",
+      "Line": 111,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The cold-restore caller, qualifying record type, and exact SQLite call cardinality are directly established. The number of local commands varies, which limits severity but not confidence in the N+1 mechanism.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "SQLite queries on the session database",
+      "PerformanceScaling": "Cold restore now performs one additional `SELECT event_id FROM turns` for every persisted local turn whose host anchor is not directly present in the provider-restored ID set.",
+      "PerformanceOutcome": "increased cold chat restore latency and database callback/queue pressure proportional to local-turn history",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Restoring local turns required one `getPersistedTurnsForChat` query; records were then interleaved in memory without per-record database reads.",
+      "ChangedBehavior": "When visible IDs are supplied, the added `Promise.all(records.map(...))` invokes `db.getTurnEventId` separately for each unresolved local anchor. For restored Codex history, host anchors commonly need translation to native turn IDs, so this path applies to each `/rename` acknowledgement or `!command` turn in the chat.",
+      "CausalDiffEvidence": "RIGHT line 111 adds a per-record `await db.getTurnEventId(record.anchorTurnId)` after the existing bulk persisted-turn query.",
+      "Title": "Resolve local turn anchors in one database query",
+      "Impact": "Reloading a long chat with many host-local commands incurs an N+1 database pattern on the session restore critical path instead of a single row read.",
+      "Evidence": "`AgentService._interleaveLocalTurns` now always supplies the restored turn-ID set. `getPersistedTurnsForChat` first reads all local rows, then RIGHT line 111 calls `getTurnEventId` inside the per-record map; that method is a queued SQLite `SELECT` for one ID. The local-turn documentation identifies `/rename` and `!command` as persisted examples.",
+      "Recommendation": "Join `local_turns.anchor_turn_id` to `turns` in the initial chat query, or add one bulk event-ID lookup for all unresolved anchors and translate them in memory."
+    },
+    {
+      "ID": "PERF-D441BDA6648A",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/codex/codexTurnDiffTracker.ts",
+      "Side": "RIGHT",
+      "Line": 79,
+      "Severity": "medium",
+      "Confidence": 0.95,
+      "ConfidenceRationale": "The cumulative payload semantics and synchronous per-notification call path are explicit. Notification count and diff size vary, so severity is medium, but repeated full-prefix work and its growth are certain whenever a turn emits multiple updates.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "synchronous string scans and allocations for the complete aggregated unified diff",
+      "PerformanceScaling": "For a turn with K incremental file-change notifications, the kth update scans the entire diff accumulated so far; similarly sized additions therefore produce quadratic total bytes scanned and temporary strings as the turn grows.",
+      "PerformanceOutcome": "increased agent-host CPU and GC pressure, delaying notification processing and turn progress for repository-wide edits",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The agent host did not consume `turn/diff/updated`, so it performed no synchronous full-diff parsing for each native edit update.",
+      "ChangedBehavior": "Every native diff notification now stores the latest aggregate and immediately splits the complete aggregate into file sections, then splits each section again to recover its header, even though previously seen sections dominate later cumulative notifications.",
+      "CausalDiffEvidence": "RIGHT line 79 introduces `notification.diff.split(...).filter(...)` in the handler for every cumulative `turn/diff/updated` notification.",
+      "Title": "Stop reparsing the full cumulative diff on every update",
+      "Impact": "A Codex refactor that edits many files or repeatedly updates a large file makes each subsequent diff notification progressively more expensive, causing visible lag near the end of the turn.",
+      "Evidence": "The protocol type documents `diff` as the latest aggregated diff across all file changes in the turn. `_handleTurnDiffUpdated` dispatches every notification synchronously to `update`, where RIGHT line 79 splits that full aggregate and allocates sections before checking `initialDiffs`; only the map insertion is deduplicated, not the scan/allocation work.",
+      "Recommendation": "Capture first-seen file sections only when the corresponding file-change completion identifies new paths, or otherwise maintain incremental/path-indexed state so updates do not split and allocate the entire cumulative diff repeatedly."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Codex turn incrementally edits workspace files and then completes",
+        "CriticalPath": "Each `turn/diff/updated` is synchronously dispatched and scanned before later notifications progress. On normal turn completion, `_stageTurnDiff` places capture persistence in `_pendingChatProgress`, so reconstruction and storage complete before the workbench receives the completion signal.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts `_getTurnDiffTracker`",
+            "Operation": "Resolve the native cwd with `realpath`",
+            "Cardinality": "One call per flushed related-turn group.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No native turn-diff capture performed this filesystem call.",
+            "CriticalPathEffect": "Runs inside the completion persistence barrier."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexTurnDiff.ts `storeCodexTurnDiffs`",
+            "Operation": "Read current contents for every distinct path represented by captures and related active diffs",
+            "Cardinality": "One read per distinct before/after path after set deduplication; all reads launch concurrently.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No native snapshot filesystem reads occurred.",
+            "CriticalPathEffect": "All reads must settle before reconstruction and completion publication."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/codex/codexTurnDiff.ts `storeCodexTurnDiffs`",
+            "Operation": "Insert or replace each reconstructed file-edit snapshot, including before/after BLOBs",
+            "Cardinality": "One `storeFileEdit` per effective host-turn/path delta; each performs two SQLite statements and calls are awaited sequentially.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Codex native edits were not persisted into the file-edit store.",
+            "CriticalPathEffect": "All writes complete before capture resolves and normal chat completion is published."
+          }
+        ],
+        "ScalingInput": "Number of cumulative diff updates K, aggregate diff bytes at each update, distinct changed paths F, related parent/child turns, and steering snapshots. Path reads are deduplicated across captures, while update parsing is not.",
+        "EffectiveConcurrency": "Notification parsing is synchronous. Distinct file reads use unbounded `Promise.all`; snapshot database writes are sequential. Related turns are grouped and earlier native groups gate later groups.",
+        "CacheBehavior": "The tracker keeps only the latest notification plus first-seen section per path and snapshots until flush. `contents` deduplicates reconstructed content by path/hash only within one flush; there is no cross-turn cache. Successful groups are removed; failed groups retain tracker state until session disposal.",
+        "MechanismConfidence": "High: the protocol explicitly defines cumulative payloads, and synchronous scan, completion gating, path deduplication, read concurrency, and write serialization are direct in code.",
+        "MagnitudeUncertainty": "Typical turns edit few files, but repository-wide refactors can emit many cumulative updates and large aggregates. Exact notification cadence and filesystem/database duration vary.",
+        "Verdict": "Reported the quadratic cumulative-diff scan. The new persistence boundaries are required for the feature; their per-file costs and unbounded reads were considered, but no additional finding was submitted beyond the stronger repeated-work mechanism."
+      },
+      {
+        "Scenario": "Restore Checkpoint, Retry, or Start Over crosses multiple Codex requests",
+        "CriticalPath": "Before any file is restored, `_navigateToCheckpointIndex` requires every crossed checkpoint's authoritative turn changeset to resolve. Each resolve opens/holds a changeset subscription, refreshes it, waits for Ready/Error, then checkpoint writes proceed serially.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts `_resolveTurnFileEdits`",
+            "Operation": "Subscribe to or refresh one turn changeset resource through the Agent Host protocol",
+            "Cardinality": "One distinct refresh per unresolved crossed checkpoint; same-resource requests coalesce, but different turn resources do not.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Navigation used edits already collected from tool calls and did not request crossed turn changesets.",
+            "CriticalPathEffect": "All refreshes must finish before the first checkpoint file write."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts `_computeTurnChangeset`",
+            "Operation": "Open the session database and compute file-edit diffs for each subscribed turn changeset",
+            "Cardinality": "One computation per crossed turn resource. Sequencing is per `(session, turnId)`, so different turns run independently.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Restore did not induce per-crossed-turn changeset computations.",
+            "CriticalPathEffect": "Server work backs each IPC refresh and therefore blocks checkpoint navigation."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSnapshotController.ts `_writeCheckpointContent`",
+            "Operation": "Read snapshot BLOB resources and write/delete/move workspace files while applying checkpoints",
+            "Cardinality": "One or more operations per effective file edit in every crossed checkpoint; checkpoints apply serially, files within a checkpoint run concurrently.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same workspace restore operations used already-hydrated tool-call edits.",
+            "CriticalPathEffect": "Runs after prefetch and directly performs restoration."
+          }
+        ],
+        "ScalingInput": "Number N of checkpoints between the current cursor and target, then effective file edits per crossed checkpoint after resource deduplication.",
+        "EffectiveConcurrency": "The added prefetch uses unbounded `Promise.all` across N checkpoints. Client coalescing is only per identical URI; server `SequencerByKey` keys include turn ID, so aggregate concurrency is N. File application remains serial by checkpoint and parallel by file within each checkpoint.",
+        "CacheBehavior": "A checkpoint sets `turnEditsResolved` only after a successful resolve, so later navigation is warm and skips IPC. Existing changeset subscriptions can share state, but the resolver explicitly refreshes each resource to avoid stale empty results. Failed fetches remain cold.",
+        "MechanismConfidence": "Very high: restore callers, crossed range, Promise.all, explicit protocol refresh, and per-turn server sequencer keys are all traced.",
+        "MagnitudeUncertainty": "Chat history length and per-turn file count vary; early restore in a long-running agent chat produces the largest burst.",
+        "Verdict": "Reported the unbounded per-turn refresh/computation burst because it blocks a user action and scales with chat length."
+      },
+      {
+        "Scenario": "Cold reload restores provider history and interleaves host-local `/rename` or `!command` turns",
+        "CriticalPath": "Agent history is loaded, then `_interleaveLocalTurns` awaits persisted local records and anchor translation before restored turns can be returned.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts `getPersistedTurnsForChat`",
+            "Operation": "Read all persisted turns for the chat",
+            "Cardinality": "One bulk SQLite query per chat load, excluding pre-existing ownership/mirror maintenance.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This was the only local-turn row query needed for normal interleaving.",
+            "CriticalPathEffect": "Required before local turns can be interleaved."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostChatRowStore.ts `getPersistedTurns`",
+            "Operation": "Look up one provider event ID for each unresolved local anchor",
+            "Cardinality": "Up to one queued SQLite SELECT per persisted local turn whose anchor is not directly visible; calls are created together but the database mutation sequencer serializes operations.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No per-record event-ID reads occurred.",
+            "CriticalPathEffect": "`Promise.all` is awaited before restore returns."
+          }
+        ],
+        "ScalingInput": "Number L of persisted local turns in the chat, reduced by anchors already present in the restored visible-ID set.",
+        "EffectiveConcurrency": "The per-record promises fan out at the caller, but each `getTurnEventId` queues on the shared SQLite operation sequencer, yielding serialized N+1 work.",
+        "CacheBehavior": "The visible ID set is built once from provider turns. There is no bulk anchor mapping or event-ID cache for this load; in-memory local-turn indexes are populated only after queries finish.",
+        "MechanismConfidence": "Very high: the changed caller always supplies visible IDs, and the per-record method is a directly traced SQLite SELECT.",
+        "MagnitudeUncertainty": "Most chats have few local turns, while command-heavy long-lived chats can accumulate many. SQLite locality reduces individual query cost but not callback and queue multiplicity.",
+        "Verdict": "Reported the N+1 cold-restore query pattern with a bounded join/bulk-lookup fix."
+      },
+      {
+        "Scenario": "Truncate or restore native Codex history and discard later provider-backed rows",
+        "CriticalPath": "The host updates chat state, invokes one Codex `thread/revert` RPC when native turns must be removed, then deletes matching provider rows from SQLite before refreshing session changesets.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts `truncateChat`",
+            "Operation": "Invoke Codex `thread/revert`",
+            "Cardinality": "At most one RPC per truncation when a later native turn exists.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same native revert RPC was sent, but changeset refresh was fired without waiting.",
+            "CriticalPathEffect": "The changeset refresh now waits for truncation completion; UI state truncation itself was already dispatched."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts `deleteProviderTurns`",
+            "Operation": "Delete provider turns/segments and cascaded artifacts in one SQL statement/transaction",
+            "Cardinality": "One transaction per truncation, with provider IDs passed as one JSON array.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only retained terminal outputs were deleted, with one deletion promise per command tool call.",
+            "CriticalPathEffect": "Awaited inside provider truncation before the changeset refresh."
+          }
+        ],
+        "ScalingInput": "Number of native turns removed and matching host segments; provider IDs are grouped into one SQL call rather than emitted per item.",
+        "EffectiveConcurrency": "One provider RPC followed by one serialized database transaction. The final changeset refresh runs after this sequence; no per-ID concurrency burst is introduced.",
+        "CacheBehavior": "No cache participates. SQLite cascade cleanup owns row lifecycle, and later refresh observes the post-delete state.",
+        "MechanismConfidence": "High: the RPC, grouped SQL deletion, and reordered refresh are explicit.",
+        "MagnitudeUncertainty": "Large truncations delete more rows, but boundary-call cardinality remains constant and replaces prior per-command deletion fan-out.",
+        "Verdict": "No finding. The changed path adds a grouped deletion and correct ordering without an avoidable scaling boundary; it likely reduces prior per-command database fan-out, but there is insufficient evidence of a shipped regression symptom to record a regression fix."
+      }
+    ],
+    "Summary": "Completed the performance review across all changed files. Submitted three findings: unbounded crossed-checkpoint refresh fan-out, repeated full scans of cumulative Codex turn diffs, and per-local-turn SQLite anchor lookups. Also traced native snapshot persistence, restore file I/O, subscription coalescing, server sequencer scope, cache lifetimes, failure retention, and truncation cleanup; no additional high-confidence performance issue or provable regression fix met the reporting bar."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-19T19:42:32.091469582Z",
+    "CompletedAt": "2026-10-19T19:46:16.88274056Z",
+    "WallClockMilliseconds": 224791,
+    "ModelCalls": 13,
+    "InputTokens": 1022960,
+    "OutputTokens": 13130,
+    "TotalTokens": 1036090,
+    "ReasoningTokens": 4983,
+    "CacheReadTokens": 910016,
+    "CacheWriteTokens": 112905,
+    "APIDurationMilliseconds": 202040,
+    "ToolCalls": 99,
+    "NanoAIUnits": 119128740000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 910016,
+      "cache_write": 112905,
+      "input": 39,
+      "output": 13130
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
