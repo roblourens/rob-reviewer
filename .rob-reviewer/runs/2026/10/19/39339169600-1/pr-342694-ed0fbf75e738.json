@@ -1,0 +1,223 @@
+{
+  "PullRequest": {
+    "Number": 342694,
+    "Title": "agentHost: move_session server tool to move sessions and nested sessions",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nMove Chats, Block 6: an agent host server tool, `move_session`, that lets an agent move sessions and nested sessions when the user asks. It is behind `chat.agentHost.moveChats.enabled` (default off), the same setting as the rest of Move Chats, and doesn't depend on the drag-and-drop UI (Block 5).\n\n## What it does\n\nOne tool, shaped like `create_session`: `session` (a link; with a `?chat=` id it names a nested session, without one the whole session; omitted means the calling chat), `relationship` (`nested` | `independent`), `into` and `after` (default: at the end). It covers:\n\n- reordering a nested session within its session;\n- moving a nested session into another session, after a given nested session or at the end;\n- making a nested session its own session (`independent`);\n- moving a whole single-chat session into another session.\n\nMoves run on the existing host operations and validation (`AgentService.moveChat` / `moveSession`, the AHP `moveChat` and `vscode/moveSession` paths), in the same move sequencer. The tool's pre-check shares the host's check phases, so it can't drift from them. Every `AgentChatMoveRefusal` maps to one actionable sentence for the model; a compile-time exhaustive map enforces this, including `differentCredentialOwner`.\n\n## Decisions\n\n- **Confirmation:** every call asks the user, reorders included (`sessionConfirmationToolNames`). The prompt is skipped only when the user turned approvals off (Allow All, Claude `bypassPermissions`, Codex full access), as for `create_session` and `delete_session`. The confirmation names what moves and where, linking only sessions and chats the host knows; the host builds it (`IAgentServerToolHost.getConfirmationDisplay`) for Copilot, Claude and Codex.\n- **Moving the calling chat:** checked when requested, applied when the turn succeeds, like `set_workspace`. A service plus a turn-end contribution (order 160) do this, and they hold the chat's queued turns until the move is done, so a queued message starts in the new session. A move refused at turn end is only logged.\n- **Moving another chat mid-turn:** allowed. The running turn, its pending confirmation and the session status follow the chat; a unit test covers this.\n- **Links:** sessions and chats resolve only from links and the sessions' recorded chats; no owner is ever derived from a chat URI.\n- **Gating:** `move_session` is in its own non-materialized group that reads the setting on every call and requires the provider's `multipleChats` capability; sessions are re-advertised when the setting changes. With the setting off, `move_session` is absent from every tool list and no description mentions it.\n- **General improvement:** `list_sessions` and `get_current_session` now always list a session's main session and nested sessions (`chats`: title, `?chat=` link, `main`, status; list data only). The links work with `send_message`, `get_session_context` and `rename_chat`, and with `move_session` while it is offered.\n- **Backstop:** at most 50 moves per process, following the existing orchestration-limits switch.\n\n## Reviews and performance\n\n- Four review rounds. r1 led to the shared pre-checks, held queued turns for a scheduled move, required APIs, the cross-field rules in the schema, and test gaps. r2 was a cleanup. r3 gated the move wording on the setting, sequenced the tool's check and move, and verified the confirmation links. r4: SHIP, with its four LOW findings addressed except the pre-existing Codex `hideConfirmationInput` behavior.\n- Performance review: no regression with the setting off. Tool lists are unchanged; the added cost is one config lookup per tool-list query and one `Map.get` per turn end. Each `move_session` call reads the session list once (tool path only).\n\n## Validation\n\nRun on the final commit, rebased onto `e8314212e7d`:\n\n| Command | Result |\n|---|---|\n| `npm run typecheck-client` | passed |\n| `npm run eslint -- \u003c30 changed .ts files\u003e` | passed, no warnings |\n| Hygiene (pre-commit hook on every commit) | passed |\n| `./scripts/test.sh --reporter dot` with `sessionServerTools`, `serverToolGroups`, `scheduledChatMoves`, `chatContributions`, `claudeAgent`, `claudeServerToolMcpServer`, `copilotAgentSession`, `copilotToolDisplay`, all 40 `codex/*`, `agentService`, `protocolServerHandler`, `agentHostChatMovability`, `agentSideEffects`, `agentHostContributions`, three telemetry suites, `sessionWorkspaceConversion` | 4877 passing, 19 pending (pre-existing), 0 failing |\n| `./scripts/test-integration.sh --run src/vs/platform/agentHost/test/node/e2e/providers/{copilot,claude,codex}AgentHostE2E.integrationTest.ts --grep \"server tool:\\|[Mm]ov\"` (strict replay, twice) | Copilot 56 passing + 1 pending; Claude 42 + 8 pending; Codex 51 + 2 pending; both runs green |\n\n- The 18 new `move_session` e2e fixtures (6 tests × 3 providers) were recorded with `AGENT_HOST_REPLAY_RECORD=1`. Later changes produced no cache misses, so nothing was re-recorded.\n- The e2e tests cover reorder, move, promote, whole-session move, a self-move applied after `turnComplete`, and a refused move, each with a confirmation shown.\n- Azure pipeline 111 (cross-platform Agent Host E2E) is queued after this PR opens.\n\n**Live test** (isolated Code OSS Agents window, Copilot):\n\n- Full run: reorder (approve and deny), move after a given nested session and at the end, promote, whole-session move, moving another chat mid-turn, self-move and self-promote, a queued message running in the new session, refusals, the setting off at launch and flipped at runtime, approvals off, and ownership and order after a restart. All passed.\n- Scoped re-run on the fix rounds:\n  - discovering nested sessions via `chats` and moving with only those links;\n  - move wording off/on with the setting;\n  - a promoted session moved as a whole, warm and after a restart;\n  - confirmation links (known → link, odd or unknown → plain text, with no injected link or bold);\n  - a cold whole-session move, and smoke tests.\n\n  All passed.\n- **Not run live:** Claude and Codex (their SDKs write to the real home directories, so they can't be isolated); both are covered by the e2e tests. Also not run: `differentCredentialOwner` (no sponsored session in isolation; unit-covered on the host side).\n\n## Follow-ups\n\n- Called from a non-top-level chat (for example a HydraFusion solver), `move_session` gets the Copilot harness's generic \"This tool can only be called from a top-level chat with a known root tool-call origin.\" That message is shared by every `topLevelChatOnly` tool; making it actionable is a harness change.\n- With the setting off, a session that advertised the tool earlier gets the framework's generic \"Server tool … is disabled.\" A group-specific message needs an `IServerToolGroup` hook.\n- Editor tabs aren't reordered live after a reorder (sidebar and database are correct).\n- Codex ignores `hideConfirmationInput` for server tools (pre-existing).\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342694",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d3e8d710e282d88dfd13386efcbe8aaa10ec1220",
+    "HeadRef": "agents/move-session-tool-design-implementation",
+    "HeadSHA": "ed0fbf75e7381d595f4b267909d2c39d378f2b6a",
+    "CreatedAt": "2026-10-19T21:14:06Z",
+    "UpdatedAt": "2026-10-19T22:19:01Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-B425E08C9B4D",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/shared/sessionMoveTools.ts",
+      "Side": "RIGHT",
+      "Line": 413,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The call path, cache lifetime, I/O boundaries, and all-sessions-to-three-targets cardinality mismatch are explicit in repository code. Magnitude depends on session count and fallback eligibility, so severity is medium rather than high.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "central catalog/database reads, provider metadata round trips, session-database opens, and CPU over all registered sessions",
+      "PerformanceScaling": "Each move_session invocation performs work proportional to the complete registered session history, although argument resolution needs only the source, destination, and optional anchor; in the documented link-based flow this repeats the same full scan just performed by list_sessions.",
+      "PerformanceOutcome": "The move tool's critical path gains avoidable I/O and latency, with fallback sessions adding one provider round trip plus session-database reads each and fallback concurrency limited to four.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, requesting list_sessions performed one full catalog computation and no subsequent move tool immediately forced another one; existing targeted session operations can use the accessor's getSession(session) lookup.",
+      "ChangedBehavior": "Every move_session execution constructs a lookup backed by accessor.listSessions(). createMoveSessionLookup coalesces lookups only within that one call, while AgentService.listSessions retains results only while a computation is in flight and deletes settled entries, so a preceding list_sessions call is not reused.",
+      "CausalDiffEvidence": "The new execute path at RIGHT line 413 unconditionally invokes the full listSessions accessor for move argument resolution; no equivalent post-list scan existed before the new tool.",
+      "Title": "Avoid rescanning the entire session catalog for each move",
+      "Impact": "The normal workflow tells the model to obtain links from list_sessions and then call move_session. On a large history, the second call blocks confirmation/move progress on another full catalog read; legacy/fallback rows can reopen per-session storage and contact providers before the requested move starts.",
+      "Evidence": "RIGHT line 413 wires argument resolution to `createMoveSessionLookup(() =\u003e accessor.listSessions())`. AgentService.listSessions removes settled computations from `_inFlightListSessions`; `_computeSessions` bulk-reads all catalog candidates and documents that each provider fallback costs a provider round trip plus session-database reads, under a Limiter(4). getMoveSessionArgs performs only source/destination/anchor resolution (at most three distinct sessions).",
+      "Recommendation": "Resolve the at-most-three referenced sessions through targeted getSession/state-catalog lookups (including their recorded chats), or carry a generation-keyed short-lived listing from the immediately preceding list_sessions call; preserve freshness by revalidating the selected sessions in the existing move sequencer rather than recomputing the entire catalog."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Broad list_sessions request, including the default move-disabled configuration",
+        "CriticalPath": "AgentService.listSessions must enumerate metadata, filter it, serialize every returned session, and hand the text to the provider's LLM tool-result channel before the agent can continue.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts::_computeSessions",
+            "Operation": "Bulk-read catalog metadata for all eligible registered sessions",
+            "Cardinality": "One bulk operation spanning all registered candidates per settled list call",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same broad list already performed this catalog read.",
+            "CriticalPathEffect": "Blocks list result construction"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts::_computeSessions",
+            "Operation": "Read provider/session metadata for catalog fallback rows",
+            "Cardinality": "Up to one provider metadata round trip plus session-database reads per fallback session, limited to four concurrent rows",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same fallback existed before this PR.",
+            "CriticalPathEffect": "Blocks completion for fallback rows"
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionServerTools.ts:serializeSession",
+            "Operation": "Serialize nested chat title/link/status objects into the LLM tool result",
+            "Cardinality": "One object per visible nested chat across every returned session",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only top-level session metadata was serialized.",
+            "CriticalPathEffect": "Adds synchronous allocation and increases provider/model result bytes"
+          }
+        ],
+        "ScalingInput": "All non-archived top-level sessions, plus after this diff all visible nested chats contained by them; there is no default result cap.",
+        "EffectiveConcurrency": "Concurrent list requests of the same mode coalesce only while a computation is in flight. Catalog fallback resolution uses Limiter(4); serialization is synchronous after metadata resolution.",
+        "CacheBehavior": "A warm eligible central catalog avoids per-session provider/session-db fallback, but still performs a central bulk read. Settled list computations are removed, so sequential calls recompute. Nested-chat serialization is repeated on every result.",
+        "MechanismConfidence": "High: the new all-chat map, uncapped broad filter, JSON serialization, and direct provider handoff are explicit.",
+        "MagnitudeUncertainty": "Nested-chat history size varies; tens of nested chats are supported and persisted, but repository evidence does not establish percentile sizes or measured token latency.",
+        "Verdict": "The payload grows with total nested chats even while move_session is disabled. This mechanism was investigated as serialization pressure; the concrete accepted review finding instead targets the more costly repeated full catalog scan on the move workflow."
+      },
+      {
+        "Scenario": "Move another nested session or whole session with move_session",
+        "CriticalPath": "After confirmation, argument resolution awaits a full listSessions computation; only then can the globally sequenced move restore selected sessions, read catalogs/worktree state, and commit.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionMoveTools.ts:execute",
+            "Operation": "Compute the full session list to resolve at most three move references",
+            "Cardinality": "One all-session catalog computation per move invocation",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No move tool forced a second full listing after links were obtained.",
+            "CriticalPathEffect": "Newly blocks every move before selected-session validation begins"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_moveChat and _readChatMoveInputs",
+            "Operation": "Read source/destination catalog snapshots and worktree ownership/session state for the selected move",
+            "Cardinality": "Bounded per selected source/destination, with descendant chat-state reads proportional to the moved subtree",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Existing AHP/UI move paths used these operations, but the PR newly exposes them on this server-tool path.",
+            "CriticalPathEffect": "Authoritative validation and commit block move completion"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostWorktreeCoOwnership.ts:readSessionWorktrees/readPrimaryWorktree",
+            "Operation": "Read source worktree records and destination primary-worktree metadata",
+            "Cardinality": "One source read, one destination primary read, and one detached-worktree read per additional worktree",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Existing moves performed these selected-session reads; the new tool invokes the same path.",
+            "CriticalPathEffect": "Blocks validation and move planning"
+          }
+        ],
+        "ScalingInput": "Argument resolution needs at most source, destination, and optional anchor, but the added lookup scans all registered sessions; move work additionally scales with the moved chat subtree and recorded worktrees.",
+        "EffectiveConcurrency": "All checks and moves use one global chat-move Sequencer. Full-list fallback rows run at concurrency four; the move itself does not overlap another move.",
+        "CacheBehavior": "Lookups within one invocation share one listing promise, but no settled result is reused from the list_sessions call that normally supplied the links. Warm catalogs reduce fallback cost but not the all-session bulk read.",
+        "MechanismConfidence": "Very high: line 413 unconditionally supplies listSessions, and the in-flight cache is deleted after settlement.",
+        "MagnitudeUncertainty": "Latency depends on total history and catalog fallback eligibility; the all-history cardinality mismatch is certain even when the warm bulk read is fast.",
+        "Verdict": "Reportable repeated work: the normal list_sessions-to-move_session sequence performs two sequential full catalog computations although move resolution references at most three sessions."
+      },
+      {
+        "Scenario": "Move the calling chat after its turn succeeds",
+        "CriticalPath": "The tool first performs the full-list lookup and a sequenced pre-check. Turn end then holds queued-chat admission while a second authoritative sequenced validation and move completes; queued messages cannot start before release.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionMoveTools.ts:execute",
+            "Operation": "Full session-list computation for argument resolution",
+            "Cardinality": "One all-session computation before scheduling",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No scheduled move tool existed.",
+            "CriticalPathEffect": "Blocks the tool result and therefore turn completion"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_checkServerToolMove/_applyServerToolMove",
+            "Operation": "Pre-check and later re-read catalog/chat/worktree state during authoritative apply",
+            "Cardinality": "Two selected-move validation rounds for a successful self move; descendant reads scale with moved subtree",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Existing direct moves performed only their authoritative validation/apply round.",
+            "CriticalPathEffect": "First round blocks scheduling; second blocks queued turns while admission is held"
+          }
+        ],
+        "ScalingInput": "Full registered session count for lookup; moved subtree size and worktree count for both pre-check and authoritative apply.",
+        "EffectiveConcurrency": "Pre-check and apply serialize with all moves. The scheduled map holds at most one entry per chat/turn, and queued turns are explicitly held during apply.",
+        "CacheBehavior": "The move lookup has only per-invocation coalescing. Pre-check state cannot safely serve as an authoritative cache because state may change before turn end; apply revalidates.",
+        "MechanismConfidence": "High for the two validation rounds and admission hold; lower for material user impact beyond the list scan.",
+        "MagnitudeUncertainty": "Moved subtrees are usually small and the duplicate validation is an intentional freshness tradeoff; no measurements show it dominates the already reported full-list scan.",
+        "Verdict": "No separate finding: revalidation is required because the move is intentionally deferred until turn success, and caching the first result would violate freshness."
+      },
+      {
+        "Scenario": "Toggle chat.agentHost.moveChats.enabled and refresh advertised tools",
+        "CriticalPath": "On the relevant setting transition, the host iterates loaded sessions, recomputes definitions, and dispatches a server-tools change only when definitions differ.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentServiceComposition.ts:onDidRootConfigChange",
+            "Operation": "Publish SessionServerToolsChanged for each loaded session whose advertised catalog changes",
+            "Cardinality": "At most one dispatch per loaded session when this specific setting flips",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No move_session advertisement needed refreshing.",
+            "CriticalPathEffect": "Runs during the setting update, not startup or normal tool invocation"
+          }
+        ],
+        "ScalingInput": "Number of currently loaded sessions, not total persisted history.",
+        "EffectiveConcurrency": "Synchronous serial iteration on a user-driven root configuration event; no burst limiter.",
+        "CacheBehavior": "The last enabled value is retained, so unrelated root config changes do only one configuration lookup and do not iterate/advertise. advertise compares definitions and suppresses unchanged dispatches.",
+        "MechanismConfidence": "High: the value guard and per-loaded-session loop are explicit.",
+        "MagnitudeUncertainty": "The number of simultaneously loaded sessions is not established, but this is a rare explicit configuration transition.",
+        "Verdict": "Not reportable: work is bounded to actual feature-setting transitions and is required to update tool availability."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 68 changed files' inventory and relevant production/test diffs. Submitted one high-confidence repeated-work finding for the uncached all-session scan on each move_session call. Also traced serialization growth, deferred-move revalidation, configuration fan-out, cache behavior, and database/provider/filesystem boundaries; no regression-fix learning record was warranted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-19T23:23:20.136017911Z",
+    "CompletedAt": "2026-10-19T23:26:35.701660945Z",
+    "WallClockMilliseconds": 195565,
+    "ModelCalls": 16,
+    "InputTokens": 1345905,
+    "OutputTokens": 12680,
+    "TotalTokens": 1358585,
+    "ReasoningTokens": 4986,
+    "CacheReadTokens": 1221632,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 177059,
+    "ToolCalls": 99,
+    "NanoAIUnits": 123934480000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1221632,
+      "cache_write": 0,
+      "input": 124273,
+      "output": 12680
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

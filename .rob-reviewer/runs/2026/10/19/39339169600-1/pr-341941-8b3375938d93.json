@@ -1,0 +1,224 @@
+{
+  "PullRequest": {
+    "Number": 341941,
+    "Title": "github: migrate GitHub repository filesystem to shared API",
+    "Body": "Refs https://github.com/microsoft/vscode-internalbacklog/issues/9678\r\n\r\n- Migrate the read-only Sessions repository filesystem from direct HTTP and authentication calls to the shared `GitHubApiClient` and typed `content.getTree` / `content.getBlob` APIs. Requests use shared-process IPC on desktop and local providers on web.\r\n- Retain the five-minute tree cache, one-minute missing-ref cache, concurrent tree-request sharing, immutable blob reads, and binary-safe decoding.\r\n- Clear account-bound caches and cancel outstanding work on account/grant invalidation or disposal. Filesystem reads no longer prompt for sign-in.\r\n- Reject truncated recursive trees instead of exposing a partial filesystem, and map API failures to filesystem errors.\r\n- Remove unused display-name/cache-invalidation helpers, never-fired emitters, redundant cancellation, and duplicate directory tracking. Add regression coverage and update the GitHub architecture documentation and inventory.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341941",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "5c1cfa69632b837d5b0629e95507156b31cb0423",
+    "HeadRef": "dev/dmitriv/github-filesystem-api",
+    "HeadSHA": "8b3375938d93798e6c954bd5bab854e6dc267e8d",
+    "CreatedAt": "2026-10-16T04:40:36Z",
+    "UpdatedAt": "2026-10-16T05:41:07Z",
+    "MergedAt": "2026-10-16T05:40:06Z",
+    "Labels": [
+      "network",
+      "agents-window"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-16047E0CF978",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/fileTreeView/browser/githubFileSystemProvider.ts",
+      "Side": "RIGHT",
+      "Line": 172,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed line, cache control flow, added regression test's exact call count, completion caller, and network/IPC implementation are all directly traced. Only the prevalence and exact response size of truncated repositories are uncertain, which is reflected in medium severity rather than mechanism confidence.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "the full recursive Git tree response, including network bytes, desktop IPC string transfer, JSON/schema parsing, and server API quota",
+      "PerformanceScaling": "Cost is O(tree response size) for every sequential stat/readdir/readFile attempt after the prior rejection; concurrent attempts coalesce only while one request remains in pendingFetches, and no result survives the failure.",
+      "PerformanceOutcome": "repeated multi-megabyte downloads and parsing block repository file completions/context browsing and consume GitHub API/network capacity",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The provider accepted the recursive response, built a partial entry map, and cached it for five minutes, so later filesystem probes did not refetch the same tree during that window.",
+      "ChangedBehavior": "The added branch rejects a truncated response after getTree has fully downloaded, transferred, parsed, and schema-validated it, but stores neither a positive entry nor a negative/terminal cache entry; finally then removes the in-flight promise.",
+      "CausalDiffEvidence": "The added throw at line 172 exits before treeCache.set at lines 194-195, while the promise's finally removes pendingFetches; this newly converts a once-per-five-minute cached response into repeated full getTree calls for the same key.",
+      "Title": "Cache truncated-tree failures before rejecting them",
+      "Impact": "For a large repository that GitHub returns with truncated=true, each later virtual-filesystem probe retries the entire recursive-tree request. This is particularly visible in github-remote-file completion/context workflows: completion results are marked incomplete and invoke IFileService.resolve again, so retries repeatedly stall UI results and redownload the large response.",
+      "Evidence": "fetchTree caches successes and 404s and coalesces only a currently pending promise (lines 129-153). doFetchTree performs client.getTree before this added throw (lines 160-172), and the new test 'rejects truncated trees without caching a partial filesystem' proves three sequential provider operations produce three treeCalls. Production variableCompletions.ts registers an incomplete completion provider and calls IFileService.resolve for github-remote-file workspaces on each completion request, establishing a realistic retry path. On desktop, RemoteApiRequestProvider forwards the full response text over IPC before ContentClient parses every tree entry.",
+      "Recommendation": "Record a per-key truncated-tree failure sentinel before throwing and replay the same Unavailable error for a bounded TTL (for example the existing five-minute tree TTL, with account/grant invalidation clearing it), while retaining in-flight coalescing and never exposing the partial entries."
+    },
+    {
+      "ID": "PERF-37DFADDB218B",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/fileTreeView/browser/githubFileSystemProvider.ts",
+      "Side": "RIGHT",
+      "Line": 255,
+      "Severity": "high",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The new call path, cache admission logic, 500-entry lifecycle, provider client lifetime, and 10 MiB payload bound are directly traced. Admission depends on the server returning an ETag, which is the transport's documented ordinary-read path; exact user file-size distributions affect severity frequency but not the retention mechanism.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceResource": "base64 Git blob JSON response strings retained by GitHubTransport._restCache",
+      "PerformanceScaling": "Retained bytes grow with the sum of unique blob response bodies read for the selected account until the transport's 500-entry LRU turns over. A permitted 10 MiB file produces roughly 13.3 MiB of base64 plus JSON, so dozens of large unique files retain hundreds of MiB and the count-only worst case is multiple GiB.",
+      "PerformanceOutcome": "large long-lived shared-process/renderer heap growth, GC pressure, and potential process instability while browsing repository files",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "readFile issued a direct IRequestService request, parsed and decoded the blob, and retained no blob cache; after the returned bytes were consumed, the response JSON/base64 string was reclaimable.",
+      "ChangedBehavior": "The added content.getBlob call routes each blob GET through Local/RemoteApiRequestProvider and GitHubTransport. Ordinary GETs default to ETag caching, and an ETagged success stores the complete response body string in the transport's 500-entry LRU; the provider's retained GitHubApiClient keeps that account transport alive until account/grant invalidation or disposal.",
+      "CausalDiffEvidence": "The added call at line 255 replaces the prior direct, uncached blob request with the shared typed client path whose default transport policy retains successful ETagged response bodies.",
+      "Title": "Do not retain full blob payloads in the count-only ETag cache",
+      "Impact": "Opening or attaching many distinct large repository files now leaves every encoded blob body retained after readFile returns. On desktop this memory is held in the shared-process account transport; on web it is held locally. Since the new limit still allows 10 MiB decoded files, a realistic sequence of tens of media/data files can add hundreds of MiB even though callers retain only decoded file bytes.",
+      "Evidence": "content.getBlob builds a normal GET without a cache opt-out. LocalApiRequestProvider forwards it as GitHubRestTextRequest with no etag:false, and GitHubTransport lines 813-827 stores every ETagged GET body in _restCache. That cache is LRUCache(..., 500), bounded by entry count rather than bytes, and its entry type retains body:string. GitHubApiClient retains one client lease, while the architecture documents that ordinary reads preserve conditional-response state. The provider explicitly permits decoded payloads up to 10 MiB, whose base64 JSON representation is substantially larger.",
+      "Recommendation": "Add and use a no-body-cache/etag:false request policy for immutable getBlob reads (and consider recursive trees), or make the transport cache byte-weighted with a small total payload budget and reject oversized entries. Preserve in-flight coalescing; if repeat blob reads need caching, cache decoded bytes under an explicit byte budget rather than retaining base64 JSON bodies."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cleanup-lifecycle",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Workbench startup and github-remote-file provider registration",
+        "CriticalPath": "The contribution is created AfterRestored, but construction only creates a GitHubApiClient wrapper and listeners; account/client acquisition and repository reads remain off the startup critical path until the first filesystem operation.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One provider per workbench window, independent of repository count until use.",
+        "EffectiveConcurrency": "No request is scheduled during registration.",
+        "CacheBehavior": "Tree, missing-ref, and pending maps start empty; the shared account client is acquired lazily.",
+        "MechanismConfidence": "High: contribution phase, constructor, and lazy acquireClient call path were inspected.",
+        "MagnitudeUncertainty": "Listener/construction cost is negligible relative to startup and no boundary is reached.",
+        "Verdict": "No reportable startup regression; the diff preserves lazy boundary work."
+      },
+      {
+        "Scenario": "Browse or complete files in a github-remote-file repository",
+        "CriticalPath": "A cold stat/readdir/IFileService.resolve must acquire the selected-account client, fetch the recursive tree, transfer the response over desktop IPC, parse/schema-validate it, and build the entry map before browsing or completion results can progress. Warm successful and warm missing-ref probes avoid the network. Truncated-tree failures remain on the critical path for every later sequential probe.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/fileTreeView/browser/githubFileSystemProvider.ts:161 doFetchTree",
+            "Operation": "GET the recursive Git tree",
+            "Cardinality": "One cold call per effective owner/repo/ref after five-minute success caching and in-flight coalescing; for truncated responses, one per sequential retry because no failure state is cached.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same scenario issued one direct GitHub tree request and cached even a truncated result for five minutes. The diff keeps the cold network call but newly repeats it after each truncated rejection.",
+            "CriticalPathEffect": "Blocks stat, readdir, file completion, and context-picker progress until the entire recursive response is read and parsed."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/github/common/remote/ipcClient.ts RemoteApiRequestProvider.execute",
+            "Operation": "Forward request metadata to the shared process and return the full response body text",
+            "Cardinality": "Desktop only: one round trip for each effective cold tree request; zero on web. The same per-key coalescing and retry counts apply.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The workbench IRequestService handled the GitHub request directly without the GitHub shared-process API boundary.",
+            "CriticalPathEffect": "Full body transfer precedes renderer-side JSON/schema parsing and therefore remains on the browsing critical path."
+          }
+        ],
+        "ScalingInput": "Recursive Git tree entry count/response bytes per distinct owner/repo/ref, plus the number of sequential filesystem/completion attempts. Completion walks cap displayed results but still require the full recursive tree first.",
+        "EffectiveConcurrency": "Provider pendingFetches coalesces concurrent requests per repository/ref. Different keys reach the shared transport queue. After a failed truncated response, the pending entry is removed, so later attempts dispatch again.",
+        "CacheBehavior": "Successful trees are cached five minutes and 404s one minute; both clear on account/grant changes. Truncated responses are neither positively nor negatively cached. The shared transport may additionally retain ETagged response text.",
+        "MechanismConfidence": "Very high: changed throw placement, pending-map cleanup, cache writes, test call counts, and completion call path are directly traced.",
+        "MagnitudeUncertainty": "The prevalence and exact byte size of repositories receiving truncated=true are not measured, but the added test proves every sequential rejection reissues getTree, and completion callers establish repeated realistic probes.",
+        "Verdict": "Reportable repeated network/IPC/parsing work for truncated trees; submitted as a medium-severity repeated-work finding."
+      },
+      {
+        "Scenario": "Read repository file contents",
+        "CriticalPath": "readFile waits for the repository tree when cold, then a Git blob GET, desktop IPC response transfer, JSON/schema parsing, whitespace normalization, base64 decode, and the decoded-size check. Known files above 10 MiB stop before the blob request; an unknown/underreported size reaches the transport's 16 MiB response cap.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/fileTreeView/browser/githubFileSystemProvider.ts:255 readFile",
+            "Operation": "GET Git blob JSON by immutable SHA",
+            "Cardinality": "One request per file read absent an in-flight identical request; known oversized entries issue zero blob calls. Sequential rereads conditionally revalidate through the transport.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old provider also issued one direct blob request per read, but did not route the response through the shared transport's retained conditional-body cache.",
+            "CriticalPathEffect": "Blocks opening/attaching the file until the entire encoded body arrives and is decoded."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/github/common/remote/ipcClient.ts RemoteApiRequestProvider.execute",
+            "Operation": "Return the complete base64 JSON response text from shared process to renderer",
+            "Cardinality": "Desktop only: one response transfer per effective blob request; web uses the local provider.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No shared GitHub IPC boundary existed on the direct IRequestService path.",
+            "CriticalPathEffect": "Transfer and renderer JSON/schema parsing precede base64 decode and file availability."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/sessions/contrib/fileTreeView/browser/githubFileSystemProvider.ts:256 readFile",
+            "Operation": "Parse and schema-copy Git blob JSON, normalize content text, and decode base64",
+            "Cardinality": "Once per completed blob read; work and transient allocation scale linearly to the 10 MiB decoded limit.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old path parsed JSON and decoded with atob plus a byte-copy loop; the new decoder is established as faster, so this transient work alone was not reported.",
+            "CriticalPathEffect": "Synchronous renderer CPU/allocation occurs after response arrival and before readFile resolves."
+          }
+        ],
+        "ScalingInput": "Unique blob SHA count and encoded payload bytes; each accepted decoded file is at most 10 MiB, while the base64 JSON body is roughly four-thirds larger. Tree work scales once per repository/ref cache window.",
+        "EffectiveConcurrency": "Tree requests coalesce per repository/ref. The shared transport coalesces identical concurrent blob GETs and applies its admission queue to distinct requests; sequential reads of unique SHAs each execute once.",
+        "CacheBehavior": "The provider has no decoded blob cache. The shared transport defaults ordinary GETs to conditional caching and retains ETagged full body strings in a 500-entry count-only LRU for the selected-account client lifetime. Account/grant invalidation or disposal releases the client/cache.",
+        "MechanismConfidence": "Very high: getBlob request policy, transport cache admission, count-only LRU, body-string retention, and retained client lifecycle are directly traced.",
+        "MagnitudeUncertainty": "Typical repository file sizes and the number of large unique files opened per session are unknown. The cache byte growth and 10 MiB per-file bound are explicit, so prevalence affects severity frequency rather than confidence.",
+        "Verdict": "Reportable retained-memory regression because large base64 bodies now enter a count-only long-lived ETag cache; submitted as a high-severity cache-lifecycle finding. The 10 MiB preflight and faster decoder otherwise bound/improve individual reads."
+      },
+      {
+        "Scenario": "Account/grant change and provider disposal",
+        "CriticalPath": "These lifecycle events abort the retained client signal, cancel outstanding tree/blob work, clear provider caches, and release the client lease; they are not on normal read progress except when invalidation races a read.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/github/browser/githubApiClient.ts reset/dispose via client disposal",
+            "Operation": "Release the desktop shared-process client lease and cancel obsolete requests",
+            "Cardinality": "One release per acquired client generation, not per cached item.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The direct request provider had no shared-client lease; provider disposal only cleared local maps.",
+            "CriticalPathEffect": "Lifecycle cleanup is off the normal read critical path; a racing read is intentionally cancelled."
+          }
+        ],
+        "ScalingInput": "Number of cached repository keys and currently pending operations.",
+        "EffectiveConcurrency": "All work owned by the old client generation is aborted together; guarded pending cleanup prevents an obsolete promise from deleting a new generation's request.",
+        "CacheBehavior": "Positive, 404, and pending provider maps clear synchronously. Disposing/resetting the client releases transport resources when its shared grant reference reaches zero.",
+        "MechanismConfidence": "High: reset, clearCaches, signal ownership, guarded pending cleanup, and disposal tests were inspected.",
+        "MagnitudeUncertainty": "Equivalent grant leases from other features can delay destruction of the underlying shared transport, but the provider's own ownership and cancellation are explicit.",
+        "Verdict": "No separate cleanup regression; the diff adds bounded ownership and cancellation. Shared transport body retention is covered by the blob-cache finding."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and transitive client, transport, IPC, filesystem, completion, cache, and lifecycle paths. Submitted two diff-caused findings: uncached truncated-tree failures repeat full recursive requests, and blob migration admits large base64 bodies to a count-only retained ETag cache. No concrete shipped-regression fix met the evidence threshold for blame recording."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-19T23:18:06.196375204Z",
+    "CompletedAt": "2026-10-19T23:21:54.208403592Z",
+    "WallClockMilliseconds": 228012,
+    "ModelCalls": 20,
+    "InputTokens": 1390589,
+    "OutputTokens": 14873,
+    "TotalTokens": 1405462,
+    "ReasoningTokens": 6883,
+    "CacheReadTokens": 1265152,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 209318,
+    "ToolCalls": 117,
+    "NanoAIUnits": 130526880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1265152,
+      "cache_write": 0,
+      "input": 125437,
+      "output": 14873
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
