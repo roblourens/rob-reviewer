@@ -1,0 +1,99 @@
+{
+  "PullRequest": {
+    "Number": 342434,
+    "Title": "agentHost: Isolate restore snapshot read-count test from provider setup",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nOne of a series of small, independent fixes for timing-sensitive tests found by stress-testing #342237, which runs the unit tests in parallel worker processes.\n\n## Problem\n\n`AgentService (node dispatcher) › restoreSession › restoring a normalized session with peers and a restored subagent reads its catalog snapshot no more often than before recorded storage` failed in the #342237 stress run ([Windows / Stress-Auto-B](https://github.com/microsoft/vscode/actions/runs/39163025353/job/117780117504), 8 workers on 8 CPUs). The restore read the catalog snapshot one time more than expected (`+` actual, `-` expected):\n\n```diff\n  {\n+   snapshotReads: 12,\n-   snapshotReads: 11,\n    storage: [\n      'copilot:/snapshot-reads-peer-storage',\n      'ahp-chat://subagent/Y29waWxvdDovc25hcHNob3QtcmVhZHMtb3duZXI/tc-sub'\n    ]\n  }\n```\n\nIt has not failed in serial PR CI, so a slow, loaded machine exposes it.\n\n## Root cause\n\nThe test builds a fresh `AgentHostDatabase`, registers the provider and immediately restores. `registerTestAgentProvider` starts the provider's initial sessions_v2 migration (`AgentService._onDidRegisterProvider` → `_ensureSessionsV2Imported`), so the restore runs concurrently with it:\n\n1. Two of the 11 counted reads come from the migration, not the restore: `_resolveSessionsV2ImportCandidate` (via `_registeredSessionMetadata` → `_readDefaultChatBacking`) and `_buildImportedCatalogSyncRequest`.\n2. `_restoreSessionState` reads the session's central catalog row (`_readCachedChatCatalog` → `AgentHostCatalogListReader.read`) before the migration has written it. `AgentHostStateManager.restoreSession` therefore announces a summary with only the untitled default chat.\n3. Later in the restore, `_snapshotDefaultChatTitle` → `updateChatTitle` marks that summary dirty. `SessionSummaryNotifier` flushes dirty summaries on a 100 ms `RunOnceScheduler`. The flush emits a `chats` change (the title and the peer), and `AgentService`'s `onDidChangeSessionSummary` handler calls `_queueCatalogSync`. The resulting background write reads the snapshot in `_persistListVisibleSessionStateNow`.\n4. Normally the restore finishes within 100 ms of the title snapshot, so that read happens after the test has counted. On a slow machine the timer fires first. The restore's own ordered catalog write (`_restorePeerChats` → `_persistOrderedListVisibleSessionState`) then waits for the background write (`previous` in `_drainOrderedCatalogStateWrite`), or takes it on as its trailing write. Either way `restoreSession` resolves only after the twelfth read.\n\nWhen the migration has already finished, the restore finds the catalog row and announces the complete summary (titled default chat and the peer). The flush then has no change to emit, and no catalog write is queued. In both orderings the restore itself reads the snapshot 9 times.\n\nThe product behaves as designed: the summary converges through the debounced flush, and the background write only persists the session's catalog row once more. Only the test depends on whether a 100 ms timer fires before or after `restoreSession` resolves.\n\n## Fix\n\nTest only. Before installing the spy, the test waits for the provider's initial migration (`_initialProviderMigrations.get(agent.id)`, as other tests in this file do). It now counts only the restore's own reads, so the expected count is 9 instead of 11. The check still catches the regression it was written for, since peer or subagent admission reading the snapshot again would raise the count. The storage assertion is unchanged.\n\n## Proof\n\nA temporary change (not committed) makes every `AgentHostDatabase` call in this test complete 20 ms later, simulating a loaded machine:\n\n```diff\n \t\t\tconst snapshotReads = spy(database, 'readCatalogSnapshot');\n+\t\t\t// REPRO: every database round trip completes 20 ms later, as on a loaded machine.\n+\t\t\tfor (const name of Object.getOwnPropertyNames(AgentHostDatabase.prototype)) {\n+\t\t\t\tconst target = database as unknown as Record\u003cstring, (...args: unknown[]) =\u003e unknown\u003e;\n+\t\t\t\tconst original = target[name];\n+\t\t\t\tif (name === 'constructor' || typeof original !== 'function') {\n+\t\t\t\t\tcontinue;\n+\t\t\t\t}\n+\t\t\t\ttarget[name] = function (this: unknown, ...args: unknown[]) {\n+\t\t\t\t\tconst result = original.apply(this, args);\n+\t\t\t\t\treturn result instanceof Promise ? result.then(async value =\u003e { await timeout(20); return value; }) : result;\n+\t\t\t\t};\n+\t\t\t}\n```\n\nEach cell is 3 runs of the whole test file after applying the change and running `npm run transpile-client`, using the commands from the Validation table:\n\n| Runner | main | this PR |\n|---|---|---|\n| node | 0/3 passing; 3/3 fail with the exact CI diff (`snapshotReads: 12` vs `11`) | 3/3 passing |\n| Electron | 0/3 passing; 3/3 fail with the exact CI diff | 3/3 passing |\n\nInstrumenting the reproduction on `main` showed the sequence above: `_queueCatalogSync` fired from the summary flush before the restore's ordered write started, and the ordered write then waited for it.\n\n## Validation\n\n| Command | Result |\n|---|---|\n| `npm run transpile-client` | done |\n| `npm run test-node -- --run src/vs/platform/agentHost/test/node/agentService.test.ts` | 1146 passing, 16 pending |\n| `VSCODE_SKIP_PRELAUNCH=1 ./scripts/test.sh --reporter dot --run src/vs/platform/agentHost/test/node/agentService.test.ts` | 1146 passing, 16 pending |\n| `npm run eslint -- src/vs/platform/agentHost/test/node/agentService.test.ts` | clean |\n| `npm run typecheck-client` | passed |\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342434",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "01bfb5147e54f6490144e94a3d9f334b8b0a5250",
+    "HeadRef": "agents/restore-snapshot-reads-test-timing",
+    "HeadSHA": "94a431ddd8cb880b0f2458c55e08274c53c7a649",
+    "CreatedAt": "2026-10-18T22:31:55Z",
+    "UpdatedAt": "2026-10-20T10:51:44Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Unit test restoring one normalized Copilot session with one peer and one restored subagent while provider catalog initialization is in flight",
+        "CriticalPath": "After the diff, test setup must finish the already-started initial provider migration, catalog reconciliation, peer-store idle work, and any tracked background catalog writes before installing the snapshot-read spy; the restore then performs its nine asserted snapshot reads. Before the diff, migration and restore could overlap. This affects only the test critical path, not product startup or restore code.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/test/node/agentService.test.ts:28368 via AgentService._onDidRegisterProvider/_importProviderSessionsV2",
+            "Operation": "Initial sessions_v2 provider migration and reconciliation against the fresh AgentHostDatabase and test session stores",
+            "Cardinality": "One provider and one seeded session in this test; the provider's listChatsToMigrate mock returns an empty in-process array, and existing migration/reconciliation promises are awaited rather than duplicated.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same migration began on provider registration and could run concurrently with restore; its database reads could be observed by the spy depending on timing.",
+            "CriticalPathEffect": "Newly ordered before restore; previously overlapped with restore. It can add only the lost overlap to this single test's wall time."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/test/node/agentService.test.ts:28371 via AgentService.restoreSession",
+            "Operation": "Restore reads and updates the normalized catalog for the owner, peer, and restored subagent",
+            "Cardinality": "Fixed fixture of one owner, one peer, and one subagent; the assertion establishes nine readCatalogSnapshot calls after migration is isolated.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same restore ran immediately after provider registration and could contend or serialize indirectly with concurrent migration/background writes.",
+            "CriticalPathEffect": "Remains on the test's restore critical path and now starts after migration settles."
+          }
+        ],
+        "ScalingInput": "Fixed unit-test fixture: one provider, one owner session, one peer, and one subagent. No user-controlled collection or production frequency is changed.",
+        "EffectiveConcurrency": "Before the diff, provider migration and restore could overlap. After the diff, they are explicitly serialized for this one test. Provider migration remains coalesced and sequenced per provider; no aggregate concurrency burst is added.",
+        "CacheBehavior": "Each test uses a fresh in-memory AgentHostDatabase and fresh service, so the scenario is cold. The initial migration is already coalesced by _initialProviderMigrations/_providerMigrations; the helper awaits those existing entries and drains reconciliation/background work without creating a new cache entry or migration pass.",
+        "MechanismConfidence": "High: the changed await and service internals directly establish serialization and show no added migration or database operation.",
+        "MagnitudeUncertainty": "Exact milliseconds depend on test-host load, but all storage is test-local/in-memory and cardinality is fixed. There is no production path change.",
+        "Verdict": "No reportable performance regression. The diff removes timing-dependent overlap in one test and changes measurement scope from eleven mixed migration/restore reads to nine restore-only reads; it does not add expensive work, fan out boundaries, defeat coalescing, or alter product behavior."
+      }
+    ],
+    "Summary": "Reviewed the complete one-file diff and traced the moved helper plus its new call through provider registration, migration coalescing, reconciliation/background-write draining, and session restore. The only performance-relevant change is deliberate serialization in a fixed-cardinality test; no actionable production or test-suite scaling regression was introduced, and the PR is not a shipped performance-regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-20T12:15:52.869205109Z",
+    "CompletedAt": "2026-10-20T12:17:07.664731976Z",
+    "WallClockMilliseconds": 74795,
+    "ModelCalls": 12,
+    "InputTokens": 443870,
+    "OutputTokens": 4413,
+    "TotalTokens": 448283,
+    "ReasoningTokens": 1109,
+    "CacheReadTokens": 384530,
+    "CacheWriteTokens": 59304,
+    "APIDurationMilliseconds": 58884,
+    "ToolCalls": 55,
+    "NanoAIUnits": 53873600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 384530,
+      "cache_write": 59304,
+      "input": 36,
+      "output": 4413
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
