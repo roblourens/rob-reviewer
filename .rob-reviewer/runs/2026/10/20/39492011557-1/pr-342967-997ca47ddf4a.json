@@ -1,0 +1,204 @@
+{
+  "PullRequest": {
+    "Number": 342967,
+    "Title": "Engineering - let a timed-out sign job be retried without 'artifact already exists'",
+    "Body": "Official product builds can't recover when a sign job times out after it already published some of its artifacts. Pipeline artifacts are immutable, so every retry of the job fails with `Artifact … already exists for build`.\n\n**Evidence**\n- [484798](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=484798): `Windows (ARM64) - Sign` spent 79 min in `✍️ Codesign` (median ~13), published 4 of its 6 outputs, then hit the 90-min cap while generating the SBOM for the 5th. Each of the next 4 attempts failed on `Artifact vscode_client_win32_arm64_setup already exists for build 484798`. Publish had already shipped that setup from attempt 1 to the CDN two minutes before the timeout.\n- Same failure on Linux and Windows in [476034](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=476034), [477162](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=477162) and [477708](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=477708). The timeouts had different triggers (ESRP latency, a slow diagnostics step, waiting on another job), so making the upload idempotent is the lever rather than tuning one step.\n\n**Change**\n- `checkForArtifact.ts` accepts several `\u003cvariable\u003e \u003cartifact\u003e` pairs and queries the build's artifacts once. The existing 2-argument use in the macOS compile job is unchanged.\n- The Windows, Linux and macOS Sign jobs run it as their last step, and each 1ES `pipelineArtifact` output gets `condition: and(succeeded(), ne(variables['\u003cX\u003e_PUBLISHED'], 'true'))`.\n\n**Why keeping the existing artifact is correct**\n- 1ES outputs run only after every user step and the SDL scans succeeded, so an artifact under its final name always comes from an attempt that fully signed and scanned it.\n- Publish ships non-gated artifacts as soon as they appear, so the existing one may already be on the CDN. Re-uploading different bits under the same name would be inconsistent, and Publish would skip it as already processed anyway.\n- The check step is `continueOnError`. If the API call fails, every variable is `false` and the job publishes exactly as today.\n\n**Validation**\n- `tsc` on the build project: no new errors versus `main`.\n- Ran `checkForArtifact.ts` against a mock artifacts API: multiple pairs, the legacy 2-argument form, `_sbom` filtering, API errors (all `false`) and bad arguments (exit 1).\n- Parsed the three templates and checked that every conditioned output's variable is set for that exact artifact name.\n- Not runnable locally: the retry itself. On the first attempt nothing exists, so behavior is unchanged apart from one ~5 s step.\n\n\u003e Authored with Copilot\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342967",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "23e257a3daed3f3d59498fe88f128ca59cdff592",
+    "HeadRef": "copilot/vscode/retry-skip-published-artifacts",
+    "HeadSHA": "997ca47ddf4a99adc6b8b460bf4e1c413f6c5039",
+    "CreatedAt": "2026-10-20T19:00:30Z",
+    "UpdatedAt": "2026-10-20T20:23:59Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-42E70D09AD09",
+      "Focus": "performance-review",
+      "Path": "build/azure-pipelines/linux/product-build-linux.yml",
+      "Side": "RIGHT",
+      "Line": 170,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The call path and bounds are explicit: the changed YAML invokes checkForArtifact; checkForArtifact uses retry(getPipelineArtifacts); requestAZDOAPI uses retry(fetch); retry.ts runs 10 attempts; and requestAZDOAPI creates a fresh 2-minute abort timer per outer call. The production template instantiates two Windows, three Linux, and two macOS Sign jobs. Actual outage frequency is uncertain, which limits severity rather than confidence in the mechanism.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Azure DevOps artifacts API calls and occupied build-agent time",
+      "PerformanceScaling": "The nested retry cost is up to 10 outer attempts × 10 inner fetch attempts per Sign job, multiplied by up to seven concurrently enabled platform/architecture Sign jobs; hanging calls also multiply the fresh 2-minute outer timeout to about 20 minutes of wall time.",
+      "PerformanceOutcome": "blocked release critical path and excessive network retries during service failures",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "Before this PR, Windows, Linux, and macOS Sign jobs proceeded directly from packaging/signing to their outputs without querying the artifacts API. Only the two pre-existing macOS compile paths used this helper; the PR adds the nested-retry boundary to up to seven Sign jobs on the artifact-publication critical path.",
+      "ChangedBehavior": "Each Sign job now blocks output publication on an artifact-list network request. On retryable transport failures that request is retried by both checkForArtifact and requestAZDOAPI, and the new YAML instantiates this nested retry in up to seven parallel architecture jobs.",
+      "CausalDiffEvidence": "The added final script step at build/azure-pipelines/linux/product-build-linux.yml:170 invokes checkForArtifact.ts in every Linux Sign job; equivalent added steps are present in the Windows and macOS Sign templates. checkForArtifact.ts wraps getPipelineArtifacts() in retry(), while getPipelineArtifacts() calls requestAZDOAPI(), whose fetch is already wrapped in the same 10-attempt retry helper and whose AbortController timeout is recreated at 2 minutes for every outer invocation.",
+      "Title": "Avoid nesting retries in every Sign job",
+      "Impact": "During an Azure DevOps artifacts-API transport outage, each affected Sign job can remain blocked for roughly 20 minutes before falling back to the intended `false` variables, delaying artifact publication and consuming agents; across a full product build the seven new call sites can generate up to 700 fetch attempts. Even immediate transport failures create a large synchronized request burst against the unhealthy service.",
+      "Evidence": "checkForArtifact.ts:31 calls retry(() =\u003e getPipelineArtifacts()), and getPipelineArtifacts delegates to publish.ts:572 requestAZDOAPI. requestAZDOAPI itself calls retry(fetch) at publish.ts:577 with a 2-minute AbortController at lines 573-574; retry.ts:9 permits 10 attempts. Thus a hanging/transport-failing API can cause 10 outer requests, each with up to 10 fetch attempts, and each outer hanging request can consume a fresh 2-minute timeout. Because this added step is the last user step before templateContext outputs, continueOnError does not let publication proceed until all retrying finishes.",
+      "Recommendation": "Remove the outer retry in checkForArtifact.ts and call getPipelineArtifacts() directly, relying on requestAZDOAPI's existing retry policy before setting all variables to false on failure. If the best-effort check needs a tighter release-path bound, also use a short explicit timeout, but do not stack another retry loop."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Successful first-attempt official product build",
+        "CriticalPath": "After all signing and packaging steps finish, the added Node script and artifact-list GET must complete before templateContext output publication can begin. The platform stages run independently, so build completion is delayed by the slowest affected Sign job.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/{linux,win32,darwin}/product-build-*.yml added final script step",
+            "Operation": "Launch checkForArtifact.ts to set output condition variables.",
+            "Cardinality": "One new Node process per enabled Sign job, up to seven in a full official build.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Sign jobs proceeded directly from their final package/sign step to output processing.",
+            "CriticalPathEffect": "The process must exit before output publication starts."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/checkForArtifact.ts:getPipelineArtifacts -\u003e common/publish.ts:requestAZDOAPI",
+            "Operation": "List all artifacts for the current Azure DevOps build.",
+            "Cardinality": "One successful artifacts-list GET per Sign job, up to seven aggregate; the response is scanned for four to six fixed names.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These Sign jobs made no artifact-list request on this path.",
+            "CriticalPathEffect": "All output publication in that Sign job waits for the response."
+          },
+          {
+            "Kind": "network",
+            "Location": "platform product-build YAML templateContext.outputs",
+            "Operation": "Publish product pipeline artifacts and associated SBOM outputs.",
+            "Cardinality": "Four macOS outputs, four to six Linux outputs depending on architecture/options, and six Windows outputs per job.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same outputs were published unconditionally after successful steps.",
+            "CriticalPathEffect": "Artifact/SBOM publication remains after user steps; on the first attempt all outputs still run."
+          }
+        ],
+        "ScalingInput": "Number of enabled platform/architecture Sign jobs, at most seven in the inspected official product pipeline; each job checks only four to six names after one list request.",
+        "EffectiveConcurrency": "One lookup is serialized within each Sign job, while up to seven architecture Sign jobs (Windows x64/arm64, Linux x64/arm64/armhf, macOS x64/arm64) can issue independent lookups concurrently. There is no shared limiter or coalescing.",
+        "CacheBehavior": "There is no local cache or cross-job coalescing. On a first attempt the authoritative artifact list is fetched and all queried names miss; each architecture job fetches the same build-wide list independently.",
+        "MechanismConfidence": "High: the new process, one build-wide list call per enabled Sign job, output ordering, and architecture multiplicity are explicit in the YAML and TypeScript.",
+        "MagnitudeUncertainty": "A healthy lookup is expected to be a small fixed delay and stages overlap, so exact first-attempt wall-time impact depends on API latency and the slowest stage.",
+        "Verdict": "No separate finding for the healthy path: the fixed one-request-per-job overhead is bounded and intentionally enables idempotent retries, though it is on the publication critical path."
+      },
+      {
+        "Scenario": "Retry after partial artifact publication",
+        "CriticalPath": "The retry still performs the pre-existing signing/package steps first, then the new check gates output processing. Existing artifacts skip their output work; missing artifacts continue to publication.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/checkForArtifact.ts:main",
+            "Operation": "Read existing artifact names after an earlier attempt partially published outputs.",
+            "Cardinality": "One artifacts-list GET serves all four to six names in a job.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No preflight read occurred; output processing attempted every artifact and an immutable-name conflict could fail the retried job.",
+            "CriticalPathEffect": "The GET must finish before any remaining artifact can publish."
+          },
+          {
+            "Kind": "network",
+            "Location": "added conditions on templateContext.outputs in each platform product-build YAML",
+            "Operation": "Publish missing artifacts; conditions suppress already existing ones.",
+            "Cardinality": "Only outputs absent from the returned list publish; effective count ranges from zero to all outputs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every configured output attempted publication, including immutable artifacts from an earlier attempt.",
+            "CriticalPathEffect": "Skipping existing outputs avoids their upload/SBOM work and allows missing outputs to proceed."
+          }
+        ],
+        "ScalingInput": "Four to six configured outputs per architecture job and the subset already published by the earlier attempt.",
+        "EffectiveConcurrency": "Each retried job handles one grouped list request rather than one request per artifact. Different architecture jobs remain independent and may retry concurrently.",
+        "CacheBehavior": "The build artifact service is the authoritative warm state. Already published names are detected from one list response; there is no stale local cache. A failed lookup deliberately behaves as all misses.",
+        "MechanismConfidence": "High: one grouped request supplies all variables, and each added condition directly suppresses the matching output.",
+        "MagnitudeUncertainty": "The number and size of artifacts already present varies with where the earlier attempt stopped, so upload savings vary.",
+        "Verdict": "The changed successful-retry path is performance-positive overall: one grouped metadata read can avoid multiple large artifact/SBOM publications and repeated failing job attempts."
+      },
+      {
+        "Scenario": "Artifacts API transport failure during product build",
+        "CriticalPath": "The final check cannot reach its catch/fallback until nested retries finish. continueOnError changes the task result but does not bypass the wait, so all artifact publication remains blocked.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "added script at build/azure-pipelines/linux/product-build-linux.yml:170 and equivalent Windows/macOS additions -\u003e checkForArtifact.ts:31 -\u003e publish.ts:requestAZDOAPI",
+            "Operation": "Retry listing build artifacts during a transport failure or timeout.",
+            "Cardinality": "Up to 10 outer requestAZDOAPI calls × 10 fetch attempts per job, multiplied by up to seven jobs (700 fetch attempts). For hanging transport calls, each outer invocation can consume a fresh two-minute timeout.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Windows, Linux, and macOS Sign jobs did not make this request and therefore did not incur its nested retry delay; only two pre-existing macOS compile call sites used the helper.",
+            "CriticalPathEffect": "Can block each Sign job for about 20 minutes before the false-variable fallback permits outputs, with synchronized load on the unhealthy service."
+          }
+        ],
+        "ScalingInput": "Retry layers (10×10), enabled architecture jobs (up to seven), and whether each network failure returns immediately or waits for the two-minute abort.",
+        "EffectiveConcurrency": "Up to seven jobs can enter the failure path together. Within each job retries are nominally sequential, but checkForArtifact's 10-attempt retry wraps requestAZDOAPI's own 10-attempt fetch retry.",
+        "CacheBehavior": "There is no negative cache or cross-job failure coalescing. Each outer attempt creates a new request and timeout, and every job retries independently against the unhealthy service.",
+        "MechanismConfidence": "Very high: both 10-attempt loops, the fresh two-minute timeout per outer request, the final-step placement, and seven added production call sites are directly traced.",
+        "MagnitudeUncertainty": "The prevalence and duration of Azure DevOps transport outages are not measured in the repository; immediate HTTP 5xx responses exercise only the outer ten attempts, while transport failures/timeouts exercise both loops.",
+        "Verdict": "Reportable medium-severity network/latency regression: the PR materially amplifies a nested retry mechanism onto seven release-critical Sign jobs."
+      },
+      {
+        "Scenario": "Legacy macOS unsigned-client artifact check",
+        "CriticalPath": "The check remains between packaging the unsigned client and publishing it for the universal build.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/darwin/steps/product-build-darwin-compile.yml existing checkForArtifact invocation",
+            "Operation": "Check whether the unsigned client archive already exists.",
+            "Cardinality": "One Node process and one successful artifact-list GET per non-CI macOS architecture compile job, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same helper invocation fetched the same list and checked one name.",
+            "CriticalPathEffect": "Still gates unsigned client artifact publication."
+          }
+        ],
+        "ScalingInput": "One variable/artifact pair per macOS compile invocation.",
+        "EffectiveConcurrency": "At most the two macOS architecture compile jobs each make one independent lookup; argument batching does not change this legacy one-pair invocation.",
+        "CacheBehavior": "The existing macOS compile use still performs one authoritative lookup with no cache, exactly as before.",
+        "MechanismConfidence": "High: the sole caller still passes exactly two arguments, and the helper still performs one list request and one name lookup.",
+        "MagnitudeUncertainty": "Only negligible extra fixed logging/allocation was added for the one-pair invocation.",
+        "Verdict": "No performance regression from the helper's multi-pair refactor itself; the existing call retains the same boundary cardinality and asymptotic work."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and all diff pages. One medium-severity boundary-fanout finding was submitted for nested retries newly placed in up to seven Sign jobs; healthy first attempts, partial-publication retries, output suppression, and the legacy macOS caller were separately traced and did not justify additional findings."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-20T20:42:11.430943897Z",
+    "CompletedAt": "2026-10-20T20:44:04.724144557Z",
+    "WallClockMilliseconds": 113293,
+    "ModelCalls": 9,
+    "InputTokens": 238281,
+    "OutputTokens": 7099,
+    "TotalTokens": 245380,
+    "ReasoningTokens": 2937,
+    "CacheReadTokens": 194677,
+    "CacheWriteTokens": 43577,
+    "APIDurationMilliseconds": 95288,
+    "ToolCalls": 37,
+    "NanoAIUnits": 43784380000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 194677,
+      "cache_write": 43577,
+      "input": 27,
+      "output": 7099
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

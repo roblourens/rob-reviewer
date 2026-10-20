@@ -1,0 +1,232 @@
+{
+  "PullRequest": {
+    "Number": 342346,
+    "Title": "test: run Agent Host E2E as its own test unit in GitHub Actions and ADO",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Summary\n\nAgent Host E2E moves out of `scripts/test-integration.{sh,bat}` and becomes its **own test unit**, with its own script, CI step, timeout and Azure DevOps test ID. It is wired the same way in GitHub Actions and Azure DevOps.\n\n| | Before | After |\n|---|---|---|\n| Script | part of `scripts/test-integration.{sh,bat}` | `scripts/test-agent-host-e2e.{sh,bat}` |\n| GitHub Actions step | part of `🧪 Run integration tests (Electron)` | `🧪 Run Agent Host E2E tests (Electron)` |\n| Azure DevOps test ID | part of `integration-electron` | `integration-agent-host-e2e` |\n| Timeout | shared with every integration suite | its own |\n| ADO rerun checkpoint | shared with every integration suite | its own |\n\n\u003e [!NOTE]\n\u003e **For now, Agent Host E2E still runs on the same machine**, as its own step right before `🧪 Run integration tests (Electron)`. This PR does **not** move it to a separate job or VM. It is the groundwork that makes that a small follow-up, so E2E can run in parallel with the other integration tests and be retried on its own.\n\n## Why\n\nAgent Host E2E is the slowest and the flakiest part of the Electron integration tests. Bundling it with every other integration suite made both problems worse.\n\n### It is the long pole\n\nSuccessful `Windows / Electron` integration steps in `pr.yml`, Oct 10–17 (n = 317). Agent Host E2E is skipped when a PR can't affect it, so the runs split cleanly:\n\n| Windows `🧪 Run integration tests (Electron)` | Runs | p50 | p95 | Max | Timeout |\n|---|---|---|---|---|---|\n| Agent Host E2E skipped | 98 | 10.4 min | | 11.8 min | 30 min |\n| Agent Host E2E ran | 219 | **26.0 min** | **28.8 min** | **29.8 min** | 30 min |\n\nAgent Host E2E adds about 16 minutes at the median, more than all other integration suites combined. With it, 13% of healthy runs took 28 minutes or more of a 30-minute budget.\n\nThe split steps in this PR's own CI show the same:\n\n| Platform | GitHub: Agent Host E2E | GitHub: other integration tests | ADO: Agent Host E2E | ADO: other integration tests |\n|---|---|---|---|---|\n| Windows x64 | 15.8 min | 11.8 min | 16.9 min | 9.1 min |\n| Linux x64 | 6.9 min | 9.1 min | 4.3 min | 6.5 min |\n| macOS | 3.9 min | 5.7 min | 3.6 min (arm64) | 6.3 min (arm64) |\n\n### It is where the flakes are\n\nAll **6 of 6** flaky failures of the Electron integration step from Oct 10–17 trace back to Agent Host E2E. \"Flaky\" means the job failed, then passed when the same SHA was re-run.\n\n| Job | Failures | What happened |\n|---|---|---|\n| Linux / Electron | 4 ([1](https://github.com/microsoft/vscode/actions/runs/39033134232/job/117397719741), [2](https://github.com/microsoft/vscode/actions/runs/38401430762/job/115309785884), [3](https://github.com/microsoft/vscode/actions/runs/38654911592/job/116162264847), [4](https://github.com/microsoft/vscode/actions/runs/38697184686/job/116296427744)) | Every E2E suite passed, then its RAM-disk (tmpfs) cleanup failed (`target is busy`, held by an orphaned Codex sandbox). #342277 mitigates this; it counted 13 such failures in 10 days, about 1 in 217 PR runs. |\n| Windows / Electron | 2 ([1](https://github.com/microsoft/vscode/actions/runs/38983183562/job/117248871338), [2](https://github.com/microsoft/vscode/actions/runs/38714176482/job/116352693536)) | Agent Host E2E took 19.2 and 18.2 minutes. The step then hit its 30-minute timeout 4 and 9 seconds into healthy extension-host suites (Git Base, GitHub Authentication). |\n\n### Bundling makes it worse\n\n- **Shared time budget.** A slow E2E run timed out whichever unrelated suite happened to be running when time ran out. The failure was reported against \"integration tests\", not against Agent Host E2E.\n- **Shared retries.** One flaky E2E failure meant rerunning everything. In Azure DevOps, a job rerun repeated the whole `integration-electron` unit, including about 6–9 minutes of other suites that had already passed.\n- **Hidden results.** When E2E failed, the script stopped, so the remaining integration suites never ran and their results were unknown.\n\n## What this PR gives today\n\n- **Separate timeouts.** In GitHub Actions, Agent Host E2E gets 30 minutes on Windows and 15 on Linux and macOS; the other integration tests get 20 minutes everywhere. In Azure DevOps, each step gets 30 minutes.\n- **Clear attribution.** A failure or timeout now names its unit: `🧪 Run Agent Host E2E tests (Electron)` or `🧪 Run integration tests (Electron)`.\n- **Independent retries in Azure DevOps.** Each unit records its own checkpoint, so rerunning a failed job skips whichever unit already passed.\n- **Both results in GitHub Actions.** The integration step still runs after an Agent Host E2E failure, but not after cancellation. In Azure DevOps it keeps the default `succeeded()` condition, so it is skipped and the job fails, as before.\n\n## What it enables next (not in this PR)\n\n- **Run Agent Host E2E in its own job or VM**, in parallel with the other integration tests. On Windows, the two would no longer run back to back (26 minutes at p50).\n- **Retry it on its own** without rerunning the other integration tests. In GitHub Actions this needs the separate job, because \"Re-run failed jobs\" reruns the whole job.\n\n## Changes\n\n- **Scripts.**\n  - **New `scripts/test-agent-host-e2e.{sh,bat}`.** Runs the parallel Agent Host E2E runner (`test/integration/agentHost/runner.ts`), forwards its options (`--jobs`, `--grep`, `--build`, `--tfs`), and handles the `VSCODE_SKIP_AGENT_HOST_E2E` skip. `npm run test-agent-host-e2e` still works.\n  - **`scripts/test-integration.{sh,bat}` no longer run Agent Host E2E.** They still exclude its entrypoints from their serial node.js run. `--run \u003cone E2E file\u003e` still works; the runner uses it for each suite.\n- **GitHub Actions** (`pr-{linux,darwin,win32}-test.yml`).\n  - A new `🧪 Run Agent Host E2E tests (Electron)` step, with the existing change detection and test profile, runs before `🧪 Run integration tests (Electron)`.\n  - The integration step keeps the test profile, because the provider integration tests read it.\n- **Azure DevOps**, both pipelines below run the two steps on the same machine.\n  - **Product build (definition 111).** A new `integration-agent-host-e2e` test ID runs before `integration-electron` in `product-build-{linux,darwin,win32}-test.yml`. It is registered in `testCheckpoint.ts` and `publish-test-checkpoint.yml`, and added next to `integration-electron` in all 15 job lists.\n  - **Flaky detection (definition 700).** Each iteration of `product-smoke-flaky-{linux,darwin,win32}.yml` runs an Agent Host E2E step before the integration step.\n- **Change detection.** `detect.ts` treats the new scripts as test infrastructure, which forces the full test profile.\n- **Guard tests in `build/lib/test/`.**\n  - **Coverage test.** The runner's suite list must be exactly the set of files the integration scripts exclude, and the `.sh` and `.bat` scripts must use the same exclusion pattern.\n  - **Pairing test.** Every GitHub Actions or Azure DevOps step that runs `test-integration` must have an Agent Host E2E step in the same file, with the same command and environment. It covers all 9 such files.\n  - **Wiring and inventory tests.** They pin the GitHub Actions wiring and the Azure DevOps test ID inventory and checkpoints.\n- **Docs.** The E2E README and the `integration-tests` and `agent-host-e2e-tests` skills are updated.\n\n## Safety: no tests dropped, and failures still fail CI\n\n**The same tests run, checked three ways.**\n\n| Check | Result |\n|---|---|\n| Structure | The runner's 6 suites are exactly the 6 files the integration scripts exclude; the coverage test enforces this. Compared with `main`, the only behavioral change in `test-integration.{sh,bat}` is the removed runner call. The extension-host sections are byte-identical. |\n| Azure DevOps, per suite | Published test results from `main` build [485709](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=485709) (old flow, same base commit) and [485718](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=485718) (new flow) have identical result files and per-suite test counts: 3226 tests on macOS, 3222 on Linux, 3879 on Windows. |\n| Local (macOS), same build, only the scripts differ | The old and new flows ran the **same 1927 test titles** (1790 passing, 137 pending). The E2E suites ran exactly once in each flow. |\n\n**Failures still fail CI**, checked by adding failing tests in draft #342386 (do not merge):\n\n| Pipeline | Agent Host E2E step | Integration step | Overall |\n|---|---|---|---|\n| GitHub Actions, all 3 platforms ([run](https://github.com/microsoft/vscode/actions/runs/39124548569)) | fails, exit 1 | still runs, fails, exit 1 | job fails |\n| ADO product build ([485723](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=485723)), all 3 platforms | fails; the test results list the injected test as failed | skipped | job fails |\n| ADO flaky detection ([485724](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=485724)), all 3 platforms | `exited with code '1'` | `exited with code '1'` | partially succeeded (`continueOnError`, as intended) |\n\nOn Windows, this covers both `.bat` scripts under GitHub's `pwsh` and Azure DevOps's `exec { }`.\n\n## Validation\n\n- **Build tests.**\n  - `cd build \u0026\u0026 node --test lib/test/agentHostTestSelection.test.ts lib/test/testCheckpoint.test.ts lib/test/testCheckpointTemplates.test.ts lib/testAgentHostE2EStartup.test.ts`: **passed** (41/41)\n  - Each guard test fails on the gap it guards:\n    - The coverage test fails when an unlisted `*AgentHostE2E.integrationTest.ts` file is added.\n    - The pairing test fails on the flaky-detection pipelines without their E2E step.\n    - The inventory test fails when `integration-agent-host-e2e` is removed from one job list.\n- **New script, locally (macOS).**\n  - `./scripts/test-agent-host-e2e.sh --grep \"provider session config schema is exposed through AHP\"`: all 6 suites pass, exit 0.\n  - With `VSCODE_SKIP_AGENT_HOST_E2E=1`, the script prints the skip message and exits 0.\n  - With an invalid `--jobs 0`, it exits 1.\n- **Lint and syntax.** `npm run eslint` on the changed TypeScript, `bash -n` on the `.sh` scripts, and parsing of every changed YAML file: **passed**.\n- **CI on the PR head (9daad9eaf1b).**\n  - **GitHub Actions** ([run](https://github.com/microsoft/vscode/actions/runs/39124533082)): every check **passed**, including Compile \u0026 Hygiene, which runs all `build/` tests.\n  - **ADO product build** ([485725](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=485725), `VSCODE_BUILD_TYPE=CI`, no publishing): **succeeded** on Windows, Linux and macOS. Both units recorded their own checkpoints.\n    - One unrelated Linux smoke test failed on the first attempt and passed on retry: `Agents Window (SSH Dev Container AgentHost)` timed out waiting for a response.\n- **ADO flaky detection** ([485719](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=485719), integration only, 2 iterations, on 9cf899d11f0): **succeeded**. Every iteration ran Agent Host E2E, then the integration tests, and Windows kept its odd/even iteration split. The pipelines haven't changed since.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342346",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "789f2c470d13c4760f2b5cc6a9e1919c05d04f7d",
+    "HeadRef": "agents/split-agent-host-e2e-ci-step",
+    "HeadSHA": "9daad9eaf1b9450f46dd21b8149f2b4ef4e25e0b",
+    "CreatedAt": "2026-10-17T23:17:32Z",
+    "UpdatedAt": "2026-10-18T14:29:41Z",
+    "MergedAt": "2026-10-18T14:28:58Z",
+    "Labels": [
+      "flaky-test-fix"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-2CD69C1A2C42",
+      "Focus": "performance-review",
+      "Path": ".github/workflows/pr-linux-test.yml",
+      "Side": "RIGHT",
+      "Line": 362,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The changed status-function condition, sequential workflow order, full integration command, 20-minute timeout, and prior shell/batch fail-fast control flow are all explicit in the repository. Exact duration varies by platform, but the added critical-path subprocess and its serialization are certain.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "an additional full Electron integration subprocess tree and its CPU, memory, and filesystem work",
+      "PerformanceScaling": "The added cost is one complete non-E2E integration suite per platform for every E2E failure; the steps are serialized, so all of that suite's duration is added directly to failed-job latency.",
+      "PerformanceOutcome": "blocked critical path and increased CI runner time after a definitive test failure",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Agent Host E2E ran at the start of `test-integration.sh`/`.bat`; a nonzero runner exit stopped the script before the node and extension-host integration suites, so failed jobs did not pay for that remaining work.",
+      "ChangedBehavior": "A failed Agent Host E2E step is now followed serially by the unrelated Electron integration suite on each affected GitHub Actions platform, rather than ending the test command immediately.",
+      "CausalDiffEvidence": "The added RIGHT-side condition at .github/workflows/pr-linux-test.yml:362 explicitly admits `steps.agent-host-e2e.outcome == 'failure'`, so the following full `./scripts/test-integration.sh` subprocess runs after the new E2E step has failed. The same condition is added on macOS and Windows. Before this diff, `test-integration.sh` invoked `node ./test/integration/agentHost/runner.ts` under `set -e` (and the batch script used `if errorlevel 1 goto :failed`), so an E2E failure terminated the combined step before the remaining integration suite started.",
+      "Title": "Do not serialize the full integration suite after E2E has failed",
+      "Impact": "Whenever Agent Host E2E fails or flakes, the PR job retains the runner and delays the already-known failure result by one complete Electron integration run (up to the new 20-minute timeout on each platform), increasing CI latency and runner consumption precisely on failed runs.",
+      "Evidence": "`test/integration/agentHost/runner.ts` runs six E2E entrypoints via child processes and returns a nonzero exit when any fails. The added workflow step runs that runner first; line 362 then overrides GitHub Actions' normal success gating and launches `scripts/test-integration.sh`, whose unfiltered path runs all non-E2E node integration tests followed by extension-host suites. These are sequential workflow steps on the same runner, with the second step capped at 20 minutes. Previously the E2E runner lived inside `test-integration.sh`; `set -e` on Unix and `goto :failed` on Windows prevented the remaining suites from running after its failure.",
+      "Recommendation": "Preserve collection of both results without serializing them: move Agent Host E2E and the regular integration suite to independent jobs/runner executions so they can run concurrently. Until that split exists, retain normal fail-fast gating instead of forcing the regular suite to start after E2E failure."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "GitHub Actions affected PR, successful Agent Host E2E",
+        "CriticalPath": "For an affected PR, the E2E runner and then the full regular Electron integration suite must both finish before later job steps can progress. They remain on one runner and are not overlapped.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/integration/agentHost/runner.ts main/runSuite; scripts/test-integration.sh unfiltered path",
+            "Operation": "Run the six Agent Host E2E entrypoints and all remaining Electron integration suites.",
+            "Cardinality": "One runner process spawning six E2E suite processes, followed by one unfiltered integration script that launches the node integration Electron process and multiple extension-host test processes, per enabled platform.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same E2E and regular integration subprocesses ran in the same order inside one test-integration invocation.",
+            "CriticalPathEffect": "All processes are sequential across the two units and block completion of the PR platform job."
+          }
+        ],
+        "ScalingInput": "Six fixed E2E entrypoints plus the repository's non-E2E node and extension-host integration suites, once per Linux/macOS/Windows PR job.",
+        "EffectiveConcurrency": "The E2E runner starts up to six suite workers internally; after all workers finish, the workflow starts the regular integration command. Effective concurrency between the two units is one (fully serialized).",
+        "CacheBehavior": "Dependencies and Electron are already prepared by earlier CI steps; both new commands set VSCODE_SKIP_PRELAUNCH=1, so neither performs a cold download. The same workspace and build outputs remain warm between the sequential steps. Change detection is the only skip cache and is evaluated once before these steps.",
+        "MechanismConfidence": "High: command cardinality, ordering, worker cap, and prelaunch skip are explicit in the changed workflows and runner.",
+        "MagnitudeUncertainty": "Step-boundary overhead is not measured, but it is constant and small relative to the unchanged test processes.",
+        "Verdict": "No reportable regression on the success path: the expensive test cardinality and serialization are unchanged; only the shell/workflow step boundary is new."
+      },
+      {
+        "Scenario": "GitHub Actions unaffected PR where Agent Host E2E is skipped",
+        "CriticalPath": "A small extra shell/batch step completes before the unchanged regular integration suite.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "scripts/test-agent-host-e2e.sh and scripts/test-agent-host-e2e.bat skip branch",
+            "Operation": "Check VSCODE_SKIP_AGENT_HOST_E2E and exit without launching the E2E runner.",
+            "Cardinality": "One wrapper process that exits immediately, then one regular integration invocation per platform.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The skip check occurred inside the existing test-integration process before regular integration tests.",
+            "CriticalPathEffect": "The wrapper adds only constant process-launch overhead before the integration suite."
+          }
+        ],
+        "ScalingInput": "One skip check per enabled platform, independent of repository or test count.",
+        "EffectiveConcurrency": "Serialized, but the skipped E2E step performs no test work.",
+        "CacheBehavior": "Change detection sets VSCODE_SKIP_AGENT_HOST_E2E=1. The new wrapper exits before starting Node or Electron; regular integration uses the already-prepared Electron build with VSCODE_SKIP_PRELAUNCH=1.",
+        "MechanismConfidence": "High: both wrappers return before their Node exec/call when the skip variable is set.",
+        "MagnitudeUncertainty": "Exact shell startup cost is unmeasured but bounded to one process and no Electron/test execution.",
+        "Verdict": "No reportable regression; the only added work is a bounded wrapper launch."
+      },
+      {
+        "Scenario": "GitHub Actions affected PR where Agent Host E2E fails or flakes",
+        "CriticalPath": "The failed E2E unit completes first; the full non-E2E integration suite is then placed on the failed job's critical path before the failure result can finish.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": ".github/workflows/pr-linux-test.yml:362 (mirrored in pr-darwin-test.yml:208 and pr-win32-test.yml:259)",
+            "Operation": "Launch test-integration after steps.agent-host-e2e.outcome == failure.",
+            "Cardinality": "One complete regular Electron integration subprocess tree after each E2E failure, on each affected platform.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The E2E runner was inside test-integration; set -e/goto :failed stopped before regular node and extension-host suites when E2E failed.",
+            "CriticalPathEffect": "Adds the entire integration duration, capped at 20 minutes, to failed-job latency."
+          }
+        ],
+        "ScalingInput": "One full regular integration suite per E2E failure per platform.",
+        "EffectiveConcurrency": "Strictly serialized on one runner; the regular suite cannot overlap the E2E attempt.",
+        "CacheBehavior": "The workspace remains warm after E2E failure and prelaunch remains skipped, but there is no negative-result suppression: the explicit status condition intentionally starts the unrelated suite despite the definitive failure.",
+        "MechanismConfidence": "Very high: the changed condition explicitly admits failure, ordering is sequential, and prior scripts explicitly failed fast.",
+        "MagnitudeUncertainty": "Actual suite duration and failure prevalence vary by platform and PR, but the added full-suite execution and 20-minute cap are certain.",
+        "Verdict": "Reportable medium latency/runner regression; submitted finding at .github/workflows/pr-linux-test.yml:362."
+      },
+      {
+        "Scenario": "Azure DevOps product integration first attempt and job retry",
+        "CriticalPath": "On a first successful attempt, E2E, its checkpoint publication, regular integration, and its checkpoint publication are sequential. On retry after a later integration failure, the E2E command is removed from the critical path by its checkpoint hit.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/*/steps/product-build-*-test.yml",
+            "Operation": "Run packaged Electron E2E and regular integration tests.",
+            "Cardinality": "One E2E subprocess unit and one regular integration subprocess unit per cold attempt; on a retry after E2E passed, zero E2E subprocesses.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Both sets ran inside the single integration-electron command and therefore shared one retry checkpoint.",
+            "CriticalPathEffect": "Cold successful work is equivalent except for checkpoint publication; warm retry latency is reduced by skipping E2E."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/publish-test-checkpoint.yml and integration-agent-host-e2e test ID",
+            "Operation": "Record and publish the independent E2E success checkpoint.",
+            "Cardinality": "One additional checkpoint file write and pipeline-artifact publication after successful E2E per platform.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the combined integration-electron checkpoint was published after both test sets passed.",
+            "CriticalPathEffect": "Adds a bounded checkpoint publication before regular integration, in exchange for eliminating the full E2E unit on applicable retries."
+          }
+        ],
+        "ScalingInput": "One checkpoint per platform per successful cold run; retry savings scale with the number of attempts after E2E has already passed.",
+        "EffectiveConcurrency": "One test unit at a time in the same job. The E2E runner still has its internal worker concurrency; no aggregate burst was added.",
+        "CacheBehavior": "The checkpoint restore performs one existing Azure DevOps artifact-list request for all IDs. A successful E2E unit now publishes its own tiny checkpoint artifact, allowing it to be skipped on a later job attempt; build files remain warm within an attempt.",
+        "MechanismConfidence": "High: restore uses one artifact-list request, conditions gate each ID independently, and record/publish occurs only after its test succeeds.",
+        "MagnitudeUncertainty": "Checkpoint publication latency and retry frequency are not measured; the artifact is a small fixed JSON file, while the skipped retry work is six E2E suites.",
+        "Verdict": "No regression finding. The small fixed extra artifact publication buys concrete avoidance of repeated E2E subprocess work on later integration-test retries."
+      },
+      {
+        "Scenario": "Azure DevOps flaky-detection iterations",
+        "CriticalPath": "Within every iteration, E2E remains before regular integration. Because both steps use continueOnError, the regular suite now also runs after an E2E failure; this intentionally collects both flaky-test results but lengthens that failing iteration.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/{linux,darwin,win32}/product-smoke-flaky-*.yml",
+            "Operation": "Run E2E and regular integration as separate continue-on-error tasks.",
+            "Cardinality": "Per effective iteration: six E2E suite subprocesses followed by the complete regular integration subprocess tree.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One integration script ran E2E first and exited before regular integration on E2E failure, though the pipeline continued to later iterations.",
+            "CriticalPathEffect": "Successful iteration cost is unchanged; after E2E failure, the regular integration tree is newly executed before the iteration sequence advances."
+          }
+        ],
+        "ScalingInput": "Effective configured iterations after Windows odd/even sharding; one extra regular suite for each iteration whose E2E unit fails.",
+        "EffectiveConcurrency": "Iterations and the two units within each iteration are serialized, except for the E2E runner's internal suite workers. Windows shards divide configured iterations before execution.",
+        "CacheBehavior": "Packaged builds are extracted once and reused across configured iterations. VSCODE_SKIP_PRELAUNCH=1 avoids downloads; there is no per-iteration checkpoint.",
+        "MechanismConfidence": "High: task order, continueOnError, and prior script fail-fast behavior are explicit.",
+        "MagnitudeUncertainty": "Configured iteration count and failure rate vary. The added failure-path work is certain, but this pipeline's explicit purpose is to collect independent flaky results.",
+        "Verdict": "The same failure-path eager work exists, but it is an explicit diagnostic tradeoff in a flaky-detection pipeline; no duplicate finding beyond the actionable PR-job critical-path issue."
+      },
+      {
+        "Scenario": "Local standalone integration and Agent Host E2E commands",
+        "CriticalPath": "Users now choose either test-integration (non-E2E tests) or test-agent-host-e2e (six E2E suites); running both commands sequentially is explicit rather than hidden in one command.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "test/integration/agentHost/runner.ts prepareTestRuntime and scripts/test.sh",
+            "Operation": "Check local dependencies/Electron version and prepare missing runtime assets.",
+            "Cardinality": "At most one dependency install or Electron download on a cold/mismatched workspace, followed by up to six E2E child test processes; regular integration is a separate invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The runner performed the same preparation when called from test-integration; subsequent regular tests were forced to skip prelaunch.",
+            "CriticalPathEffect": "Cold preparation blocks the selected command; warm runs avoid downloads through existing checks."
+          }
+        ],
+        "ScalingInput": "Fixed six E2E entrypoints, with runtime download only on a cold or mismatched workspace.",
+        "EffectiveConcurrency": "The standalone runner caps workers at min(requested jobs, six); regular integration runs after it only when the caller invokes both commands sequentially.",
+        "CacheBehavior": "The standalone E2E runner checks node_modules and Electron and downloads only when absent/version-mismatched. The regular integration script independently performs its normal prelaunch check unless the caller sets VSCODE_SKIP_PRELAUNCH. These are positive existence/version checks, not retained process caches.",
+        "MechanismConfidence": "High: wrapper dispatch and runtime existence/version checks are explicit.",
+        "MagnitudeUncertainty": "Local command combinations and cold-cache prevalence vary by developer workflow.",
+        "Verdict": "No reportable regression: command scope intentionally changes, worker concurrency remains bounded, and cold runtime preparation is guarded by existing positive checks."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 25 changed files and all diff pages. Successful and skipped CI paths preserve effective test cardinality; independent ADO checkpoints reduce retry repetition. One concrete regression was submitted: GitHub PR jobs now serialize a full regular integration run after Agent Host E2E has already failed, adding avoidable failed-job latency and runner work."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-20T20:39:29.977993807Z",
+    "CompletedAt": "2026-10-20T20:42:08.495234005Z",
+    "WallClockMilliseconds": 158517,
+    "ModelCalls": 8,
+    "InputTokens": 301019,
+    "OutputTokens": 10030,
+    "TotalTokens": 311049,
+    "ReasoningTokens": 4579,
+    "CacheReadTokens": 244302,
+    "CacheWriteTokens": 56693,
+    "APIDurationMilliseconds": 138118,
+    "ToolCalls": 59,
+    "NanoAIUnits": 58188180000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 244302,
+      "cache_write": 56693,
+      "input": 24,
+      "output": 10030
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
