@@ -1,0 +1,113 @@
+{
+  "PullRequest": {
+    "Number": 342869,
+    "Title": "Fix Customizations install availability after provider switches",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Summary\n\nFixes #342864.\n\n`CustomizationMarketplaceInstallService.bindInstallProvider()` previously cleared provider installations and fired `onDidChange` before assigning the replacement provider binding. Synchronous consumers such as an already-open marketplace detail recomputed installability from the old binding. When the replacement provider's first inventory was empty, the unchanged-inventory guard introduced by #342805 correctly suppressed that refresh, but also removed the only later notification that could repair the stale Install action.\n\nThis change establishes the invariant that a binding-change notification always observes both:\n\n- the replacement provider binding (or the cleared binding when switching away); and\n- an invalidated installation snapshot with the previous provider inventory removed.\n\nThe fix deliberately leaves request cancellation, provider listeners, refresh ordering, stale-response rejection, pending install/repair/uninstall state, and disposal behavior unchanged.\n\n## Regression test\n\nThe new `exposes an empty replacement provider to synchronous change observers` service test:\n\n1. starts with a provider whose authoritative inventory is empty;\n2. switches to a local harness without an install provider;\n3. subscribes to `onDidChange` and synchronously reads `getInstallState()`;\n4. switches to a replacement provider session whose first inventory is also empty; and\n5. verifies that the notification already exposes `available`, with the final state also `available`.\n\nBefore the production change, this test failed deterministically because the synchronous listener saw `unavailable` while the final state was `available`. After the ordering fix, it passes.\n\nThe complete install-service suite also covers provider-to-none replacement, provider inventory authority, changed and unchanged non-empty inventories, newest-response wins, install/repair/uninstall routing, cancellation, source-policy changes, and disposal.\n\n## Validation\n\n- `npm run build-fast -- --client-only` — passed (full client build after dependency restoration; incremental rebuild after the production change).\n- `./scripts/test.sh --run src/vs/workbench/contrib/chat/test/browser/aiCustomization/customizationMarketplaceInstallService.test.ts --grep \"exposes an empty replacement provider to synchronous change observers\"` — failed before the production change with synchronous state `unavailable`, then passed after the fix (1 passing).\n- `./scripts/test.sh --run src/vs/workbench/contrib/chat/test/browser/aiCustomization/customizationMarketplaceInstallService.test.ts` — passed (63 passing).\n- `npm run eslint -- src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMarketplaceInstallService.ts src/vs/workbench/contrib/chat/test/browser/aiCustomization/customizationMarketplaceInstallService.test.ts` — passed (2 files).\n- `npm run typecheck-client` — passed.\n- `git diff --check` — passed.\n\nA live manual UI run was not performed because the repro requires two controlled session/harness configurations with different install-provider applicability. The focused service test exercises the same synchronous `onDidChange` read used by existing marketplace detail/Browse consumers.\n\n## Independent review\n\nAn independent Astra review used `gpt-6-astra` with maximum reasoning and long context, focusing on synchronous event ordering, provider replacement, empty and non-empty inventories, cancellation/stale requests, pending operations, disposal, and regression coverage. It reported no significant issues, no high-severity findings, and no meaningful medium-severity findings.\n\n## Environment note\n\nAfter rebasing the fresh worktree onto current `origin/main`, `npm run install-fast` refreshed packages but failed downloading the unrelated Foundry native runtime (`Microsoft.ML.OnnxRuntime 1.28.0`). JavaScript dependencies were restored with `npm install --ignore-scripts`; all validation commands above then completed successfully. No dependency manifests changed.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342869",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "ulugbekna",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "7c4967fad9776df2bf2dc830b8e37aa11a452bff",
+    "HeadRef": "ulugbekna/agents/fix-empty-provider-transition-regression",
+    "HeadSHA": "1825ed565433bea24c17580bbd0d32caba443b71",
+    "CreatedAt": "2026-10-20T12:48:02Z",
+    "UpdatedAt": "2026-10-20T15:51:51Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "repeated-work",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Switch the active customization harness/provider while the marketplace detail or customization lists are open",
+        "CriticalPath": "The harness observable synchronously calls bindInstallProvider, clears the prior request, clears provider installations, assigns the replacement binding, and emits one change. Existing UI observers may synchronously read getInstallState or the cached installation snapshot and update/filter visible items. The asynchronous provider inventory fetch is started only after the notification and is off the synchronous UI critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostCustomizationMarketplaceInstallProvider.ts:258",
+            "Operation": "Load session-bound customization installation receipts through agentHostService.listCustomizationInstallations",
+            "Cardinality": "At most one new inventory request per provider bind; rapid provider switches can leave prior non-cancellable host calls briefly overlapping, while stale results are rejected by binding/version checks.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same refreshProviderInstallations call occurred once after every provider binding, with the same placement, cancellation token, and stale-response guards.",
+            "CriticalPathEffect": "The call is asynchronous and does not block the synchronous binding-change notification or immediate install-state read; its eventual changed inventory can cause a later notification."
+          }
+        ],
+        "ScalingInput": "Synchronous observer work scales with the number of existing listeners and visible/observed customization items; snapshot reconstruction scales with recorded/provider installations but is lazily cached. The diff preserves exactly one binding-change event and therefore does not increase that cardinality.",
+        "EffectiveConcurrency": "One refresh is initiated for each provider bind. providerRequest.clear cancels the prior token and refreshVersion/binding identity rejects stale completions; underlying host IPC may overlap during rapid switches because that API does not accept the token, but this behavior is unchanged by the diff.",
+        "CacheBehavior": "emitChange invalidates installationSnapshot as before; the next observer read rebuilds it once and later reads reuse it. The replacement provider starts from an intentionally empty snapshot, and the provider receipt cache remains bounded and unchanged.",
+        "MechanismConfidence": "High: the changed hunk only moves the existing emitChange after providerBinding assignment within the same bind invocation; all event guards and the subsequent refresh call are unchanged.",
+        "MagnitudeUncertainty": "Visible collection sizes and exact filtering/layout cost vary, but the diff does not add an event, rebuild, layout, or boundary call, so magnitude does not create a regression mechanism.",
+        "Verdict": "No reportable performance regression. Consumers perform the same amount of synchronous work once per provider switch; they now observe the replacement binding rather than the old one."
+      },
+      {
+        "Scenario": "Complete the replacement provider's initial inventory refresh, including an empty inventory",
+        "CriticalPath": "After the binding-change event, refreshProviderInstallations awaits the provider inventory boundary, compares the returned array with the cleared providerInstallations array, and emits only if inventory differs. An empty result exits through the unchanged equality guard without a second notification.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/aiCustomization/customizationMarketplaceInstallService.ts:171",
+            "Operation": "Fetch the replacement provider's installation inventory",
+            "Cardinality": "One fetch per binding; provider onDidChange events can trigger further fetches, each versioned, exactly as before the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The fetch, JSON serialization comparison, and conditional later notification had identical cardinality and ordering relative to request setup; only the earlier notification observed the old binding.",
+            "CriticalPathEffect": "This asynchronous fetch determines authoritative installed state but does not delay the initial binding notification; non-empty changes notify observers later, while empty inventories are handled by the initial notification."
+          }
+        ],
+        "ScalingInput": "Comparison cost scales with the provider inventory length and snapshot rebuilding scales with installation count. The diff neither changes inventory size nor adds comparisons or refreshes.",
+        "EffectiveConcurrency": "Refreshes for one binding are versioned so only the newest completion commits. Replacement cancels the prior request token and identity-checks responses; no new concurrency or burst was added.",
+        "CacheBehavior": "Cold replacement state clears prior provider installations; equal empty results are a negative/empty success and do not re-emit. Non-empty results populate providerInstallations and invalidate the lazily rebuilt snapshot. All cache keys, bounds, and invalidation frequency are unchanged.",
+        "MechanismConfidence": "High: direct diff and call-path inspection show assignment/event reordering only, with refresh, deduplication, cancellation, and cache behavior untouched.",
+        "MagnitudeUncertainty": "Provider inventory sizes and host latency vary, but boundary count and serialization work are unchanged, so there is no diff-caused performance impact.",
+        "Verdict": "No reportable performance regression and no qualifying performance-regression fix; the PR fixes synchronous state visibility rather than reducing a performance mechanism."
+      }
+    ],
+    "Summary": "Reviewed the complete two-file diff and traced provider rebinding through synchronous UI observers, lazy snapshot construction, list filtering, async provider inventory retrieval, cancellation, stale-response rejection, and bounded provider receipt caching. The change preserves event and boundary-call cardinality and introduces no performance issue."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-20T17:10:23.657296141Z",
+    "CompletedAt": "2026-10-20T17:11:37.829456971Z",
+    "WallClockMilliseconds": 74172,
+    "ModelCalls": 7,
+    "InputTokens": 163053,
+    "OutputTokens": 3717,
+    "TotalTokens": 166770,
+    "ReasoningTokens": 901,
+    "CacheReadTokens": 123743,
+    "CacheWriteTokens": 39289,
+    "APIDurationMilliseconds": 55387,
+    "ToolCalls": 36,
+    "NanoAIUnits": 32036620000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 123743,
+      "cache_write": 39289,
+      "input": 21,
+      "output": 3717
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
