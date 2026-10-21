@@ -1,0 +1,177 @@
+{
+  "PullRequest": {
+    "Number": 342968,
+    "Title": "Engineering - retry macOS notarization once on MacSignFailed",
+    "Body": "macOS ESRP notarization intermittently fails with `Status: FailDoNotRetry Error: {\"code\":\"MacSignFailed\",…}`, which fails the macOS Sign job until someone retries it by hand.\n\n**Evidence**\nIn every occurrence I pulled, the failure was in the **notarize** phase after all four codesigns succeeded, and only one file failed each time (mostly the server or web zip, once the DMG). Other builds notarized fine in the same hour, and a manual job retry always went green.\n- Final failure: [481671](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=481671) (arm64 failed on two attempts with different files).\n- Manual retries: [476331](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=476331), [477747](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=477747), [481662](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=481662), plus x64 in 481671. In the last 30 days that was 6 manual retries and about 10 h of delay on official builds.\n\n**Change**\n`darwin/codesign.ts` notarizes the failed file once more after 3 minutes, and only when the ESRP output contains `\"code\":\"MacSignFailed\"`. Any other failure, or a second `MacSignFailed`, fails as today. Codesign is never repeated.\n\n`retryCountOnTaskFailure` can't do this, because signing runs in a `deemon` background process and retrying the task would only reattach to it.\n\nThe notarization is awaited per process instead of through `await proc.pipe(process.stdout)`. In zx 8.8.5 that pipe promise only resolves once every process piped into stdout has finished. The notarize processes therefore no longer wait on each other.\n\n**Safety**\nNotarization submits the already signed file to Apple, so repeating it is harmless. A file that isn't properly signed fails again. Worst case adds about 12 minutes to a job capped at 240.\n\n**Validation**\n- `tsc` on the build project: no new errors versus `main`.\n- Ran `codesign.ts` against a fake ESRP `sign.ts`:\n  - A transient `MacSignFailed` recovers on attempt 2.\n  - A persistent one fails after 2 attempts.\n  - Another error code fails at once.\n  - The happy path makes exactly one sign and one notarize call per file.\n\n\u003e Authored with Copilot\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342968",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "cb40b49b4c7d67fa909ddcb35a63c83810d728b6",
+    "HeadRef": "copilot/vscode/retry-mac-notarization",
+    "HeadSHA": "b0f55c29665c58428f1a2848da64fb40593270ef",
+    "CreatedAt": "2026-10-20T19:00:33Z",
+    "UpdatedAt": "2026-10-21T01:40:16Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Successful macOS codesign and notarization for a standard x64/arm64 product build",
+        "CriticalPath": "Each of four artifact tasks must finish its codesign subprocess and notarization subprocess before the top-level Promise.all and the post-job attach step can complete. The work is on the packaging job's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/darwin/codesign.ts:44 via build/azure-pipelines/common/codesign.ts:28 and common/sign.ts:200",
+            "Operation": "Spawn Node sign.ts, which synchronously launches the dotnet ESRP CLI for Darwin signing.",
+            "Cardinality": "Four signing subprocess chains for a standard build, one per artifact group.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same four signing subprocess chains ran concurrently before the diff.",
+            "CriticalPathEffect": "Each artifact's notarization cannot start until signing completes; all four chains must complete before packaging progresses."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/sign.ts:164-200",
+            "Operation": "ESRP CLI signs each artifact group through the configured ESRP service.",
+            "Cardinality": "One ESRP CLI invocation for each of four artifact groups on the signing phase.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical remote signing invocations existed before the diff.",
+            "CriticalPathEffect": "Remote signing latency gates each corresponding notarization and ultimately the Promise.all."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/darwin/codesign.ts:22 via build/azure-pipelines/common/codesign.ts:28",
+            "Operation": "Spawn Node sign.ts, which launches dotnet ESRP CLI for MacAppNotarize.",
+            "Cardinality": "Four notarization subprocess chains on a successful standard build.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same four notarization subprocess chains ran; the diff changes how each process result is awaited but adds no successful-path process.",
+            "CriticalPathEffect": "All four successful notarizations must finish before the job proceeds."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/sign.ts:110-117,164-200",
+            "Operation": "ESRP/Apple notarization submission for each artifact group.",
+            "Cardinality": "Four successful notarization submissions, grouped by artifact.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical four submissions occurred before the diff.",
+            "CriticalPathEffect": "The slowest required artifact submission bounds completion of the top-level Promise.all."
+          }
+        ],
+        "ScalingInput": "Four artifact groups (client, DMG, server, web) for non-universal builds; each group is handled by one subprocess rather than per contained file.",
+        "EffectiveConcurrency": "The existing Promise.all starts four task chains. Each chain has at most one child process active, so effective aggregate concurrency is at most four. The diff does not raise that cap.",
+        "CacheBehavior": "There is no local positive or negative cache: every build submits each artifact group to ESRP. On the successful path the diff adds no retry and does not alter cold/warm behavior.",
+        "MechanismConfidence": "High: the four explicit task chains, subprocess launch, ESRP operation set, and Promise.all join are directly visible in repository code.",
+        "MagnitudeUncertainty": "Remote ESRP and Apple durations vary, but no successful-path boundary or cardinality is added.",
+        "Verdict": "No reportable regression. Successful builds perform the same grouped signing and notarization boundaries, with unchanged bounded concurrency."
+      },
+      {
+        "Scenario": "Successful universal macOS build",
+        "CriticalPath": "The direct codesign.ts pipeline step waits for both client and DMG task chains through Promise.all; signing and notarization are critical-path remote operations.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/darwin/codesign.ts:65-74",
+            "Operation": "Launch sign.ts/dotnet ESRP for signing and then notarization.",
+            "Cardinality": "Two signing and two notarization subprocess chains.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two sign and two notarize subprocess chains ran.",
+            "CriticalPathEffect": "Both chains must complete before the direct pipeline step returns."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/sign.ts:101-117,164-200",
+            "Operation": "Submit client and DMG operations to ESRP, including Apple notarization.",
+            "Cardinality": "Two grouped signing submissions and two grouped notarization submissions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same grouped remote submissions ran before the diff.",
+            "CriticalPathEffect": "Remote completion gates the build step."
+          }
+        ],
+        "ScalingInput": "Two artifact groups because server and web tasks are excluded when VSCODE_ARCH is universal.",
+        "EffectiveConcurrency": "At most two active child processes, one per task chain; unchanged by the diff.",
+        "CacheBehavior": "No cache or coalescing exists, but each logical artifact group is submitted once on success before and after the diff.",
+        "MechanismConfidence": "High: the architecture guard and direct pipeline invocation establish this two-item path.",
+        "MagnitudeUncertainty": "Exact remote service duration is variable, but the unchanged cardinality and concurrency are explicit.",
+        "Verdict": "No reportable regression; the successful universal workflow has unchanged expensive-boundary counts."
+      },
+      {
+        "Scenario": "A notarization returns MacSignFailed",
+        "CriticalPath": "The failed artifact waits three minutes and then must complete one retry before its task can succeed or fail. Other artifact chains continue independently, but top-level Promise.all still waits for all successful work or rejects on a terminal failure.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/darwin/codesign.ts:22-39",
+            "Operation": "Launch one additional Node sign.ts/dotnet ESRP notarization attempt for each artifact group with the targeted failure.",
+            "Cardinality": "At most one added subprocess chain per failing artifact: up to four on standard builds or two on universal builds, but normally only the artifact that failed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The first failed notarization terminated the build; recovery required an external job rerun, which repeated broader signing/notarization work.",
+            "CriticalPathEffect": "Adds a fixed three-minute wait plus the retry duration to recovery or terminal-failure latency for that artifact."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/darwin/codesign.ts:22-39 via build/azure-pipelines/common/sign.ts:110-117,164-200",
+            "Operation": "Resubmit the already signed artifact group through ESRP/Apple notarization.",
+            "Cardinality": "One additional grouped remote submission per MacSignFailed artifact, bounded by NOTARIZE_ATTEMPTS = 2.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No in-process resubmission occurred; the job failed and any manual job retry repeated all relevant phases.",
+            "CriticalPathEffect": "The retry is on the recovery critical path after the three-minute delay."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is the number of the 2 or 4 artifact groups that independently return the exact MacSignFailed code. Each such group receives at most one retry.",
+        "EffectiveConcurrency": "One process per artifact chain remains the limit. A failed initial process exits before its timer and retry, so aggregate subprocess concurrency cannot exceed the existing two/four task count; there is no retry burst above the initial cap.",
+        "CacheBehavior": "Failures are not cached or coalesced across artifact groups. The retry is intentionally fresh after a fixed delay; the two-attempt constant bounds repeated work.",
+        "MechanismConfidence": "High: the exact-code guard, constant attempt limit, timer, subprocess call, and top-level task cardinality directly establish the mechanism.",
+        "MagnitudeUncertainty": "It is uncertain how often multiple artifact groups fail together and how long a retry takes, but the maximum repeat count and concurrency are explicit and small.",
+        "Verdict": "No reportable performance regression. The added boundary is narrowly triggered, limited to one retry per failed artifact, does not increase peak concurrency, and is the intentional recovery work replacing immediate failure/manual reruns. Persistent failures pay bounded extra diagnosis latency, not an unbounded or scaling regression."
+      }
+    ],
+    "Summary": "Reviewed the complete one-file diff and traced standard, universal, successful, transient-failure, and persistent-failure paths through child-process and ESRP/Apple boundaries. The change adds only a fixed one-retry path for the targeted failure and does not increase successful-path work or peak concurrency; no high-confidence actionable performance issue was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-21T01:49:23.567982957Z",
+    "CompletedAt": "2026-10-21T01:51:06.541912029Z",
+    "WallClockMilliseconds": 102973,
+    "ModelCalls": 6,
+    "InputTokens": 89578,
+    "OutputTokens": 5382,
+    "TotalTokens": 94960,
+    "ReasoningTokens": 2820,
+    "CacheReadTokens": 65536,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 84916,
+    "ToolCalls": 20,
+    "NanoAIUnits": 23002240000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 65536,
+      "cache_write": 0,
+      "input": 24042,
+      "output": 5382
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
