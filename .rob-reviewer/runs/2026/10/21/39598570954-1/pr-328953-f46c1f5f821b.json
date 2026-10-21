@@ -1,0 +1,244 @@
+{
+  "PullRequest": {
+    "Number": 328953,
+    "Title": "agentHost: sync workspace folders for existing sessions",
+    "Body": "## Summary\n\n- synchronize existing Editor Window Agent Host sessions when multi-root workspace folders are added or removed\n- keep working-directory actions on the ordinary optimistic AHP path and reduce accepted changes synchronously in Agent Host state\n- apply the complete authoritative root snapshot immediately before each provider send\n- preserve the immutable primary directory and never interrupt an active provider turn\n\n## Provider behavior\n\n- Claude safely rebinds its query/runtime when secondary roots change\n- Codex applies roots natively on the existing thread through `turn/start`\n- Copilot configures SDK additional-directory permissions and reuses the existing structural dispose/resume lifecycle when roots diverge\n- successful Copilot snapshots are persisted so removed roots do not return after cold restore\n\n## Workbench and protocol\n\n- reconcile workspace, trust, registration, subscription, reconnect, and pre-send changes through ordinary optimistic dispatch\n- convert working-directory action URIs at the Remote Development boundary\n- validate and canonicalize directory actions synchronously while preserving per-client action ordering\n- retain the existing AHP action schema and protocol version\n\n## Validation\n\n- 904 changed Node tests passing, 17 pending\n- 89 changed browser tests passing\n- 156 Copilot agent tests passing after final lifecycle and persistence repairs\n- `npm run typecheck-client`\n- `npm run valid-layers-check`\n- ESLint and hygiene checks for changed TypeScript files\n- `git diff --check`\n- independent code review and Rubber Duck review\n",
+    "URL": "https://github.com/microsoft/vscode/pull/328953",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "DonJayamanne",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "9f57500448ddef1b880e62c93b2832936a3142f6",
+    "HeadRef": "don/agents/dynamic-multi-root-working-directories",
+    "HeadSHA": "f46c1f5f821b75255773a5b64f1c2d462d03cd19",
+    "CreatedAt": "2026-08-04T12:28:20Z",
+    "UpdatedAt": "2026-09-19T23:24:53Z",
+    "MergedAt": "2026-08-05T15:22:44Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-E17DD3E688C1",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostUntitledProvisionalSessionService.ts",
+      "Side": "RIGHT",
+      "Line": 309,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed listener, retained rebound entries, per-key-only sequencer, and `_reconcileGeneration` create/dispose calls are directly traced. Provider creation cost is concrete: AgentService resolves config/customizations; Copilot initializes its client and probes project state; Claude probes git project state; Codex schedules SDK thread prewarming when available. Typical open-session count is uncertain, which affects severity rather than mechanism confidence.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "Agent Host IPC calls, provider session objects, git/customization work, and possible Codex SDK thread/prewarm subprocess operations.",
+      "PerformanceScaling": "Cost grows linearly with the number of tracked open chat resources whose working-directory snapshot differs; all keys run concurrently because sequencing is only per resource.",
+      "PerformanceOutcome": "A workspace event can cause concurrent provider lifecycle churn, increasing CPU/I/O pressure and interaction latency.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff, workspace-folder events did not traverse `_entries` or recreate provisional/provider generations; existing live sessions also had no replacement-session work on this event.",
+      "ChangedBehavior": "A workspace-folder add/remove now starts replacement generation work for every tracked chat resource whose roots differ. Each replacement crosses the Agent Host boundary to `createSession`, publishes the replacement, and disposes the previous provider session; per-key sequencing does not bound aggregate concurrency across resources.",
+      "CausalDiffEvidence": "The added workspace-folder listener iterates every `_entries` item and, at RIGHT line 309, queues `_reconcileGeneration` whenever the root set differs. Rebound real sessions remain in `_entries` as `newEntry` until the chat UI is disposed, so this is not limited to untouched drafts.",
+      "Title": "Do not recreate every tracked provider session on folder changes",
+      "Impact": "Adding or removing one workspace folder with several open agent chats can burst provider session creation/disposal, git/customization work, IPC, and Codex prewarm thread operations, consuming CPU/I/O and making the workbench or next agent interaction sluggish. Materialized chats pay this churn even though the live-session synchronizer already updates their roots with lightweight deltas.",
+      "Evidence": "`_entries` contains both untitled drafts and rebound real resources (`tryRebind` installs `newEntry` and does not remove it until chat disposal). The new listener queues all differing entries independently. `_reconcileGeneration` awaits `_agentHostService.createSession(...)`, then `_disposeBackend(previous.backendSession)`. AgentService `createSession` invokes provider creation and initial customization resolution; Codex `createSession` calls `_schedulePrewarm`, which can `_materializeIfNeeded` and issue thread operations. `SequencerByKey` serializes only a single resource, so N tracked resources can perform these expensive boundaries concurrently.",
+      "Recommendation": "Restrict this listener to genuinely unmaterialized untitled drafts (or remove entries when they are handed off to a live session) and let `AgentHostSessionWorkingDirectorySynchronizer` handle materialized sessions. If multiple drafts still need rebuilding, coalesce the event and run replacements through a shared concurrency limiter."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "repeated-work",
+      "missing-coalescing",
+      "cleanup-lifecycle",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Add or remove a folder while existing agent chats are open",
+        "CriticalPath": "Live-session reconciliation is scheduled asynchronously from the workspace event, so it is not a direct UI event barrier; its IPC/provider work can still contend with the workbench. The newly added provisional-generation replacement also runs asynchronously and can overlap across chats.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionWorkingDirectorySynchronizer.ts `_reconcile`",
+            "Operation": "Dispatch one optimistic session working-directory action for each effective root addition/removal.",
+            "Cardinality": "One dispatch per changed secondary root per active eligible session; optimistic state suppresses duplicate deltas and automatic triggers collapse to one follow-up pass.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Session working-directory actions were rejected and no workspace-event reconciliation was sent.",
+            "CriticalPathEffect": "Off the immediate workspace-event critical path, but the host must reduce these actions before later same-client turn actions."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostUntitledProvisionalSessionService.ts:309 `_reconcileGeneration`",
+            "Operation": "Create a replacement Agent Host/provider session and dispose the previous generation.",
+            "Cardinality": "Up to one create plus one dispose per tracked open resource whose roots differ, including rebound materialized resources.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Workspace-folder changes did not traverse tracked entries or replace generations.",
+            "CriticalPathEffect": "Runs asynchronously but all resource keys may overlap, creating CPU/I/O/subprocess contention and delaying nearby interactions."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts `_schedulePrewarm`",
+            "Operation": "If the SDK is already available, materialize a Codex thread for each newly created replacement session and later unsubscribe/expire it.",
+            "Cardinality": "Potentially one prewarm per replacement Codex session, concurrently across tracked chat resources.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No folder-event-driven replacement sessions existed to schedule these prewarms.",
+            "CriticalPathEffect": "Background work, but it consumes provider/subprocess capacity and can contend with active turns."
+          }
+        ],
+        "ScalingInput": "Number of active session registrations, number of tracked open chat resources, and number of changed workspace roots after set deduplication.",
+        "EffectiveConcurrency": "Live reconciliation is serialized and burst-coalesced per session, but not globally. Provisional generation replacement uses `SequencerByKey`, which serializes one chat resource while allowing all tracked resources to create/dispose provider sessions concurrently.",
+        "CacheBehavior": "The live synchronizer reads optimistic subscription state, preventing redispatch while confirmations are pending, and coalesces automatic triggers. Root comparisons avoid work when membership is unchanged. The replacement path has no global event-level coalescing or shared lifecycle-work limiter.",
+        "MechanismConfidence": "High: changed event handlers, cardinality, per-key concurrency, and provider create/dispose/prewarm boundaries are directly traced.",
+        "MagnitudeUncertainty": "Most users have few simultaneous open chats and workspace-folder changes are infrequent, but the tracked set is not statically bounded and provider lifecycle cost varies by provider and warm SDK state.",
+        "Verdict": "Reportable for the provisional-session listener because it fans expensive provider lifecycle work across retained materialized entries. The live delta synchronizer itself is appropriately coalesced and only emits effective root changes."
+      },
+      {
+        "Scenario": "Send the next prompt after workspace roots changed",
+        "CriticalPath": "Before turn dispatch, the workbench awaits a local reconciliation pass and trust lookup for new roots, then dispatches optimistic deltas before the turn. On the host, the complete resolved snapshot reaches the provider before the prompt enters its runtime. Provider reconfiguration is therefore on the prompt critical path only when roots actually changed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts:2464 `_handleTurn`",
+            "Operation": "Dispatch effective root deltas before the ordinary turn action.",
+            "Cardinality": "Zero when the optimistic snapshot already matches; otherwise one action per effective added/removed secondary root.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Prompt dispatch did not perform root reconciliation.",
+            "CriticalPathEffect": "Trust checks and ordered optimistic dispatch precede turn dispatch; server acknowledgements are not awaited."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeAgentSession.ts `send` / `_rebindForSyncedState`",
+            "Operation": "Restart/rebuild the Claude SDK query with changed additional directories.",
+            "Cardinality": "One rebuild per distinct changed root snapshot; identical and reordered sets are suppressed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Additional roots were fixed at initial materialization, so later sends did not rebuild for workspace changes.",
+            "CriticalPathEffect": "Blocks the first prompt after a root change; unchanged warm sends retain the existing query."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts `_sendMessage`",
+            "Operation": "Destroy the current Copilot SDK session and resume it with changed additional-directory permissions.",
+            "Cardinality": "One destroy/resume cycle per distinct changed additional-root set; equivalent reordered sets do not restart.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Root changes were not applied to an existing SDK session.",
+            "CriticalPathEffect": "Blocks the first prompt after a root change; ordinary warm sends do not restart."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeAgentSession.ts rematerializer and src/vs/platform/agentHost/node/copilot/copilotAgent.ts `_doResumeSession`",
+            "Operation": "Persist the successfully applied complete working-directory snapshot for cold restore.",
+            "Cardinality": "One metadata write after a successful changed-root rebuild/resume, not per unchanged send.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No updated root snapshot was persisted after runtime root changes.",
+            "CriticalPathEffect": "Included in changed-root reconfiguration before success is committed; absent from ordinary unchanged warm sends."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts `_sendMessage` turn/start construction",
+            "Operation": "Send current runtime workspace roots in the existing Codex turn/start request.",
+            "Cardinality": "Still one turn/start request per prompt; root metadata changes payload contents but does not add another boundary call.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same per-turn request existed, using the session's earlier root snapshot.",
+            "CriticalPathEffect": "Existing prompt boundary; the diff does not add a separate Codex request or restart."
+          }
+        ],
+        "ScalingInput": "Effective number of changed roots and frequency of workspace changes, not message count when roots are stable.",
+        "EffectiveConcurrency": "Reconciliation and sends are serialized per session/client ordering. Claude rebinds one query per changed snapshot; Copilot destroys and resumes one SDK session; Codex reuses the existing thread and places the latest roots in the existing per-turn request.",
+        "CacheBehavior": "Warm unchanged sends use set equality to avoid Claude/Copilot lifecycle work. Cold resumes seed from persisted metadata, while a send-time authoritative snapshot supersedes stale metadata and is persisted after successful application. There is no negative cache needed because failures intentionally remain retryable.",
+        "MechanismConfidence": "High: provider equality gates and exact restart/rebind call paths are visible and tested.",
+        "MagnitudeUncertainty": "SDK destroy/resume or Claude startup duration depends on provider state and machine, but its conditional placement on the changed-root prompt path is certain.",
+        "Verdict": "No additional finding: expensive provider lifecycle work is limited to actual root changes, coalesced with structural changes, and required to make permissions authoritative before the prompt."
+      },
+      {
+        "Scenario": "Create or rebind an untitled provisional session in a multi-root workspace",
+        "CriticalPath": "Picker-driven provisional creation and first-send rebind await Agent Host session creation. Workspace-folder-triggered replacement is background until a consumer waits for the current mapping.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostUntitledProvisionalSessionService.ts `_reconcileGeneration` and `tryRebind`",
+            "Operation": "Call Agent Host createSession and disposeSession for provisional generations.",
+            "Cardinality": "Normally one create for the selected draft and one create/dispose during rebind; after this diff, a workspace event may add one create/dispose pair for every tracked differing resource.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Initial creation/rebind boundaries already existed, but workspace-folder events did not multiply them across entries.",
+            "CriticalPathEffect": "Picker/rebind calls are critical to observing preserved config; workspace-event replacement is background but can become a wait target and contend globally."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts `createSession` and provider project discovery",
+            "Operation": "Resolve working directory and probe project/git/customization metadata during provider session creation.",
+            "Cardinality": "One provider initialization path per replacement session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No folder-event-driven replacement creation invoked these probes.",
+            "CriticalPathEffect": "Part of each Agent Host createSession request; concurrent replacements amplify filesystem/git work."
+          }
+        ],
+        "ScalingInput": "Number of tracked open draft or rebound chat resources and effective workspace membership changes.",
+        "EffectiveConcurrency": "Operations are serialized per chat resource. Independent untitled resources can create sessions concurrently; the new workspace event schedules all differing resources at once.",
+        "CacheBehavior": "Per-resource pending work is deduplicated and desired root sets are compared unordered, so workspace reorders are no-ops. There is no aggregate limiter across resources. Provider warm state may make creation cheaper, while Codex warm SDK state enables rather than eliminates prewarming.",
+        "MechanismConfidence": "High: `_entries` lifecycle, set comparison, queueing, and transitive provider work are traced.",
+        "MagnitudeUncertainty": "The common number of simultaneous drafts/open rebound chats is product-usage dependent; each boundary and unbounded cross-key overlap is established.",
+        "Verdict": "This is the reported concurrency-burst regression; restrict replacement ownership to true unmaterialized drafts and bound any remaining multi-draft work."
+      },
+      {
+        "Scenario": "Receive and validate working-directory actions in Agent Host state",
+        "CriticalPath": "The protocol notification is ordered per client, synchronously validated/canonicalized, and reduced before a later turn from that client can proceed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts and src/vs/platform/agentHost/node/agentService.ts `_prepareWorkingDirectoryAction`",
+            "Operation": "Deserialize the action, parse/canonicalize file URIs, check provider capability, and reduce it into session state.",
+            "Cardinality": "One host pass per dispatched effective root delta; list scans scale with the small workspace-root count.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Session root actions were immediately rejected rather than validated and reduced.",
+            "CriticalPathEffect": "Synchronous host work before subsequent ordered actions, but it performs no provider restart or I/O itself."
+          }
+        ],
+        "ScalingInput": "Effective changed-root action count multiplied by current workspace-root count.",
+        "EffectiveConcurrency": "Existing client sequencing preserves action order. Validation scans the current directory list; no new asynchronous filesystem or network operation is performed.",
+        "CacheBehavior": "No cache is needed for the small current root list; client-side optimistic state suppresses duplicate pending deltas. Canonicalization reuses existing URI spelling where possible.",
+        "MechanismConfidence": "High: the validation path and synchronous operations are direct.",
+        "MagnitudeUncertainty": "Very large multi-root workspaces increase URI comparison work, but realistic root counts and absence of boundary I/O keep this below reporting threshold.",
+        "Verdict": "No finding: bounded CPU/serialization work is proportional to effective deltas and is necessary for authoritative ordered state."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 28 changed files. One medium-severity concurrency-burst finding was submitted for workspace-folder events recreating provider generations across all tracked entries, including retained materialized sessions. Per-turn reconciliation, host validation, provider root application, persistence, coalescing, and cleanup paths were otherwise bounded to effective root changes or existing turn boundaries."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-21T12:29:21.516953931Z",
+    "CompletedAt": "2026-10-21T12:31:56.029669129Z",
+    "WallClockMilliseconds": 154512,
+    "ModelCalls": 10,
+    "InputTokens": 817351,
+    "OutputTokens": 10851,
+    "TotalTokens": 828202,
+    "ReasoningTokens": 3904,
+    "CacheReadTokens": 693790,
+    "CacheWriteTokens": 123531,
+    "APIDurationMilliseconds": 140534,
+    "ToolCalls": 78,
+    "NanoAIUnits": 111231100000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 693790,
+      "cache_write": 123531,
+      "input": 30,
+      "output": 10851
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
