@@ -1,0 +1,235 @@
+{
+  "PullRequest": {
+    "Number": 339438,
+    "Title": "github: add cloud automations, tasks and environments domains",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nRefs #339181.\r\n\r\n## Summary\r\n\r\nAdd typed Mission Control domains to the authorization-scoped `IGitHubClient`, backed by the existing GitHub credentials and transport:\r\n\r\n- **`automations`**: repository automation CRUD, manual runs, run history, and the authenticated, unpaginated `/agents/automations/tools` and `/agents/automations/triggers` catalogs.\r\n- **`tasks`**: task lifecycle and metadata, steering/abort, paginated raw events, and complete raw AHP history.\r\n- **`environments`**: environment lifecycle/status and typed connect/reconnect results, including credential-bearing and waking responses.\r\n- **`missionControlModels`**: the SWE model catalog at `/agents/swe/models`, not the general Copilot `/models` catalog.\r\n\r\nContracts and runtime parsers follow the Mission Control API. Clients are thin adapters: list operations return one page, pagination stays explicit, and there is no automatic detail hydration, polling, or AHP replay. Automation updates send `application/json`; omitted fields are left unchanged.\r\n\r\n## Consumer API\r\n\r\nAcquire the existing account client from `IWorkbenchGitHubService`. Authentication and endpoint selection remain on the client; every domain operation still requires an `AbortSignal`.\r\n\r\n```ts\r\nconst reference = await service.acquireDefaultAccountClient(signal);\r\ntry {\r\n\tconst page = await reference.object.automations.list(\r\n\t\t{ owner: 'dmitrivMS', name: 'myRepo' }, signal,\r\n\t);\r\n\t// Use page.data.automations; pagination remains explicit.\r\n} finally {\r\n\treference.dispose();\r\n}\r\n```\r\n\r\n## Transport and hosting behavior\r\n\r\n- Reuse the existing queue, cancellation/deadline handling, credentials, retry machinery, ETag cache, and telemetry. Shared REST request options add the policy controls and response metadata needed by these domains; existing REST/GraphQL defaults and admission/lease limits remain in place.\r\n- The workbench configures github.com accounts for `https://api.githubcopilot.com/agents`, with the integration header and without the default GitHub REST API-version header. Other hosts must supply approved endpoints explicitly; no Enterprise endpoint is inferred. Configuration participates in client lease identity. Missing configuration rejects Mission Control calls only.\r\n- Ordinary safe reads can coalesce/revalidate and retain one network/5xx retry when no server cooldown applies. Mutations, task-event reads, and credential-minting connect/reconnect GETs are not retried. Environment responses are not cached or shared; Mission Control redirects are not followed. Successful bodyless acknowledgements are discarded rather than parsed as JSON.\r\n- Dispatched writes with ambiguous outcomes report `outcome: 'indeterminate'` rather than being automatically replayed. Structured API errors expose sanitized contract fields, not raw response bodies.\r\n- Agents cooldowns use a service-host/originating-account identity separate from GitHub REST. Confirmed 403/429 throttling and 5xx `Retry-After` hints gate queued/subsequent requests without automatically replaying the failed request. Throttling without a usable hint falls back to 60 seconds. A successful waking 202 returns its delay as polling metadata, not a cooldown.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339438",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "c02f008cd15daeb773323c3813c203afc3fa40bc",
+    "HeadRef": "agents/github-api-domains-automations-tasks-envs",
+    "HeadSHA": "3db415d49981a042125c884a4ef5361b5160cac5",
+    "CreatedAt": "2026-10-03T00:33:20Z",
+    "UpdatedAt": "2026-10-08T03:11:42Z",
+    "MergedAt": "2026-10-08T03:10:42Z",
+    "Labels": [
+      "network"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-BEFB00468A12",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/github/common/missionControl/tasksClient.ts",
+      "Side": "RIGHT",
+      "Line": 332,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The recursive implementation of `jsonObject`, the nested amendment call graph, the complete unpaginated input, and browser-side execution path are explicit. Only the prevalence of near-limit histories is uncertain.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "Main-thread CPU plus temporary and returned JavaScript objects/arrays allocated while recursively copying parsed JSON.",
+      "PerformanceScaling": "CPU and allocation grow with total history bytes and nesting; message payload/action subtrees are copied in the outer event pass and then copied again at each nested amendment, so large extension payloads incur multiple full traversals.",
+      "PerformanceOutcome": "Increased history-load latency, CPU/GC pressure, and potential dropped frames while parsing large task histories.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR there was no Mission Control AHP history path or synchronous schema-copy pass over complete task histories in the GitHub client.",
+      "ChangedBehavior": "The new complete-history parser first recursively copies every JSON field in each AHP frame and then repeats recursive preservation at the payload, message-data, and action layers while validating known fields.",
+      "CausalDiffEvidence": "Added line 332 introduces the outer recursive clone for each frame; nested added `parse.amend(parse.jsonObject, ...)` parsers cause the already-copied subtrees to be traversed and allocated again.",
+      "Title": "Parse complete AHP histories without recursively cloning every frame",
+      "Impact": "Opening a long-running task history can synchronously traverse and allocate several object graphs for a multi-megabyte response on the workbench thread, increasing response latency and causing UI pauses and GC churn. Cost is largest for message actions with deeply nested extension data and for histories near the 16 MiB transport cap.",
+      "Evidence": "Added line 332 wraps every event in `parse.amend(parse.jsonObject, ...)`. `parse.jsonObject` recursively rebuilds every nested object/array via `Object.fromEntries` and `jsonValue` (`schema.ts:145-149`); the same frame then reaches nested `parse.amend(parse.jsonObject, ...)` calls for `payload` (lines 341-344), message `data` (line 310), and `action` (line 312). `getAhpEvents` requests the complete history across all sessions in one response, and the transport permits a 16 MiB body. This runs after JSON parsing in the browser-side workbench service.",
+      "Recommendation": "Validate the JSON-compatible frame once, then validate known envelope fields against that object without recursively rebuilding the same payload at each layer; preserve extension fields with a single pass or shallow object reuse."
+    },
+    {
+      "ID": "PERF-590BFC1F91B9",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/github/common/missionControl/missionControlClient.ts",
+      "Side": "RIGHT",
+      "Line": 165,
+      "Severity": "medium",
+      "Confidence": 0.92,
+      "ConfidenceRationale": "The new cache opt-in, complete unpaginated history contract, 500-entry count limit, 16 MiB body limit, and shared-client lifetime are directly established in code. Exact impact depends on server ETag/no-store headers and real history sizes, which lowers severity rather than mechanism confidence.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceResource": "Raw response-body bytes retained as JavaScript strings in the shared LRU cache.",
+      "PerformanceScaling": "Retained memory grows with the number of distinct task/page/representation keys (up to 500 entries) times each history body size (up to 16 MiB); warm revalidation extends entry recency rather than releasing the body.",
+      "PerformanceOutcome": "Substantial retained memory and resulting GC pressure during long-lived Mission Control usage.",
+      "ChangeCausality": "materially-amplified",
+      "PreviousBehavior": "Before this PR, Mission Control task-event and complete-history payloads could not enter this GitHub client's shared REST cache; the cache primarily served the pre-existing GitHub REST operations.",
+      "ChangedBehavior": "All non-sensitive Mission Control GETs, including paginated task events and the complete unpaginated AHP history, now opt into the shared transport's ETag body cache.",
+      "CausalDiffEvidence": "Added line 165 passes `etag: true` for non-sensitive Mission Control requests, newly admitting the complete-history response bodies added by this PR into the long-lived shared cache.",
+      "Title": "Do not retain complete task histories in the entry-counted ETag cache",
+      "Impact": "When a consumer inspects event histories for many long-running tasks and the service supplies ETags without `no-store`, raw multi-megabyte response strings remain reachable until 500 newer entries evict them. Even dozens of histories can retain hundreds of megabytes for the lifetime of the account client, causing memory and GC pressure in the workbench.",
+      "Evidence": "The changed line sets `etag: !sensitive` for every ordinary Mission Control read. `TasksClient.getAhpEvents` is an ordinary GET whose contract is the complete raw stream across every session without pagination (`tasks.ts:535`), while `GitHubTransport` stores the raw body in an LRU limited to 500 entries (`githubTransport.ts:130,705`) and permits each response to reach 16 MiB (`githubTransport.ts:148`). The cache has no byte budget, and keys differ by task URL, page/query, and Accept representation, so histories for different tasks do not deduplicate; in-flight coalescing helps only concurrent identical reads.",
+      "Recommendation": "Separate in-flight coalescing from retained ETag caching and disable retained-body caching for `getEvents`/`getAhpEvents`, or enforce a byte-weighted cache budget so large histories evict proportionally while preserving small-response revalidation."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "serialization-allocation",
+      "boundary-fanout",
+      "missing-coalescing",
+      "concurrency-burst",
+      "eager-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Acquire and retain the default GitHub account client in the workbench",
+        "CriticalPath": "Account/session selection and synchronous client construction must complete; the newly constructed Mission Control client and four domain adapters perform no network or parsing work until a domain method is called.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of retained authorization clients, bounded by the existing 64-client service capacity; the workbench normally retains one default-account reference.",
+        "EffectiveConcurrency": "No requests are scheduled during construction.",
+        "CacheBehavior": "No response cache is populated. Mission Control endpoint configuration only participates in the existing client lease key.",
+        "MechanismConfidence": "High: constructors and call sites show only object/listener allocation.",
+        "MagnitudeUncertainty": "The extra objects and one credential-invalidation listener per retained client are small; no heavyweight eager boundary is reached.",
+        "Verdict": "No reportable eager-work regression; construction is lightweight and bounded."
+      },
+      {
+        "Scenario": "List or read automations, tasks, models, and ordinary environment metadata",
+        "CriticalPath": "Credential acquisition (including cold identity resolution when needed), queue admission/cooldown, one service GET, bounded body read, JSON parse, and domain schema parsing all complete before results are available.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubCredentialService.ts:_resolveIdentity",
+            "Operation": "Resolve the authenticated GitHub account with `/user` on a cold/new credential generation.",
+            "Cardinality": "At most once per credential generation; concurrent requests share the current generation and warm requests reuse it.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Existing authenticated GitHub operations already used the same credential service and cold identity-resolution boundary.",
+            "CriticalPathEffect": "On the first domain request for a generation, identity resolution completes before the Mission Control call can dispatch."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/missionControl/missionControlClient.ts:request",
+            "Operation": "GET one requested Mission Control page, detail, tool/trigger catalog, or SWE model catalog.",
+            "Cardinality": "One cold/conditional request per explicit operation after identical in-flight coalescing; no automatic page scan or detail hydration.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These Mission Control domain boundaries were not exposed through `IGitHubClient` before the PR.",
+            "CriticalPathEffect": "Response download and parsing are on the result critical path."
+          }
+        ],
+        "ScalingInput": "One request per explicitly requested page/detail/catalog. Distinct task, repository, page/query, endpoint, and Accept values produce distinct keys; no hidden hydration or automatic pagination occurs.",
+        "EffectiveConcurrency": "The shared queue allows four globally and two per host/caller, but `_nextIndex` permits only one active request for a host/account key. Concurrent identical non-sensitive reads coalesce with at most 64 waiters; different resources serialize per service account.",
+        "CacheBehavior": "Cold ordinary reads make a network request and may retain an ETag body. Warm reads still make a conditional network request and parse the cached body on 304. Concurrent identical reads coalesce. `no-store` evicts; failures and empty/no-validator successes are not negatively cached. Sensitive environment list/get calls disable cache and sharing entirely.",
+        "MechanismConfidence": "High: route wrappers, queue policy, cache key, and transport flow are explicit.",
+        "MagnitudeUncertainty": "Catalog and ordinary page sizes are service-dependent, but pages are explicitly capped by caller pagination and the transport body cap.",
+        "Verdict": "No fan-out or concurrency-burst finding for ordinary reads; explicit pagination and account serialization bound network work. Large retained ETag bodies are covered by the submitted cache-lifecycle finding."
+      },
+      {
+        "Scenario": "Create, update, delete, dispatch, steer, archive, or connect/reconnect an environment",
+        "CriticalPath": "Credential acquisition, serialized queue admission, exactly one non-retried service request, bounded response read when applicable, and response parsing must finish. Connect/reconnect returns a 202 polling hint but performs no automatic polling.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/missionControl/missionControlClient.ts:request",
+            "Operation": "Send one Mission Control mutation or credential-minting connect/reconnect request.",
+            "Cardinality": "Exactly one dispatch per explicit call; no automatic retry, redirect, replay, or poll.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The authorization-scoped client had no Mission Control mutation or environment-credential boundary.",
+            "CriticalPathEffect": "The service response or acknowledgement is on the operation critical path."
+          }
+        ],
+        "ScalingInput": "One request per explicit mutation or credential-minting call; caller-driven waking polls scale with caller policy rather than an internal loop.",
+        "EffectiveConcurrency": "Mutations and credential GETs are unshared and non-retried. The queue serializes active operations for a service account and retains at most 64 requests for that account/caller.",
+        "CacheBehavior": "Writes are not cacheable. Credential-bearing connect/reconnect and sensitive environment operations disable ETags and coalescing; no negative caching is used.",
+        "MechanismConfidence": "High: request policy explicitly disables retries, sharing, redirects, and caching for these operations.",
+        "MagnitudeUncertainty": "Caller polling frequency after 202 is outside this diff; the client only surfaces Retry-After.",
+        "Verdict": "No reportable burst or missing-coalescing issue; duplicate credential calls are intentionally not shared, and account serialization bounds aggregate concurrency."
+      },
+      {
+        "Scenario": "Read paginated SDK task events or a complete raw AHP task history",
+        "CriticalPath": "Credential acquisition, queue admission, one GET, download up to 16 MiB, JSON parsing, and synchronous schema validation/copying complete before the history is returned. AHP history is unpaginated and therefore one whole-history boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/missionControl/tasksClient.ts:getEvents/getAhpEvents",
+            "Operation": "GET one SDK-event page or the complete AHP history for a task.",
+            "Cardinality": "One request per explicit page/history after identical in-flight coalescing; AHP serves the complete task history in one response.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Mission Control task-history network operation existed on `IGitHubClient`.",
+            "CriticalPathEffect": "The full response must download before JSON/schema parsing and caller progress."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/github/common/missionControl/tasksClient.ts:parseTaskAhpEventsResponse",
+            "Operation": "Parse JSON and recursively validate/preserve every event, payload, message-data, and action object.",
+            "Cardinality": "One full parse per response, including each 304 cached-body reuse; work scales with every frame and nested extension field.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The client had no complete AHP schema traversal before this PR.",
+            "CriticalPathEffect": "Synchronous parsing and copying occur before the promise resolves and are on the browser workbench critical path."
+          }
+        ],
+        "ScalingInput": "SDK events scale by explicitly requested page. AHP scales with all raw frames across every session in one task; distinct task IDs and Accept representations are distinct cache entries.",
+        "EffectiveConcurrency": "Each service account has one active request. Identical simultaneous reads coalesce up to 64 waiters; different histories queue. Internal network/5xx retry is disabled.",
+        "CacheBehavior": "Cold reads make one network call. Despite retry being disabled, both event APIs currently opt into ETag retention through the common non-sensitive default; warm reads conditionally revalidate and reparse. Cache capacity is 500 entries by count rather than bytes, with no negative cache.",
+        "MechanismConfidence": "High: complete-history shape, nested recursive parser, cache policy, body cap, and queue behavior are directly traced.",
+        "MagnitudeUncertainty": "Real task-history byte sizes and server ETag/no-store behavior vary; the transport nevertheless admits 16 MiB and the contract explicitly requests complete history.",
+        "Verdict": "Reportable regressions submitted for count-bounded retention of large histories and repeated recursive cloning during complete-history parsing."
+      },
+      {
+        "Scenario": "Continue using existing GitHub REST/GraphQL features while Mission Control traffic is active",
+        "CriticalPath": "All traffic shares global queue admission, while Mission Control uses a separate service-host/account identity and `agents` cooldown resource. Existing REST/GraphQL calls do not wait on ordinary Agents cooldowns, though all requests still compete for the four global active slots.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/githubTransport.ts and requestQueue.ts",
+            "Operation": "Existing GitHub REST/GraphQL requests continue through the shared queue while Mission Control requests target the Copilot service host.",
+            "Cardinality": "Unchanged per existing caller; Mission Control adds only explicitly invoked calls and no hidden fan-out.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Mission Control calls consumed global queue slots or shared ETag-cache capacity.",
+            "CriticalPathEffect": "Possible bounded global-slot contention exists only when both workloads are active; separate host/account/cooldown identities avoid serializing them behind Agents throttles."
+          }
+        ],
+        "ScalingInput": "Concurrent explicit operations across existing GitHub features and Mission Control domains.",
+        "EffectiveConcurrency": "Four active globally, two per host/caller, and one active per account key. GitHub REST and api.githubcopilot.com have different host/account keys; Mission Control cannot exceed its own account serialization but may consume global slots.",
+        "CacheBehavior": "Mission Control and GitHub REST share the transport's 500-entry ETag LRU for the same authorization client, though account/host keys prevent representation collisions. Mission Control entries can consume shared capacity.",
+        "MechanismConfidence": "High for queue/cache sharing and isolation; low prevalence does not change the mechanism.",
+        "MagnitudeUncertainty": "Current production callers of the newly exposed domains are not added in this diff, so contention prevalence is unknown.",
+        "Verdict": "No separate concurrency finding: global work is capped at four and Mission Control is account-serialized. Shared cache memory amplification is covered by the submitted cache finding."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 24 changed files and relevant transport, queue, credential, cache, parser, lifecycle, and test context. Submitted two medium findings: large complete-history bodies enter a count-only long-lived ETag cache, and complete AHP histories are recursively copied multiple times during synchronous parsing. Explicit pagination, request coalescing, account serialization, retry policy, cancellation, and sensitive-response handling otherwise bound network and concurrency costs."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-21T17:37:05.447133693Z",
+    "CompletedAt": "2026-10-21T17:40:05.575052975Z",
+    "WallClockMilliseconds": 180127,
+    "ModelCalls": 8,
+    "InputTokens": 582610,
+    "OutputTokens": 10967,
+    "TotalTokens": 593577,
+    "ReasoningTokens": 4923,
+    "CacheReadTokens": 475648,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 166934,
+    "ToolCalls": 68,
+    "NanoAIUnits": 83744720000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 475648,
+      "cache_write": 0,
+      "input": 106962,
+      "output": 10967
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

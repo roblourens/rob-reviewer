@@ -1,0 +1,235 @@
+{
+  "PullRequest": {
+    "Number": 343186,
+    "Title": "github: avoid unnecessary allocations during request validation.",
+    "Body": "",
+    "URL": "https://github.com/microsoft/vscode/pull/343186",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "2deba53c56298b7b8651db9f09abf9723e788c79",
+    "HeadRef": "dev/dmitriv/github-parse",
+    "HeadSHA": "6ef438cb458894e047315328885647b0a848492c",
+    "CreatedAt": "2026-10-21T10:02:39Z",
+    "UpdatedAt": "2026-10-21T10:21:19Z",
+    "MergedAt": null,
+    "Labels": [
+      "network"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/github/common/client/schema.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 145,
+      "BasePath": "src/vs/platform/github/common/client/schema.ts",
+      "BaseLine": 123,
+      "IntroducingPath": "src/vs/platform/github/common/schema.ts",
+      "IntroducingCommit": "e63c52742b08f197ca9127f931531f1b11f4b4c2",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceCategory": "gc",
+      "Mechanism": "Schema validation allocated a duplicate object for every nested API record even when no value changed, scaling allocations with records across collected pages.",
+      "Symptom": "Avoidable allocation and GC pressure while validating large nested or paginated GitHub API responses.",
+      "FixedBehavior": "Unchanged plain API objects are returned by reference, with a shallow copy created only when parsing transforms a field.",
+      "Evidence": "Base line 123 eagerly allocated a fresh result object for every parse.object call. This parser is recursively composed for nested API records and paginated lists that can collect up to 100 pages of 100 entries, so unchanged responses created one duplicate object per parsed record. Added line 145 reuses a plain input record and copies only if a declared field is transformed. Blame identifies the eager allocation as introduced by e63c52742b08f197ca9127f931531f1b11f4b4c2.",
+      "Confidence": 0.92
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "unbounded-retention",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Validate REST and GraphQL API responses for interactive PR, review, CI, search, and agent workflows",
+        "CriticalPath": "The network response and any remote-provider IPC reply must complete before JSON decoding and schema validation; validation is therefore on the request critical path. The diff removes duplicate container allocation for unchanged plain objects/arrays and copies only transformed containers.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/client/localApiRequestProvider.ts:execute",
+            "Operation": "REST or GraphQL HTTP request returning buffered text",
+            "Cardinality": "One request for ordinary reads; complete list workflows use up to 100 sequential pages, commonly 100 records per page after endpoint grouping.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same HTTP requests, pagination, and response sizes occurred before the diff.",
+            "CriticalPathEffect": "Each page must arrive before its JSON text can be decoded and validated; independent endpoint reads can overlap."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/github/common/remote/ipcClient.ts:RemoteApiRequestProvider.execute",
+            "Operation": "Remote provider sends request metadata/body and receives response body text",
+            "Cardinality": "One request/reply pair per HTTP page when the shared-process provider is used; no per-record IPC.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one-pair-per-page boundary existed; response bodies already used a separate text tuple slot.",
+            "CriticalPathEffect": "IPC reply is required before caller-side JSON decoding and validation."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/github/common/client/request.ts:parseResponse and src/vs/platform/github/common/client/schema.ts:createObjectParser/arrayOf",
+            "Operation": "JSON.parse followed by recursive schema validation",
+            "Cardinality": "One decode per response page; validation visits each declared field and collection entry. Effective input can reach thousands of records across bounded pagination.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Validation eagerly allocated a new object and array for every nested container even when no value changed.",
+            "CriticalPathEffect": "Runs synchronously after each response arrives. The diff eliminates one duplicate object/array allocation per unchanged parsed container."
+          }
+        ],
+        "ScalingInput": "Declared fields and nested containers per response, multiplied by records per page and collected pages; complete workflows are bounded at 100 pages and typically 100 records per page.",
+        "EffectiveConcurrency": "Pages are fetched sequentially by collectPages; realistic feature workflows may run independent endpoints in Promise.all, while the shared request queue limits admission and identical GETs are coalesced. There is no new concurrency introduced by the diff.",
+        "CacheBehavior": "REST GETs use a 500-entry LRU ETag cache and in-flight coalescing. Warm/revalidated responses still require caller-side decoding/validation of the buffered body, so the allocation reduction applies on cold and warm paths. GraphQL requests use their existing in-flight coalescing behavior; schema parsing has no separate result cache.",
+        "MechanismConfidence": "High: diff identity tests and call paths prove unchanged JSON containers are reused and transformed containers are copied lazily.",
+        "MagnitudeUncertainty": "Exact allocation and GC savings depend on response shape and page count; undocumented fields are now retained in returned values, but traced product consumers generally project list results immediately and no unbounded cache or IPC amplification was established.",
+        "Verdict": "No reportable regression. The changed parser reduces synchronous allocation/GC work; preserving unknown fields can increase temporary retained size for callers that keep raw domain objects, but repository paths did not establish unbounded lifetime or a concrete user-visible regression."
+      },
+      {
+        "Scenario": "Dispatch API requests while keeping request bodies out of IPC metadata validation",
+        "CriticalPath": "Body serialization and request metadata validation occur before IPC/network dispatch, so they are on the request critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/github/common/client/request.ts:BufferedApiRequestProvider.request",
+            "Operation": "Serialize the optional request body once and validate body-free metadata",
+            "Cardinality": "Exactly once per logical API request, independent of body field count after JSON.stringify.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The body was serialized once, then parseRequest's eager copying incidentally removed it from metadata. The diff explicitly destructures it because validation now reuses plain input objects.",
+            "CriticalPathEffect": "Must complete before provider execution."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/github/common/remote/ipc.ts:ApiRequestMessage",
+            "Operation": "Send metadata and body text in separate tuple slots for remote execution",
+            "Cardinality": "One IPC call per remote request/page.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same tuple boundary and call count existed; eager parser copying previously filtered the body from metadata.",
+            "CriticalPathEffect": "Remote execution waits for the IPC request; caller waits for its reply."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/client/localApiRequestProvider.ts:execute",
+            "Operation": "Execute the validated REST, GraphQL, Mission Control, or connector request",
+            "Cardinality": "One network operation per provider request, subject to existing coalescing/pagination.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same endpoint and request count.",
+            "CriticalPathEffect": "Dominates request latency and is unchanged by metadata allocation behavior."
+          }
+        ],
+        "ScalingInput": "Request frequency and body byte length; the shallow metadata destructure is constant in the small request-field count, while body serialization scales with body size as before.",
+        "EffectiveConcurrency": "One metadata object and one serialized body per logical request; shared GET coalescing and the existing request queue remain authoritative. Mutations are not retried and are independently scheduled under existing policy.",
+        "CacheBehavior": "GET cache keys and coalescing use existing transport metadata/body semantics. Separating body before validation does not change cache keys, negative caching, or in-flight sharing.",
+        "MechanismConfidence": "High: direct call flow shows the metadata object reaches the same provider and boundary exactly once.",
+        "MagnitudeUncertainty": "The added shallow destructure allocates one metadata object, but it replaces the top-level object that parseRequest previously allocated, so no net per-request allocation regression was established.",
+        "Verdict": "No reportable regression; the explicit split preserves prior boundary cardinality while allowing parser reuse."
+      },
+      {
+        "Scenario": "Download anonymous raw repository content with protected transport limits",
+        "CriticalPath": "Metadata validation, optional IPC, and the anonymous download all complete before file contents are returned.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/client/localApiRequestProvider.ts:execute",
+            "Operation": "Anonymous raw-content download capped at 1 MiB with a five-minute timeout",
+            "Cardinality": "One download per requested file; no per-byte or per-option fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One download with the same default cap and timeout; options were spread after defaults, allowing override, whereas the diff now forwards only caller/deadline/priority.",
+            "CriticalPathEffect": "The download is the critical path for file content."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/github/common/remote/ipcClient.ts:RemoteApiRequestProvider.execute",
+            "Operation": "Forward raw-content request to a remote provider when applicable",
+            "Cardinality": "One request/reply pair per file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same IPC call count and payload body behavior.",
+            "CriticalPathEffect": "Required before and after the shared-process network call."
+          }
+        ],
+        "ScalingInput": "Number of files requested and content bytes, with each response bounded to 1 MiB by the fixed option.",
+        "EffectiveConcurrency": "One download per call under existing transport scheduling; no loop or burst is added.",
+        "CacheBehavior": "No new parser cache is involved. Existing transport scheduling/redirect behavior remains; tests cover cold downloads rather than a response-object cache.",
+        "MechanismConfidence": "High: the changed object literal forwards three allowed scheduling fields and retains the existing fixed limits.",
+        "MagnitudeUncertainty": "Actual file sizes and request frequency vary, but the diff narrows options and does not add work.",
+        "Verdict": "No reportable regression; boundary count is unchanged and the response byte bound can no longer be raised through extra options."
+      },
+      {
+        "Scenario": "Parse and retain Mission Control structured error diagnostics",
+        "CriticalPath": "On failed Mission Control requests, the response body must be decoded and diagnostics parsed before the error can be surfaced or serialized across IPC.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/client/localMissionControlRequestProvider.ts",
+            "Operation": "Mission Control API request that returns a structured error body",
+            "Cardinality": "One network response per failed request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same request and error-body boundary.",
+            "CriticalPathEffect": "Failure handling waits for the response and bounded body parsing."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/github/common/missionControl/missionControlClient.ts:parseApiError",
+            "Operation": "Copy only documented top-level and nested diagnostic fields",
+            "Cardinality": "One top-level object, one activation context, and one object per documented error entry.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old general object parser always copied and filtered these fields; the diff opts this retention-sensitive path into the new explicit copying parser.",
+            "CriticalPathEffect": "Runs synchronously before constructing/serializing ApiRequestError."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/github/common/remote/serialization.ts:serializeGitHubError",
+            "Operation": "Serialize a bounded Mission Control error to the caller when using the remote provider",
+            "Cardinality": "At most one error reply per failed remote request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same IPC error reply; undocumented fields were already filtered.",
+            "CriticalPathEffect": "Caller cannot observe the failure until the reply arrives."
+          }
+        ],
+        "ScalingInput": "Number of structured error entries and documented string lengths in one bounded transport response.",
+        "EffectiveConcurrency": "One parse per failed request; failures do not create additional remote calls or retries on this path.",
+        "CacheBehavior": "Failures are not positively cached by schema parsing, and no negative-cache behavior changes. Error objects live according to caller ownership as before.",
+        "MechanismConfidence": "High: changed parsers and tests prove fresh filtered copies at every retained diagnostic object boundary.",
+        "MagnitudeUncertainty": "Service error payload size varies, but explicit copyObject usage prevents unknown nested diagnostics from being retained or serialized.",
+        "Verdict": "No reportable regression; explicit copying preserves the prior bounded-retention behavior despite the general parser optimization."
+      }
+    ],
+    "Summary": "Reviewed all nine changed files and complete diff pages. The PR removes eager recursive schema-container allocations, preserves request/IPC boundary cardinality, fixes raw-download option filtering, and keeps retained Mission Control diagnostics explicitly copied. No diff-introduced performance finding met the reporting threshold; the concrete parser allocation regression fix was recorded separately."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-21T17:33:43.616952368Z",
+    "CompletedAt": "2026-10-21T17:37:00.592291812Z",
+    "WallClockMilliseconds": 196975,
+    "ModelCalls": 15,
+    "InputTokens": 1052612,
+    "OutputTokens": 11135,
+    "TotalTokens": 1063747,
+    "ReasoningTokens": 4450,
+    "CacheReadTokens": 941568,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 173517,
+    "ToolCalls": 88,
+    "NanoAIUnits": 104350320000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 941568,
+      "cache_write": 0,
+      "input": 111044,
+      "output": 11135
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
