@@ -1,0 +1,121 @@
+{
+  "PullRequest": {
+    "Number": 343073,
+    "Title": "agentHost: keep live MCP server state when a plugin is republished under a new URI (fixes flake)",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n**TL;DR:** `runtime MCP: identical plugin republished under a different URI does not restart servers` flaked because the republished plugin's MCP server was published as `stopped` even though it kept running. It only flipped to `ready` when an unrelated inventory refresh landed, which raced the end of the next turn. This PR fixes the product: when a plugin is replaced under a new URI, the controller moves the running server's live state to the replacement child in the same tick. The test now also asserts the state right after the republish, so a regression fails deterministically.\n\n### CI failures\n- macOS, GitHub `pr.yml` › `Run Agent Host E2E tests (Electron)`, Oct 19 (passed on re-run with the same SHA): https://github.com/microsoft/vscode/actions/runs/39333991327/job/118339055918\n  ```\n  - { processStarts: 1, restartStates: [], state: 'stopped' }\n  + { processStarts: 1, restartStates: [], state: 'ready' }\n  ```\n  No restart happened (`processStarts: 1`, `restartStates: []`), so the server never stopped; only its published state was wrong.\n\n### Root cause\n- Since #342634, an identical plugin republished at a new URI no longer reloads the Copilot runtime. Its MCP servers keep running and emit no lifecycle events.\n- The republished plugin's MCP children get **new ids**, because child ids derive from the plugin URI.\n- `McpCustomizationController.runtimeStates` is keyed by the **previously published** child id ([`mcpCustomizationController.ts` L238](https://github.com/microsoft/vscode/blob/64ea39c174587b6931c32b76b6bd69c290c81188/src/vs/platform/agentHost/node/shared/mcpCustomizationController.ts#L238)). The publish overlay looks up children only by id ([L106](https://github.com/microsoft/vscode/blob/64ea39c174587b6931c32b76b6bd69c290c81188/src/vs/platform/agentHost/node/shared/mcpCustomizationController.ts#L106), applied by the Copilot plugin controller at [`copilotAgent.ts` L10464](https://github.com/microsoft/vscode/blob/64ea39c174587b6931c32b76b6bd69c290c81188/src/vs/platform/agentHost/node/copilot/copilotAgent.ts#L10464)). It misses, so the new child is published with the default `stopped` state.\n- The state is corrected only when a later `applyOne`/`applyAll` re-resolves the child by name. In this test that happens through the turn-start `session.mcp_servers_loaded` → `rpc.mcp.listConfigured` refresh ([`copilotAgentSession.ts` L9835](https://github.com/microsoft/vscode/blob/64ea39c174587b6931c32b76b6bd69c290c81188/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L9835)). Locally it landed only **26 ms** before `turnComplete` of the replayed turn (`.538` vs `.564`). On a slow runner the RPC loses that race, and the test reads `stopped` after the turn.\n\nThe rest of the controller already identifies live servers by **name** (`_findPublishedMcpCustomization`, `serverNameForCustomizationId`). Only the runtime-state overlay used the stale id.\n\n### Fix\n- `McpCustomizationController` re-keys live child servers whenever session customizations change. If a live child's **container is no longer published** and the same server name now resolves to another published child, the live state moves to that child and is emitted as `SessionMcpServerStateChanged`, in the same tick as the republish. Later publishes overlay by the new id, so the server stays `ready`.\n- A container that is still published is never followed, and the state moves only when exactly one published child has the server's name. So another plugin declaring the same server name keeps its own state (addressing review feedback). The runtime-state overlay is unchanged and still matches by id only.\n- The change is in the shared controller, so Codex plugin children get the same behavior.\n- New unit tests in `mcpCustomizationController.test.ts`: a child whose plugin is replaced under another URI keeps its live state; a second plugin declaring the same server name does **not** take it, either while the original is published or when the original is replaced.\n- E2E test: also asserts `republishedState`, the relocated server's state right after the republish. A regression now fails deterministically instead of depending on the refresh race.\n\n### Evidence\nLocal runs on macOS of `--grep \"republished under a different URI\"`. \"Injected delay\" means a temporary 3 s delay before the turn-start inventory refresh, applied in `out/` only, to model the slow runner.\n\n| Build | Injected delay | Result |\n|---|---|---|\n| baseline (no fix) | none | ❌ `republishedState: 'stopped'` (the race was won by 26 ms, so `state: 'ready'`) |\n| baseline (no fix) | 3 s | ❌ `{ processStarts: 1, restartStates: [], republishedState: 'stopped', state: 'stopped' }`, the exact CI symptom |\n| **fix** | none | ✅ pass |\n| **fix** | 3 s | ✅ pass |\n\n### Validation\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/shared/mcpCustomizationController.test.ts`: ✅ 37 passing. The replacement and ambiguous-name tests each fail with their guard disabled.\n- `./scripts/test.sh` on `copilotAgent.test.ts`, `codexAgent.test.ts`, `codexMcpServers.test.ts`, `codexClientCustomizations.test.ts`, and `mcpCustomizationController.test.ts`: ✅ 955 passing.\n- `./scripts/test-integration.sh --run src/vs/platform/agentHost/test/node/e2e/providers/copilotAgentHostE2E.integrationTest.ts --grep \"republished under a different URI\"`: ✅ with the fix, ❌ without it (table above).\n- `--grep \"runtime MCP\"` (adjacent tests, with the fix): the republish, built-in subagent, and host plugin file tests passed. On this shared machine (load average ~100), `stopped and restarted` failed **twice with the fix and passed once with the fix and once on baseline**. The log shows the MCP child taking ~9.5 s to reach `ready` against that test's ~10 s retry window, a path this change doesn't touch. `invalid sibling images` hit a 5 s subscribe timeout once and passed on rerun. Teardown hooks failed on `GET /json/version` replay misses from an external DevTools port probe on the machine. Please treat CI as the signal for these adjacent tests.\n- `npm run eslint -- \u003cchanged files\u003e`: ✅. `npm run typecheck-client`: ✅. Commit hygiene hook: ✅.\n- Local E2E runs used a temporarily raised server-startup timeout in `out/` (54 s cold start under this load), which is not part of this PR. The table above was re-run on the final re-key implementation; teardown hooks reported only external `GET /json/version` probe misses.\n\ncc @connor4312\n\n\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/343073",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ea64e8b6f3af9dba91c77ddb7e994ef47d922448",
+    "HeadRef": "agents/copilot-runtime-mcp-flake",
+    "HeadSHA": "47d8f95d949af10d7079e8d9a99c2641876c47c4",
+    "CreatedAt": "2026-10-20T22:50:35Z",
+    "UpdatedAt": "2026-10-21T00:46:47Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A running MCP child server's plugin is republished under a new URI and the session customization replacement is emitted.",
+        "CriticalPath": "The state manager first reduces the customization action, then synchronously fires onDidEmitEnvelope; the new controller listener scans the resulting in-memory customization inventory and relocates matching live child state before envelope dispatch returns.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Top-level customizations plus their MCP children, and the controller's live MCP-server map. A relocation adds one lookup over the inventory for each orphaned live child whose server name is unique; ordinary entries are filtered without that lookup.",
+        "EffectiveConcurrency": "Single-threaded synchronous event dispatch inside one state-manager action; relocation updates are coalesced in one observable transaction. No async fan-out or concurrent boundary work is added.",
+        "CacheBehavior": "The controller reads authoritative session state directly and allocates transient Set/Map indexes per qualifying customization envelope; there is no cold/warm external cache and no negative-cache retry behavior.",
+        "MechanismConfidence": "High confidence in the synchronous O(customizations + children + relocated-live-children × inventory) CPU/allocation mechanism; low evidence that realistic cardinality or frequency makes it user-visible.",
+        "MagnitudeUncertainty": "Plugin catalogs and MCP-child counts vary, but realistic plugins expose few MCP servers and republish is an administrative event rather than a per-token, per-frame, or per-message hot path.",
+        "Verdict": "No reportable performance regression. The diff performs bounded in-memory reconciliation on the customization-change path and introduces no expensive boundary operation."
+      },
+      {
+        "Scenario": "Ordinary SessionCustomizationUpdated and SessionCustomizationsChanged actions, including Copilot plugin sync and Codex workspace skill/hook refreshes.",
+        "CriticalPath": "Each qualifying action is synchronously reduced and then invokes every MCP controller subscribed to that session; each listener scans the current customization tree even when no child container replacement occurred.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_doRefreshSkillHookCustomizations",
+            "Operation": "Discover workspace agents, instructions, and skills before publishing the Codex refresh.",
+            "Cardinality": "One grouped discovery pass per coalesced/serialized refresh across configured workspace roots; this boundary occurs before the changed listener executes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same filesystem discovery and grouped publishing occurred before the PR; only the subsequent in-memory envelope listener is new.",
+            "CriticalPathEffect": "Discovery must finish before customization update actions are emitted; the added listener does not add, repeat, or move these filesystem calls."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_fetchSkillHookContainers via _doRefreshSkillHookCustomizations",
+            "Operation": "Fetch Codex native skill and hook catalogs through the app-server before constructing grouped containers.",
+            "Cardinality": "Grouped catalog requests per serialized refresh, independent of the number of customization children published.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical native catalog fetches occurred before the diff.",
+            "CriticalPathEffect": "Requests complete before the update loop; the changed code neither invokes them nor moves them onto a new path."
+          }
+        ],
+        "ScalingInput": "Number of emitted top-level update actions times customization containers and children, multiplied by MCP controllers sharing the owner session. Codex groups skills by workspace root/scope and hooks into one container, limiting effective update cardinality rather than emitting one action per skill/hook child.",
+        "EffectiveConcurrency": "Providers sequence or coalesce refreshes (Codex directory operations use a sequencer and native catalog notifications are debounced); state actions and listeners run serially. Multiple controllers create synchronous listener fan-out but no concurrency burst.",
+        "CacheBehavior": "No memoized index is used; each envelope rebuilds transient published-id and child-name indexes. This is repeated CPU/allocation work, but there is no I/O cache, remote cache, or cache-miss amplification.",
+        "MechanismConfidence": "High confidence that scans fan out synchronously; moderate-to-low confidence that practical inventories/controller counts make the added CPU and transient allocations materially expensive.",
+        "MagnitudeUncertainty": "Large multi-root catalogs and many retained Codex runtimes can multiply scans, but grouping keeps action cardinality small and repository evidence does not establish a realistic latency or throughput symptom.",
+        "Verdict": "No finding. The broad listener adds repeated in-memory work, but traced grouping, event frequency, and lack of expensive boundaries do not support a high-confidence actionable performance regression."
+      },
+      {
+        "Scenario": "MCP lifecycle transitions for top-level and child servers after the controller is installed.",
+        "CriticalPath": "Child transitions emit SessionMcpServerStateChanged and do not trigger the new listener. Top-level transitions emit SessionCustomizationUpdated, which synchronously triggers one inventory scan after the state update.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Top-level lifecycle transition count times customization-tree size and same-owner controller count. Lifecycle changes are server-state events, not token/stream events.",
+        "EffectiveConcurrency": "Provider updates are applied synchronously in observable transactions; state envelopes are serialized by JavaScript execution. No new limiter, queue, IPC, or subprocess is involved.",
+        "CacheBehavior": "Runtime state is held in the existing observable live map. The new reconciliation has no persistent cache and cannot accumulate keys; transient indexes are released after each call.",
+        "MechanismConfidence": "High confidence in which action types trigger the listener and in the absence of an external boundary; low confidence in material impact.",
+        "MagnitudeUncertainty": "Users may configure varying MCP server counts, but no evidence shows lifecycle transitions at a frequency or inventory size that produces user-visible CPU, GC, startup, or throughput degradation.",
+        "Verdict": "No reportable performance regression. The added scan is limited to top-level customization updates and does not affect the narrower high-frequency child-state action."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and traced the new listener through state dispatch, provider publishers, controller ownership/disposal, customization grouping, and transitive filesystem/network refreshes. No high-confidence performance finding or regression-fix learning signal was established."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-21T06:38:22.002265841Z",
+    "CompletedAt": "2026-10-21T06:39:54.704391384Z",
+    "WallClockMilliseconds": 92702,
+    "ModelCalls": 12,
+    "InputTokens": 419802,
+    "OutputTokens": 5632,
+    "TotalTokens": 425434,
+    "ReasoningTokens": 1630,
+    "CacheReadTokens": 361029,
+    "CacheWriteTokens": 58737,
+    "APIDurationMilliseconds": 70469,
+    "ToolCalls": 58,
+    "NanoAIUnits": 55088060000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 361029,
+      "cache_write": 58737,
+      "input": 36,
+      "output": 5632
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

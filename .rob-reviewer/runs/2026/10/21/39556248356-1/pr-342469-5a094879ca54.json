@@ -1,0 +1,261 @@
+{
+  "PullRequest": {
+    "Number": 342469,
+    "Title": "implement keep/undo in copilot harness",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## What this does\n\nAgent Host chats lost the local harness's per-change review when their editing session was reduced to checkpoints (fe781b70ab4, 5bb2223128a). Since then, the agent host gained its own review state: a Working Set changeset with the tool edits the user hasn't kept, whose `accept-changes` and `discard-changes` operations keep or undo a file or a single hunk (#342812, #342614, #342841, #342899). The working set above the chat input uses them. This PR shows the same Working Set in the editor with the local harness's Keep/Undo UX, with only optional `_meta` extensions to the protocol and no new SDK surface:\n\n1. **Getting the edits.** A new `AgentHostEditReview` subscribes to the chat session's Working Set and reads each file's baseline and the content the host last recorded.\n2. **Building the review.** It creates one entry per file, using the same `ChatEditingModifiedDocumentEntry` local chat uses. The original side is the file's Working Set baseline with independent user edits incorporated, and the modified side is the live document. Clean documents reload the agent's recorded write; dirty documents reconcile non-conflicting disk edits with their unsaved text before the review updates.\n3. **Showing it.** `AgentHostSnapshotController`, the chat's `IChatEditingSession`, used to be always empty and now exposes those entries. The existing UI reads from it unchanged: the editor overlay (Keep / Undo / n of m), hunk Keep/Undo, keybindings, the legacy working set and the \"Suggested Edits\" multi-diff.\n4. **Keeping and undoing.** File Keep and Undo invoke `accept-changes` and `discard-changes` on the file, and hunk Keep and Undo invoke them on the hunk's lines. The host records the decision, and the editor and the working set both follow its updated Working Set.\n\nThe scope is the editor-to-Working-Set bridge, the host coordination needed for review during a turn, and synchronization of incoming agent edits with dirty documents. It reuses the existing editor UI and host review operations rather than introducing a second review ledger or replacing the SDK's edit tools.\n\nBehavior:\n\n- **One source of truth:** the editor and the working set show the same Working Set, so Keep or Undo in either one shows in the other. Review state lives in the agent host, not in the window.\n- **Timing:** the host updates the Working Set after each of the agent's edits, so the editor highlights a change as soon as the host records it.\n- **During a turn,** Keep and Undo work between edits, except in a file the agent is writing: that file is read-only, its overlay shows progress, and its Keep and Undo stay disabled until its edit is recorded and the editor has synchronized and diffed it. Other files remain reviewable. See [Keep and Undo while the agent works](#keep-and-undo-while-the-agent-works).\n- **Keep** marks the changes as kept with the host and leaves the file unchanged. **Undo** reverts them on disk, and undoing a created file deletes it. Either way, the host only acts on changes the user hasn't kept.\n- **User edits:** typing outside the agent's changes is moved into the editor's baseline, so it isn't shown as the agent's, including before the first editor diff finishes. Incoming non-conflicting agent edits are combined with dirty text without implicitly saving it. Keep leaves that text unsaved. Undo retains its save-first behavior, without save participants, because the host reverts on disk with a 3-way merge; it stops if saving fails and refuses to revert lines the user changed too.\n- **Safety:** Keep and Undo capture the shown Working Set version when clicked, before waiting for earlier operations or updates. They refuse a different version rather than deciding on changes the user did not see. Hunk operations fail closed if their lines cannot be mapped. Overlapping dirty edits preserve the user's text, warn, and suspend that file's editor review until its contents can be reconciled.\n- **Accessibility and recovery:** successful file and hunk decisions play the existing edits-kept/edits-undone signals without duplicate success signals. Accessibility help explains unsaved-text behavior. Failed synchronization releases the editor's review lock, reports how to recover, and retries blocked files after save/revert. If closing a review diff is cancelled, its original stays alive until the editor actually closes, even after the review is disposed; retained entries no longer keep editing restrictions active.\n- **Scope:** `chat.editor.keepUndo.enabled` (experimental, default off, read-only off in the Agents window). Only chats in the chat view or an editor, on the local agent host, with the Copilot provider like the working set. Inline chat keeps its own review, and subagent chats share their parent's Working Set.\n\n### Working set\n\nThis PR does not redesign the working set above the chat input. Its earlier Session Changes | To Review tabs are gone: main's working set already lists the Working Set with Keep and Undo, and the editor now shows the same changes. The existing working-set actions also send the version they displayed.\n\n## Session Changes now reflect Undo\n\nEarlier versions of this PR reverted files from the workbench, and the host didn't record that, so Session Changes kept showing undone edits. Undo now goes through the Working Set's `discard-changes`, which the host records as an edit. Session Changes, This Turn and the working set update after an Undo, and the agent host stays the only place that decides what was kept. Uncommitted and Branch changes read git and update as before.\n\n## Keep and Undo while the agent works\n\nAs in local chat, changes can be kept or undone while the agent works, except in a file the agent is writing. The host side:\n\n- **Live Working Set:** the host refreshes the Working Set after each of the agent's edits instead of 5 seconds after they pause, so the editor highlights each change as soon as it's recorded.\n- **Versions:** each Working Set file publishes the version of its changes in `_meta` (`vscode.workingSetVersion`). Keep and Undo send the version they showed, and the host refuses changes made since. During an active turn, a request without that displayed version is rejected with guidance to wait until the turn finishes; the host does not substitute its latest publication for what a client actually saw. Versionless requests retain their existing behavior when idle.\n- **Keep** stays available while a turn runs, since it only records which changes were kept.\n- **Undo** stays available while a turn runs when the provider's edit tool calls wait for it. Copilot's do, through the new `IAgentHostFileEditCoordinator`: `onPreToolUse` waits for an Undo of the file in progress, and an Undo waits for the edits of its file in progress, so each edit and each Undo is recorded in order.\n- **Editing mark:** while an edit tool call writes a file, its Working Set entry is marked in `_meta` (`vscode.workingSetEditing`). The host clears that mark with a freshly computed Working Set, not an older in-flight result. The editor applies the mark even while the Working Set is recomputing and even without a chat response, and keeps the file read-only and Keep/Undo disabled until its reload or dirty-buffer reconciliation and diff finish. A newer update cancels stale reconciliation work; an earlier update cannot unlock a later edit.\n- **Edit lifetime:** background subagents keep their file locks when the root turn ends and until their snapshots finish recording, even if the subagent has already completed. A hook that was waiting when its turn ended is denied rather than proceeding without a lock.\n- **Telling the agent:** after an Undo, the agent gets one note with its next tool result or prompt (`additionalContext`), naming the file and lines and asking it not to make those changes again unless asked. Following the prompt-text rules in the agent host's `AGENTS.md`, it's per-turn text, byte-stable apart from the path and lines.\n\nThe editor synchronizes a document before comparing it with the Working Set and attributes the incorporated write to the agent. Without that ordering, a Working Set update could arrive before the document reload, and the later reload was mistaken for user typing, leaving no highlighted changes. Clean files still reload from disk; dirty files use the explicit reconciliation path below.\n\n## User edits and dirty files\n\nLocal's model-based tools edit the same buffer as the user. The Copilot SDK instead writes to disk, so a dirty editor can otherwise miss the agent's edit and produce a \"file is newer\" warning on Save. This PR reconciles those recorded disk edits into the editor; it does not redirect SDK writes or automatically save before a tool.\n\n1. **Separate synchronization baseline.** `TextFileEditorModel` retains immutable text from its last synchronized disk version, including successful saves, only while an explicit consumer needs it. The opted-in local Copilot handler enables retention before the first review, and active reviews hold their own references; the final release drops the saved-text copies. This is not the Working Set baseline, which can span several agent edits and Keep decisions. A document that becomes dirty while retention is enabled can use its known ancestor even before its first reviewed edit. Enabling retention after a document is already dirty does not invent an ancestor.\n2. **Three-way reconciliation.** The model compares that ancestor with the current buffer and the recorded disk content using the editor worker. Non-conflicting incoming changes are rebased over unsaved user edits and applied through normal text-model edit operations, preserving the undo history and current line endings.\n3. **Version-safe save bookkeeping.** Before applying the result, it rechecks the model version, cancellation, save state, encoding, and the exact disk content/version. Save metadata advances only to the incorporated disk version; the buffer remains dirty if it still differs from disk. The next normal Save can preserve both edits, while later unseen disk writes still receive the normal conflict protection.\n4. **No silent conflict resolution.** Overlaps, missing safe ancestors, timed-out comparisons, or repeated stale reads preserve the user's buffer and produce a warning. The stale editor review is removed and retried after a save/revert or a later Working Set update; the SDK's recorded changes remain in the host Working Set.\n5. **Preserved editor semantics.** Immutable ancestors survive LF/CRLF changes without absorbing later unsaved typing. A no-op reconciliation preserves the saved undo-version marker; when disk really changes, undoing to the old disk text must not incorrectly mark the document saved. UTF-8 BOM handling and existing encoding restrictions remain in place.\n\nFor example, if the user changes a comment without saving and the agent changes an unrelated function, the editor shows both changes, highlights the agent's function change with Keep/Undo, and keeps the user's comment unsaved. Keep does not save it. Undo still saves first before asking the host to discard the agent's change.\n\nOnly the opt-in Agent Host editor review invokes automatic reconciliation. Normal dirty-file reload behavior is unchanged. Existing send-time saving is also unchanged, and the SDK still does not automatically read unsaved editor text when deciding what to edit.\n\n## Research findings\n\n- **The host owns Keep and Undo.** The Working Set (`changeset/working-set`) offers `accept-changes` and `discard-changes` on a file (Resource) or on zero-based lines (Range), without confirmation. A Range target picks the hunks it touches. A discard reverts the changes since the last Keep with a 3-way merge and records the revert. Before this PR's in-turn changes, the host disabled both while a turn ran and updated the Working Set 5 seconds after edits paused.\n- **It's built from the SDK hooks.** `CopilotAgentSession` drives `FileEditTracker` from `onPreToolUse` / `onPostToolUse`. The Working Set is derived from those records rather than git; Session Changes and This Turn retain their existing host aggregation. The success hook provides completed-edit snapshots; the failure hook can still deliver pending Undo context. The hooks are async, so the host can hold an edit tool call back, which Undo during a turn relies on.\n- **Editor hunks match host hunks.** The host diffs with the editor's options (`ignoreTrimWhitespace: false`, no moves). Its \"after\" side is the content it last recorded, not the live document, so the editor maps a hunk's lines across typing the host hasn't recorded.\n- **Working Set content URIs change with the content,** because they're keyed by edit records. The editor compares them to tell which files changed.\n- **A bug that only the live run found:** `ChatServiceImpl._startSession` creates a chat's editing session before it registers the chat model, so the provider couldn't look the chat up and never attached the review. `IChatEditingSessionProvider.createEditingSession` now receives `isGlobalEditingSession`.\n- **A race before the first editor diff:** typing in a reviewed file could be applied to the original at offsets that didn't match. The Agent Host review now prepares its baseline and edit mapping through the editor worker before exposing entries, rechecking document versions and cancellation after asynchronous work. Hunk mapping also uses the worker and rejects stale or timed-out results. The shared local-chat mapping behavior is unchanged; the review supplies its mapping through an opt-in hook, with a conservative fallback if its initial diff times out.\n- **Dirty reconciliation needs file-model ownership.** Updating the buffer alone leaves stale save metadata, while only refreshing its ETag can hide unseen disk changes. The file model owns both reconciliation and save bookkeeping. Its disk ancestor is an immutable string rather than a deferred snapshot backed by a mutable piece tree.\n- **Independent reviews:** Claude Opus 5.5, GPT 6 Astra, Gemini 4 Argon and GPT 6.1 Sol each reviewed the first prototype's research and plan. That prototype tracked edits in the window; this one replaces it with the host's Working Set. Two of their findings carry over: no review for inline chat or remote hosts, and failing closed when content can't be read.\n\n## Limitations\n\n- Changes appear per tool call, not as the agent streams them: the agent writes each edit to disk at once.\n- An Undo waits up to 30 seconds for the agent's edit of the file in progress, then asks to try again. A file counts as being edited from the agent's pre-tool hook until its edit is recorded, including while a permission prompt waits.\n- Undo saves unsaved changes without asking, and refuses lines the user also changed.\n- Dirty reconciliation automatically handles only non-conflicting changes with a known synchronized ancestor. Overlaps still require user resolution; it is not full parity with local's model-first editing of unsaved text.\n- While the editor-review feature or an existing review owns retention, normally sized models retain one shared immutable last-synchronized text copy. No saved-text copy is retained without a consumer. Models too large for synchronization, restored dirty documents without a known ancestor, and files already dirty when retention first starts cannot be automatically reconciled.\n- Host write coordination remains shared across clients independently of the editor setting; the opt-in controls editor review and its baseline-retention owners, not the host's ordering guarantees.\n- Keeping or undoing a renamed file reports the host's error.\n- Notebooks, non-UTF-8 files and deleted files aren't reviewed in the editor.\n- Only Copilot's edit tool calls wait for an Undo, so other providers keep Undo disabled while a turn runs; Keep stays available.\n- Review preparation and hunk mapping use worker diffs with a 1 second computation limit. Timed-out or stale hunk mappings are refused rather than guessing their lines.\n- Telemetry attributes Keep and Undo to the chat's latest request.\n- Editor review remains limited to supported Copilot sessions on the local host. Remote-host review and broader request/checkpoint undo are outside this PR.\n\n## Open questions\n\n- **Protocol:** should a Working Set file's version and editing mark become standard AHP fields instead of `vscode.*` `_meta`?\n- **Settings:** now that the editor and the working set share the Working Set, should the editor review follow `chat.editor.workingSet.enabled` instead of its own setting?\n\n## Changes\n\n| Area | Files |\n|---|---|\n| Review layer (new) | `agentHostEditReview.ts` (Working Set entries, shown-version operations, range mapping, synchronization gating, cancellation, conflict notification and save/revert recovery) |\n| Wiring | `agentHostSnapshotController.ts` (delegation), `agentHostSessionHandler.ts` (attach to chat-view and editor sessions on the local host), `chatEditingService.ts` / `chatEditingServiceImpl.ts` (`isGlobalEditingSession` for providers; `storeState` and entry lookup only use `ChatEditingSession`s) |\n| Shared editing | `chatEditingModifiedDocumentEntry.ts` (`_resetOriginalContent`, an opt-in edit-mapping hook, and overridable `diffInfo`), `chatEditingTextModelChangeService.ts` (accepts the review's initial mapping without changing local-chat defaults), `chatEditingModifiedFileEntry.ts` / `chatEditingService.ts` / `chatMarkdownContentPart.ts` (being-modified state can omit a response), `chatEditingCodeEditorIntegration.ts` (the Toggle Diff autorun ends with its integration, so it no longer leaks when an entry is disposed undecided) |\n| Dirty-file synchronization | `textFileEditorModel.ts` / `textFileEditorModelManager.ts` / `textfiles.ts` (reference-counted ancestor retention, explicit reconciliation API, worker diff/rebase, stale-operation guards, dirty/undo tracking and exact-version save metadata); `agentHostSessionHandler.ts` and `agentHostEditReview.ts` own the scoped retention lifetimes |\n| Accessibility | `chatAccessibilityHelp.ts` (unsaved-edit, conflict and Keep/Undo guidance); review operations reuse the existing accessibility signals |\n| Setting | `constants.ts`, `chat.shared.contribution.ts` |\n| Working set | `agentHostSessionInputPills.ts` (Keep and Undo name the version of the changes they showed) |\n| Agent host: Working Set | `agentHostChangesetService.ts` (refreshes after each edit; clears editing marks with current versions and skips superseded computations), `sessionDiffAggregator.ts` (`computeWorkingSetFiles` and file versions), `agentHostChangesetOperationService.ts` (Working Set operations while a turn runs), `agentHostAcceptChangesOperationHandler.ts` / `agentHostDiscardChangesOperationHandler.ts` / `workingSetVersion.ts` (version checks and discards while a turn runs), `common/meta/agentWorkingSetFileMeta.ts` (new) |\n| Agent host: edit coordination | `agentHostFileEditCoordinator.ts` (new), `copilotAgentSession.ts` / `copilotSessionLauncher.ts` / `copilotPluginConverters.ts` (edits wait for an Undo of their file; the agent is told about Undos), `agentHostServices.ts` |\n| Tests | `agentHostEditReview.test.ts`, `agentHostFileEditCoordinator.test.ts` and `agentWorkingSetFileMeta.test.ts` (new); `textFileEditorModel.test.ts` (real file-model merge/save/undo, conflicts, stale computations, EOL/BOM and saved-version regressions); `chatAccessibilityHelp.test.ts`; `agentHostSnapshotController`, `agentHostChatContribution`, Accept and Discard Changes handler, changeset operation service, changeset service, Copilot session and plugin converter tests |\n\n## How to test\n\n1. Set `\"chat.editor.keepUndo.enabled\": true` and `\"chat.editor.workingSet.enabled\": true`, then open a new chat or reopen an existing one so the editor-review setting takes effect.\n2. In a local Copilot (Agent Host) chat in a git repository, ask the agent to edit a file and create another one.\n3. **Editor:** open the edited file from the working set. The agent's hunks are highlighted with Keep/Undo, the overlay shows Keep / Undo / n of m, and ⌘Y / ⌘N (Ctrl+Y / Ctrl+N on Windows and Linux) keep or undo the hunk at the cursor.\n4. **Hunk Undo:** after the turn, undo one hunk. It reverts on disk, and the working set and Session Changes drop it.\n5. **Keep:** keep the remaining hunks. The file leaves the working set and the editor review, and stays unchanged on disk.\n6. **Created file:** select Undo in its overlay. The file is deleted and leaves the working set.\n7. **Working set:** Keep or Undo a file in the working set. The editor review follows.\n8. **Saved user edits:** type into a file the agent edited, away from its changes, and save it before asking for another edit. Your text isn't highlighted, and Undo preserves it.\n9. **While the agent works:** ask for several edits with a pause between them, such as a `sleep 30` command. Each change is highlighted as soon as the host records it. Keep or Undo a hunk before the turn ends: it applies, and the agent is told about the Undo with its next tool result. While the agent writes a file, that file's editor is read-only and its Keep and Undo stay disabled until the latest synchronization and diff finish. Other files remain reviewable.\n10. **Legacy working set:** with `chat.editor.workingSet.enabled` off, the legacy working set lists the files with Keep/Undo.\n11. **Dirty user edits:** turn Auto Save off. Ask the agent to pause before editing an open file, then type into an unrelated line and leave it unsaved before the edit tool runs. Sending a request may save existing dirty files, so make the unsaved edit during the pause or, for a file not yet under review, while its write permission waits. The agent's change should appear with Keep/Undo alongside the unsaved text, while disk still lacks the user-only change. A normal Save should persist both without an overwrite warning. Keeping the agent change should not itself save the user-only change.\n12. **Conflict and recovery:** repeat with an unsaved edit overlapping the agent's target. The buffer should remain intact with a warning rather than an automatic winner. Resolve the file and save or revert it; editor review should resume.\n13. **Later external write:** after a successful dirty-buffer reconciliation, change the file on disk again without incorporating that new version. Saving the still-dirty buffer should retain the ordinary conflict protection.\n14. **Cancelled diff close:** open the review diff, close any ordinary editor tab for that file, and leave a user edit unsaved in the diff. Keep the agent's change and cancel the ensuing save/close prompt. The diff and its original should remain readable. Save and close it later; it should close normally without leaving the file read-only.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342469",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "justschen",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "2e2f249355a01896009c72c58e88a4457fedb50a",
+    "HeadRef": "agents/keep-undo-flow-research-prototype",
+    "HeadSHA": "5a094879ca5485e4df88645f7a3aaf89f28f3d98",
+    "CreatedAt": "2026-10-19T02:48:20Z",
+    "UpdatedAt": "2026-10-21T05:57:53Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-0807A12F9E1D",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostChangesetService.ts",
+      "Side": "RIGHT",
+      "Line": 1486,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The diff replaces a 5-second resettable debounce with a direct refresh on every stored tool edit. The refresh reads every source database, scans all historical edit rows, reconstructs each file identity, reads content, and computes per-file diffs. Calls arriving after a queued compute starts can enqueue another full pass, so only exact pre-start bursts coalesce.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Database reads, decoded file strings, identity-map allocations, and diff-worker CPU",
+      "PerformanceScaling": "For a subscribed Working Set, cost grows with tool-edit event count multiplied by accumulated edit rows and changed files.",
+      "PerformanceOutcome": "Repeated CPU, GC, and database work delays Working Set updates and reduces agent-host throughput.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Mid-turn refresh requests reset a 5-second debounce, combining a burst of edits into one full recomputation; turn completion still forced a final refresh.",
+      "ChangedBehavior": "Every onToolCallEditsApplied event now immediately calls refreshWorkingSetChangeset, and edits arriving during an active compute can queue another complete computation.",
+      "CausalDiffEvidence": "RIGHT line 1486 replaces the deleted debounced Working Set scheduler with an immediate refresh call on each tool-edit event.",
+      "Title": "Coalesce Working Set refreshes during edit bursts",
+      "Impact": "An edit-heavy turn in a large or long-running subscribed session repeatedly rescans all recorded edits and rediffs all changed files.",
+      "Evidence": "The changed call reaches _computeWorkingSetChangeset, computeWorkingSetFiles, and computeUnionedFileDiffs. That path calls getAllFileEdits for every source, scans and deduplicates all rows, reads before/after content, and invokes computeDiffCounts per effective file identity. The deleted scheduler used disposableTimeout with _DIFF_DEBOUNCE_MS, which is 5000 ms.",
+      "Recommendation": "Coalesce requests that arrive while a compute is running, or incrementally recompute only the edited file/rows, while preserving a final ordered flush at turn completion."
+    },
+    {
+      "ID": "PERF-2A39FBA6368A",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostEditReview.ts",
+      "Side": "RIGHT",
+      "Line": 402,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The new review is fed a deduplicated Working Set file list and serially awaits _updateFile for every non-deleted file. On a cold entry, the traced path reads baseline/current snapshots, creates a model reference, force-resolves the disk model, materializes strings, computes full-text worker diffs, and retains the model. Warm updates with an unchanged version skip this work, so the cold fan-out and its cardinality are well established; only the exact cost per repository is uncertain.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "File/content-provider reads, resolved text models, full-file strings, and diff-worker CPU",
+      "PerformanceScaling": "Cold review cost is per effective Working Set file: up to two snapshot reads plus a disk/model resolve and multiple full-text diff computations, processed serially; retained model/content memory grows with total changed file bytes.",
+      "PerformanceOutcome": "Excessive I/O and CPU, slow review readiness, and retained-memory growth when opening sessions with large multi-file changes.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "AgentHostSnapshotController exposed an empty entries list and did not read Working Set snapshot contents, resolve each changed file into a text model, or compute editor diffs for all files.",
+      "ChangedBehavior": "The new review loops through the complete Working Set and awaits _updateFile for each entry. Cold _updateFile calls _readContents, _createEntry, _reloadFromDisk, and _prepareFile before publishing and retaining an entry.",
+      "CausalDiffEvidence": "agentHostEditReview.ts is entirely added by this PR; RIGHT line 402 introduces the per-file awaited hydration loop reached as soon as the Working Set subscription becomes ready.",
+      "Title": "Hydrate review entries lazily instead of opening every changed file",
+      "Impact": "Opening an opted-in Agent Host chat whose session changed tens or hundreds of files eagerly loads and diffs every file even if the user never opens the file or the multi-diff view; entries arrive serially and the work can continue behind the chat UI.",
+      "Evidence": "RIGHT line 402 is inside `for (const file of files)` and serially awaits `_updateFile`. The cold path performs `_fileService.readFile` for baseline/current content, `createModelReference`, `model.resolve({ forceReadFromFile: true })`, and `computeStringEditFromDiffWithMetadata`; each created entry keeps the model reference until decision/disposal. `isSameWorkingSetFile` only avoids this after the cold version is hydrated.",
+      "Recommendation": "Represent Working Set files with lightweight entries first, then resolve/read/diff only files that are open, visible, or explicitly requested. If some eager hydration is required for overlays, use a small shared limiter and prioritize open editors rather than serially processing the entire set."
+    },
+    {
+      "ID": "PERF-243A6EE3C4C8",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostChangesetService.ts",
+      "Side": "RIGHT",
+      "Line": 574,
+      "Severity": "medium",
+      "Confidence": 0.95,
+      "ConfidenceRationale": "The new set is populated after every successful subscribed Working Set compute, but subscription removal does not delete from it; deletion occurs only when the changeset state disappears or the owner itself is removed. Every edit start/end synchronously traverses every retained changeset and every file. The lifetime/scaling mechanism is direct; uncertainty is only how many historical sessions a typical long-lived host retains.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "cache-lifecycle",
+      "PerformanceResource": "Retained Working Set keys and synchronous scans/URI parsing over every file in their persisted changeset states",
+      "PerformanceScaling": "Per edit-start/end CPU grows with the sum of files across every Working Set ever published for owners still retained by the host, not with currently subscribed Working Sets or the edited resource.",
+      "PerformanceOutcome": "Increasing synchronous CPU overhead and edit-event latency over a long-lived process as users visit more chat sessions.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "There was no published-Working-Set registry and edit-tool lifecycle events did not scan historical Working Set states.",
+      "ChangedBehavior": "Successful computes permanently add changesetUri to _publishedWorkingSets. onDidChangeEditing then loops that whole set and each state.files array on both edit start and edit end; removing a subscription leaves the key present.",
+      "CausalDiffEvidence": "RIGHT line 574 introduces retention independent of subscription lifetime; the same diff adds the onDidChangeEditing listener and full-set scan that consume those retained keys.",
+      "Title": "Drop published Working Sets when their subscriptions end",
+      "Impact": "After opening/reviewing many sessions, every later agent edit scans all files from those earlier sessions even when no client observes them, making edit coordination progressively more expensive.",
+      "Evidence": "RIGHT line 574 adds every published URI to `_publishedWorkingSets`. `_publishWorkingSetEditing` iterates that set and every `state.files`, parsing and comparing each URI. `AgentHostChangesetSubscriptionService.removeSubscription` only updates its own map/event, while this service deletes the new set entry only in `onChangesetOwnerRemoved` or when `getChangesetState` returns no state.",
+      "Recommendation": "Track only actively subscribed Working Sets: remove the URI on subscription removal (and failed/unpublished teardown), or derive/index active states by canonical file resource so each editing event touches only matching subscribed sets."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "eager-work",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "serialization-allocation",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A subscribed Working Set follows an active agent turn with many edit tool calls",
+        "CriticalPath": "Each stored edit now queues a Working Set compute; database history reads and per-file diff results must complete before the updated Working Set and editor review become ready.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDiffAggregator.ts:computeUnionedFileDiffs",
+            "Operation": "Read all file-edit rows from each tracked session/chat source",
+            "Cardinality": "One getAllFileEdits call per source for every non-coalesced refresh; each result contains the source's accumulated history.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The operation existed, but mid-turn requests were reset/coalesced by a 5-second debounce rather than invoked per stored edit.",
+            "CriticalPathEffect": "All source reads settle before identities can be built and the Working Set can publish."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDiffAggregator.ts:computeUnionedFileDiffs/computeSingleSourceWorkingSetDiff",
+            "Operation": "Read first/last or rebased file-edit content",
+            "Cardinality": "Content reads scale with effective changed-file identities on each full refresh.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Same operation after a debounced pause or final flush; the diff increases its frequency to each edit event.",
+            "CriticalPathEffect": "Per-file content is required before counts and publication."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/sessionDiffAggregator.ts:computeUnionedFileDiffs",
+            "Operation": "Compute line diff counts in the diff worker",
+            "Cardinality": "Up to one worker computation per effective changed file per full refresh, burst concurrently inside the compute.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Worker calls were grouped behind the Working Set debounce.",
+            "CriticalPathEffect": "All diff promises settle before the refreshed changeset is published."
+          }
+        ],
+        "ScalingInput": "Tool-edit event count, accumulated edit rows across the session/default/peer-chat databases, and effective changed-file identities after deduplication.",
+        "EffectiveConcurrency": "A SequencerByKey serializes computes per owner, but requests arriving after a compute starts enqueue another pass. Within each compute, all effective file identities schedule content reads and diff work concurrently without a shared limiter.",
+        "CacheBehavior": "There is no incremental Working Set cache for this path. Calls made before a queued task starts coalesce, but an active task clears the queued marker; later events rescan all rows and rediff all files. Successful and empty results are recomputed alike.",
+        "MechanismConfidence": "High: the removed debounce, queue lifecycle, full-history reads, and per-file diff fan-out are directly traced.",
+        "MagnitudeUncertainty": "Exact row/file counts and worker duration vary by session; long-running refactors and multi-chat sessions provide realistic large inputs.",
+        "Verdict": "Reportable repeated work: immediate per-edit refresh materially increases full-history database and diff-worker work."
+      },
+      {
+        "Scenario": "Opening an opted-in Agent Host chat and hydrating its editor Keep/Undo review",
+        "CriticalPath": "Hydration is asynchronous relative to chat construction, but each file's snapshot reads, model resolution, and diffs must finish before that file's review entry is usable; the serial loop delays later entries.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostEditReview.ts:_readContents/_readText",
+            "Operation": "Read baseline and current snapshot content through the Agent Host content URI provider",
+            "Cardinality": "One current read and, for non-created files, one baseline read per cold or changed Working Set file.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "AgentHostSnapshotController exposed no review entries and performed no Working Set snapshot reads for editor review.",
+            "CriticalPathEffect": "Both reads must finish before the entry can be created or updated."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostEditReview.ts:_createEntry/_reloadFromDisk",
+            "Operation": "Resolve or force-reload the live text file model from disk",
+            "Cardinality": "At least one model resolution/reload per cold review file; dirty reconciliation can add two disk reads per attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Changed files were not eagerly opened as editor review models.",
+            "CriticalPathEffect": "The file entry cannot be published until the live model is synchronized."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostEditReview.ts:_prepareFile/getReviewedOriginal and textFileEditorModel.ts:reconcileExternalChanges",
+            "Operation": "Compute full-text StringEdits in the editor worker",
+            "Cardinality": "Multiple worker diffs per changed file; dirty files can require two reconciliation diffs plus review-original/diff preparation, with one retry on races.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Agent Host editor-review diff preparation occurred.",
+            "CriticalPathEffect": "Diffs gate entry readiness and later files because the outer file loop is serial."
+          }
+        ],
+        "ScalingInput": "Effective non-deleted files in the Working Set and their byte sizes; unchanged versions are deduplicated after their first hydration.",
+        "EffectiveConcurrency": "Files are processed strictly one at a time by the update sequencer and per-file await. Baseline/current reads and some diff pairs run in parallel within one file only.",
+        "CacheBehavior": "Cold subscription hydrates every file. Warm updates skip entries whose content URIs/version match; changed files repeat snapshot reads and diff preparation. There is no lazy visible/open-file cache.",
+        "MechanismConfidence": "High: the complete cold call path and serial cardinality are explicit in the added file.",
+        "MagnitudeUncertainty": "Cost depends on Working Set size and file bytes; generated changes and repository-wide refactors can realistically reach tens or hundreds of files.",
+        "Verdict": "Reportable eager work and boundary fan-out: all files are loaded/diffed whether or not the user opens their review."
+      },
+      {
+        "Scenario": "Starting and ending later edit tool calls after users have visited many Working Sets",
+        "CriticalPath": "onDidChangeEditing synchronously scans retained published states before event handling completes; matching edit ends can also queue Working Set recomputation.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Sum of files in all published Working Sets whose owners remain in agent-host state, including no-longer-subscribed sessions.",
+        "EffectiveConcurrency": "The scan is synchronous and unbounded; start/end events run it independently. Matching refreshes are subsequently serialized per owner.",
+        "CacheBehavior": "_publishedWorkingSets is append-only until the owner/state is removed, not until its subscription ends. No resource index narrows the scan to the edited file.",
+        "MechanismConfidence": "High: insertion, consumers, subscription removal, and the only deletion paths were all inspected.",
+        "MagnitudeUncertainty": "The number of retained historical owners depends on session lifecycle and user history, but subscription removal is proven not to evict entries.",
+        "Verdict": "Reportable cache-lifecycle regression: per-edit CPU grows with historical published state rather than active subscriptions."
+      },
+      {
+        "Scenario": "Keeping or undoing one or many reviewed files",
+        "CriticalPath": "Each decision waits for pending review updates, validates the latest Working Set, and invokes the host operation; undo of a dirty file first waits for a filesystem save.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostEditReview.ts:_invokeOperation",
+            "Operation": "Invoke Accept Changes or Discard Changes on the Agent Host",
+            "Cardinality": "One host invocation per selected effective file or hunk, serialized.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Editor review did not expose these per-file/hunk host operations; the existing Working Set pills already invoked host operations explicitly.",
+            "CriticalPathEffect": "Each selected decision remains pending until its invocation and subsequent Working Set update complete."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostEditReview.ts:_invokeOperation",
+            "Operation": "Save a dirty document before discard",
+            "Cardinality": "At most one save per dirty file being undone.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Editor-based undo of Agent Host changes did not exist.",
+            "CriticalPathEffect": "The discard waits for save completion to preserve unsaved text semantics."
+          }
+        ],
+        "ScalingInput": "Number of selected undecided files and optional range-diff size.",
+        "EffectiveConcurrency": "The UI starts per-entry promises, but a single operations Sequencer serializes host invocations to preserve Working Set ordering; no boundary burst occurs.",
+        "CacheBehavior": "Latest subscription state and file version are checked before each operation; failed/stale versions are not cached as success.",
+        "MechanismConfidence": "High: operation sequencing and boundaries are explicit.",
+        "MagnitudeUncertainty": "Batch sizes are user-controlled and usually modest.",
+        "Verdict": "No additional finding: serialization is intentional for ordering, and the per-file IPC/save cardinality follows explicit user decisions."
+      }
+    ],
+    "Summary": "Completed the performance pass across all 49 changed files. Submitted three findings covering removed Working Set coalescing, eager all-file editor-review hydration, and subscription-independent published-state retention. Also checked edit coordination, reconciliation/save paths, operation serialization, caches, and boundary concurrency."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-21T06:44:17.360896457Z",
+    "CompletedAt": "2026-10-21T06:48:34.700731252Z",
+    "WallClockMilliseconds": 257339,
+    "ModelCalls": 12,
+    "InputTokens": 1276172,
+    "OutputTokens": 16689,
+    "TotalTokens": 1292861,
+    "ReasoningTokens": 7967,
+    "CacheReadTokens": 1126400,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 235030,
+    "ToolCalls": 98,
+    "NanoAIUnits": 138342800000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1126400,
+      "cache_write": 0,
+      "input": 149772,
+      "output": 16689
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

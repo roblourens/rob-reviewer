@@ -1,0 +1,143 @@
+{
+  "PullRequest": {
+    "Number": 343074,
+    "Title": "terminal: stop run_in_terminal sending Ctrl+U into PowerShell commands (fixes flake)",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n**TL;DR:** `chat - run_in_terminal › no-output command reports empty output` flaked on Windows with `cmd: The term 'cmd' is not recognized…`. When shell integration comes up a few ms after the 5 s wait, `run_in_terminal` falls back to its `none` strategy, which types Ctrl+U before the command. PowerShell's PSReadLine (default Windows edit mode) has no Ctrl+U binding and inserts the raw `\\x15`, so `cmd /c rem` ran as `\\x15cmd /c rem`. This is a product bug, not a test bug: the fix stops treating shell *output* as pending user input and never sends Ctrl+U to PowerShell on Windows.\n\n### CI failures\n- ADO `main` build [485970](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=485970\u0026view=results), 2026-10-19, Windows X64, `Run integration tests (Electron)`. It was the only failure in 436 Windows Electron integration runs on `main` from 2026-10-06 to 2026-10-20. None of the 152 failed `Windows / Electron` jobs of `pr.yml` in that window hit it.\n\n### Root cause\nFrom the failing build's `terminal.log` and `exthost.log`:\n\n| Time | Event |\n|---|---|\n| 31.917 | First terminal of the window (pty host just spawned). `ToolTerminalCreator` waits 5000 ms for shell integration ([toolTerminalCreator.ts](https://github.com/microsoft/vscode/blob/c3890577dad36cbeabe43583c12262be20b77cca/src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/toolTerminalCreator.ts#L94)) |\n| 36.918 | Wait times out, so the tool uses the `none` execute strategy |\n| 36.992 | Shell integration activates, 74 ms late (`terminal-suggest` activated on `onTerminalShellIntegration:*`) |\n| ~38 | `none` strategy sends `\\x15`, then `cmd /c rem\\r` |\n| 39.024 | Command fails (`npm` activated on `onTerminalQuickFixRequest`) |\n| 40.025 | Tool result: `cmd: The term 'cmd' is not recognized…` |\n\nTwo defects combine:\n1. `_registerInputListener` sets `receivedUserInput` from `instance.onData` ([runInTerminalTool.ts](https://github.com/microsoft/vscode/blob/c3890577dad36cbeabe43583c12262be20b77cca/src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/tools/runInTerminalTool.ts#L2770)). That event is *\"the raw data stream coming from the pty\"* ([terminal.ts](https://github.com/microsoft/vscode/blob/c3890577dad36cbeabe43583c12262be20b77cca/src/vs/workbench/contrib/terminal/browser/terminal.ts#L1053)), so a shell printing its prompt counts as user input.\n2. With that flag set, the `none` and `basic` strategies send Ctrl+U to clear pending input ([noneExecuteStrategy.ts](https://github.com/microsoft/vscode/blob/c3890577dad36cbeabe43583c12262be20b77cca/src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/executeStrategy/noneExecuteStrategy.ts#L84), [basicExecuteStrategy.ts](https://github.com/microsoft/vscode/blob/c3890577dad36cbeabe43583c12262be20b77cca/src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/executeStrategy/basicExecuteStrategy.ts#L207)). On Windows, PSReadLine defaults to its Windows edit mode ([Cmdlets.cs](https://github.com/PowerShell/PSReadLine/blob/a2d143f78904f8a954f8d4b055e55ceca6939bfc/PSReadLine/Cmdlets.cs#L177)), which doesn't bind Ctrl+U ([KeyBindings.cs](https://github.com/PowerShell/PSReadLine/blob/a2d143f78904f8a954f8d4b055e55ceca6939bfc/PSReadLine/KeyBindings.cs#L177)). Unbound keys are self-inserted ([ReadLine.cs](https://github.com/PowerShell/PSReadLine/blob/a2d143f78904f8a954f8d4b055e55ceca6939bfc/PSReadLine/ReadLine.cs#L707)). xterm.js doesn't render the inserted NAK, so the error looks like `cmd` is missing from PATH.\n\n### Fix\n- `_registerInputListener` now listens to `onDidInputData`, i.e. data written *to* the pty (keystrokes, terminal replies, the tool's own text). A fresh terminal no longer counts as having pending input.\n- New `canClearPromptInputWithCtrlU()` in `strategyHelpers.ts`: the `none` and `basic` strategies don't send Ctrl+U to **PowerShell on Windows**, detected by the launch executable or the detected shell type. PSReadLine's Emacs edit mode, the default on macOS and Linux, binds Ctrl+U to `BackwardKillInput`, so pwsh there (and bash, zsh, fish everywhere) keeps Ctrl+U. On Windows, Ctrl+U never cleared pending input; it was inserted alongside it. No other key clears the line safely in every PSReadLine mode: Escape is a chord prefix in Emacs mode, and Ctrl+C accepts an empty line that shell integration reports as a finished command.\n- `BasicExecuteStrategy` now interrupts a still-running command (Ctrl+C when `executingCommandObject` is set) independently of the pending-input flag. The old `onData` listener set that flag on any process output, so a process that kept running after the idle fallback used to be interrupted; without this, the next command would be typed into it.\n- The integration test is unchanged and stays strict.\n\n### Evidence\n| Check | Without fix | With fix |\n|---|---|---|\n| CI Windows, 30× loop of this test with the shell integration wait forced to time out (as on ADO) | ❌ [failed on attempt 1/30](https://github.com/microsoft/vscode/actions/runs/39510555890/job/118930213292) with the CI symptom `cmd: The term 'cmd' is not recognized…` | ✅ [30/30 passed](https://github.com/microsoft/vscode/actions/runs/39510668205/job/118930592836), all 30 through the `none` strategy (per the run's `terminal.log`) |\n| Local pty, pwsh 7.6.7 / PSReadLine 2.4.5, `-EditMode Windows`, send `\\x15true\\r` | `The term '\\x15true' is not recognized` | n/a (Ctrl+U no longer sent) |\n| Same, send `true\\r` (or `-EditMode Emacs` + `\\x15true\\r`) | runs | runs |\n| New unit tests (`none`/`basic` strategies send no Ctrl+U to pwsh on Windows, Ctrl+C to a still-running command; shell output is not pending input) | 3/3 fail, e.g. pwsh on Windows gets `['\\x15', 'cmd /c rem']` | 3/3 pass |\n\nStress PRs (temporary, closed): baseline #343069, with fix #343070 (run on the first commit; the review follow-up 44a2172413f keeps the Windows PowerShell path identical). They run only the `Windows / Electron` job and set `terminal.integrated.shellIntegration.timeout: 0` in the suite setup, so every attempt falls back to the `none` strategy as build 485970 did.\n\n### Validation\n- `./scripts/test.sh --run src/vs/workbench/contrib/terminalContrib/chatAgentTools/test/browser/noneExecuteStrategy.test.ts --run …/test/browser/basicExecuteStrategy.test.ts --run …/test/electron-browser/runInTerminalTool.test.ts --run …/test/browser/strategyHelpers.test.ts --run …/test/browser/richExecuteStrategy.test.ts --run …/test/browser/executeStrategy.test.ts`: 277 passing, 108 pending, 0 failing\n- Same new tests with the product change reverted: they fail (as expected). Reverting only the running-command check fails the `*StillExecuting` scenarios.\n- `npm run eslint -- \u003cchanged files\u003e`: clean\n- `npm run typecheck-client`: clean\n- `npm run valid-layers-check`: clean\n\nNo UI changes.\n\ncc @meganrogge\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/343074",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b4b8253b27ea0f2d4992a33a24d18c9b94d5e948",
+    "HeadRef": "agents/fix-empty-output-integration-test",
+    "HeadSHA": "44a2172413f5ecfb105f212c8be15a0d15b2462a",
+    "CreatedAt": "2026-10-20T22:52:02Z",
+    "UpdatedAt": "2026-10-21T00:46:45Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Normal run_in_terminal command in a fresh or reused terminal using no/basic shell integration",
+        "CriticalPath": "Terminal initialization/reuse, xterm readiness, the existing idle wait, one PTY write for the command, then command completion/idle detection. The listener change is passive and does not add work before progress.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/executeStrategy/basicExecuteStrategy.ts:218 and noneExecuteStrategy.ts:88",
+            "Operation": "Write the requested command to the terminal PTY via ITerminalInstance.sendText",
+            "Cardinality": "One command write per invocation, plus the pre-existing optional Ctrl+U write only when actual input is pending and the shell supports it.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same command write occurred, while any shell output could mark the prompt as having pending input and cause an unnecessary Ctrl+U PTY write plus a 100 ms idle wait.",
+            "CriticalPathEffect": "The requested command write remains on the critical path; the diff does not increase normal-path boundary calls and avoids classifying high-volume shell output as pending input."
+          }
+        ],
+        "ScalingInput": "One listener callback per input write rather than per PTY output chunk; command count controls executions, with one cached foreground terminal per chat session.",
+        "EffectiveConcurrency": "Foreground commands are serialized through one reused terminal; background commands use separate terminals. The changed strategy operations remain sequential and add no aggregate concurrency.",
+        "CacheBehavior": "Foreground terminal association is reused warm per chat session; cold creation still performs the unchanged terminal/profile/shell-integration setup. No cache key, miss, or invalidation behavior changed.",
+        "MechanismConfidence": "High: terminalInstance shows onData is PTY output while onDidInputData fires after process writes from keyboard/tool input; strategy call flow and waits are explicit.",
+        "MagnitudeUncertainty": "Exact output-event volume varies by command, but the changed listener strictly moves away from the potentially high-volume PTY output stream and does not increase normal command latency.",
+        "Verdict": "No regression. The listener reduces callback frequency for output-heavy commands and can remove unnecessary pre-command PTY writes/waits."
+      },
+      {
+        "Scenario": "run_in_terminal on Windows PowerShell with pending terminal input",
+        "CriticalPath": "After the existing pre-execution idle wait, shell/OS detection now skips Ctrl+U and its following 100 ms idle wait, then sends the command.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/executeStrategy/strategyHelpers.ts:26 and noneExecuteStrategy.ts:75/basicExecuteStrategy.ts:207",
+            "Operation": "PTY input writes for Ctrl+U and the requested command",
+            "Cardinality": "Changed from optional Ctrl+U plus command to command only for Windows PowerShell; one removed PTY write and one removed 100 ms idle wait per affected invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "When the pending-input flag was true, the strategy wrote Ctrl+U, waited for 100 ms of PTY idleness, then wrote the command.",
+            "CriticalPathEffect": "The diff shortens this path by removing the unsupported clearing write and wait."
+          }
+        ],
+        "ScalingInput": "One shell classification per command invocation; constant-size path/enum checks. Effective boundary cardinality drops from two PTY writes to one when pending input is recorded.",
+        "EffectiveConcurrency": "Operations are serialized within the terminal strategy; no new task, queue, or parallel PTY activity is introduced.",
+        "CacheBehavior": "No cache participates. Detection uses current terminal shell type, launch executable, and OS on each invocation with constant work.",
+        "MechanismConfidence": "High: the helper result directly gates the existing sendText and waitForIdle calls.",
+        "MagnitudeUncertainty": "Frequency depends on Windows PowerShell use and pending-input state, but direction is definitively reduced work.",
+        "Verdict": "No regression. This is a bounded latency and boundary-call reduction."
+      },
+      {
+        "Scenario": "Basic shell integration reuses a terminal whose previous command remains active after idle fallback",
+        "CriticalPath": "The strategy first waits for PTY idleness, observes executingCommandObject, writes Ctrl+C, waits for 100 ms of post-interrupt idleness, then writes the next command.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/executeStrategy/basicExecuteStrategy.ts:203",
+            "Operation": "Send Ctrl+C through the terminal PTY before the next command",
+            "Cardinality": "One newly guaranteed interrupt write when command detection reports an active prior command; previously this happened only if the pending-input flag was also true.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "If receivedUserInput was false, the strategy skipped the interrupt and immediately wrote the next command despite the active command object.",
+            "CriticalPathEffect": "Adds one PTY write and a 100 ms idle interval on this recovery path before sending the next command, while preventing the next command from being written into the still-running process."
+          }
+        ],
+        "ScalingInput": "At most one added interrupt PTY write and one idle wait per new invocation while a prior command object is still executing; it does not scale with output history or collection size.",
+        "EffectiveConcurrency": "The interrupt, idle wait, and next command are deliberately serialized. No burst or per-item parallelism exists.",
+        "CacheBehavior": "The warm foreground terminal is reused; there is no result cache. Shell integration state is read directly from the existing command-detection capability.",
+        "MechanismConfidence": "High for the added boundary and critical-path wait; high that it is limited to an already-running prior process and one operation per invocation.",
+        "MagnitudeUncertainty": "This recovery state is uncommon and exact process response time varies; the explicit idle duration is 100 ms after the last output.",
+        "Verdict": "No reportable regression. The added work is bounded, occurs only on a degraded recovery path, and is required to preserve command execution semantics rather than redundant scalable work."
+      },
+      {
+        "Scenario": "Lifetime of the terminal input listener on cached and disposed tool terminals",
+        "CriticalPath": "The listener only updates a boolean on input events and is off the command critical path except for the strategy's later boolean read.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One listener per newly created tool terminal; cached foreground reuse does not register another listener, and disposal removes it.",
+        "EffectiveConcurrency": "Callbacks execute synchronously per input event with constant work; no queued async work or concurrency is introduced.",
+        "CacheBehavior": "Listener ownership follows the cached terminal lifetime and is disposed once with terminal disposal; cache reuse does not duplicate registration.",
+        "MechanismConfidence": "High: _registerInputListener is called only after terminal creation, cached terminals return before it, and Event.once(onDisposed) disposes the subscription.",
+        "MagnitudeUncertainty": "Input event frequency varies with user/tool writes, but callback work is constant and output-heavy PTY traffic no longer invokes it.",
+        "Verdict": "No cleanup or retention regression; listener cardinality and lifecycle remain bounded, with a cooler event source."
+      }
+    ],
+    "Summary": "Reviewed all seven changed files and complete diff pages. Traced PTY writes, idle waits, listener ownership, normal/recovery execution, shell detection, cache reuse, and concurrency. No high-confidence actionable performance regression was introduced, and the PR does not establish a shipped performance-regression fix requiring blame attribution."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-21T06:39:58.339928126Z",
+    "CompletedAt": "2026-10-21T06:41:27.038312611Z",
+    "WallClockMilliseconds": 88698,
+    "ModelCalls": 7,
+    "InputTokens": 184810,
+    "OutputTokens": 4975,
+    "TotalTokens": 189785,
+    "ReasoningTokens": 1632,
+    "CacheReadTokens": 139264,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 70533,
+    "ToolCalls": 37,
+    "NanoAIUnits": 33738960000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 139264,
+      "cache_write": 0,
+      "input": 45546,
+      "output": 4975
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
