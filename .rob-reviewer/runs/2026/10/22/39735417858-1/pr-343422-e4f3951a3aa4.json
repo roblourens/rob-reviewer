@@ -1,0 +1,165 @@
+{
+  "PullRequest": {
+    "Number": 343422,
+    "Title": "agentHost: re-enable MCP servers the host disabled when their decision is cleared",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nRelated: #343410 (found while testing it end to end).\n\n## Problem\n\nTurning a Copilot Connector's MCP server off and then back on in Customizations leaves it off in already-open Agent Host sessions. The row shows \"Stopped\" with a Start button, and the agent has none of its tools until a new session is created.\n\nBefore each message, and whenever customization settings change, the host brings the runtime's enable/disable state in line with each server's setting. To avoid overriding a disable that comes from the SDK configuration, it only enables a server when there is explicit intent: the server is declared by the client or at launch, or has an explicit enablement entry. Turning a server back on removes its \"off\" entry, because a decision equal to the inherited default isn't stored. Connector servers are never declared, so after that nothing counts as explicit intent, the server never gets a target state, and it stays disabled.\n\n## Fix\n\nTrack the servers this host disabled at runtime (`_hostDisabledMcpServerNames`, updated when `mcp.disable` or `mcp.enable` succeeds) and treat them as having explicit intent. When the user restores the inherited default, the host enables the server it disabled. Servers disabled by the SDK configuration are never in this set, so the existing protection is unchanged.\n\n## How to test\n\n- New unit test, `re-enables an MCP server it disabled once its decision returns to the inherited default`: it fails without the fix (`enable: []`) and passes with it.\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts --run src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts --run src/vs/platform/agentHost/test/node/agentService.test.ts`: 3699 passing. This includes `does not force-enable a newly discovered configured-disabled MCP server or infer intent from startup`.\n- `npm run typecheck-client` and ESLint on the changed files: clean.\n- Manual: with a Copilot Connector connected, open an Agents window session and send a message. In Customizations \u003e Tools, turn the Connector's server off, then on again. The server should start without Start or a new session.\n\nNot addressed here: a server disabled with `mcp.disable` is still restarted by the runtime when a turn reloads MCP. The host disables it again after the turn. That behaviour predates this change, is reproducible with ordinary user MCP servers, and needs a runtime fix.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/343422",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "vritant24",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "c8f3fd17f6b3caad6ccf9dec1fc45b5e155c16c2",
+    "HeadRef": "vritant24/connector-disabled-restart",
+    "HeadSHA": "e4f3951a3aa43d1c199fe2c3fe7aec5822790633",
+    "CreatedAt": "2026-10-22T05:47:11Z",
+    "UpdatedAt": "2026-10-22T06:04:33Z",
+    "MergedAt": null,
+    "Labels": [
+      "ai-customizations",
+      "copilot-connectors"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Submit a turn after disabling a Connector MCP server and then restoring its inherited enablement default.",
+        "CriticalPath": "Turn preparation already awaits MCP reconciliation before the SDK send. Existing listConfigured must complete; after the decision returns to inherited enabled, the changed state can add one required mcp.enable call and server restart before that turn proceeds.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_doReconcileMcpServerEnablement",
+            "Operation": "List configured MCP servers.",
+            "Cardinality": "One listConfigured call per already-existing reconciliation; server candidates are processed from that single inventory.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same reconciliation and listConfigured IPC ran before every prepared turn.",
+            "CriticalPathEffect": "Awaited during turn preparation before the SDK send."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_enableMcpServer",
+            "Operation": "Enable an MCP server, which restarts its runtime process/connection.",
+            "Cardinality": "At most once for each successfully host-disabled server after its desired state changes back to enabled; the set entry is deleted after success, and observed enabled state suppresses subsequent calls.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The broken path omitted this enable call and left the requested server unavailable; explicitly declared servers already used this same enable path.",
+            "CriticalPathEffect": "Awaited before the first turn sent after restoration, because the server's tools must be available to that turn."
+          }
+        ],
+        "ScalingInput": "Number of distinct servers successfully disabled by this host and still awaiting restoration; realistic effective cardinality is the user's disabled Connector servers, bounded by the session's configured MCP inventory.",
+        "EffectiveConcurrency": "All reconciliation requests are serialized by _mcpEnablementSequencer; enable/disable operations within one reconciliation are awaited sequentially. The effective changed cardinality is one enable per previously host-disabled server whose decision has returned to enabled, not one per customization candidate.",
+        "CacheBehavior": "_hostDisabledMcpServerNames is populated only after successful disable, checked during desired-state resolution, and deleted only after successful enable. Failed mutations do not corrupt the state, and later warm reconciliations observe the server enabled and issue no further enable call.",
+        "MechanismConfidence": "High: changed lines directly gate the existing enable IPC, and the new test proves one disable, one enable, then no repeated enable on a third turn.",
+        "MagnitudeUncertainty": "MCP startup duration varies by server, but the work is necessary to restore requested functionality and is one-shot per restored server.",
+        "Verdict": "No reportable regression. The added boundary work is the required restoration behavior, is coalesced by sequencing, and is suppressed after success."
+      },
+      {
+        "Scenario": "Customization enablement changes while an Agent Host session is idle.",
+        "CriticalPath": "The customization event schedules reconciliation asynchronously, so it is off the immediate settings-change critical path. A later turn can queue behind the same sequencer if reconciliation remains active.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:initializeSession onDidChange callback -\u003e _reconcileMcpServerEnablement",
+            "Operation": "List configured servers and optionally enable the restored server.",
+            "Cardinality": "One inventory read per queued event; the diff adds at most one successful enable per restored host-disabled server, after which the set entry is removed.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The callback already queued the inventory IPC and reconciliation; only the previously missing enable decision is added.",
+            "CriticalPathEffect": "Off the settings UI's synchronous critical path; may complete before or serialize with the next turn."
+          }
+        ],
+        "ScalingInput": "Customization change events and the number of configured MCP servers resolved in each existing reconciliation.",
+        "EffectiveConcurrency": "Customization events and turn preflights share one Sequencer, preventing overlapping inventory reads and duplicate runtime mutations.",
+        "CacheBehavior": "Session-local tracking preserves the origin of a disable across the settings decision being removed. Successful enable invalidates that entry; disposal releases the set with the session.",
+        "MechanismConfidence": "High: the changed set membership is only consulted inside the pre-existing reconciliation and does not schedule work itself.",
+        "MagnitudeUncertainty": "Event bursts could queue existing reconciliations, but this diff neither adds event subscriptions nor increases reconciliation frequency.",
+        "Verdict": "No reportable regression. Frequency and concurrency are unchanged, and added work occurs only when needed to restore a server."
+      },
+      {
+        "Scenario": "Refresh Copilot Connectors after MCP customization changes.",
+        "CriticalPath": "Connector refresh already reconciles MCP enablement before connector reconciliation and again after newly discovered names. The first pass may restore a host-disabled server; the second pass observes it enabled and performs no duplicate enable.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_doRefreshConnectors",
+            "Operation": "Two existing MCP inventory reconciliations around Connector reconciliation.",
+            "Cardinality": "Existing pre/post refresh inventory calls; no new calls are scheduled by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Both reconciliation calls already occurred around Connector refresh.",
+            "CriticalPathEffect": "Awaited on the Connector refresh path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_enableMcpServer",
+            "Operation": "Enable a previously host-disabled Connector server.",
+            "Cardinality": "One call per restored server; successful completion deletes tracking before the post-refresh reconciliation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The server remained disabled, so the required enable IPC and restart did not occur.",
+            "CriticalPathEffect": "Awaited before Connector reconciliation so it sees the requested enabled state."
+          }
+        ],
+        "ScalingInput": "Number of Connector servers that this host disabled and whose enablement decisions were subsequently cleared.",
+        "EffectiveConcurrency": "Connector refreshes are coalesced by _connectorRefresh, guarded against active turns/control operations, and MCP reconciliations are serialized by _mcpEnablementSequencer.",
+        "CacheBehavior": "The set acts as one-shot session state. Warm post-refresh reconciliation incurs only O(1) membership checks and no repeated enable IPC.",
+        "MechanismConfidence": "High: call ordering, set deletion, refresh coalescing, and sequencer ownership are explicit in the traced code.",
+        "MagnitudeUncertainty": "Connector/server startup latency is environment-dependent; the diff's call count and one-shot behavior are established.",
+        "Verdict": "No reportable regression. The required enable work is bounded and does not duplicate across the two reconciliation passes."
+      },
+      {
+        "Scenario": "Long-lived session with MCP servers disabled and removed or later restored.",
+        "CriticalPath": "Set retention is not on a user-visible critical path; membership checks occur during existing per-server enablement resolution.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Distinct MCP server names successfully disabled during one session.",
+        "EffectiveConcurrency": "All mutations occur through sequenced reconciliation on the session event loop; no concurrent worker or process resource is retained by the set itself.",
+        "CacheBehavior": "Names remain only until successful re-enable or session disposal. A removed server name can remain for the session lifetime, but the set is bounded by distinct configured server names that the host successfully disabled, rather than turns, events, or history items.",
+        "MechanismConfidence": "High for lifecycle and scaling: the set is an instance field and no global/static owner retains the session.",
+        "MagnitudeUncertainty": "Users could reconfigure servers over a long session, but realistic MCP inventories are small and each retained value is a string; there is no plausible material memory-growth impact.",
+        "Verdict": "No reportable unbounded-retention issue; lifetime and cardinality are session-bounded and small."
+      }
+    ],
+    "Summary": "Reviewed both changed files and all diff hunks. The production change adds one-shot session state that distinguishes host-disabled servers from SDK-config-disabled servers. It can intentionally cause one existing enable IPC/server restart when a decision returns to inherited enabled, but does not add reconciliation triggers, duplicate work, uncontrolled concurrency, or material retained growth. No performance findings and no qualifying performance-regression fix to record."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-22T06:48:40.873144045Z",
+    "CompletedAt": "2026-10-22T06:49:57.99567362Z",
+    "WallClockMilliseconds": 77122,
+    "ModelCalls": 8,
+    "InputTokens": 181833,
+    "OutputTokens": 4254,
+    "TotalTokens": 186087,
+    "ReasoningTokens": 1213,
+    "CacheReadTokens": 141929,
+    "CacheWriteTokens": 39880,
+    "APIDurationMilliseconds": 56542,
+    "ToolCalls": 28,
+    "NanoAIUnits": 34134760000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 141929,
+      "cache_write": 39880,
+      "input": 24,
+      "output": 4254
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
