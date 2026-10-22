@@ -1,0 +1,290 @@
+{
+  "PullRequest": {
+    "Number": 343339,
+    "Title": "agentHost: don't block session open on Copilot Connector reconciliation",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #343338\n\n## Problem\n\nOpening an unloaded session in the Agents window resumes its SDK session, and `CopilotSessionLauncher._finalizeSession` awaited `reconcileCopilotConnectors` before returning it. The `connectors.reconcile` RPC resolves only after the runtime restarts the session's Connector MCP servers and their **remote** MCP `initialize` completes. Across 35 real launches, that took **1.71 / 2.08 / 3.44 s** (min / median / max), **~67 %** of each launch. In every case `Reconciled …` was logged 0–9 ms after the runtime's `Slack MCP` `initialize`. See the issue for the full trace.\n\n## Change\n\n- **Launcher:** starts the same reconciliation (same RPCs, same point in the launch) without awaiting it, and hands the promise to the session through `ICopilotSessionRuntime.adoptLaunchConnectorReconcile`. This replaces `setCopilotConnectorServers`, whose only caller was this path. `reconcileCopilotConnectors` already catches every RPC failure when no token is passed, so launch failure semantics are unchanged.\n- **Session:** adopts the promise once its wrapper is installed. When it settles, the session publishes Connector ownership, refreshes MCP inventory and fires `tools/list_changed`, mirroring `_doRefreshConnectors`. It re-checks wrapper identity and disposal after each await, and the whole chain never rejects.\n- **Ordering**, so nothing observes pre-reconcile Connector state:\n  - `send()` waits before the turn reaches the SDK, so the first turn still has its Connector tools.\n  - `_runMcpServerControl` (Start/Stop) waits, just as it already waits for `_connectorRefresh`.\n  - `_doRefreshConnectors` waits, cancellably, retaining the request on cancellation as before. In-place refreshes therefore never run concurrently with the launch reconcile.\n  - `resolveMcpAuthentication` waits, because Connector ownership decides whether a pending request may take a client MCP token. Without this, a token offered in that window would reach a Connector-owned server; the updated test fails that way.\n\n**Net effect:** in the traced click, the session opens in ~0.8 s instead of 2.6 s. The reconcile normally finishes in the background before the user types anything. If they send immediately, only the first turn waits for the remainder, which every open pays today.\n\n## Tests\n\n- `copilotSessionLauncher.test.ts`: `uses session-owned Connector accounts without delaying launch: *` now blocks `connectors.reconcile` until `launch()` has returned. The test would hang if the launcher still awaited it.\n- `copilotAgentSession.test.ts`:\n  - **New:** `opens without waiting for launch-time reconciliation, then publishes it before sends and MCP controls run`.\n  - **New:** `ignores launch-time reconciliation that settles after the session is disposed`.\n  - **Updated:** `republishes pending connector authentication when Connector ownership becomes available, without accepting an MCP token` now offers the token while the reconcile is still pending.\n- **Mutation check:** removing the new waits in `send` / `_runMcpServerControl` / `resolveMcpAuthentication` makes both the new ordering test and the updated auth test fail; the latter shows `resolved: true` with `{ kind: 'token', accessToken: 'connector-token' }`.\n\n### Validation\n\n- `./scripts/test.sh --reporter dot --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --run src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts`: **passed** (2356 passing, 1 pending)\n- `npm run typecheck-client`: **passed**\n- `npm run eslint -- \u003c4 changed files\u003e`: **passed**\n- Not run: the provider integration test `providerIntegration/copilotConnectors.integrationTest.ts`, which needs a real Connector account. It calls `reconcileCopilotConnectors` directly and is unaffected.\n\n### How to verify manually\n\nWith Copilot Connectors enabled and a Connector configured, click an unloaded session in the Agents window. In `agenthost.log`, `Restored session …` now follows `SDK resumeSession settled` by well under a second. `Reconciled N connector MCP server(s)` appears afterwards, and the session's Connector tools are available on the first turn.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/343339",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "f7550a018e1e81de20f916645d295124432c4d5c",
+    "HeadRef": "agents/dbgjs-vscode-insiders-performance-issue",
+    "HeadSHA": "b49784e891152aceecfbea6153eded35574e365d",
+    "CreatedAt": "2026-10-21T20:47:00Z",
+    "UpdatedAt": "2026-10-21T23:40:04Z",
+    "MergedAt": null,
+    "Labels": [
+      "waiting-for-review"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-BEEC57057D2B",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts",
+      "Side": "RIGHT",
+      "Line": 1080,
+      "Severity": "medium",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The call path and overlap are explicit: launch returns with the reconcile promise pending, _warmChat immediately starts MCP servers, and startMcpServers has no ordering wait. The exact amount of duplicate runtime work depends on SDK coalescing, so severity is medium, but concurrent expensive lifecycle requests and first-send dependency are established.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "Concurrent remote MCP server start/restart operations and their network initialization handshakes",
+      "PerformanceScaling": "For every prewarmed chat with Connectors enabled, one connectors.reconcile and one all-server rpc.mcp.list now overlap; both fan across that chat's configured Connector servers, so contention and duplicate lifecycle work grow with connector count and concurrent prewarmed chats.",
+      "PerformanceOutcome": "Increased first-turn latency and extra network/process startup load when prewarming sessions with Connectors enabled",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "_finalizeSession awaited reconcileCopilotConnectors before returning, so the unchanged prewarm rpc.mcp.list() ran only after Connector restart and remote initialization had completed.",
+      "ChangedBehavior": "Launch now returns while Connector reconciliation is restarting Connector MCP servers. CopilotAgent._warmChat immediately invokes launch.session.startMcpServers(), whose implementation calls rpc.mcp.list() specifically to start all lazy MCP servers, without waiting for _launchConnectorReconcile.",
+      "CausalDiffEvidence": "The added line starts reconcileCopilotConnectors and hands off its still-pending promise, allowing _finalizeSession to return immediately. The deleted implementation awaited that same reconciliation before returning the wrapper, so downstream prewarm startup could not overlap it.",
+      "Title": "Serialize prewarm MCP startup after connector reconciliation",
+      "Impact": "When a chat is prewarmed with one or more Connectors, the all-server startup RPC races the launch-time Connector restart/remote handshake. The runtime must serialize or repeat overlapping lifecycle work for the same servers; because the first send waits for reconciliation, any resulting contention directly erodes prewarm latency and can delay that first turn.",
+      "Evidence": "reconcileCopilotConnectors calls connectors.reconcile, which restarts Connector servers and waits for its result. CopilotAgent._warmChat calls startMcpServers immediately after _launchProvisional returns, and startMcpServers documents that rpc.mcp.list starts the session's MCP servers. Unlike send, MCP controls, authentication, and refresh, startMcpServers has no _launchConnectorReconcile wait. Thus prewarming deterministically places these two expensive lifecycle RPCs concurrently for the same session.",
+      "Recommendation": "Gate startMcpServers on the adopted launch reconciliation before calling rpc.mcp.list (the warm caller already fire-and-forgets this method, so this preserves non-blocking warmChat), then start any remaining lazy non-Connector servers."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 1080,
+      "BasePath": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts",
+      "BaseLine": 1063,
+      "IntroducingPath": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts",
+      "IntroducingCommit": "d185731337ad1ca5103b525c0e9e55a36670a997",
+      "MechanismFamily": "eager-work",
+      "PerformanceCategory": "latency",
+      "Mechanism": "_finalizeSession synchronously awaited connectors.reconcile on every Connector-enabled create/resume; that RPC restarts Connector MCP servers and does not resolve until their remote MCP initialization handshakes finish.",
+      "Symptom": "Opening or resuming a Connector-enabled session was blocked on multi-second remote Connector server initialization before the session wrapper could be returned.",
+      "FixedBehavior": "The changed line starts the same reconciliation but adopts its promise into the session without awaiting it in _finalizeSession, removing the remote handshake from session-open's critical path while later Connector-dependent operations remain ordered behind it.",
+      "Evidence": "The deleted base line awaited reconcileCopilotConnectors inside _finalizeSession before wrapper construction/return. reconcileCopilotConnectors crosses connectors capability/account RPCs and connectors.reconcile; the changed code's own launch-path comment identifies the latter as restarting Connector MCP servers and resolving only after remote handshakes that take seconds. The replacement at line 1080 hands the promise to runtime.adoptLaunchConnectorReconcile and immediately proceeds to return the wrapper, directly removing that wait from create/resume latency.",
+      "Confidence": 0.96
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "concurrency-burst",
+      "missing-coalescing",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create or resume a Connector-enabled session from the Agents UI",
+        "CriticalPath": "SDK create/resume, agent discovery, script-safety application, sandbox setup, execution-subagent configuration, optional verbosity, wrapper initialization, event registration, sandbox/canvas/shell synchronization, and resume metrics remain on the open path. Connector reconciliation now starts near the end of launcher finalization but is off the session-open critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_createSession/_resumeSession",
+            "Operation": "SDK createSession or resumeSession opens the agent runtime session.",
+            "Cardinality": "One successful open per launch attempt; resume can fall back to one create when the persisted session is empty.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same SDK open path before the diff.",
+            "CriticalPathEffect": "Still on session-open critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotConnectors.ts:reconcileCopilotConnectors; launched at copilotSessionLauncher.ts:1080",
+            "Operation": "Connector capability and account reads followed by connectors.reconcile; reconcile restarts Connector MCP servers and awaits remote initialization.",
+            "Cardinality": "Normally capabilities + account + one reconcile per Connector-enabled launch; failures may add one status read.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same sequence was awaited inside _finalizeSession before the wrapper could be returned.",
+            "CriticalPathEffect": "Moved off session-open critical path; immediate Connector-dependent operations still wait for its shared promise."
+          },
+          {
+            "Kind": "network",
+            "Location": "Runtime work behind connectors.reconcile",
+            "Operation": "Remote MCP initialize handshakes caused by Connector server restart.",
+            "Cardinality": "Scales with Connector-owned servers in the launched session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Completed before session open returned.",
+            "CriticalPathEffect": "No longer blocks open; it blocks an immediate first turn through the adopted promise."
+          }
+        ],
+        "ScalingInput": "One reconciliation sequence per launched SDK session; Connector remote restart work scales with the number of Connector-owned runtime servers. Multiple concurrently opened sessions have no shared limiter.",
+        "EffectiveConcurrency": "Within one session, capability/account/reconcile RPCs are sequential. Across sessions they may run concurrently. The adopted promise coalesces all later waits for that session.",
+        "CacheBehavior": "No Connector reconciliation cache is used. Capability/account/status are read per launch. The adopted in-flight promise acts as per-session coalescing until settlement; warm and cold launches both perform the sequence when Connectors are enabled.",
+        "MechanismConfidence": "High: the deleted await and added promise adoption explicitly change critical-path placement.",
+        "MagnitudeUncertainty": "Exact launch saving and remote handshake duration vary with Connector count and service/network latency, but removal from the open critical path is direct.",
+        "Verdict": "This scenario is a performance improvement and was recorded as a regression fix, not a review finding."
+      },
+      {
+        "Scenario": "Send the first turn immediately after a deferred launch reconciliation starts",
+        "CriticalPath": "send() waits for the single adopted launch reconcile, Connector ownership publication, one MCP inventory refresh, and then invokes the SDK send. If reconciliation already settled, this wait is absent.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:send",
+            "Operation": "Await the already-running connectors.reconcile RPC.",
+            "Cardinality": "One RPC sequence per launch, shared by all waiting operations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "send could only be called after launch had already awaited full reconciliation.",
+            "CriticalPathEffect": "Only the unresolved remainder is on first-turn critical path; previously the entire reconciliation was paid before open returned."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_publishLaunchConnectorReconcile/_refreshMcpServersFromRpc",
+            "Operation": "Refresh authoritative MCP inventory via rpc.mcp.listConfigured after reconciliation publishes Connector ownership.",
+            "Cardinality": "One publication refresh on normal settlement, with retries only if lifecycle version changes; concurrent newer refreshes supersede publication results.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Launch set Connector ownership before wrapper return and did not perform this post-reconcile publication refresh.",
+            "CriticalPathEffect": "Included in the adopted promise, so an immediate send waits for it."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_refreshUserMcpServers",
+            "Operation": "Refresh user MCP configuration alongside listConfigured when a user-MCP provider is present.",
+            "Cardinality": "At most one provider read per publication refresh, plus lifecycle-driven retries.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No launch-reconcile publication refresh ran after wrapper installation.",
+            "CriticalPathEffect": "Included in the first-send wait through publication."
+          }
+        ],
+        "ScalingInput": "One shared launch reconciliation per session regardless of how many callers observe it; inventory size scales with configured MCP servers.",
+        "EffectiveConcurrency": "Concurrent send/control/auth callers await the same promise. Publication performs one authoritative inventory refresh; it is not duplicated per waiter.",
+        "CacheBehavior": "The in-flight promise is cleared after settlement. MCP inventory uses request-version supersession rather than a persistent cache; warm state is reused only through current session state.",
+        "MechanismConfidence": "High for the wait and boundary placement; moderate for material latency of the inventory refresh.",
+        "MagnitudeUncertainty": "The added inventory/user-config refresh duration is environment-dependent and usually smaller than remote reconciliation; evidence did not establish a separate high-severity regression.",
+        "Verdict": "No separate finding: work is coalesced and the ordering preserves Connector ownership before the SDK turn; the only reportable first-turn risk is the prewarm race below."
+      },
+      {
+        "Scenario": "Prewarm a new chat with Connectors enabled before its first send",
+        "CriticalPath": "warmChat waits for session initialization but intentionally fire-and-forgets startMcpServers. After this diff initialization returns while launch reconciliation is pending, so rpc.mcp.list overlaps the Connector restart. A claimed first turn waits for reconciliation and is therefore exposed to any contention.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:1080",
+            "Operation": "connectors.reconcile restarts Connector MCP servers.",
+            "Cardinality": "One per Connector-enabled prewarmed launch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same call existed, but launch awaited it before returning to _warmChat.",
+            "CriticalPathEffect": "Off warmChat's return path but on an immediate claimed first turn through send's wait."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:startMcpServers, called by copilotAgent.ts:_warmChat",
+            "Operation": "rpc.mcp.list starts every lazy MCP server for the prewarmed session.",
+            "Cardinality": "One all-server list per prewarmed chat, fanning across configured servers.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The unchanged list call ran only after awaited Connector reconciliation had completed.",
+            "CriticalPathEffect": "Fire-and-forget for warmChat, but now competes with reconciliation whose completion gates the first turn."
+          },
+          {
+            "Kind": "network",
+            "Location": "Runtime work behind connectors.reconcile and rpc.mcp.list",
+            "Operation": "Remote MCP initialize handshakes from overlapping server start/restart lifecycle work.",
+            "Cardinality": "Potentially affects each Connector-owned server; burst grows with connectors and simultaneous prewarms.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Connector restart/initialize completed before the prewarm list started remaining lazy servers.",
+            "CriticalPathEffect": "Contention can delay reconcile settlement and therefore the first turn, while consuming duplicate startup/network capacity."
+          }
+        ],
+        "ScalingInput": "One reconcile plus one all-server list per warmed chat; both fan across configured Connector servers. Aggregate burst scales with concurrent warmed chats and Connector count.",
+        "EffectiveConcurrency": "The two lifecycle operations run concurrently for the same SDK session, and no gate in startMcpServers waits for _launchConnectorReconcile. There is no cross-chat limiter.",
+        "CacheBehavior": "No cache or negative cache applies. The reconcile promise coalesces send/control/auth/refresh waiters, but startMcpServers bypasses it entirely.",
+        "MechanismConfidence": "High: the new non-awaited handoff, immediate prewarm call, and absence of a wait in startMcpServers are all directly traced.",
+        "MagnitudeUncertainty": "The SDK/runtime may coalesce some same-server lifecycle work, so the exact duplicate handshake count is uncertain; concurrent expensive lifecycle requests and their first-turn dependency are explicit.",
+        "Verdict": "Reportable medium-severity concurrency burst; finding submitted."
+      },
+      {
+        "Scenario": "MCP Start/Stop, connector refresh, and MCP token resolution while launch reconciliation is pending",
+        "CriticalPath": "Each operation waits for the same launch reconciliation before observing or mutating Connector state. MCP controls then wait for any connector refresh; refresh is cancellably ordered after launch reconciliation; token resolution waits before scanning pending requests.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_doRefreshConnectors/_runMcpServerControl/resolveMcpAuthentication",
+            "Operation": "Await the shared connectors.reconcile, then optionally issue one in-place connector refresh sequence.",
+            "Cardinality": "One launch sequence shared by all operations; one coalesced refresh at a time per session.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "These operations ran only after launch had already completed reconciliation.",
+            "CriticalPathEffect": "Intentionally blocks these state-dependent operations; no per-waiter boundary fan-out."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_runMcpServerControl callers",
+            "Operation": "MCP start/stop/OAuth control RPC after ordered waits.",
+            "Cardinality": "One RPC per explicit user control operation, per-server sequenced.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same control RPCs without a launch-promise wait because reconciliation had already completed.",
+            "CriticalPathEffect": "On the requested control operation's path, not session-open."
+          }
+        ],
+        "ScalingInput": "Waiter count can grow with user actions, but all waiters share one reconciliation and do not add Connector RPCs. Subsequent refresh cardinality remains one coalesced _connectorRefresh per session.",
+        "EffectiveConcurrency": "Per-session promise coalescing prevents duplicate launch reconciliation. MCP controls use a per-server lifecycle sequencer after the shared waits; refresh uses one _connectorRefresh and connector reconcile tracking.",
+        "CacheBehavior": "The launch promise is cleared on settlement. Connector refresh requests are generation-tracked and retained on cancellation; no additional launch reconcile is started.",
+        "MechanismConfidence": "High: waits and coalescing fields are explicit.",
+        "MagnitudeUncertainty": "User action frequency varies, but multiplicity is bounded by existing coalescing/sequencing.",
+        "Verdict": "No finding: the diff preserves ordering without multiplying expensive boundaries."
+      },
+      {
+        "Scenario": "Dispose or replace a session while launch-time reconciliation is pending",
+        "CriticalPath": "Disposal does not await publication. When the promise settles, wrapper identity and disposal checks prevent inventory refresh/notification against the dead session. Wrapper disposal initiates SDK disconnect.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:1080 and copilotAgentSession.ts:_publishLaunchConnectorReconcile",
+            "Operation": "Pending connectors.reconcile may continue until settlement while wrapper disconnect is initiated.",
+            "Cardinality": "At most one pending sequence per disposed/replaced wrapper.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Launch could not return, and therefore ordinary post-open disposal could not occur, until reconciliation had settled.",
+            "CriticalPathEffect": "Off disposal's synchronous path; replacement/disconnect behavior depends on SDK RPC shutdown semantics."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionWrapper.ts:dispose/disconnect",
+            "Operation": "SDK wrapper disconnect during disposal or replacement.",
+            "Cardinality": "One per disposed wrapper.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same wrapper teardown, but no post-open pending launch reconciliation remained.",
+            "CriticalPathEffect": "Replacement explicitly awaits disconnect; ordinary disposal initiates best-effort disconnect."
+          }
+        ],
+        "ScalingInput": "At most one pending launch reconcile and one captured wrapper per session; retention lasts until the runtime RPC settles.",
+        "EffectiveConcurrency": "A telemetry-driven replacement can start another session after disconnect; old publication is identity-guarded. No explicit cancellation token is attached to launch reconciliation.",
+        "CacheBehavior": "No cache. The pending promise reference clears only on settlement; disposal guards suppress publication but do not explicitly cancel the underlying RPC.",
+        "MechanismConfidence": "High for pending-promise capture and disposal guards; low for any unbounded lifetime after disconnect.",
+        "MagnitudeUncertainty": "Repository evidence does not establish that connectors.reconcile can outlive SDK disconnect indefinitely; therefore possible temporary retention is not a high-confidence leak finding.",
+        "Verdict": "No finding: the diff guards post-disposal publication, and persistent retention beyond disconnect is not proven."
+      }
+    ],
+    "Summary": "Reviewed all four changed files and every diff hunk. The PR removes a real remote Connector handshake from create/resume critical path, but introduces one actionable concurrency regression: prewarm's all-server MCP startup is not ordered behind the newly deferred Connector restart. Other Connector-dependent paths share the adopted promise and do not multiply reconciliation work; disposal/replacement guards prevent post-settlement publication, with no additional high-confidence performance finding."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-22T01:58:21.732837763Z",
+    "CompletedAt": "2026-10-22T02:01:35.110513005Z",
+    "WallClockMilliseconds": 193377,
+    "ModelCalls": 13,
+    "InputTokens": 701243,
+    "OutputTokens": 11001,
+    "TotalTokens": 712244,
+    "ReasoningTokens": 4089,
+    "CacheReadTokens": 616749,
+    "CacheWriteTokens": 84455,
+    "APIDurationMilliseconds": 161878,
+    "ToolCalls": 67,
+    "NanoAIUnits": 88915060000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 616749,
+      "cache_write": 84455,
+      "input": 39,
+      "output": 11001
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
