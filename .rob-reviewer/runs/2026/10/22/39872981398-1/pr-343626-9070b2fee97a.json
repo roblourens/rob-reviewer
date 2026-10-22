@@ -1,0 +1,185 @@
+{
+  "PullRequest": {
+    "Number": 343626,
+    "Title": "Support Compare Agents in empty local repositories",
+    "Body": "## Summary\n\n- remove the Git remote requirement from Compare Agents eligibility\n- support unborn repositories by snapshotting the current non-ignored working tree into an internal parentless commit before creating each isolated branch/worktree\n- leave the source branch unborn and the user index untouched while giving every attempt a populated, clean baseline\n- preserve existing committed local/remote repository behavior and ignored-file copy/symlink setup\n\nFixes #343622\n\n## Validation\n\n- `npm run eslint -- \u003c8 changed TypeScript files\u003e`\n- `npm run typecheck-client`\n- `npm run build-fast -- --client-only`\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/shared/worktreeIsolation.test.ts --run src/vs/sessions/contrib/chat/test/browser/newChatWidget.test.ts` (240 passing)\n- `./scripts/test-integration.sh --run src/vs/platform/agentHost/test/node/agentHostGitService.integrationTest.ts --grep \"creates a populated clean worktree from an unborn repository snapshot\"` (1 passing)\n\nThe real-Git test verifies that the source remains unborn on `main`, the isolated branch is populated and clean, ignored files remain excluded for the existing include/symlink phase, and snapshot creation does not require user Git identity.",
+    "URL": "https://github.com/microsoft/vscode/pull/343626",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "meganrogge",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "404a7f5aadc421b3d82807747468a69ff6cdf234",
+    "HeadRef": "agents/compare-local-empty-repo",
+    "HeadSHA": "9070b2fee97ad8daab96f4966ad779be662f2a22",
+    "CreatedAt": "2026-10-22T21:46:15Z",
+    "UpdatedAt": "2026-10-22T22:04:20Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-166F339587D0",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts",
+      "Side": "RIGHT",
+      "Line": 1210,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The attempt bound, first-send call path, repository-wide serialization, unchanged unborn source branch, and capture subprocesses are explicit in code. Exact duration varies with repository size and filesystem, which limits severity rather than confidence in the mechanism.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Git subprocesses, full working-tree filesystem scans, temporary-index writes, and blob hashing/staging",
+      "PerformanceScaling": "For a comparison with A attempts and F non-ignored files in the unborn repository, this performs A full status/stage/write-tree captures, so source-tree work grows O(A × F); A is 2–10 and creation is serialized per repository.",
+      "PerformanceOutcome": "Comparison startup is blocked by repeated filesystem and Git work before all agent requests can start, producing avoidable launch latency and I/O/CPU pressure.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Comparisons without a remote were rejected, so the unborn local-repository path did not perform this snapshot work. Existing committed-repository worktree creation starts from the selected branch and does not capture the source tree for every attempt.",
+      "ChangedBehavior": "Each attempt whose selected branch is still unborn calls captureWorkingTreeAsTree and commitTree before its worktree is added. Creating the first attempt's generated branch does not create the selected source branch, so every later attempt enters the same block.",
+      "CausalDiffEvidence": "The added call at worktreeIsolation.ts:1210 places a complete source-tree capture inside the per-session worktree-creation callback; that callback executes once for every comparison attempt, while the same added block leaves the source branch unborn and therefore repeats for subsequent attempts.",
+      "Title": "Reuse one unborn-repository snapshot across comparison attempts",
+      "Impact": "Starting Compare Agents in a newly initialized repository with many files rescans and stages the identical source tree once per selected model (up to ten times), and the repository-scoped worktree sequencer makes those captures additive on the launch critical path.",
+      "Evidence": "startComparison maps all 2–10 attempts to createAndSendNewChatRequest and waits for Promise.all (sessionComparisonService.ts:103–178). First send calls resolveOnFirstSend (agentService.ts:1868–1884). All creations for one repository are queued by _worktreeCreationSequencer (worktreeIsolation.ts:1167), and each queued callback independently reaches the added capture at line 1210 because selectedBranch remains unborn. captureWorkingTreeAsTree runs `git status --untracked-files=all`, builds a temporary index, stages every reported path with `git add`, and runs `write-tree` (agentHostGitService.ts:1047–1090, 806–810, 845–856). There is no cache or comparison-level coalescing.",
+      "Recommendation": "Capture the unborn baseline once at comparison setup and pass/reuse that commitish for all attempts, or add a repository-scoped snapshot lifetime/invalidation mechanism so attempts from one launch share one capture while later launches still observe source edits."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "subprocess-critical-path"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Render Compare Agents eligibility for a selected local workspace without a Git remote",
+        "CriticalPath": "Synchronous composer visibility evaluation reads provider/session/workspace metadata; it must complete before the action is shown, but performs no subprocess, IPC, filesystem, database, or network operation.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of folders in the selected/session workspace and registered session types; both are small in normal use.",
+        "EffectiveConcurrency": "Single synchronous UI evaluation; no queue or parallel work.",
+        "CacheBehavior": "Branch and repository metadata are already resolved observables/config values. The diff removes the remote-state dependency and adds no cache or miss path.",
+        "MechanismConfidence": "High confidence from tracing _shouldShowComparisonAction and _getComparisonBranch.",
+        "MagnitudeUncertainty": "Workspace folder/type arrays vary, but all changed work is in-memory and bounded; no material performance regression is evidenced.",
+        "Verdict": "No reportable regression: the changed eligibility check performs bounded in-memory lookup and removes a redundant later branch check."
+      },
+      {
+        "Scenario": "Start Compare Agents in a committed local repository that has no remote",
+        "CriticalPath": "The UI starts 2–10 attempt sessions in parallel and waits for all launches. Each first send must create its worktree before its agent request proceeds.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess/filesystem",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1167-1228",
+            "Operation": "Existing branch lookup, generated-branch worktree creation, and worktree metadata/filesystem setup for each attempt",
+            "Cardinality": "One worktree creation per attempt (2–10), serialized for the repository.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same worktree creation path existed for eligible repositories; the diff broadens eligibility to local repositories without a remote but does not add snapshot capture when the selected branch has a commit.",
+            "CriticalPathEffect": "All attempt launches await creation; serialization makes worktree durations additive."
+          }
+        ],
+        "ScalingInput": "Configured comparison attempts, from 2 through 10.",
+        "EffectiveConcurrency": "Frontend attempt creation uses Promise.all, while _worktreeCreationSequencer serializes worktree creation by repository.",
+        "CacheBehavior": "Per-session materialized-worktree reuse prevents duplicate creation for one session; no cross-attempt reuse is expected for distinct worktrees.",
+        "MechanismConfidence": "High confidence from startComparison, createAndSendNewChatRequest, first-send resolution, and the repository-keyed sequencer.",
+        "MagnitudeUncertainty": "Worktree checkout duration depends on repository size, but this diff does not alter that mechanism for committed repositories.",
+        "Verdict": "No separate finding: broader product eligibility reaches existing per-attempt worktree creation, but the diff does not increase its per-attempt work or concurrency on this committed-repository path."
+      },
+      {
+        "Scenario": "Start Compare Agents in an unborn repository containing non-ignored project files",
+        "CriticalPath": "Each attempt's first send blocks on repository-scoped worktree creation. Before addWorktree can run, the added path captures and commits the source working tree.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1202-1213; src/vs/platform/agentHost/node/agentHostGitService.ts:1047-1109",
+            "Operation": "Check branch/HEAD/current branch and run full working-tree capture (`git status`, rev-parse/index lookup, read-tree, add, write-tree), then `commit-tree`",
+            "Cardinality": "Repeated once per comparison attempt: 2–10 captures of the same source baseline; each capture enumerates/stages all F non-ignored files.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The no-remote/unborn comparison was ineligible and performed no snapshot. Existing worktree creation had no source-tree capture block.",
+            "CriticalPathEffect": "Repository serialization makes all repeated captures additive before Promise.all launch completion and before the corresponding agents can process the prompt."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:1069-1091, 845-856",
+            "Operation": "Create/delete temporary index directory and pathspec file; stage/hash working-tree file contents",
+            "Cardinality": "One temporary-index lifecycle and one all-changed-path staging pass per attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Absent from this worktree-creation scenario.",
+            "CriticalPathEffect": "Awaited inside each serialized capture."
+          },
+          {
+            "Kind": "subprocess/filesystem",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:1222-1229",
+            "Operation": "Add one isolated branch/worktree from the generated snapshot commit",
+            "Cardinality": "One per attempt, as required for comparison isolation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Worktree add already existed, but an unborn selected branch could not supply a valid commitish.",
+            "CriticalPathEffect": "Awaited after snapshot capture for each attempt."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is attempts A (2–10) multiplied by non-ignored source files F; no grouping or coalescing reduces captures.",
+        "EffectiveConcurrency": "Attempt requests begin concurrently, but _worktreeCreationSequencer executes all snapshot and worktree work serially per repository.",
+        "CacheBehavior": "Git object storage may make repeated object writes warm, and index-path lookup is cached, but every attempt still reruns status, changed-path parsing, temporary-index creation, staging, and write-tree. There is no repository/comparison snapshot cache or coalescing.",
+        "MechanismConfidence": "Very high confidence: all multiplicities, boundaries, and serialization are explicit in code.",
+        "MagnitudeUncertainty": "Absolute delay depends on file count, file sizes, filesystem, and Git implementation; prevalence is limited to unborn repositories. The multiplicative work and critical-path serialization are certain.",
+        "Verdict": "Reportable medium-severity repeated-work regression: the new support snapshots an identical baseline separately for every attempt instead of sharing one capture."
+      },
+      {
+        "Scenario": "Create a VS Code-owned parentless snapshot commit without configured user identity",
+        "CriticalPath": "After a tree is captured, one commit-tree subprocess must complete before addWorktree can start.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:1095-1109",
+            "Operation": "Run `git commit-tree` with four internal identity environment variables",
+            "Cardinality": "One per unborn snapshot invocation; repeated cardinality is covered by the unborn comparison finding.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "commitTree ran without internal identity overrides; this unborn worktree caller did not exist.",
+            "CriticalPathEffect": "Awaited before worktree creation."
+          }
+        ],
+        "ScalingInput": "Number of unborn snapshot invocations.",
+        "EffectiveConcurrency": "Serialized per repository through the caller's sequencer.",
+        "CacheBehavior": "No cache; commit creation is constant-size relative to tree contents because blobs/tree were already written.",
+        "MechanismConfidence": "High confidence from the implementation and only new caller.",
+        "MagnitudeUncertainty": "The environment merge itself is negligible; subprocess cost is dominated by the separately reported repeated snapshot path.",
+        "Verdict": "No independent finding: identity injection adds negligible work, and its repeated subprocess cardinality is part of the snapshot-per-attempt issue."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files and every diff page. One concrete regression was reported: unborn repositories repeat a full source-tree snapshot for each serialized comparison attempt. Other changed paths are bounded metadata checks, tests, or constant-cost identity setup without an independent performance issue."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-22T23:48:33.235103423Z",
+    "CompletedAt": "2026-10-22T23:50:17.897053972Z",
+    "WallClockMilliseconds": 104661,
+    "ModelCalls": 11,
+    "InputTokens": 407285,
+    "OutputTokens": 6117,
+    "TotalTokens": 413402,
+    "ReasoningTokens": 1872,
+    "CacheReadTokens": 351299,
+    "CacheWriteTokens": 55953,
+    "APIDurationMilliseconds": 86242,
+    "ToolCalls": 51,
+    "NanoAIUnits": 54275660000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 351299,
+      "cache_write": 55953,
+      "input": 33,
+      "output": 6117
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
