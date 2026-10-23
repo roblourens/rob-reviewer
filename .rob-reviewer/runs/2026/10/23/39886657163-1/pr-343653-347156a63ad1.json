@@ -1,0 +1,130 @@
+{
+  "PullRequest": {
+    "Number": 343653,
+    "Title": "Agent host: mark MCP tool calls auth-required when they start during pending authentication",
+    "Body": "When the agent host has an MCP authentication request pending for a server, only MCP tool calls that were already running when the request arrived were marked as waiting on authentication. MCP routing proxy calls also got this, via `_adoptPendingMcpAuthentication`. An ordinary MCP tool call that started *after* the request was raised was shown as just running, even though it is blocked until sign-in completes. For example, the Copilot runtime now holds a call to a cached tool on a server that still needs auth, instead of failing it.\r\n\r\nThis change attaches such tool calls to the pending request once they are ready (after `ChatToolCallReady`, since the chat reducer only applies `ChatToolCallAuthRequired` to running calls). They now show as auth-required, are resolved with `ChatToolCallAuthResolved` when sign-in completes, and take part in the existing per-tool-call auth cancellation. The attach logic is split out of `_adoptPendingMcpAuthentication`, so the routing proxy path is unchanged.\r\n\r\nOlder Copilot runtimes fail such calls quickly, so with them the auth-required state is only briefly visible before the failure.\r\n\r\n**Testing**\r\n\r\n- New unit test `MCP tool call started while authentication is pending transitions to auth required` in `copilotAgentSession.test.ts`. An auth request is raised first, then MCP tool calls start on that server and on another server. The reduced state shows only the first as `AuthRequired` (the other stays `Running`), and it returns to `Running` once the token resolves. The test fails without the source change.\r\n- `npm run test-node -- --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts`: 1333 passing\r\n- `npm run eslint` on both changed files: clean\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/343653",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "connor4312",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "760092c853d1efe73604086a7e7b2c0344597813",
+    "HeadRef": "connor/agent-host-mcp-auth-adopt-tool-calls",
+    "HeadSHA": "347156a63ad1876f9a8949bce5503bf826e0475c",
+    "CreatedAt": "2026-10-22T23:56:44Z",
+    "UpdatedAt": "2026-10-23T01:14:06Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "An MCP tool call starts after its server has already raised an authentication request",
+        "CriticalPath": "The runtime emits tool.execution_start; handleToolStart records the active call, emits ChatToolCallReady, scans local active-call and pending-auth collections, and synchronously emits ChatToolCallAuthRequired. The runtime's MCP execution remains blocked on the already-pending authentication independently of this added local state publication; no new remote operation must complete because of the diff.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_attachActiveMcpToolCallsToPendingAuthentication",
+            "Operation": "Publish ChatToolCallAuthRequired through the agent progress event toward the client",
+            "Cardinality": "One small action per newly attached MCP tool call; duplicate starts/reattachment are suppressed by toolCallId.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No auth-required action was published for a tool that started after the auth request, so this boundary event was absent for that call.",
+            "CriticalPathEffect": "Synchronous process-local emission occurs in the start handler; downstream publication updates UI/auth state but does not add an awaited boundary to MCP execution."
+          },
+          {
+            "Kind": "network",
+            "Location": "Copilot runtime MCP tool execution associated with tool.execution_start",
+            "Operation": "Execute the MCP tool against its configured server after authentication succeeds",
+            "Cardinality": "One remote execution per logical MCP tool call, subject to runtime behavior and shared authentication.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same MCP tool execution and authentication wait existed; the diff only publishes the missing local auth-required state.",
+            "CriticalPathEffect": "The tool remains blocked on the pre-existing authentication requirement; this remote operation is the scenario's expensive execution boundary."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is the number of concurrently active MCP tool calls for the same server and the number of pending authentication requests. Only the latest requirement is eligible, and each tool-call ID is attached/emitted once through the existing deduplication check. Tests and telemetry logic establish parallel rounds as a supported pattern, but no evidence indicates realistically large in-flight sets.",
+        "EffectiveConcurrency": "JavaScript event callbacks execute serially. Logical parallel tool calls produce separate starts; the pending toolCalls list coalesces duplicate attachment by toolCallId, and authentication resolution remains shared by the pending request.",
+        "CacheBehavior": "No remote cache lookup is added. Warm and cold behavior differ only in whether a matching pending requirement exists; without one, the added path performs local bounded scans and emits nothing. Matching attachments are retained only for the pending request and removed when the registry responds or is cancelled.",
+        "MechanismConfidence": "High: the changed call path, local scans, deduplication, cleanup, and single action emission are directly visible in the source; no added network, filesystem, subprocess, or database call is reached.",
+        "MagnitudeUncertainty": "Exact production parallel-call distributions are unavailable, but the added action payload is small and local collection sizes are lifecycle-bounded by in-flight calls and pending requests.",
+        "Verdict": "No reportable regression. The diff adds the required single state-transition publication and bounded local bookkeeping, without increasing remote boundary count or placing an await on the tool-start path."
+      },
+      {
+        "Scenario": "A cached MCP routing proxy activates a server while authentication is pending",
+        "CriticalPath": "Activation is coalesced by server, refreshes MCP inventory, adopts matching pending authentication and waits for its completion, refreshes inventory again, then waits for Ready. The helper extraction preserves the previous adoption and wait behavior.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_refreshMcpServersFromRpc",
+            "Operation": "Call SDK MCP listConfigured during inventory refresh",
+            "Cardinality": "Two inventory refresh phases per activation in this path, with lifecycle-version retries possible; unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same pre- and post-authentication inventory RPCs were performed before the helper extraction.",
+            "CriticalPathEffect": "Both refreshes are awaited before routing activation completes."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_refreshMcpServersFromRpc / _doActivateMcpRoutingServer",
+            "Operation": "Refresh user MCP server state as part of the inventory refresh and eventually execute routed MCP work",
+            "Cardinality": "Grouped with each inventory refresh and one routed tool activation; no changed call count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same refresh and routed execution boundaries were already on this path.",
+            "CriticalPathEffect": "Existing remote work remains on the activation critical path."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is one activation promise per server plus pending auth requests for that server. Callers for the same server share _mcpRoutingActivations; the changed helper returns the same matching completion promises as before.",
+        "EffectiveConcurrency": "Concurrent activation requests for one server coalesce to one promise. Server lifecycle work remains serialized by existing mechanisms; the diff does not widen concurrency.",
+        "CacheBehavior": "Warm activation callers reuse the in-flight per-server activation promise. Routing cache refresh and MCP inventory behavior are unchanged; authentication completion is shared rather than repeated per caller.",
+        "MechanismConfidence": "High: the before/after helper logic returns the same filtered pending completion set, and the existing per-server activation map explicitly coalesces callers.",
+        "MagnitudeUncertainty": "RPC duration and server count vary by environment, but their count and placement are unchanged by this PR.",
+        "Verdict": "No reportable regression. The refactor preserves pending-auth adoption semantics, cache/coalescing behavior, effective concurrency, and expensive-boundary cardinality."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and all diff pages. Traced tool-start attachment, pending-request ownership and cleanup, action publication, parallel-call scaling, and routing-proxy activation boundaries. The PR adds bounded local bookkeeping and one deduplicated progress action per affected call, with no new remote operation or material critical-path cost; no findings submitted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-23T02:03:28.128006848Z",
+    "CompletedAt": "2026-10-23T02:04:55.081838903Z",
+    "WallClockMilliseconds": 86953,
+    "ModelCalls": 12,
+    "InputTokens": 398118,
+    "OutputTokens": 5354,
+    "TotalTokens": 403472,
+    "ReasoningTokens": 1735,
+    "CacheReadTokens": 342389,
+    "CacheWriteTokens": 55693,
+    "APIDurationMilliseconds": 69425,
+    "ToolCalls": 47,
+    "NanoAIUnits": 52264460000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 342389,
+      "cache_write": 55693,
+      "input": 36,
+      "output": 5354
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
