@@ -1,0 +1,233 @@
+{
+  "PullRequest": {
+    "Number": 343828,
+    "Title": "agentHost: separate PR polling from unchanged repair cooldowns",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Summary\n\nAgent Merge could delay its first CI repair for 10 minutes merely because another check was pending, including the human-approval check observed on #343730. Its polling interval was also coupled to the unchanged-repair cooldown.\n\n- Start applicable Agent Merge repairs immediately, without waiting for pending checks to settle.\n- Refresh authoritative PR state every 60 seconds in Agent Merge and GitHub artifact automation; snapshot updates do not postpone the polling backstop.\n- Reserve the 10-minute cooldown for unchanged repair retries. New heads, new failures, or resolved blockers can trigger earlier work; preserve repair budgets and native-action reconciliation safeguards.\n- Add regression coverage for startup with pending approval, repeated polling, cooldowns, progress, disposal, and artifact automation reactivation; update the related documentation.\n\n## Validation\n\nAll commands below passed using Node 24.22.1:\n\n- `fnm exec --using=24.22.1 npm run build-fast -- --client-only` — passed.\n- `fnm exec --using=24.22.1 ./scripts/test.sh --reporter dot --run src/vs/platform/agentHost/test/common/agentMerge.test.ts --run src/vs/platform/agentHost/test/node/agentMergeController.test.ts --run src/vs/platform/agentHost/test/node/agentMergeRerun.test.ts` — 157 tests passed.\n- `fnm exec --using=24.22.1 ./scripts/test.sh --reporter dot --run src/vs/platform/agentHost/test/node/githubPullRequestArtifactIntegration.test.ts` — 59 tests passed.\n- `fnm exec --using=24.22.1 npm run typecheck-client` — passed.\n- `fnm exec --using=24.22.1 npm run eslint -- src/vs/platform/agentHost/node/agentMergeController.ts src/vs/platform/agentHost/common/agentMerge.ts src/vs/platform/agentHost/test/common/agentMerge.test.ts src/vs/platform/agentHost/test/node/agentMergeRerun.test.ts` — passed.\n- `fnm exec --using=24.22.1 npm run eslint -- src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts src/vs/platform/agentHost/test/node/githubPullRequestArtifactIntegration.test.ts` — passed.\n- `git diff --check` — passed before commit.\n\nLive GitHub/agent end-to-end flows and full integration/smoke suites were not run. The dependency refresh encountered registry authentication failure during postinstall, but the root dependencies supported all successful checks above; no credentials or registry configuration were changed.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/343828",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "918511315731c9a42d68dab5dde73e77c06ab46e",
+    "HeadRef": "agents/agent-merge-failure-analysis",
+    "HeadSHA": "6131a7a751cc27a5ff7c2ba53c3a5ab84743a046",
+    "CreatedAt": "2026-10-23T16:01:41Z",
+    "UpdatedAt": "2026-10-23T17:15:46Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-2B3F806EA522",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentMergeController.ts",
+      "Side": "RIGHT",
+      "Line": 1024,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The timer path, observable write path, and repeated call path are direct: backstop -\u003e `_evaluate(refresh=true)` -\u003e authoritative refresh -\u003e snapshot autorun -\u003e evaluation scheduler -\u003e `_evaluate(refresh=false)`. Every evaluation reaches `_readCurrentBranch` for a bound target, and the concrete Git service implements that as `git branch --show-current`. Magnitude varies with the number and lifetime of enabled folders.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Git subprocess launches and branch-read filesystem work",
+      "PerformanceScaling": "The redundant work grows linearly with enabled folder count and monitoring lifetime: approximately one extra Git process per folder per minute.",
+      "PerformanceOutcome": "avoidable background subprocess, CPU, and filesystem overhead",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "There was no per-minute authoritative refresh in the backstop evaluation, so the controller did not manufacture this extra snapshot-triggered evaluation every minute; evaluations were driven by independent resource updates and the much slower prior backstop.",
+      "ChangedBehavior": "Every new 60-second backstop refresh self-schedules a second full controller evaluation after the 30-second snapshot debounce.",
+      "CausalDiffEvidence": "The added authoritative refresh at line 1024 publishes loading/ready snapshot changes. The existing subscription autorun schedules `runtime.evaluationScheduler` on every such change, so the poll evaluation queues another evaluation 30 seconds later even though the current evaluation already awaits the refresh and evaluates that same final snapshot.",
+      "Title": "Avoid re-evaluating the snapshot just refreshed",
+      "Impact": "A long-lived Agent Merge folder now incurs an avoidable Git subprocess about once per poll in addition to the poll evaluation itself (roughly 60 redundant process launches per hour per enabled folder), causing background CPU/disk wakeups and process churn; multi-folder sessions multiply the cost.",
+      "Evidence": "`AgentMergeRuntime.backstopScheduler` now runs every 60 seconds with `refresh=true`. `subscription.refresh` updates the observed snapshot, whose autorun unconditionally calls `runtime.evaluationScheduler.schedule()`. The current evaluation then proceeds using the refreshed snapshot, but the scheduled evaluation repeats branch validation; `_readCurrentBranch` calls `AgentHostGitService.getCurrentBranchName`, which spawns `git branch --show-current` via `execFile`.",
+      "Recommendation": "Suppress or consume snapshot notifications produced by the refresh currently being awaited (for example, track the refresh generation and cancel only its queued debounce once that snapshot has been processed), while preserving evaluations for genuinely external snapshot changes."
+    },
+    {
+      "ID": "PERF-48AC0B13CFB3",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts",
+      "Side": "RIGHT",
+      "Line": 897,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The binding-local timer and pooled-resource lifetime are explicit in the traced code. `GitHubPullRequestArtifactResource.refresh` refreshes core and all effective fragments, while authoritative refreshes cancel an existing fragment operation rather than joining it. Only the prevalence of users recording the same PR in many retained sessions is uncertain.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "GitHub REST/GraphQL requests for core, review threads, checks, mergeability, and paginated thread data",
+      "PerformanceScaling": "For B enabled bindings of one pooled PR, the new path requests roughly B full refreshes per minute, each spanning at least four fragment fetches; cost can grow further with review-thread pagination.",
+      "PerformanceOutcome": "excessive network I/O, request-queue latency, and avoidable rate-limit consumption",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The pooled pull-request resource owned one fragment-aware, jittered polling schedule per unique PR; artifact bindings did not each force an authoritative full refresh.",
+      "ChangedBehavior": "Each automation binding now independently forces a full authoritative refresh of its shared pull-request resource every 60 seconds.",
+      "CausalDiffEvidence": "The added `schedulePoll()` at line 897 installs a 60-second timer in every `GitHubPullRequestArtifactBinding`; its callback reaches the added authoritative `resource.refresh`. Artifact resources are pooled by authority/runtime/resource/credential scope, but automation activation is per recorded artifact/session binding, so multiple bindings for one pooled PR each create this timer.",
+      "Title": "Coalesce polling across bindings of the same pull request",
+      "Impact": "When the same PR is recorded with automation enabled in multiple sessions/artifacts, background GitHub traffic and request-queue pressure grow with binding count rather than unique PR count. Synchronized polls can cancel/restart each other's fragment reads, delaying automation and increasing rate-limit consumption.",
+      "Evidence": "`ArtifactResourcePool` shares one `GitHubPullRequestArtifactResource` for the same resource and credential scope, while `ArtifactBinding.observeView` invokes `activateAutomation` separately per recorded artifact/session. Each added poll calls `subscription.refresh(..., { authoritative: true })`; the resource interests include core, review threads, checks, and mergeability, so one poll fans out to at least four GitHub fragment fetches (and potentially pagination). `PullRequestResourceService._refreshFragment` cancels an existing operation for authoritative requests, so sibling binding polls do not coalesce at this layer.",
+      "Recommendation": "Own the 60-second authoritative deadline on the pooled `GitHubPullRequestArtifactResource`, or coalesce binding refresh requests through one shared in-flight/deadline state, then let every binding evaluate the resulting shared snapshot."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/node/agentMergeController.ts",
+      "FixedSide": "LEFT",
+      "FixedLine": 1092,
+      "BasePath": "src/vs/platform/agentHost/node/agentMergeController.ts",
+      "BaseLine": 1092,
+      "IntroducingPath": "src/vs/platform/agentHost/node/agentMergeController.ts",
+      "IntroducingCommit": "95f9401ceb4916bb0a2f5ee9807f8fea240f0b2c",
+      "MechanismFamily": "eager-work",
+      "PerformanceCategory": "latency",
+      "Mechanism": "The old gate synchronously withheld an otherwise applicable repair prompt for a 10-minute quiet period whenever any sibling check remained pending, putting timer delay directly on the autonomous CI-repair critical path.",
+      "Symptom": "Applicable Agent Merge CI repairs could not start for at least 10 minutes, including when a human-approval check remained pending indefinitely.",
+      "FixedBehavior": "CI-only Agent Merge prompts are evaluated and dispatched immediately; only an identical already-dispatched repair fingerprint observes the separate 10-minute retry cooldown.",
+      "Evidence": "In the base revision, line 1092 computed `_getCIRepairHold(runtime)` for CI-only prompts; the helper delayed work until checks had been unchanged for 10 minutes (and up to a 60-minute maximum hold). This PR deletes that hold path, and the added pacing tests show a failed CI check now starts immediately even while an approval/other workflow remains pending.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Agent Merge enablement and immediate CI repair while another check remains pending",
+        "CriticalPath": "Resolve and validate the folder branch, acquire GitHub credentials, create/refresh the pull-request subscription, evaluate the gate, and claim the repair turn. The PR removes the former 10-minute CI quiet-period timer from this critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentMergeController.ts:_readCurrentBranch -\u003e node/agentHostGitService.ts:getCurrentBranchName",
+            "Operation": "Run `git branch --show-current` to validate that the automation still owns the configured checkout branch.",
+            "Cardinality": "At least once per applicable evaluation for each enabled folder; startup may additionally refresh session Git state when cached branch metadata is missing.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same branch validation existed, but an applicable CI-only repair was then held for the pending-check quiet period.",
+            "CriticalPathEffect": "Blocks gate evaluation and repair dispatch until branch ownership is confirmed."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeController.ts:_ensureSubscription",
+            "Operation": "Authoritatively fetch pull-request core, conversation/reviews/threads, required checks, and mergeability.",
+            "Cardinality": "One initial grouped subscription refresh per enabled folder/target; core is serial, then effective fragments fan out, with pagination where needed.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same initial authoritative subscription refresh occurred before the diff.",
+            "CriticalPathEffect": "Blocks the first gate evaluation so repair decisions use authoritative PR state."
+          }
+        ],
+        "ScalingInput": "Number of enabled Agent Merge folders, number of interested pull-request fragments, and review/comment pagination depth.",
+        "EffectiveConcurrency": "Evaluations are serialized per session/folder key; the initial pull-request refresh reads core first and then refreshes interested fragments concurrently through the bounded GitHub request queue. Different enabled folders can evaluate concurrently.",
+        "CacheBehavior": "Pull-request entries are shared by normalized PR/account, REST reads use ETags and in-flight transport coalescing, while authoritative refreshes bypass resource-level reuse and GraphQL reads still consume requests. Git branch reads are not cached by this path.",
+        "MechanismConfidence": "High: the deleted hold calculation, tests, subscription refresh implementation, and Git subprocess implementation were traced directly.",
+        "MagnitudeUncertainty": "Actual GitHub latency and number of enabled folders vary, but the removed 10-minute critical-path delay and boundary cardinality are explicit.",
+        "Verdict": "The immediate-repair portion is a real latency fix and was recorded as regression-fix learning; no performance finding is filed against that intended behavior."
+      },
+      {
+        "Scenario": "Long-lived Agent Merge polling for new heads, failures, blockers, and native merge readiness",
+        "CriticalPath": "Every 60 seconds the backstop revalidates the local branch, performs an authoritative PR refresh, evaluates the gate, and either starts work or schedules the next deadline. Snapshot-triggered follow-up evaluation is off the authoritative network critical path but repeats local validation 30 seconds later.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentMergeController.ts:1024 via snapshot autorun and _readCurrentBranch",
+            "Operation": "The poll's snapshot writes schedule a second evaluation, which launches another `git branch --show-current`.",
+            "Cardinality": "One redundant Git subprocess per enabled folder per one-minute poll, about 60 per hour per folder.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No one-minute authoritative backstop refresh manufactured this follow-up evaluation.",
+            "CriticalPathEffect": "The duplicate evaluation is not needed for the already-consumed refreshed snapshot, but adds recurring host CPU/disk/process work and can contend with useful work."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentMergeController.ts:1024",
+            "Operation": "Authoritatively refresh all effective pull-request fragments.",
+            "Cardinality": "One grouped refresh per enabled folder per minute: core plus conversation fragments, required checks, and mergeability; pagination can make a fragment multiple wire calls.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The controller relied on resource polling and a 10-minute backstop without forcing a full authoritative refresh each backstop.",
+            "CriticalPathEffect": "The poll waits for this refresh before deciding whether work is newly applicable."
+          }
+        ],
+        "ScalingInput": "Enabled folder count times monitoring duration; fragment and pagination cardinality controls network work.",
+        "EffectiveConcurrency": "One evaluation sequencer per folder prevents overlap for that key; multiple folders poll independently. Each authoritative refresh fetches core first and then interested fragments in parallel under global/account/caller request limits.",
+        "CacheBehavior": "Warm REST ETags reduce response bytes but not request count; GraphQL fragment reads are not eliminated by REST cache. Resource entries and in-flight identical wire calls can be shared, but an authoritative refresh cancels an existing resource fragment operation.",
+        "MechanismConfidence": "High: the new timer, refresh, observable autorun, and execFile-backed branch lookup form a direct repeated-work path.",
+        "MagnitudeUncertainty": "Individual Git launches are short and typical sessions may have few folders, so severity is medium rather than high; the exact recurring multiplicity is deterministic.",
+        "Verdict": "Reportable repeated subprocess work: the poll refresh self-schedules an unnecessary second evaluation."
+      },
+      {
+        "Scenario": "GitHub artifact automation enablement, idle polling, cooldown retry, reactivation, and disposal",
+        "CriticalPath": "On enable/configuration revision, the binding refreshes authoritative GitHub state before evaluating options. While idle it requests the same refresh every 60 seconds; due retries perform an additional freshness check before dispatch. Disposal removes binding timers.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:897",
+            "Operation": "Each binding's poller calls a full authoritative refresh of the pooled PR resource.",
+            "Cardinality": "At least four fragment fetches per binding per minute (core, review threads, checks, mergeability), plus review-thread/comment pagination; B bindings for one PR request about B full refreshes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One pooled resource used its fragment-aware jittered schedule per unique PR; bindings did not each impose a full-refresh timer.",
+            "CriticalPathEffect": "The refresh blocks that binding's automation evaluation, and synchronized authoritative calls can cancel/restart pooled fragment operations and occupy request-queue slots."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:unchangedForMerge/checkout",
+            "Operation": "Validate checkout root, branch, commit, and dirty state for unchanged-only automatic merge.",
+            "Cardinality": "Once per relevant merge evaluation, including snapshot/config/run-triggered evaluations; not executed for automation configurations without unchanged-only merge.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same unchanged-checkout validation existed before this PR.",
+            "CriticalPathEffect": "Blocks merge eligibility evaluation but is conditional and unchanged by the poll implementation."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:968",
+            "Operation": "Refresh authoritative state before retrying an already-recorded repair occurrence.",
+            "Cardinality": "One full refresh per due retry; if the outer evaluation also has `refreshRequested`, it can be preceded by another full refresh.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Due retries already performed this freshness refresh; the new outer polling/configuration refresh can add another preceding refresh in overlapping cases.",
+            "CriticalPathEffect": "Blocks retry dispatch until occurrence/applicability is revalidated."
+          }
+        ],
+        "ScalingInput": "Number of recorded artifact/session bindings sharing a PR, enabled automation lifetime, enabled option set, and review-thread pagination depth.",
+        "EffectiveConcurrency": "Each artifact/session binding has its own running/pending guard and poller. Resources are pooled across matching bindings, but the binding-local guards are not shared; resource refreshes fetch core serially then review threads, checks, and mergeability concurrently through the bounded request queue.",
+        "CacheBehavior": "The `GitHubPullRequestArtifactResource` is pooled by authority/runtime/resource/credential scope. REST ETags and transport in-flight coalescing can reduce bytes, but binding-local authoritative calls are not coalesced at the resource layer and can cancel active fragment work. Disabled/disposed bindings stop timers; overdue deadlines are retained for reactivation.",
+        "MechanismConfidence": "High: resource pooling, per-binding activation, authoritative cancellation semantics, fragment interests, and request implementations were all traced.",
+        "MagnitudeUncertainty": "The number of users recording the same PR in multiple retained sessions is uncertain, but per-binding timer ownership and per-refresh fragment fan-out are explicit, so uncertainty affects severity rather than mechanism confidence.",
+        "Verdict": "Reportable boundary fan-out: polling scales with binding count instead of unique pooled pull requests."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files. Submitted two findings: per-binding GitHub polling defeats pooled-resource coalescing, and each Agent Merge poll self-schedules a redundant Git subprocess evaluation. Also recorded the removal of the prior 10-minute CI-repair hold as a concrete latency regression fix introduced by commit 95f9401ceb4916bb0a2f5ee9807f8fea240f0b2c."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-23T20:29:05.739216712Z",
+    "CompletedAt": "2026-10-23T20:33:27.509441675Z",
+    "WallClockMilliseconds": 261770,
+    "ModelCalls": 21,
+    "InputTokens": 1504773,
+    "OutputTokens": 14451,
+    "TotalTokens": 1519224,
+    "ReasoningTokens": 6865,
+    "CacheReadTokens": 1392644,
+    "CacheWriteTokens": 112066,
+    "APIDurationMilliseconds": 234267,
+    "ToolCalls": 101,
+    "NanoAIUnits": 140665960000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1392644,
+      "cache_write": 112066,
+      "input": 63,
+      "output": 14451
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

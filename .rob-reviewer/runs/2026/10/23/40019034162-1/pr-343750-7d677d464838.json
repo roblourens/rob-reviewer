@@ -1,0 +1,236 @@
+{
+  "PullRequest": {
+    "Number": 343750,
+    "Title": "Honor custom agent model and reasoning-effort pins across harnesses",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #338949. Supersedes #341716, whose changes are included and rebased onto current `main` (co-authored).\n\nSelecting a custom agent whose `.agent.md` frontmatter pins `model` and/or `reasoning-effort` can leave the previously selected picker model and effort in place. The harness then sends that selection instead of the agent's pin.\n\n## Changes\n\n**Copilot agent-host harness (chat view)**\n- **Host discovery publishes pins:** `SessionCustomizationDiscovery` reads each discovered workspace or user agent file. It publishes the frontmatter `model` list (first entry as the protocol `model`, the ordered list in `_meta['vscode.models']`) and `reasoning-effort` (`_meta['vscode.reasoningEffort']`). `AgentCustomizationItemProvider` maps these into `ICustomAgent`. Plugin agents fall back to the protocol `model`.\n- **Model matching:** agent-host models are published under the session-type vendor (`agent-host-…`), so `ILanguageModelChatMetadata.matchesQualifiedName` never matches values like `Claude Sonnet 4.5 (copilot)` or `claude-sonnet-4.5`. For each pinned value, `ChatInputPart` tries, in order:\n  1. The existing qualified-name match.\n  2. An exact `metadata.id` match among session-targeted models, so an advertised ID such as `provider/custom:variant=fast` isn't parsed as a configuration suffix.\n  3. `resolveAgentFileModelIdentifiers`.\n\n  Pins resolve against the incoming session's model pool (its session type), not the widget's outgoing session while binding. Local harness matching is unchanged.\n- **Reasoning effort:** `reasoning-effort` is parsed into `PromptHeader` → `ICustomAgent` → `CustomChatMode`. A dedicated autorun applies it to the current agent-host model as a read-time overlay in `ChatModelConfigurationStore` (`setPresentedConfiguration`), so it follows model changes and late registration.\n  - It uses `thinkingLevel` in preference to `reasoningEffort` when a model advertises both, matching the picker and the runtime.\n  - The overlay is validated on every read against the session-scoped schema with the same filter restores use, so host locks, narrowed choices and other schema constraints win.\n  - It never reaches preferences or storage. Overlay values carry an `agent` source (`vscode.modelConfiguration.\u003ckey\u003e.source`). The Copilot host preserves it in its configuration report, and the store never adopts it as a runtime value.\n  - Captured configuration also carries the conversation's own value underneath (`vscode.modelConfiguration.\u003ckey\u003e.underlying` / `.underlyingSource`). Restores put that value back in place of the `agent`-sourced one, even after the store is cleared or another conversation changed the shared bucket. The host ignores these keys.\n  - An explicit choice for that key supersedes the overlay.\n\n**User overrides of pins**\n- The input state persists `agentPinOverrides` (`{ modeId, model?, configKeys? }`). It's written by `InputModel.toJSON` and the session operation log, and validated on revival.\n- It's recorded when the user picks a model other than the pinned one, explicitly sets a pinned configuration key, or edits an earlier request that explicitly chose that key or ran on another model. A handoff's or prompt file's `model` that differs from the pin (`requestModelByQualifiedName`) is recorded too, immediately before it applies, while the pin's own automatic application records nothing.\n- `_syncFromModel` applies the incoming overrides before the mode sync, so deliberate choices survive navigation and reloads.\n- Overrides are kept through programmatic fallbacks while an agent registers late, and cleared when the user picks another agent.\n- **Between clients:** custom-agent drafts sync the overrides in `_meta['vscode.agentPinOverrides']`, set to `null` when there are none.\n  - The synced value is authoritative. Peers adopt each other's model and effort overrides, a re-armed pin clears them, and adopted overrides persist with the input state.\n  - For live drafts from clients that don't sync overrides, effort overrides are derived from the draft's own provenance, on top of the current overrides: `explicit` adds the key, `agent` removes it.\n  - The first transferred draft uses only synced overrides, so it never replaces locally saved ones with a guess.\n  - The synced-versus-local draft comparison ignores this key only when the synced draft doesn't carry it. A pending local edit to the overrides alone therefore still wins over a peer update.\n  - Outgoing drafts are built in one place, and peer updates are compared against that same form. A fallback for the channel's own model keeps this client's agent-applied configuration, such as an effort-only agent's pin.\n- **First send:** when an untitled agent-host session materializes, or a late send re-targets it, its overrides travel with the transferred mode to the real session. Cleared overrides are transferred too. The mode is identified by its advertised id (`IChatRequestModeInfo.modeId`), not a remote agent's wrapped instruction URI.\n- **Session restore:** when an agent-host session restores from a transferred draft that didn't sync overrides, `backfillRestoredPickerState` recovers the locally saved ones for the same agent. An explicitly synced `null` is kept, so a peer's re-armed pins aren't undone by older saved overrides.\n\n**Local chat** (from #341716, adjusted)\n- Re-apply the pin after input-state restoration, unless the user overrode it, the conversation's in-session selection reason is `UserSelection`/`RestoredChoice`, or the state came from a remote peer. This runs outside the sync guard so the result is written back.\n- Retry an unresolved pin when the model list changes. An explicit or restored choice cancels the retry, and it waits while an authored model request (a handoff or prompt file) is pending. Mode switches and restores still apply the pin.\n- Keep the `hostModelSelection` guard so the Agents window's host-owned selection isn't bypassed.\n\n**Cloud delegation** (from #341716, unchanged)\n- Omit the picker-model override when the selected remote agent pins a model.\n\n## How to test\n\n1. Create `.github/agents/pinned.agent.md` with `model: [claude-sonnet-4.5, Claude Sonnet 4.5 (copilot)]` and `reasoning-effort: high`.\n2. In the chat view with the Copilot harness, select a different model and effort in the picker. Then select the `pinned` agent.\n3. The picker switches to Claude Sonnet 4.5 / High. The session's `events.jsonl` shows the agent's model and effort on `assistant.message`.\n4. Change the model and the effort manually, switch to a conversation in another mode and back, then reload the window. Your choices are kept.\n5. Switch to a mode without `reasoning-effort`. The effort returns to the conversation's own setting, and new sessions don't inherit High.\n6. Create an agent with only `reasoning-effort: high`. Its effort applies to whichever model is selected, including after you switch models.\n7. With the same agent-host session open in two windows, override the model or effort in one. The other window keeps that choice instead of re-applying the pin. Re-selecting the agent in the first window re-arms the pin in both, including for a window that was closed at the time and reopened later.\n8. Repeat step 2 in Local chat with `model: Claude Haiku 4.5 (copilot)`.\n\n## Validation\n\n- Targeted `tsc` type-check of all changed `src` files and tests: **passed** for workbench files. In agent-host files, the only errors are existing ones caused by the missing `@github/copilot-sdk` types in the minimal toolchain (confirmed against an unmodified baseline). Ran with a minimal toolchain, because a full `npm ci` wasn't possible locally.\n- Unit tests (`chatInputPart.test.ts`, `chatModelConfigurationStore.test.ts`, `chatModel.test.ts`, `chatService.test.ts`, `agentHostChatContribution.test.ts`, `agentCustomizationItemProvider.test.ts`, `sessionCustomizationDiscovery.test.ts`, `copilotManagedModelConfiguration.test.ts`, `promptFileParser.test.ts`, `copilotCloudSessionsProvider.spec.ts`): **not run locally**; relying on CI.\n  - CI on 935af2fb ran the PR's tests at the time. Its only failures were one PR test, fixed in 754c964c, and two `SessionsList` tests broken on `main`.\n  - CI for the latest commit (fb4d73b2) is pending.\n- Known unrelated failure: `main` currently fails Compile \u0026 Hygiene and two `Sessions - SessionsList` tests (`QUICK_CHATS_SECTION_ID` used without an import in `sessionsList.test.ts`). CI merges this PR with `main`, so those checks fail here until `main` is fixed.\n- Manual verification in a dev build: **not done yet**.",
+    "URL": "https://github.com/microsoft/vscode/pull/343750",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dknappettmsft",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d56476454939dfb23e70fc1c4a5acfeeb7846867",
+    "HeadRef": "dknappettmsft/custom-agent-model-pin",
+    "HeadSHA": "7d677d464838f070138cf31d2182a9f2cb19f773",
+    "CreatedAt": "2026-10-23T09:32:03Z",
+    "UpdatedAt": "2026-10-23T17:47:51Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-14BBEDFFFDEE",
+      "Focus": "performance-review",
+      "Path": "extensions/copilot/src/extension/chatSessions/vscode-node/copilotCloudSessionsProvider.ts",
+      "Side": "RIGHT",
+      "Line": 2749,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed line, endpoint implementation, existing options fetch/cache, and serial call order are all directly traced. Only the exact RTT varies by network and service conditions.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "One authenticated HTTP GET and response parse for the repository's full custom-agent list per qualifying delegation.",
+      "PerformanceScaling": "The extra request repeats once for every cloud task submitted with a non-default custom agent and non-default model, regardless of the warm provider-options cache.",
+      "PerformanceOutcome": "Cloud task creation is delayed by an additional network round trip and service latency.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The same submission proceeded from existing validation directly to createSession; provider option discovery had already fetched the repository's custom-agent list and cached the resulting options for 15 minutes, but submission did not perform another list request.",
+      "ChangedBehavior": "When both a custom agent and picker model are selected, invokeRemoteAgent now awaits getCustomAgents before it can call createSession.",
+      "CausalDiffEvidence": "The added `await this._octoKitService.getCustomAgents(...)` at line 2749 introduces the HTTP request on the delegation critical path; the base code called `_backend.createSession` without this lookup.",
+      "Title": "Reuse the fetched custom-agent list before delegation",
+      "Impact": "After choosing a custom agent and explicit model, pressing Delegate now waits for a second custom-agent-list request before the create-session request starts; on a slow or high-latency connection this directly increases task-submission latency.",
+      "Evidence": "getCustomAgents is implemented as an authenticated CAPI GET with no service-level cache. provideChatSessionProviderOptions already calls the same endpoint and caches its result for 15 minutes, but only the projected option objects are retained. The added await at line 2749 is serially between checkCCAEnabled and _backend.createSession, so even a warm options picker cannot avoid this duplicate network boundary.",
+      "Recommendation": "Retain/coalesce the fetched CustomAgentListItem data per repository alongside the existing options cache and consult that here, falling back to one shared in-flight fetch only when no cached list exists."
+    },
+    {
+      "ID": "PERF-F7627FEFB2F7",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/sessionCustomizationDiscovery.ts",
+      "Side": "RIGHT",
+      "Line": 597,
+      "Severity": "low",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The initial/refresh call path, per-agent cardinality, absent cache, and serial await are explicit in the code. Magnitude depends on agent count and filesystem latency, so severity is low.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Filesystem reads, file buffers, string conversion, and YAML/frontmatter parsing for all discovered agent files.",
+      "PerformanceScaling": "A refresh performs N added reads for N workspace/user agents, strictly one after another because the await is inside the loop. The per-directory entry runs initially and after any watched customization change, and no pin cache skips unchanged agents.",
+      "PerformanceOutcome": "Initial custom-agent availability and watcher-triggered picker refreshes incur additive I/O latency that grows linearly with the number of agents.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "After the single SDK agents.discover call, the loop projected each agent from returned metadata without any per-agent filesystem operation.",
+      "ChangedBehavior": "discoverAgents now awaits a full IFileService read and frontmatter parse for every non-plugin, non-builtin discovered agent before publishing customization results.",
+      "CausalDiffEvidence": "The added `const pins = await this._readAgentFileModelPins(uri)` at line 597 places one new filesystem boundary per discovered agent in the serial projection loop.",
+      "Title": "Cache or bound the per-agent frontmatter reads",
+      "Impact": "In multi-root or centrally provisioned setups with many custom agents, opening the agent-host experience or editing any watched customization delays the refreshed agent list by the sum of all agent-file reads, even when only one file changed.",
+      "Evidence": "SessionDiscoveredEntry awaits discovery on construction and on 100 ms-debounced watcher refreshes. SessionCustomizationDiscovery invalidates and rediscovers on watched file changes. In the changed loop, each `_readAgentFileModelPins` awaits `IFileService.readFile`, and the next agent is not processed until it completes; there is no URI/etag pin cache.",
+      "Recommendation": "Cache parsed pins by agent URI/etag and invalidate them from the existing file-change watcher; for cold misses, use a small shared concurrency limit so result ordering is preserved without serializing all reads."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Submit a cloud coding task with a custom agent and an explicitly selected model",
+        "CriticalPath": "Repository resolution and CCA validation must complete, then the newly added custom-agent-list GET must complete before createSession can begin; task creation and recording follow.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/other",
+            "Location": "extensions/copilot/src/extension/chatSessions/vscode-node/copilotCloudSessionsProvider.ts invokeRemoteAgent",
+            "Operation": "Resolve Git repository identifiers through the existing git service.",
+            "Cardinality": "Existing repository-resolution work once per submission.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same work occurred before the PR.",
+            "CriticalPathEffect": "Must complete before the repository and subsequent service calls are known."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/chatSessions/vscode-node/copilotCloudSessionsProvider.ts invokeRemoteAgent/checkCCAEnabled",
+            "Operation": "Check whether coding agent is enabled for the selected repository.",
+            "Cardinality": "At most one request per repository cache miss; TTL cache serves warm checks.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same cached validation occurred before the PR.",
+            "CriticalPathEffect": "Must complete before task creation."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/chatSessions/vscode-node/copilotCloudSessionsProvider.ts:2749",
+            "Operation": "Fetch the repository's complete custom-agent list.",
+            "Cardinality": "Exactly one uncached GET for each submission where customAgent and model are both non-default; provider option discovery may already have made the same GET.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No custom-agent-list request occurred on the submission path.",
+            "CriticalPathEffect": "New serial gate before createSession."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/chatSessions/vscode-node/copilotCloudSessionsProvider.ts invokeRemoteAgent/_backend.createSession",
+            "Operation": "Create the cloud coding session.",
+            "Cardinality": "One request per accepted submission.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Began directly after existing validation and prompt preparation.",
+            "CriticalPathEffect": "Authoritative task-creation boundary; now starts only after the added list GET."
+          }
+        ],
+        "ScalingInput": "One extra list request per qualifying submission; the returned agent collection size also controls response bytes and the linear `find`, though network latency dominates.",
+        "EffectiveConcurrency": "The new custom-agent GET is awaited serially after CCA validation and before createSession. It is not coalesced with the provider-options fetch or concurrent submissions.",
+        "CacheBehavior": "CCA status and provider options have TTL caches, with options cached for 15 minutes. OctoKit getCustomAgents itself has no cache, and the submission path does not retain the custom-agent metadata fetched for options, so warm options still incur the request.",
+        "MechanismConfidence": "High: the added await, uncached endpoint implementation, existing options fetch/cache, and createSession ordering are directly traced.",
+        "MagnitudeUncertainty": "Exact added latency depends on authentication, network RTT, service response time, and list size; the extra serial HTTP boundary is certain.",
+        "Verdict": "Reportable medium-severity repeated network work because a warm options path still performs a duplicate, serial service call on every qualifying submission."
+      },
+      {
+        "Scenario": "Initial and watcher-triggered discovery of workspace and user custom agents for an agent-host session",
+        "CriticalPath": "The per-directory entry awaits SessionCustomizationDiscovery.discover before publishing its customization bundle. Within discoverAgents, the SDK discovery RPC completes and then every discovered non-plugin/non-builtin agent file is read serially before the agents result resolves.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/sessionCustomizationDiscovery.ts discoverAgents",
+            "Operation": "Ask the Copilot SDK to discover agents.",
+            "Cardinality": "One existing RPC per initial or watcher-triggered refresh.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The SDK discovery result was projected directly after this one RPC.",
+            "CriticalPathEffect": "Returns the list that controls N and must finish before file projection."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/sessionCustomizationDiscovery.ts:597 and _readAgentFileModelPins",
+            "Operation": "Read and parse each discovered agent file to extract model and reasoning-effort frontmatter.",
+            "Cardinality": "N IFileService reads per refresh, one for every non-plugin/non-builtin agent, with no unchanged-file hits.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No per-agent filesystem boundary existed in discoverAgents.",
+            "CriticalPathEffect": "All N serial reads must finish before customizations can be published."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is the number N of discovered workspace/user agent files after excluding plugin and builtin entries. Each refresh adds N reads, including when one watched customization changed.",
+        "EffectiveConcurrency": "Rules, skills, hooks, and agent discovery run in parallel at the outer Promise.all, but the N newly added agent-file reads are serialized by an await inside the loop. Watcher events are debounced by 100 ms and refreshes are replaced/cancelled, not run concurrently.",
+        "CacheBehavior": "Discovered directories are cached until a watched change, but parsed model pins are not cached. Every successful discovery refresh re-reads every agent file; there is no positive, negative, or in-flight pin cache.",
+        "MechanismConfidence": "High: construction and watcher refresh call paths, serial await placement, cardinality filter, and lack of pin caching are explicit.",
+        "MagnitudeUncertainty": "Typical agent counts and filesystem latency vary; multi-root, remote, networked-home, or centrally provisioned setups can make N and per-read latency materially larger.",
+        "Verdict": "Reportable low-severity boundary fan-out because initial and incremental discovery now block on serial per-agent reads."
+      },
+      {
+        "Scenario": "Select or restore a custom agent whose model and reasoning effort are pinned",
+        "CriticalPath": "Mode selection resolves the pin against the session-scoped in-memory model catalog, applies a local model selection, and overlays at most one supported effort key in the per-editor configuration store. No subprocess, filesystem, database, or network operation was added.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "CPU work scales with the number of registered language models and the short ordered pin list; configuration overlay work scales with the small presented-key set, normally one effort key.",
+        "EffectiveConcurrency": "Synchronous UI-state reconciliation through observables; pending pin retries occur only on model-list events and are suppressed while another programmatic selection is pending.",
+        "CacheBehavior": "Stored model configuration remains cached by model id. Presented effort is deliberately revalidated against the current schema on reads and is cleared/restored with conversation lifecycle; no unbounded cache or retained-key growth was found.",
+        "MechanismConfidence": "High: all changed work in this scenario is in-memory and bounded by model/configuration metadata.",
+        "MagnitudeUncertainty": "Model catalogs and schemas are small in normal use; no evidence shows the added bounded scans or one-key validation producing visible UI latency.",
+        "Verdict": "No reportable performance regression; the added synchronous work is bounded and does not introduce an expensive boundary or unbounded retention."
+      },
+      {
+        "Scenario": "Synchronize, restore, and materialize custom-agent drafts across agent-host clients",
+        "CriticalPath": "Input state serialization adds a small override object and draft metadata; existing debounced draft publication and existing remote-session materialization carry those values. Restore compares and revives bounded mode/model/configuration state before rendering the input.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts syncDraft",
+            "Operation": "Publish a changed chat draft to the agent-host session channel.",
+            "Cardinality": "Existing debounced publication cadence; the PR adds bounded metadata to the same draft rather than another dispatch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Draft text/model/attachments were already published through this boundary.",
+            "CriticalPathEffect": "Existing synchronization boundary; no new call count or serial gate."
+          },
+          {
+            "Kind": "network/IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts sendRequest/_materializeUntitledSession",
+            "Operation": "Materialize an untitled remote session and send the request.",
+            "Cardinality": "Existing one materialization for first send and existing request dispatch; override state travels with the existing mode transfer.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same materialization and request boundaries existed without agentPinOverrides.",
+            "CriticalPathEffect": "Existing first-send critical path, with only bounded local state copied by the diff."
+          }
+        ],
+        "ScalingInput": "Added payload is one mode id, one boolean, and a small set of configuration-key names; work is constant with respect to conversation history and streaming output size.",
+        "EffectiveConcurrency": "Draft publication retains the existing debounce/last-writer behavior. Materialization remains serialized per untitled resource; the PR does not add parallel remote operations.",
+        "CacheBehavior": "Overrides are persisted with input state and replaced/cleared per selected mode. Presented configuration is removed on store clear and restored from captured bounded metadata; no accumulating map or history retention was introduced.",
+        "MechanismConfidence": "High: changed serialization shapes and existing publication/materialization call counts are directly visible.",
+        "MagnitudeUncertainty": "Payload growth is a handful of primitives and key strings; no realistic input controls it beyond a tiny configuration-key set.",
+        "Verdict": "No reportable performance regression; serialization/allocation growth is bounded and no extra boundary call is introduced."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 26 changed files. Reported two concrete regressions: an uncached duplicate custom-agent network lookup on cloud submission, and serial per-agent file reads on initial and incremental customization discovery. Model-pin UI reconciliation, configuration overlays, persistence, and draft synchronization add only bounded in-memory work or metadata to existing boundaries."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-23T20:40:12.513425981Z",
+    "CompletedAt": "2026-10-23T20:42:28.22342776Z",
+    "WallClockMilliseconds": 135710,
+    "ModelCalls": 9,
+    "InputTokens": 618199,
+    "OutputTokens": 9594,
+    "TotalTokens": 627793,
+    "ReasoningTokens": 3374,
+    "CacheReadTokens": 516168,
+    "CacheWriteTokens": 102004,
+    "APIDurationMilliseconds": 115325,
+    "ToolCalls": 75,
+    "NanoAIUnits": 90847520000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 516168,
+      "cache_write": 102004,
+      "input": 27,
+      "output": 9594
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
