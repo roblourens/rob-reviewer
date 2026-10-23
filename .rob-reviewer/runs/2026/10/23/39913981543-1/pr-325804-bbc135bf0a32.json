@@ -1,0 +1,214 @@
+{
+  "PullRequest": {
+    "Number": 325804,
+    "Title": "Authenticate Entra ID marketplace API requests via RFC 9728 PRM negotiation",
+    "Body": "\u003e **Scope: Microsoft Entra ID only.** The **GitHub** auth-enabled path called for in #325412 — RFC 8693 token exchange at the deployment's embedded Authorization Server, `onDidChangeSessions('github')` invalidation, and the GitHub test scenarios — is **deferred to a follow-up PR**. The GitHub path here is unchanged: it carries no bearer at all.\n\nBuilds on #325331 (now merged), which added Microsoft Entra ID sign-in as a *licensing signal* for a Private Marketplace but left the token it produced unused. Partially addresses #325412.\n\n## Why\n\nA Private Marketplace running with authentication enforced refuses its service index outright unless a token minted **for the marketplace itself** is presented. Signing in is not enough: the sign-in token identifies the user, but its audience is not the marketplace.\n\nThe marketplace's resource identity cannot be shipped in `product.json`, because a self-hosted deployment has its own app registration and its own scopes — one value baked into the build cannot serve every enterprise. So the client has to learn it from the resource at runtime, which is exactly what RFC 9728 exists for.\n\n## What it does\n\n1. Read the service index with whatever bearer the account already carries.\n2. If the marketplace refuses it (401/403), read the Protected Resource Metadata it advertises at `/.well-known/oauth-protected-resource` to learn its authorization server and scopes.\n3. Ask the account for a resource-scoped token against that server (RFC 8707) and read the index again.\n4. Attach the accepted bearer to the requests that follow — `extensionquery`/search, control manifest, asset and VSIX downloads, extension resources (icons, README incl. embedded images, CHANGELOG), and the shared-process `getManifest`/VSIX path.\n\nWhether a marketplace needs any of this is **discovered, not configured**: one that accepts what it is given is never asked what a token for it should look like, and never has the well-known endpoint fetched.\n\nDiscovery uses the well-known endpoint rather than the `WWW-Authenticate` challenge, because that header is not CORS-safelisted and the renderer's cross-origin index fetch usually cannot read it. The challenge is used only as a hint for an explicit `resource_metadata` URL.\n\n## Which origins may receive the bearer\n\n`IExtensionGalleryManifestService.getAccessToken()` is replaced by:\n\n```ts\ngetAuthorizationHeaders(targetUrl: string): Promise\u003cRecord\u003cstring, string\u003e\u003e;\n```\n\nCallers ask for headers instead of handling a raw token, so the rule deciding which origins may receive the bearer has **one implementation**, in the platform base class.\n\nThe rule is strict same-origin over `https` against the **service index** — the endpoint that demanded the token and that it was minted for — and it fails closed. This matters concretely: a marketplace serves assets from its own origin when proxying, but **upstreamed extensions are fetched from the public Microsoft marketplace**, which must never receive a private marketplace's Entra token. A parent-domain suffix match would be unsafe here, since these deployments can share a domain with unrelated tenants.\n\nThe bearer is dropped whenever the marketplace is retracted, so a sign-out, account switch, or configuration change cannot leave a usable one behind.\n\n## Commits\n\n1. **Negotiate a resource-scoped token when the marketplace gates its index** — discovery, negotiation, retry, and the origin rule.\n2. **Authenticate the gallery API requests** — search, control manifest, asset and VSIX downloads.\n3. **Authenticate the extension resource requests** — icons, README, CHANGELOG.\n4. **Authenticate the marketplace requests the shared process makes** — that process cannot negotiate, so the token and the index origin travel with the manifest over the existing channel.\n5. **Consent to the marketplace resource during interactive sign-in** — the access check is silent by contract and cannot prompt.\n6. **Cover the gated service index** — tests.\n\n## Behavior notes for reviewers\n\n- **A marketplace that still refuses after negotiation now reports `RequiresSignIn`, not `AccessDenied`.** `AccessDenied` renders as \"contact your administrator\" with no action; a missing consent grant is resolvable by the user, so sending them there was a dead end.\n- **The bearer now also reaches the remote server**, not just the shared process — both receive it over the manifest channel. The origin rule is applied identically in that process.\n- **Open and public marketplaces are unaffected.** No token is negotiated, none is attached, and the well-known endpoint is never fetched.\n\n## Testing\n\n- Unit tests cover the negotiation and the origin rule: reaching the marketplace through negotiation, skipping it when the marketplace accepts what it's given, refusing when no resource is advertised, dropping the bearer on retraction, and withholding it from a foreign origin, a parent-domain neighbour, cleartext, and an unparseable URL.\n- New `extensionGalleryManifestServiceIpc.test.ts` covers the cross-process channel, which is the one path where an argument-order mistake would silently leak or drop the bearer.\n- A manual pass against a Private Marketplace with authentication enforced is still worth doing before merge — see the test plan.",
+    "URL": "https://github.com/microsoft/vscode/pull/325804",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "mcumming",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3f98d214967086e497259c3ea63c43b11d61fb9d",
+    "HeadRef": "entra-marketplace-pr2-prm-auth",
+    "HeadSHA": "bbc135bf0a32b83e727acba2353ff18d51b7ad86",
+    "CreatedAt": "2026-07-14T14:35:26Z",
+    "UpdatedAt": "2026-10-23T03:56:20Z",
+    "MergedAt": "2026-10-21T03:52:01Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-D5AEE750958E",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryAccountService.ts",
+      "Side": "RIGHT",
+      "Line": 211,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed call order, network implementation, lack of caching, helper retry cardinality, eager service initialization, and test-observed request are all explicit. Exact endpoint latency varies by deployment, which affects severity but not the mechanism.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "HTTP network requests to OAuth protected-resource metadata endpoints",
+      "PerformanceScaling": "Each eligible Microsoft account resolution performs discovery with no positive or negative cache. `fetchResourceMetadata` issues one request for a root service URL, or sequentially tries path-appended and root well-known URLs for a service index with a path; every Microsoft session-change revalidation repeats those calls.",
+      "PerformanceOutcome": "increased latency and excessive network I/O before the extension marketplace becomes available",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "After resolving the existing Microsoft session and eligibility locally, the manifest service fetched the configured service index directly. Open marketplaces therefore required only the index request and account-change revalidation did not probe well-known metadata endpoints.",
+      "ChangedBehavior": "The added awaited call discovers protected-resource metadata before `doGetAccount` returns, so the manifest service cannot start its service-index request until discovery finishes, even when the index would accept the existing sign-in token.",
+      "CausalDiffEvidence": "The added line `const protectedResource = await this.discoverProtectedResource(serviceIndexUrl);` places uncached PRM HTTP discovery in every eligible Microsoft account resolution before the existing service-index fetch.",
+      "Title": "Discover PRM only after the index rejects the current token",
+      "Impact": "Opening or initializing an authenticated Microsoft private marketplace that does not require a resource-scoped token is delayed by an unnecessary well-known request (two sequential requests when the service-index URL has a path). Slow or absent well-known endpoints extend the marketplace critical path, and Microsoft session events repeat the delay and traffic.",
+      "Evidence": "`doGetAccount` now awaits `discoverProtectedResource(serviceIndexUrl)` before returning the account; only afterward can `handleMarketplaceAccountAccess` call `getExtensionGalleryManifestFromServiceUrl`. `discoverProtectedResource` delegates to `fetchResourceMetadata` without a cache, and that helper sequentially probes the path-appended and root well-known URLs when the target has a path. The added test `an index without protected resource metadata uses the sign-in token` explicitly observes one well-known request even though the index returns 200, proving this extra boundary call is made on the open-marketplace path.",
+      "Recommendation": "Fetch the service index first with the current session token; only on 401/403 perform PRM discovery and resource-token acquisition, then retry once. Cache/coalesce positive and negative discovery per service-index URL and invalidate it when the configured marketplace changes."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "cache-lifecycle",
+      "repeated-work",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Resolve and publish a configured Microsoft private marketplace during workbench initialization or Microsoft session revalidation",
+        "CriticalPath": "The eager manifest service starts account resolution asynchronously, so it does not synchronously block workbench startup completion; however, marketplace availability and every caller awaiting `getExtensionGalleryManifest` cannot progress until base-session lookup, PRM discovery, optional resource-session lookup, and the service-index fetch complete in sequence.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryAccountService.ts `getSession` / `getResourceSession`",
+            "Operation": "Resolve the existing Microsoft authentication session, and when PRM exists resolve a second resource-scoped session",
+            "Cardinality": "One existing base-session lookup per resolution, plus one newly added resource-scoped lookup when metadata advertises an authorization server",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the base-session lookup was performed before fetching the index.",
+            "CriticalPathEffect": "Both lookups precede service-index availability; the second is serialized after PRM discovery"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryAccountService.ts `discoverProtectedResource`",
+            "Operation": "Fetch RFC 9728 protected-resource metadata",
+            "Cardinality": "One request for a root service URL; up to two sequential well-known requests for a service-index URL with a path; repeated for every eligible account resolution",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No PRM request occurred; the service index was fetched immediately after local account resolution.",
+            "CriticalPathEffect": "Discovery is awaited before the service-index request even when the current token would be accepted"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryManifestService.ts `getExtensionGalleryManifestFromServiceUrl`",
+            "Operation": "Fetch the extension-gallery service index",
+            "Cardinality": "One request per successful eligible resolution",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "It followed base account resolution directly.",
+            "CriticalPathEffect": "The request remains required but is now delayed behind PRM discovery and optional resource-session resolution"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryManifestService.ts `updateChannels`",
+            "Operation": "Publish the resolved manifest to the shared process and optional remote server",
+            "Cardinality": "One shared-process call plus one remote call when connected, per manifest change",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same channels and call count were used; the diff only adds two small authorization strings to the payload.",
+            "CriticalPathEffect": "Calls are fire-and-forget and do not delay marketplace availability"
+          }
+        ],
+        "ScalingInput": "One or two PRM requests per eligible resolution, scaling with Microsoft session-change events rather than extension count; a URL path doubles failed-discovery probes.",
+        "EffectiveConcurrency": "Initial resolution is serialized. `getExtensionGalleryManifest` coalesces initial callers via one promise, but every Microsoft session event starts a fresh resolution; cancellation does not reach PRM discovery because it uses `CancellationToken.None`, so superseded discovery requests can overlap.",
+        "CacheBehavior": "The initial manifest promise coalesces startup callers. PRM has neither positive nor negative per-URL caching in `doGetAccount`; although `protectedResource` is stored, subsequent account resolutions rediscover it. Authentication-provider session caching is implementation-dependent.",
+        "MechanismConfidence": "High: changed call order, helper request cardinality, event path, cancellation behavior, and a test-observed well-known request establish the mechanism.",
+        "MagnitudeUncertainty": "Endpoint response time and Microsoft session-event frequency vary by deployment; the extra serialized calls and absence of discovery caching are explicit.",
+        "Verdict": "Reportable medium-severity eager network regression: open marketplaces and revalidations pay discovery before the index demonstrates that discovery is needed."
+      },
+      {
+        "Scenario": "Query the gallery, report statistics, fetch the control manifest, or download extension assets/VSIX files",
+        "CriticalPath": "Each operation performs a local authorization-origin check before its existing HTTP request. The local token lookup and URI parsing add no external boundary; the request, and an asset fallback after failure, remain the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/extensionManagement/common/extensionGalleryService.ts",
+            "Operation": "Gallery query, statistics POST, control-manifest GET, or asset/VSIX GET with optional fallback",
+            "Cardinality": "One request per logical query/stat/control operation; assets retain one primary request and at most one fallback request",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same request and fallback cardinality existed without the scoped Authorization header.",
+            "CriticalPathEffect": "Existing network calls remain on the operation path; authorization-header resolution is in-memory and does not add requests"
+          }
+        ],
+        "ScalingInput": "Queries scale with user searches and downloads; asset calls scale with requested assets, but effective network cardinality is unchanged by the diff.",
+        "EffectiveConcurrency": "Caller concurrency and primary-then-fallback ordering are unchanged; no new limiter, queue, or fan-out is introduced.",
+        "CacheBehavior": "Common headers remain backed by the existing promise. Authorization is read from current in-memory manifest-service state on every request so it follows account changes; no remote token lookup occurs here.",
+        "MechanismConfidence": "High that no new expensive boundary or changed network cardinality is introduced.",
+        "MagnitudeUncertainty": "Per-request URI parsing and promise overhead is small relative to the existing network operation and is not independently user-visible.",
+        "Verdict": "No additional finding: required header attachment does not increase network fan-out or move existing network work onto a hotter path."
+      },
+      {
+        "Scenario": "Load extension resources such as package metadata, themes, icons, README content, or changelogs",
+        "CriticalPath": "The loader determines whether the URI is a gallery resource, obtains a token through an in-memory same-origin check, then performs the existing fetch/request. Each resource still waits on its own network read.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/extensionResourceLoader/browser/extensionResourceLoaderService.ts and common/extensionResourceLoaderService.ts",
+            "Operation": "Fetch or request one extension resource",
+            "Cardinality": "One existing HTTP operation per requested resource",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same resource was fetched once with client headers but without the marketplace bearer.",
+            "CriticalPathEffect": "The boundary remains critical for that resource; the diff adds only local header computation before it"
+          }
+        ],
+        "ScalingInput": "Network operations scale with resources actually requested (for example visible icons or a selected README), exactly as before; only constant local URI checks are added.",
+        "EffectiveConcurrency": "Resource-loading concurrency is unchanged and remains controlled by callers/browser networking; there is no new per-resource IPC or authentication request.",
+        "CacheBehavior": "Gallery-manifest resolution is promise-coalesced, and token state is in memory. Existing browser/file/network caches are unchanged.",
+        "MechanismConfidence": "High from the direct loader call path.",
+        "MagnitudeUncertainty": "Exact resource counts vary with the UI, but the diff does not change effective boundary cardinality.",
+        "Verdict": "No finding: authorization metadata does not alter resource-fetch count, concurrency, or retained state."
+      },
+      {
+        "Scenario": "Interactive Microsoft sign-in and marketplace-resource consent",
+        "CriticalPath": "After the explicit base-session creation, the provider may discover PRM if it has not been learned, silently checks for a resource-scoped session, and creates one interactively only when absent. This work is on the user-triggered sign-in path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryAccountService.ts `signIn` / `consentToProtectedResource`",
+            "Operation": "Create the base Microsoft session, query for a resource-scoped session, and possibly create the resource-scoped session",
+            "Cardinality": "One base create-session call; when PRM exists, one silent resource-session lookup and at most one resource-session creation",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Sign-in created only the base session and did not consent to a marketplace-specific resource.",
+            "CriticalPathEffect": "These operations must complete before consent-oriented sign-in returns"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryAccountService.ts `signIn`",
+            "Operation": "Discover protected-resource metadata when no prior resource metadata is retained",
+            "Cardinality": "At most one discovery invocation, producing one or two sequential well-known requests depending on service-index path",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No discovery occurred during sign-in.",
+            "CriticalPathEffect": "Discovery delays the explicit sign-in flow when `protectedResource` is absent"
+          }
+        ],
+        "ScalingInput": "Constant work per explicit sign-in rather than per extension or resource.",
+        "EffectiveConcurrency": "The consent steps are intentionally serialized to avoid prompting when a silent resource session already exists; no collection fan-out occurs.",
+        "CacheBehavior": "A successfully discovered `protectedResource` is retained in memory for this sign-in path; missing metadata is not negatively cached. The broader eager discovery issue is covered by the submitted finding.",
+        "MechanismConfidence": "High for call count and ordering; lower only for provider-internal boundary cost.",
+        "MagnitudeUncertainty": "Authentication-provider implementation determines whether session lookup is local or remote and how long an interactive prompt takes.",
+        "Verdict": "No separate finding: the additional consent operations are bounded and required by the new authentication behavior; the avoidable pre-index discovery is already reported."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 13 changed files. One medium-severity eager-work/cache-lifecycle regression was submitted: uncached PRM discovery now serializes one or two network calls ahead of every eligible Microsoft marketplace index load, including open marketplaces and session revalidations. Gallery requests, resource loading, IPC propagation, and explicit consent preserve effective boundary cardinality or add bounded behavior-required work."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-23T07:04:54.249845555Z",
+    "CompletedAt": "2026-10-23T07:06:45.867660101Z",
+    "WallClockMilliseconds": 111617,
+    "ModelCalls": 8,
+    "InputTokens": 296582,
+    "OutputTokens": 6987,
+    "TotalTokens": 303569,
+    "ReasoningTokens": 2632,
+    "CacheReadTokens": 237649,
+    "CacheWriteTokens": 58909,
+    "APIDurationMilliseconds": 94576,
+    "ToolCalls": 39,
+    "NanoAIUnits": 52944060000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 237649,
+      "cache_write": 58909,
+      "input": 24,
+      "output": 6987
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
