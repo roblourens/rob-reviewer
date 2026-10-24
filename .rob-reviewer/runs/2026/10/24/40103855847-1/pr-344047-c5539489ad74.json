@@ -1,0 +1,210 @@
+{
+  "PullRequest": {
+    "Number": 344047,
+    "Title": "Engineering - fix test module import failure handling in browser runner",
+    "Body": "## Summary\n\nMake browser test-module import failures fail the run instead of silently omitting the affected suites.\n\nPreviously, the page logged `BAD \u003cmodule\u003e`, resolved the failed import with `{}`, and continued. Mocha only counted tests that successfully registered, so the run could pass despite missing entire suites. This was reproduced with a missing module: the runner reported zero failures.\n\nThe runner now logs the failing module and original error, rejects the page's completion promise, propagates that error to the CLI for a nonzero exit code, and cleans up browser resources. Import failures remain fatal even when `--grep` would exclude the affected tests. The unit-test README documents this behavior.\n\n## Why the browser checks initially failed\n\nThe stricter behavior exposed existing browser-incompatible test dependencies that the old runner had silently skipped. Windows, macOS, and Linux all failed on the same module; this was not a platform-specific regression, and removing the newly added runner regression tests did not cause it.\n\n- `webSocketOverDuplex.test.ts` lived under `common` but imported Node's `events` module and used the Node-only `Buffer` global. Its fake stream now uses typed, browser-compatible listeners, and its Base64 encoding uses the existing cross-platform buffer helper. The suite's 24 tests are preserved and can now run without Node globals.\n- A scan of the full browser test graph also found that `fixtureSyntaxHighlighting.test.ts` imported fixture helpers that depend on the CommonJS `vscode-oniguruma` and `vscode-textmate` packages, which are not mapped by the browser runner. The suite was moved to `electron-browser`, retaining its tests in the runtime that supports those dependencies.\n\nThese follow-up changes fix the exposed dependencies rather than weakening import-failure detection or dropping tests.\n\n## Validation\n\n- `npm run build-fast -- --client-only` — passed.\n- `npm run test-node -- --run src/vs/platform/agentHost/test/common/webSocketOverDuplex.test.ts` — passed: 24 suite tests plus the runner's unexpected-error check.\n- A temporary browser-like VM probe using the browser assertion implementation, without Node `process`, `Buffer`, or `require` globals — all 24 WebSocket tests passed.\n- A temporary static import-graph scan of all 2,073 browser test modules and 6,698 reachable JavaScript modules — zero unmapped static imports after the fixes.\n- Targeted TypeScript validation using repository configuration and ambient declarations — passed for the changed WebSocket suite.\n- `npm run eslint -- src/vs/platform/agentHost/test/common/webSocketOverDuplex.test.ts src/vs/workbench/test/electron-browser/componentFixtures/fixtureSyntaxHighlighting.test.ts` — passed.\n- Commit hygiene hook — passed for both changed files.\n\nThe initial runner regression harness passed 13 tests before it was intentionally removed from this PR at the maintainer's request; those tests are not retained coverage. That initial validation exercised the runner's error handling but did not cover the complete existing browser test graph, which is why the hidden dependencies were first exposed in CI.\n\nFull local browser execution was blocked by sandbox restrictions on localhost listeners (`listen EPERM`). Local execution of the relocated Electron suite was also blocked by macOS sandbox/Mach restrictions. The follow-up commit has been pushed for CI validation; the local checks above do not establish that all browser or Electron CI checks pass.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344047",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "4ff5ad971b5bc474e5fc6ca8cf2386d30a85d3eb",
+    "HeadRef": "lszomoru/agents/test-module-import-failure-fix",
+    "HeadSHA": "c5539489ad74d7b073d992241271dadc948dfc74",
+    "CreatedAt": "2026-10-24T13:24:45Z",
+    "UpdatedAt": "2026-10-24T14:45:54Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "boundary-fanout",
+      "repeated-work",
+      "serialization-allocation",
+      "concurrency-burst",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Successful browser unit-test run across selected browsers",
+        "CriticalPath": "For each selected browser, the runner creates a local HTTP server, launches a browser, discovers CSS, opens the renderer, imports test modules sequentially, runs Mocha, disposes the stall watchdog, waits for already-running console handlers, and closes the browser. The added listener wait is only during teardown, after tests finish.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/unit/browser/index.js:runTestsInBrowser",
+            "Operation": "Launch and close one Playwright browser process tree per selected browser.",
+            "Cardinality": "One launch and one close per selected browser; three concurrent runs by default.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same browser process was launched and closed once on a successful run; cleanup occurred after the catch block.",
+            "CriticalPathEffect": "Browser launch precedes all testing and browser close remains on teardown. The diff moves close into finally but does not increase cardinality."
+          },
+          {
+            "Kind": "network",
+            "Location": "test/unit/browser/index.js:createServer and test/unit/browser/renderer.html:loadModules",
+            "Operation": "Serve renderer assets, CSS, and imported test modules from the per-run localhost server.",
+            "Cardinality": "One renderer navigation plus asset/module requests per browser; one module import per discovered test module, sequentially initiated.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same local server and sequential dynamic imports were used.",
+            "CriticalPathEffect": "All imports must finish before Mocha runs. The diff leaves successful import cardinality and ordering unchanged."
+          },
+          {
+            "Kind": "ipc",
+            "Location": "test/unit/browser/index.js:runTestsInBrowser",
+            "Operation": "Invoke loadAndRun through page.evaluate and relay Mocha/console data across Playwright.",
+            "Cardinality": "One loadAndRun evaluation per browser, Mocha events per test/hook, and one console callback per page console event. The new teardown wait does not create additional callbacks or jsonValue calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same evaluation and console serialization calls occurred, but browser.close could race pending asynchronous console callbacks.",
+            "CriticalPathEffect": "The evaluation covers module loading and test execution. Teardown now waits for already-started console callbacks before close, preserving pending output rather than adding per-module work."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "test/unit/browser/index.js:runTestsInBrowser",
+            "Operation": "Glob compiled CSS and optionally read nls.messages.json.",
+            "Cardinality": "One CSS-tree glob and, in build mode, one messages-file read per browser run.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical discovery and file reads occurred before the diff.",
+            "CriticalPathEffect": "Both complete before module loading. Their frequency is unchanged."
+          }
+        ],
+        "ScalingInput": "Number of selected browsers (three by default), test modules, tests, CSS files, and console events. Module imports are sequential within a browser; browser runs are parallel by default or explicitly sequential with --sequential.",
+        "EffectiveConcurrency": "Up to one run per selected browser executes concurrently via Promise.all. Each browser imports modules serially. Console handlers may overlap; removeAllListeners with behavior 'wait' joins only handlers already in flight and does not add handler invocations.",
+        "CacheBehavior": "Each fresh page has its own browser module cache; there is no cross-browser page cache. The diff does not change module/cache keys, CSS discovery, negative caching, or coalescing.",
+        "MechanismConfidence": "High confidence that successful-path boundary cardinality is unchanged and that the only new synchronization is bounded teardown joining.",
+        "MagnitudeUncertainty": "Pending console-handler duration depends on test logging and Playwright serialization latency, but the diff waits only for already-started handlers during teardown and adds no calls; no realistic unbounded or multiplicative regression is established.",
+        "Verdict": "No reportable regression. Successful test execution performs the same imports, tests, filesystem work, IPC events, and process lifecycle; cleanup is made orderly rather than amplified."
+      },
+      {
+        "Scenario": "Browser test-module import failure, including runs with --grep",
+        "CriticalPath": "Modules are imported sequentially until the first failing import. The page logs that module, rejects loadAndRun, and the CLI tears down the watchdog, pending console handler, local server, and browser before exiting nonzero. No later module or Mocha test is on the changed failure path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "test/unit/browser/renderer.html:loadModules",
+            "Operation": "Fetch dynamic test modules from localhost until an import fails.",
+            "Cardinality": "Imports through the first failing module per browser; remaining modules are not requested by this run.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The failing request was logged and converted to an empty module, after which all remaining modules were imported and the surviving tests ran.",
+            "CriticalPathEffect": "The failing import rejects the critical path immediately."
+          },
+          {
+            "Kind": "ipc",
+            "Location": "test/unit/browser/renderer.html:loadModules and test/unit/browser/index.js:runTestsInBrowser",
+            "Operation": "Send one failed-module console event and reject the outstanding page.evaluate call.",
+            "Cardinality": "One error log and one evaluation rejection per failing browser run.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The page emitted one BAD console message but resolved the failed import, so page.evaluate continued through remaining modules and tests instead of rejecting.",
+            "CriticalPathEffect": "Failure reaches the CLI immediately; waiting for the pending console callback ensures its already-issued serialization completes before browser shutdown."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "test/unit/browser/index.js:runTestsInBrowser",
+            "Operation": "Close the Playwright browser process tree during failure cleanup.",
+            "Cardinality": "One close per failing browser run, unchanged from the eventual cleanup count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The caught failure path eventually reached browser.close after the catch; import failures themselves were swallowed and therefore did not enter that path.",
+            "CriticalPathEffect": "Cleanup is on the failure exit path and prevents browser-resource retention."
+          }
+        ],
+        "ScalingInput": "Position of the first failing module among the discovered module list and number of selected browsers. Each browser can encounter at most its first failure because loading aborts immediately.",
+        "EffectiveConcurrency": "Selected browsers still run concurrently by default, so up to one failure/cleanup path per browser can execute simultaneously. Within a browser, imports remain serial and failure propagation is single-shot.",
+        "CacheBehavior": "A failed dynamic import terminates the page run; the diff neither retries nor negatively caches it. Fresh browsers/pages do not share module caches. There is no repeated failure loop.",
+        "MechanismConfidence": "High confidence from the sequential loop, rethrow, page-promise rejection, outer finally, and browser-level Promise.all call flow.",
+        "MagnitudeUncertainty": "The amount of work avoided depends on where the failed module appears, but the direction is unambiguous: later imports and tests are removed from the failure path.",
+        "Verdict": "No reportable regression. The change reduces failure-path CPU, I/O, and elapsed time by aborting remaining module/test work, while preserving bounded cleanup."
+      },
+      {
+        "Scenario": "Component fixture TextMate syntax-highlighting suite relocated from browser to Electron-browser tests",
+        "CriticalPath": "The Electron-browser test loader imports the suite, then each test creates fixture tokenizers. Theme, grammar, and Oniguruma resources must load before tokenization assertions; DOM style reads occur only inside the test workflow.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/test/browser/componentFixtures/fixtureResourceLoader.ts:requestFixtureResource",
+            "Operation": "Load fixture themes, grammar files, and Oniguruma WASM through file-scheme XMLHttpRequests in the native Electron environment.",
+            "Cardinality": "A fixed suite-level set: one WASM load, theme loads for the fixed variants, and grammar/dependency reads required by the fixed fixture languages, with existing promise/instance reuse.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same suite loaded the same resources through localhost HTTP in each browser-runner execution; the diff changes the compatible test runtime rather than adding resource reads.",
+            "CriticalPathEffect": "Resource loads block tokenizer setup, as they did before relocation."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/test/browser/componentFixtures/fixtureSyntaxHighlighting.ts and fixtureSyntaxHighlighting.test.ts",
+            "Operation": "Create TextMate grammars and perform DOM style computation for fixed test fixtures.",
+            "Cardinality": "Fixed fixture-language/theme cardinality within one suite execution; shared setup is reused where lifecycle overlaps.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The identical test body and helper implementation performed the same grammar, tokenization, and style work under the browser-test location.",
+            "CriticalPathEffect": "This work is intrinsic to the test assertions and unchanged by the import-path relocation."
+          }
+        ],
+        "ScalingInput": "Five tests, eight fixture language IDs, eleven grammar descriptors, several theme variants, and one Oniguruma WASM resource. These are fixed fixture collections rather than user-controlled inputs.",
+        "EffectiveConcurrency": "Grammar creation uses Promise.all across the fixed language list. Shared tokenizer instances are reference-counted while overlapping fixtures exist; tests themselves follow the test runner's scheduling.",
+        "CacheBehavior": "themeLoaded coalesces the dark-theme load, onigLibPromise coalesces WASM initialization, and the tokenizer instance is shared while references remain. The relocation does not change these keys or lifecycle rules.",
+        "MechanismConfidence": "High confidence that the resource-heavy test body is unchanged and only its test classification/import paths changed.",
+        "MagnitudeUncertainty": "Exact Electron-job process reuse and total CI wall time are runner-dependent, but the suite was removed from the three-browser default inventory and no added per-item work is visible.",
+        "Verdict": "No reportable regression. The move enables existing dependencies in a compatible test runtime and does not introduce new resource fan-out or production work."
+      },
+      {
+        "Scenario": "WebSocket-over-duplex test suite under browser-compatible dependencies",
+        "CriticalPath": "Each test builds an in-memory fake duplex stream, computes a WebSocket upgrade digest when connecting, dispatches a bounded number of fake stream events, and checks frames. No real socket, IPC, or filesystem operation is used.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/test/common/webSocketOverDuplex.test.ts:createUpgradeResponse",
+            "Operation": "Compute an in-process Web Crypto SHA-1 digest for each synthetic handshake.",
+            "Cardinality": "One digest per synthetic connection; fixed by the bounded test cases.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same digest occurred, followed by Node Buffer Base64 encoding.",
+            "CriticalPathEffect": "The digest must complete before the fake upgrade response is delivered. The diff changes only Base64 conversion after the digest."
+          }
+        ],
+        "ScalingInput": "A fixed suite of 24 tests with small listener sets and bounded synthetic chunks/frames.",
+        "EffectiveConcurrency": "Tests are runner-scheduled; within a fake stream, listeners are synchronously dispatched from a copied Set. There is no aggregate external-resource concurrency.",
+        "CacheBehavior": "No persistent cache is involved. Per-test streams and listener Sets are short-lived and released with test fixtures.",
+        "MechanismConfidence": "High confidence because the changed class is test-only and all event/network behavior is in-memory.",
+        "MagnitudeUncertainty": "Listener counts are small and fixed by tests; no realistic large-cardinality production scenario reaches this test fake.",
+        "Verdict": "No reportable regression. Cross-platform Base64 and listener replacements operate on tiny bounded test data and do not affect product runtime."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over all seven changed files and every diff page. Traced success, failure, cleanup, test-runtime relocation, and test-fake scenarios, including process, IPC, localhost/network, filesystem, serialization, caching, and concurrency behavior. No high-confidence diff-introduced performance issue was found; no finding or regression-fix record was warranted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-24T14:48:14.112243832Z",
+    "CompletedAt": "2026-10-24T14:49:49.747574638Z",
+    "WallClockMilliseconds": 95635,
+    "ModelCalls": 7,
+    "InputTokens": 151712,
+    "OutputTokens": 5786,
+    "TotalTokens": 157498,
+    "ReasoningTokens": 2106,
+    "CacheReadTokens": 112128,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 72494,
+    "ToolCalls": 31,
+    "NanoAIUnits": 31890720000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 112128,
+      "cache_write": 0,
+      "input": 39584,
+      "output": 5786
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
