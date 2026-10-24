@@ -1,0 +1,141 @@
+{
+  "PullRequest": {
+    "Number": 344017,
+    "Title": "Agent Host: hand in-flight HydraFusion workflow to the steering turn",
+    "Body": "Fixes microsoft/vscode-internalbacklog#10352\n\nWhen a steering message arrived while a HydraFusion phase was still running, the turn looked stuck. The SDK kept running the workflow (34 tool calls in the report), but nothing more appeared in the chat.\n\n## Cause\n`_beginSteeringTurn` completed the original turn and called `resetTurnState`. That cleared all Fusion state for the workflow the SDK was still running: Fusion progress (including the running phase), the phase registry, and the provisional-event state. It also left ownership of the workflow and its SDK turn IDs with the completed turn. After that:\n- `_fusionPhaseToolCallId` no longer found the phase, so provisional messages were dropped and tool starts were held back.\n- Later Fusion events were ignored as belonging to an earlier or ambiguous turn, so the phase was never registered again.\n\n## Fix\nWhen steering is promoted mid-turn and that turn wasn't cancelled, the steering turn now takes over the running workflow instead of resetting it:\n- Fusion progress, the phase registry, and provisional/pending state are kept.\n- Ownership of the workflow and its SDK turn IDs moves to the new turn without marking them ambiguous.\n- Phase chats from the old turn close and reopen under the new turn on their next event, using the existing reopen path.\n- A new `CopilotFusionProgress.resumeRunningPhase()` shows the running phase's tile again in the new turn, because the old turn's tile is marked cancelled when that turn ends.\n\nSteering that is promoted after the SDK goes idle, or after a cancelled turn, still resets as before. Every other caller of the turn reset is unchanged.\n\n## Testing\nAdded the regression test `steering during a Fusion phase hands the in-flight workflow to the steering turn`. It fails without the fix and passes with it.\n\n- `npm run test-node -- --run \u003ceach src/vs/platform/agentHost/test/node/copilot*.test.ts\u003e --run src/vs/platform/agentHost/test/node/agentHostTurnTelemetry.test.ts`: passed, 3419 tests.\n- `eslint` on the changed files: passed.\n- `npm run typecheck-client`: no errors in the changed files. The only errors elsewhere come from Electron typings missing in this environment.\n\nNot verified against a live HydraFusion session or the logs attached to the issue; I couldn't download them.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344017",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sbatten",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "1184ad4d45794110deb6b897ea83b15aac44ed89",
+    "HeadRef": "sbatten/fusion-steering-handoff",
+    "HeadSHA": "40ef971a49a1e6105127a491bbb4d7dba904f619",
+    "CreatedAt": "2026-10-24T02:22:49Z",
+    "UpdatedAt": "2026-10-24T04:06:38Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "A steering message is promoted while a HydraFusion phase and one or more provisional root tool calls are still running.",
+        "CriticalPath": "The SDK user.message event synchronously enters _beginSteeringTurn, completes the old host turn, creates the successor, scans ownership/tool-call state, republishes the running phase and eligible root tool rows, then records the SDK turn. These steps must finish before the successor turn is fully projected to chat.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_beginSteeringTurn and _transferProvisionalFusionToolCalls",
+            "Operation": "Publish the resumed Fusion phase and replayed ChatToolCallStart/Ready/ContentChanged actions through the agent progress channel to chat clients.",
+            "Cardinality": "At most one resumed phase update, then two actions per eligible root tool plus one content action when the tracked tool has content; filtering occurs before emission.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old turn was completed and Fusion state reset; no running phase or provisional tool rows were replayed to the successor.",
+            "CriticalPathEffect": "Synchronous action construction/emission is on steering promotion's immediate UI path."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_transferProvisionalFusionToolCalls",
+            "Operation": "Reconstruct invocation text and serialize each replayed tool's parameters for toolInput.",
+            "Cardinality": "Once per eligible replayed root tool; getToolInputString serializes structured parameters and the changed call also eagerly computes a raw JSON string.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No presentation reconstruction occurred during steering handoff; serialization happened only when the original tool start was surfaced.",
+            "CriticalPathEffect": "CPU and temporary strings are allocated synchronously before each Ready action is emitted."
+          }
+        ],
+        "ScalingInput": "Cost scales with the session-lifetime sizes of _fusionEventTurnIds and _hostTurnIdsBySdkTurnId, plus the effective number and total argument bytes of surfaced provisional root tool calls that are active or still publishing. Phase-chat tools, client tools, pending-permission tools, and task_complete rows are filtered out.",
+        "EffectiveConcurrency": "Transfer is a synchronous serialized loop. Each eligible root tool emits Start then Ready and optionally ContentChanged in order; there is no parallel boundary burst or limiter because emission is synchronous.",
+        "CacheBehavior": "No cache lookup or remote cache is involved. Ownership maps are warm session state; Fusion progress and active tool records are reused. Tool presentation is recomputed rather than cached, including JSON serialization of parameters.",
+        "MechanismConfidence": "High confidence in the synchronous scans, replay cardinality, and duplicate parameter serialization from the traced call path; only their practical magnitude is uncertain.",
+        "MagnitudeUncertainty": "Real sessions can have large edit/patch arguments and multiple tool calls, but the effective count of simultaneously eligible root provisional calls and measured steering delay are not established. Map scans and duplicate serialization are therefore bounded-looking in ordinary use and do not clear the actionable regression threshold without latency evidence.",
+        "Verdict": "No finding. The new replay work is causally introduced, but it is required to project the handed-off workflow and is filtered to active surfaced root tools. The only clearly avoidable portion is an extra stringify, whose standalone user-visible impact is not sufficiently evidenced."
+      },
+      {
+        "Scenario": "A steering handoff occurs after a provisional Fusion tool completed but while its edit/resource/terminal result is still being persisted.",
+        "CriticalPath": "The completion's filesystem/database/edit-tracker work was already started by tool.execution_complete. The handoff moves the tracked completion to the successor turn and trackToolCompletion causes the successor's session.idle handler to drain it before ChatTurnComplete.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:handleToolComplete completion pipeline",
+            "Operation": "Read bounded terminal output and capture completed file edits.",
+            "Cardinality": "Existing work per completed tool: zero or one bounded terminal-output read plus edit captures for that tool's affected file paths.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old turn tracked the operation, but after steering reset the successor did not wait for it and its eventual UI completion was dropped.",
+            "CriticalPathEffect": "The diff can make already-running work part of the successor turn's completion critical path by tracking its promise; it does not add the read/edit operation."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:handleToolComplete completion pipeline",
+            "Operation": "Persist SDK result resources or terminal output and clean up unpublished terminal output if necessary.",
+            "Cardinality": "Existing per qualifying completion; one database handle with resource/terminal stores and conditional cleanup.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Persistence already ran, but was not transferred to or awaited by the successor turn.",
+            "CriticalPathEffect": "Outstanding persistence must now settle before the successor turn can complete if the SDK reaches idle first."
+          }
+        ],
+        "ScalingInput": "Latency is the remaining duration of each effective unpublished completion handed over; drainToolCompletions waits for all tracked promises, while each completion may include file-edit capture, resource persistence, or bounded terminal-output persistence.",
+        "EffectiveConcurrency": "The underlying completion promises may already execute concurrently. The idle path coalesces them with Promise.allSettled and waits as a group; it does not start duplicate persistence operations.",
+        "CacheBehavior": "No result cache is introduced or bypassed. The session data database is opened per pre-existing completion path, and the new map only indexes promises until finally removes them.",
+        "MechanismConfidence": "High confidence that the successor now waits for the existing promise and that no duplicate filesystem/database operation is scheduled.",
+        "MagnitudeUncertainty": "Slow storage could expose added tail latency when steering work finishes before persistence, but the diff starts no new I/O, the work normally overlaps the continuing workflow, and no duration/prevalence evidence shows a material regression.",
+        "Verdict": "No finding. Waiting preserves the required completion-before-turn-end ordering and reuses already-running promises; there is no duplicate boundary work or unbounded concurrency introduced."
+      },
+      {
+        "Scenario": "A steering message is promoted in a non-Fusion turn or after no provisional Fusion tools are eligible for transfer.",
+        "CriticalPath": "The new continuesFusionWorkflow branch still starts a successor and scans both ownership maps plus active/unpublished tool maps before finishing promotion, but emits no transfer actions when no eligible Fusion state exists.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Synchronous CPU scales with accumulated ownership-map history and current active/unpublished tool counts, even when the filter rejects every tool.",
+        "EffectiveConcurrency": "All scans are synchronous and serial; no external calls are launched.",
+        "CacheBehavior": "The maps are session-lifetime routing state rather than caches and are cleared on session disposal; there is no cold/warm cache distinction.",
+        "MechanismConfidence": "High confidence that the condition is not gated on an active Fusion phase and that the scans occur; low confidence that their cost is materially user-visible.",
+        "MagnitudeUncertainty": "Map history is session-bounded but can grow with turns/events. No evidence establishes realistic cardinalities large enough for these simple scans to create visible steering latency.",
+        "Verdict": "No finding because this is small in-memory iteration with no demonstrated costly payload or boundary fan-out on the non-Fusion path."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and all diff pages. Traced steering promotion, Fusion ownership transfer, provisional tool replay, delayed completion persistence, UI progress emission, and map cleanup. The PR introduces bounded synchronous replay and moves existing persistence waits onto the successor turn for ordering, but no high-confidence actionable performance regression meets the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-24T06:31:49.807546604Z",
+    "CompletedAt": "2026-10-24T06:33:52.531934774Z",
+    "WallClockMilliseconds": 122724,
+    "ModelCalls": 9,
+    "InputTokens": 380744,
+    "OutputTokens": 7873,
+    "TotalTokens": 388617,
+    "ReasoningTokens": 4289,
+    "CacheReadTokens": 306688,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 101293,
+    "ToolCalls": 44,
+    "NanoAIUnits": 57635920000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 306688,
+      "cache_write": 0,
+      "input": 74056,
+      "output": 7873
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
