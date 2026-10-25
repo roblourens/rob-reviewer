@@ -1,0 +1,184 @@
+{
+  "PullRequest": {
+    "Number": 344144,
+    "Title": "editor: fix @vscode/diff bridge, compare diff algorithms on a sample of diffs",
+    "Body": "Follow-up to [#316990](https://github.com/microsoft/vscode/pull/316990), which added the `advanced-external` and `advanced-wasm` diff algorithms backed by `@vscode/diff`.\r\n\r\nThis PR has two parts: a correctness fix for the bridge to `@vscode/diff`, and sampled comparisons that let us roll out `advanced-wasm` via an experiment.\r\n\r\n## 1. Fix the `@vscode/diff` bridge\r\n### Problem\r\nThe bridge in `externalLinesDiffComputer.ts` always passed `ignoreTrimWhitespace: true` to `@vscode/diff` (marked with a TODO). With that option the package's string edit drops whitespace changes, so applying it no longer reproduces the modified text. The bridge reconstructed the modified offsets by accumulating length deltas over that incomplete edit, so the offsets drifted:\r\n- wrong inner-change highlights ([#318958](https://github.com/microsoft/vscode/issues/318958), [#317301](https://github.com/microsoft/vscode/issues/317301));\r\n- `Assertion Failed` in `lineRangeMappingFromRangeMappings` ([#333747](https://github.com/microsoft/vscode/issues/333747); reproduced in Code OSS with the attached `repro.json`).\r\n\r\nThe pure-JS backend failed the same way, so this was not specific to wasm.\r\n\r\n### Fix\r\nThe bridge keeps using only the public, offset-based API (`createDiffComputer` / `computeDiff`). Conversion from the string edit to line mappings happens in VS Code. This is transitional: VS Code should eventually carry offset-based diffs further and only derive line ranges where the UI needs them.\r\n- The algorithm always diffs whitespace (`ignoreTrimWhitespace: false`), so its edit reproduces the modified text.\r\n- `ignoreTrimWhitespace` is applied in VS Code: replacements that only touch leading/trailing whitespace of a single line (on both sides) are hidden. Whitespace changes inside a line stay visible. Modified offsets are accumulated over the full edit before filtering, so they can't drift.\r\n\r\nThis mirrors [microsoft/vscode-packages#390](https://github.com/microsoft/vscode-packages/pull/390), which proposes removing `ignoreTrimWhitespace` from the package and annotating these replacements instead. Once that ships, `isInTrimWhitespace` can be replaced with the package's annotation.\r\n\r\n`maxComputationTimeMs` is still not forwarded (the TODO now says why): the wasm build of the pinned 0.0.2-7 panics when measuring time (`std/src/sys/time/unsupported.rs`, observed in Code OSS). The current package source uses `Date.now()`, and a 300 ms limit stopped a 21k → 33k line diff after 327 ms. Forwarding it belongs in the package bump.\r\n\r\n### Behavior notes\r\n- Without \"ignore trim whitespace\", results are identical to `advanced` on all diffing fixtures, except `invalid-ranges` (empty original). `advanced` special-cases an empty document and replaces it as a whole, while the string edit maps to a pure insertion. Both are valid, and the diff editor handles empty documents before calling any algorithm.\r\n- With \"ignore trim whitespace\", line changes for the issue repros are the same as `advanced`. Inner highlights can differ slightly, e.g. whether leading indentation is part of a highlighted range: lines are now aligned including whitespace before hiding, instead of ignoring whitespace during alignment.\r\n\r\n## 2. Sampled diff-algorithm comparison\r\nGoal: before switching the default from `advanced` to `advanced-wasm` (and eventually removing the built-in algorithm), measure speed and correctness on real diffs.\r\n\r\n- **Settings** (experiment-controlled, `tags: ['experimental']`, `experiment: { mode: 'auto' }`, off by default):\r\n  - `diffEditor.experimental.compareDiffAlgorithm`: `none` (default), or the candidate algorithm.\r\n  - `diffEditor.experimental.compareDiffAlgorithmSampleRate`: probability from 0 to 1 (default 0).\r\n- **When:** after a diff has been computed and returned (cache hits excluded), with the given probability. Skipped if there is no time limit (`maxComputationTimeMs === 0`), so it can't block the worker indefinitely.\r\n- **How:** the editor worker runs both algorithms on the same lines (new `$compareDiffAlgorithms`). Timings are pure algorithm time without IPC. Correctness means the inner changes rebuild the modified text: `valid`, `invalid`, or `unverified` when ignoring trim whitespace, timed out, or no inner changes. Exceptions are counted, never rethrown.\r\n- **Telemetry** `diffEditor.compareDiffAlgorithms` contains only metadata: algorithm names, `ignoreTrimWhitespace`, line counts, `isIdentical`, and per algorithm `timeMs`, `threw`, `hitTimeout`, `changeCount`, `validity`.\r\n\r\nVerified in Code OSS (`advanced` primary, `advanced-wasm` sampled at rate 1, the [#333747](https://github.com/microsoft/vscode/issues/333747) repro, 2232 → 2239 lines): `isIdentical: 1`, both `valid`, 28 ms vs 34 ms. Before the `maxComputationTimeMs` revert, the same run reported `secondaryThrew: 1`, which is how the panic above was found. The experiment framework queried `config.diffEditor.experimental.compareDiffAlgorithmSampleRate` as expected.\r\n\r\nHappy to split part 2 into its own PR if preferred.\r\n\r\n## Tests\r\n- `fixtures.test.ts`: every fixture through both external computers vs `advanced` (with whitespace), and a test pinning which whitespace changes `ignoreTrimWhitespace` hides.\r\n- New `diffAlgorithmComparison.test.ts`: identical/valid diffs, invalid diffs, throwing algorithms, unverified when ignoring trim whitespace.\r\n- `npm run test-node -- --run src/vs/editor/test/node/diffing/diffAlgorithmComparison.test.ts --run src/vs/editor/test/node/diffing/fixtures.test.ts`: 124 passing.\r\n- `scripts\\test.bat` with the same files: 123 passing. The electron renderer covers `advanced-external` only, because the package's wasm loader takes its node code path there and cannot import `node:fs`.\r\n- `npm run typecheck-client` and eslint pass.\r\n- The three issue repros, through both backends and in both whitespace modes: no assertion failures.\r\n\r\n## Manual testing\r\n- Set `\"diffEditor.diffAlgorithm\": \"advanced-wasm\"` and compare files, for example the repro texts from [#318958](https://github.com/microsoft/vscode/issues/318958) and [#333747](https://github.com/microsoft/vscode/issues/333747). They render without assertion errors.\r\n- Correct highlights for non-ASCII text (emoji, CJK) additionally need the wasm fix from [microsoft/vscode-packages#389](https://github.com/microsoft/vscode-packages/pull/389) and a package bump.\r\n- For the comparison: set the two `diffEditor.experimental.compareDiffAlgorithm*` settings, start with `--log trace`, open a diff, and check `telemetry.log` for `diffEditor.compareDiffAlgorithms`.\r\n\r\nRelated: [#318958](https://github.com/microsoft/vscode/issues/318958), [#317301](https://github.com/microsoft/vscode/issues/317301), [#333747](https://github.com/microsoft/vscode/issues/333747)\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344144",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "hediet",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3766382c18a1b5385b333c6d575a6456ae8e6961",
+    "HeadRef": "hediet/diff-wasm-bridge-lines",
+    "HeadSHA": "cf676eb9119f308cb6337e778689af22a38152a2",
+    "CreatedAt": "2026-10-25T15:40:35Z",
+    "UpdatedAt": "2026-10-25T17:14:25Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-1027B96945A0",
+      "Focus": "performance-review",
+      "Path": "src/vs/editor/browser/widget/diffEditor/diffProviderFactoryService.ts",
+      "Side": "RIGHT",
+      "Line": 180,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The added dispatch, selectable external candidates, sequential full-document execution, omitted external timeout, default 5-second primary budget, and singleton worker are all directly traced in repository code. Only the frequency and worst-case duration in a particular experiment cohort are uncertain, which limits severity rather than mechanism confidence.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "CPU time on the singleton editor web worker",
+      "PerformanceScaling": "One extra comparison is launched per sampled, uncached diff; it runs full-document primary and secondary algorithms sequentially, and an external candidate's runtime is unbounded by maxComputationTimeMs as document size and diff complexity grow.",
+      "PerformanceOutcome": "The shared editor worker can remain blocked beyond the configured diff timeout, delaying subsequent interactive diff recomputations and other editor-worker requests.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "With the normal `advanced` algorithm, an uncached diff ran only the configured primary computation, whose DefaultLinesDiffComputer enforces maxComputationTimeMs (5000 ms by default). External algorithms ran only when explicitly selected as the primary algorithm.",
+      "ChangedBehavior": "When the experiment samples an `advanced-external` or `advanced-wasm` secondary, this added call schedules another worker request that runs the external computer even for users whose primary is `advanced`; ExternalLinesDiffComputer explicitly does not forward maxComputationTimeMs, so the nonzero-timeout guard does not bound this work.",
+      "CausalDiffEvidence": "RIGHT line 180 newly dispatches the sampled comparison from the normal diff path. Before this diff, an `advanced` primary never invoked the uncapped external backend; after it, selecting `advanced-wasm` or `advanced-external` as the experiment candidate moves that backend onto sampled `advanced` diff requests.",
+      "Title": "Skip sampled algorithms that cannot honor the timeout",
+      "Impact": "With the comparison experiment enabled, opening or editing a large/pathological diff can make a single sampled external comparison monopolize the singleton editor worker past the normal 5-second budget. The already-rendered result returns first, but later edits, dirty diffs, formatting/minimal-edit work, and worker-backed completions wait behind the sample.",
+      "Evidence": "The added call at line 180 dispatches compareDiffAlgorithms after each sampled cache miss. `$compareDiffAlgorithms` resolves both algorithms and synchronously invokes `compareDiffAlgorithms`, which runs primary then secondary on the full line arrays. `ExternalLinesDiffComputer.computeDiff` omits maxComputationTimeMs with an explicit TODO because the pinned wasm build panics when timing. WorkerManager owns one EditorWorkerClient, and these synchronous computations execute on that shared worker event loop.",
+      "Recommendation": "Do not dispatch external candidates from this experiment until they can enforce maxComputationTimeMs, or isolate the comparison in a disposable/dedicated worker that can be terminated at the budget. Keep the existing sample/cache behavior, but ensure a sampled run cannot block the shared editor worker past the configured limit."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open or edit a diff with the default comparison settings disabled",
+        "CriticalPath": "The main thread checks the 10-entry diff cache, synchronizes both models, sends one computeDiff request to the editor worker, and awaits that worker result before rendering. The new comparison path exits before issuing work because the secondary is `none` and the sample rate is 0.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/editor/browser/services/editorWorkerService.ts:computeDiff",
+            "Operation": "Synchronize model data and invoke `$computeDiff` in the editor web worker.",
+            "Cardinality": "One awaited compute IPC per uncached diff; zero on a matching diffCache hit.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same primary worker request occurred before this PR.",
+            "CriticalPathEffect": "The response is required before the diff view can publish the authoritative result."
+          }
+        ],
+        "ScalingInput": "Original and modified document line counts and diff complexity; content edits are debounced by 200 ms, and identical version/options combinations are served by the URI/context cache.",
+        "EffectiveConcurrency": "A singleton EditorWorkerClient serves worker-backed editor operations; each diff algorithm is synchronous within the worker. With comparison disabled there is still one primary computation per uncached request.",
+        "CacheBehavior": "A matching URI, model/version, and options context returns the cached result and excludes comparison. Cold uncached requests sync models and compute once; warm matching requests do neither.",
+        "MechanismConfidence": "High: configuration defaults, cache check, and early-return conditions are direct in the changed code.",
+        "MagnitudeUncertainty": "Document sizes and algorithm runtimes vary, but this default-disabled path adds no sampled computation.",
+        "Verdict": "No reportable regression with the new experiment disabled."
+      },
+      {
+        "Scenario": "Open or repeatedly edit a large diff while sampled algorithm comparison is enabled",
+        "CriticalPath": "The primary worker IPC remains required for the visible diff. After it resolves, the PR fire-and-forgets a second IPC that runs primary and secondary algorithms sequentially; it is off the already-completed render's path but occupies the same worker needed by subsequent edits and other editor services.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/editor/browser/services/editorWorkerService.ts:compareDiffAlgorithms",
+            "Operation": "Invoke `$compareDiffAlgorithms` with both model URIs and algorithm names.",
+            "Cardinality": "One extra IPC for each sampled uncached diff; it serves both algorithm runs.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No comparison IPC or secondary algorithm ran after a normal primary diff.",
+            "CriticalPathEffect": "Not required for the current rendered result, but its synchronous worker work blocks later worker requests."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/editor/common/diff/externalLinesDiffComputer.ts:loadExternalModule/getExternalLinesDiffComputer",
+            "Operation": "Dynamically load and initialize `@vscode/diff` and, for the wasm variant, its backend on first external candidate use.",
+            "Cardinality": "At most once per worker/backend because module and computer promises are cached; no repeated boundary after warm-up.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Users of the `advanced` primary did not reach this external backend unless they explicitly selected it as their primary algorithm.",
+            "CriticalPathEffect": "Off the completed diff's immediate path, but initialization and subsequent comparison share the worker with interactive requests."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/editor/browser/widget/diffEditor/diffProviderFactoryService.ts:180-202",
+            "Operation": "Return comparison metadata over IPC and enqueue one `diffEditor.compareDiffAlgorithms` telemetry event.",
+            "Cardinality": "One bounded metadata result and telemetry event per completed sampled comparison.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This comparison result and telemetry event did not exist.",
+            "CriticalPathEffect": "Off the visible diff's immediate path; payload size is fixed and not itself reportable."
+          }
+        ],
+        "ScalingInput": "One comparison per sampled uncached diff after URI/version/options deduplication. Cost scales with both documents' line counts, diff complexity, number of changes validated/formatted, sample rate, and the number of active diff editors.",
+        "EffectiveConcurrency": "The comparison algorithms execute synchronously and sequentially on the singleton editor worker. Requests from later edits or other editor-worker consumers wait while this CPU work runs; there is no dedicated worker or cancellation for sampled work.",
+        "CacheBehavior": "Matching primary diff-cache hits do not sample. Algorithm instances and the external module are promise-cached after first use, but comparison results are not cached or coalesced. A cold external candidate also loads/initializes its package backend; warm samples reuse it.",
+        "MechanismConfidence": "Very high: the new dispatch, singleton worker, sequential runs, cache exclusion, and omitted external timeout are directly established.",
+        "MagnitudeUncertainty": "The rollout's actual sample rate and prevalence of pathological large diffs are unknown. The external backend's missing timeout makes worst-case duration unbounded by the configured 5-second budget.",
+        "Verdict": "Reportable: sampling an external candidate can block the shared worker beyond the configured computation budget."
+      },
+      {
+        "Scenario": "Use `advanced-external` or `advanced-wasm` as the selected primary diff algorithm",
+        "CriticalPath": "An uncached diff synchronizes models and awaits one worker computation before rendering. The bridge now diffs all whitespace and filters qualifying trim-only replacements while converting offsets.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/editor/browser/services/editorWorkerService.ts:computeDiff",
+            "Operation": "Invoke the selected external diff algorithm in the editor worker.",
+            "Cardinality": "One IPC per uncached diff, zero on a matching result-cache hit.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same worker boundary and external algorithm invocation already occurred for these selected primary algorithms.",
+            "CriticalPathEffect": "Required before the selected external diff can render."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/editor/common/diff/externalLinesDiffComputer.ts:loadExternalModule/getExternalLinesDiffComputer",
+            "Operation": "Dynamically load `@vscode/diff` and initialize the selected backend.",
+            "Cardinality": "One cold load per worker and one computer per boolean backend, then reused.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The bridge already lazily loaded and cached separate JS and wasm computers.",
+            "CriticalPathEffect": "Cold initialization is on the first external diff's critical path; warm requests reuse the promises."
+          }
+        ],
+        "ScalingInput": "Document bytes/lines, replacement count, and per-line lengths. Offset conversion and trim checks scale with emitted replacements after the external algorithm runs.",
+        "EffectiveConcurrency": "One synchronous external computation runs on the singleton worker for each uncached primary request; this scheduling was already present when users selected these algorithms.",
+        "CacheBehavior": "The package module and each JS/wasm computer are lazily promise-cached. The document diff cache skips repeated identical URI/version/options computations.",
+        "MechanismConfidence": "High for the changed bridge behavior and unchanged boundary cardinality.",
+        "MagnitudeUncertainty": "Always including whitespace may increase algorithm work for whitespace-heavy inputs, but the diff provides no evidence of a user-visible regression distinct from the required correctness repair.",
+        "Verdict": "No separate finding: the bridge correction changes CPU details but does not establish a concrete actionable performance regression on this existing primary path."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 10 changed files and traced default, sampled-comparison, and external-primary workflows. Submitted one medium-severity finding for moving an external algorithm that cannot honor maxComputationTimeMs onto the singleton worker through sampled comparisons; no concrete regression fix requiring blame was identified."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-25T17:19:44.138041584Z",
+    "CompletedAt": "2026-10-25T17:22:13.082467069Z",
+    "WallClockMilliseconds": 148944,
+    "ModelCalls": 11,
+    "InputTokens": 418839,
+    "OutputTokens": 9285,
+    "TotalTokens": 428124,
+    "ReasoningTokens": 4755,
+    "CacheReadTokens": 360960,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 129075,
+    "ToolCalls": 59,
+    "NanoAIUnits": 56160000000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 360960,
+      "cache_write": 0,
+      "input": 57879,
+      "output": 9285
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
