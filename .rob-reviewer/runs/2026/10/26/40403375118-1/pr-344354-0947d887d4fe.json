@@ -1,0 +1,199 @@
+{
+  "PullRequest": {
+    "Number": 344354,
+    "Title": "Engineering - fetch Chromium build scripts through the GitHub API with fallbacks",
+    "Body": "VS Code's Linux build fetches two Chromium scripts from raw.githubusercontent.com at build time: clang's `tools/clang/scripts/update.py` (`setup-env.sh`, on a node_modules cache miss) and `third_party/dpkg-shlibdeps/dpkg-shlibdeps.pl` (`Prepare deb package`). That host rate-limits **per network** (\"too many requests from your network\"), so on shared agent IPs neither a token nor short retries help during an outage.\n\nImpact:\n- **Releasing insider [489293](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=489293) (Oct 26 17:00):** `Prepare deb package` failed on Linux x64, arm64 and armhf after all 5 attempts from #343566 got 429, which blocked Publish. Earlier hits were 487937 and 487986 on Oct 22, so that's 3 official builds in 5 days.\n- **Main CI [489263](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=489263):** 7 jobs failed at `Install dependencies`. `curl -s ... update.py | python -` fed the 429 page to Python, which failed with `SyntaxError: illegal target for annotation`.\n- **GitHub PR CI:** 65 failed jobs across 15 runs in 30 days, 10 of those runs on Oct 26.\n\nChanges:\n- New `build/lib/chromiumSource.ts` downloads a file from the Chromium tree at the version pinned in `cgmanifest.json`. It tries these sources in order:\n  1. the GitHub REST contents API (`api.github.com`, authenticated, per-token rate limit), when a token is set\n  2. raw.githubusercontent.com, authenticated and then anonymous\n  3. Chromium's Gitiles host\n- It retries the whole set after 10, 30 and 60 s. Each request has a connect timeout and an overall deadline, and the file is written only if the content starts with `#!`. Headers, including the token, go through curl's config on stdin, and the log names the source that served the file.\n- `calculate-deps.ts` uses it for `dpkg-shlibdeps.pl`, replacing the GitHub-only loop from #343566.\n- `setup-env.sh` uses it for `update.py`, saves the script to a temp file and only then runs it. This also drops that file's second hard-coded copy of the Chromium version.\n\nAll sources serve byte-identical files at `150.0.7871.250`.\n\nGitiles is last because validation run 489314 showed it returning 403 to every request from the ADO Linux agents. It works from other networks.\n\nWhy not vendor the scripts: `dpkg-shlibdeps.pl` is GPL-2.0, which needs a licensing decision before it can live in this repo. A vendored `update.py` would also have to be re-copied on every Chromium bump, or clang would silently drift.\n\nValidation:\n- `node --test build/lib/test/chromiumSource.test.ts`: 5/5 pass. The tests cover source order with and without a token, Gitiles base64 decoding, error pages with a 200 status, and exhausting every round.\n- `tsc` passes on the changed files, and `bash -n setup-env.sh` passes.\n- A live run of the helper with a token fetched both scripts from `api.github.com` with the expected hashes.\n- Def 111 Product runs build Linux x64, arm64 and armhf only, with publish and release off and tests skipped. Each runs on a throwaway branch with a bumped `.cachesalt`, so `setup-env.sh` runs cold:\n  - Normal path: [489353](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=489353)\n  - Forced failure: [489354](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=489354), with the API host broken, so the fallback has to serve both scripts.\n\n\u003e Authored with Copilot",
+    "URL": "https://github.com/microsoft/vscode/pull/344354",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d24370021e82dade4099ea3e3c3c44f57dd01d17",
+    "HeadRef": "copilot/vscode/clang-update-fetch",
+    "HeadSHA": "0947d887d4feea4f5afcfe7d2ec35dbf0fb10cf3",
+    "CreatedAt": "2026-10-26T16:48:51Z",
+    "UpdatedAt": "2026-10-26T20:27:56Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-53764203F67C",
+      "Focus": "performance-review",
+      "Path": "build/lib/chromiumSource.ts",
+      "Side": "RIGHT",
+      "Line": 95,
+      "Severity": "medium",
+      "Confidence": 0.93,
+      "ConfidenceRationale": "The source order, synchronous spawnSync call, 120-second deadline, and critical-path callers are explicit in the changed code. The exact frequency of a slow-but-not-fast-failing API endpoint is uncertain, but the latency mechanism and affected build paths are deterministic when it occurs.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "serial network requests and blocked build-agent time",
+      "PerformanceScaling": "Latency grows by up to 120 seconds for every earlier source that stalls before a healthy fallback; the cost is paid once per helper invocation, including independently in each Debian architecture job.",
+      "PerformanceOutcome": "blocked critical path and increased build latency",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Both callers contacted raw.githubusercontent.com directly. If raw GitHub was healthy, API-host degradation could not delay dependency setup or package preparation.",
+      "ChangedBehavior": "Each download now waits for the newly preferred GitHub API request to finish or time out before trying the previously used raw GitHub URL. A slow API endpoint therefore delays a healthy raw fallback by up to 120 seconds.",
+      "CausalDiffEvidence": "The added loop at build/lib/chromiumSource.ts:94-95 synchronously calls each source in order; getSources adds api.github.com before raw.githubusercontent.com, and curlGet gives each call a 120-second --max-time. Both changed callers now use this helper on their critical path.",
+      "Title": "Fail over before a source can block for two minutes",
+      "Impact": "When api.github.com is degraded or filtered but raw.githubusercontent.com is healthy, cold Linux dependency installation and each architecture's Prepare deb package step gain up to two minutes of avoidable critical-path latency. Multiple sequential degraded sources can compound this delay and consume a meaningful fraction of the 50-90 minute Linux job timeout.",
+      "Evidence": "getSources places api.github.com first when the pipeline's GITHUB_TOKEN is present, then raw GitHub and Gitiles. downloadChromiumFile iterates these sources serially and curlGet uses spawnSync with --max-time 120. setup-env.sh invokes it before the clang update script during uncached x64 dependency setup, while calculate-deps.ts invokes it before the first dpkg-shlibdeps run during Debian package preparation. The pipelines provide GITHUB_TOKEN in both cases. Thus an API connection that stalls while raw.githubusercontent.com remains healthy blocks progress rather than failing over promptly.",
+      "Recommendation": "Use a short per-source failover deadline (or hedge the next source after a short delay) while retaining the longer overall retry budget, so a healthy fallback is reached quickly without removing resilience."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold Linux x64 dependency installation and clang provisioning",
+        "CriticalPath": "downloadChromiumFile must finish before update.py can run, and update.py must finish before npm dependency installation. All helper retries and fallback probes are therefore on the cold setup critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/linux/setup-env.sh:45",
+            "Operation": "Start Node to resolve the pinned Chromium version and download update.py.",
+            "Cardinality": "One Node subprocess per cold x64 setup, introduced to run the helper.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The shell invoked curl directly and piped its output to Python, without this Node process.",
+            "CriticalPathEffect": "Blocks the shell before the clang update script can execute."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/lib/chromiumSource.ts:36,94-108",
+            "Operation": "Fetch update.py from GitHub API, authenticated/anonymous raw GitHub, or Gitiles.",
+            "Cardinality": "Normally one API curl with a token; on failures up to four serial sources per round and four rounds, for at most 16 curl subprocess/network requests.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One direct raw.githubusercontent.com curl was attempted; API and Gitiles were not contacted and API degradation could not delay a healthy raw request.",
+            "CriticalPathEffect": "Every request and 10/30/60-second backoff blocks dependency setup; each request may run for 120 seconds."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/linux/setup-env.sh:46",
+            "Operation": "Run Chromium update.py to provision the clang toolchain.",
+            "Cardinality": "One Python process; its own clang download behavior depends on the existing script and local .build/CR_Clang state.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same script ran from curl's stdout rather than a temporary file.",
+            "CriticalPathEffect": "Must complete before npm installation, but its placement and download behavior are unchanged."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/linux/setup-env.sh:11-23",
+            "Operation": "Fetch and extract client and remote sysroots when their directories are absent.",
+            "Cardinality": "Up to two sysroot fetch workflows on cache misses before the changed helper path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical cache checks and downloads occurred before the diff.",
+            "CriticalPathEffect": "These complete before clang setup and remain on the cold setup path, but were not added or moved by the diff."
+          }
+        ],
+        "ScalingInput": "One invocation per cold x64 dependency-install job; latency scales with the number of earlier stalled sources and rounds, not with npm package count.",
+        "EffectiveConcurrency": "Sources and retry rounds are fully serialized by spawnSync and Atomics.wait. Separate CI jobs may execute independently in parallel, with no shared limiter or coalescing.",
+        "CacheBehavior": "The setup step runs only on a node_modules cache miss; a warm cache skips setup-env.sh entirely. Within a cold run the Chromium script itself is not cached, although update.py may reuse the existing .build/CR_Clang output. The new helper has no positive or negative cross-process cache.",
+        "MechanismConfidence": "High: token presence, API-first ordering, synchronous execution, timeout values, cache gating, and downstream ordering are explicit in repository code.",
+        "MagnitudeUncertainty": "API-only degradation frequency and observed timeout duration vary by network; fast HTTP failures cost little, while a connected but stalled endpoint can consume the full 120 seconds. The helper is skipped on warm node_modules cache hits.",
+        "Verdict": "Reportable medium-severity latency regression: the newly preferred API probe can serialize up to 120 seconds ahead of the previously healthy raw source."
+      },
+      {
+        "Scenario": "Prepare Debian packages for x64, arm64, and armhf",
+        "CriticalPath": "Sysroot resolution, the Chromium script download, and every dpkg-shlibdeps subprocess must complete before dependency validation and Debian package preparation can continue.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/linux/debian/install-sysroot.ts:137-179",
+            "Operation": "Resolve and, on a cache miss, install the Chromium Debian sysroot.",
+            "Cardinality": "One sysroots.json curl per package preparation; tarball network download and extraction only when its stamp cache misses.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same request, stamp check, download, and extraction behavior.",
+            "CriticalPathEffect": "Precedes dependency calculation but is unchanged by this PR."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/linux/debian/install-sysroot.ts:61-133",
+            "Operation": "Resolve and install the VS Code sysroot.",
+            "Cardinality": "Zero network fetches on a valid stamp; otherwise one GitHub release metadata request plus one asset download, each with existing retries.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same stamp cache and download path.",
+            "CriticalPathEffect": "Must complete before dependency calculation but is unchanged by this PR."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/lib/chromiumSource.ts:36,94-108; build/linux/debian/calculate-deps.ts:24-29",
+            "Operation": "Fetch dpkg-shlibdeps.pl through the API/raw/Gitiles source set.",
+            "Cardinality": "Normally one API curl; on total failure up to 16 serial curl requests with a token. The result is reused for every binary in the same process.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One script download per process was already cached, but it used up to five raw-GitHub curl attempts; it never waited on an API probe before a healthy raw request.",
+            "CriticalPathEffect": "The first dependency calculation blocks on all probes and backoffs."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/linux/dependencies-generator.ts:46-61; build/linux/debian/calculate-deps.ts:14-15,72",
+            "Operation": "Enumerate native modules and calculate shared-library dependencies.",
+            "Cardinality": "One find subprocess plus one Perl dpkg-shlibdeps subprocess for each discovered native module and four fixed executables.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same effective file cardinality and serial Perl execution.",
+            "CriticalPathEffect": "Serially computes package dependencies after the shared script is available; unchanged by the diff."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/linux/debian/calculate-deps.ts:26-28",
+            "Operation": "Create and retain a process-local script file.",
+            "Cardinality": "One temporary directory/file per package-preparation process.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old implementation likewise created one temporary directory and script path per process.",
+            "CriticalPathEffect": "Small synchronous filesystem work before the script download; not a material regression."
+          }
+        ],
+        "ScalingInput": "One helper invocation per Debian package process/architecture after process-local deduplication; fallback latency scales with stalled sources and rounds, while unchanged Perl work scales with discovered native binaries plus four fixed executables.",
+        "EffectiveConcurrency": "The helper's source requests and retry rounds are serial. Per-binary Perl subprocesses are also serial through files.map. The x64, arm64, and armhf package jobs can run concurrently in CI without a shared request limiter.",
+        "CacheBehavior": "The downloaded dpkg-shlibdeps path is cached only in the module-level variable for one Node process, so all binaries in that package preparation share one download. There is no cross-job or cross-process Chromium-script cache. Chromium and VS Code sysroots use stamp files for tarball reuse, although Chromium's sysroots.json is still fetched on each invocation.",
+        "MechanismConfidence": "High: process-level coalescing, API-first source order, serial curl execution, retry cardinality, and the package pipeline token are all directly traced.",
+        "MagnitudeUncertainty": "The number of native modules controls unchanged Perl work, not download count. API stall prevalence and duration are uncertain; three architecture jobs can experience the delay independently and concurrently.",
+        "Verdict": "Reportable API-first failover latency; no additional finding for per-binary work because the download remains correctly coalesced once per process and the Perl fan-out is pre-existing."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and traced both production build workflows. Submitted one medium-severity finding for serial two-minute source probes ahead of healthy fallbacks. No cache-retention, allocation, repeated-download, or aggregate-concurrency regression met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-26T21:27:05.251421345Z",
+    "CompletedAt": "2026-10-26T21:29:19.518462411Z",
+    "WallClockMilliseconds": 134267,
+    "ModelCalls": 8,
+    "InputTokens": 198694,
+    "OutputTokens": 7556,
+    "TotalTokens": 206250,
+    "ReasoningTokens": 3985,
+    "CacheReadTokens": 158499,
+    "CacheWriteTokens": 40171,
+    "APIDurationMilliseconds": 115631,
+    "ToolCalls": 31,
+    "NanoAIUnits": 41547060000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 158499,
+      "cache_write": 40171,
+      "input": 24,
+      "output": 7556
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
