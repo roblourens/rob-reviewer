@@ -1,0 +1,181 @@
+{
+  "PullRequest": {
+    "Number": 344282,
+    "Title": "chat: add a tool that screenshots the window",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nAdds a `screenshotWindow` client tool that captures the VS Code window hosting the chat and returns it to the model. The built-in `generate-chat-background` skill now uses it to check how an applied background actually looks with the chat, instead of judging only the generated image.\n\n### Tool\n\n- Captures only the current window through `IHostService.getScreenshot` and returns a JPEG downscaled with the existing chat image attachment sizing (`resizeImage`). The result text reports the image size and the window size in CSS pixels, so the model can relate image pixels to displayed sizes, for example for repeating tiles.\n- **Desktop only.** On web, `getScreenshot` prompts the user to pick a screen, which does not suit a model-invoked tool. It is registered from a shared `electron-browser` contribution that both the workbench and the Agents window import.\n- A member of the **VS Code** client tool set in both windows, so agent hosts receive it. Client-tool image results already map to `EmbeddedResource` content, which the Copilot CLI and Claude hosts pass to the model as images.\n- Gated by `ChatContextKeys.enabled`, deferred for agent hosts (`defer: 'auto'`), and does not require approval.\n- When capture fails (for example, the window is minimized), it returns an error the model can act on.\n\n### Skill\n\nAfter `setChatBackground` succeeds, the skill takes a screenshot and checks it:\n- the subject in the exposed margins;\n- integration (seams, patches, highlights);\n- readability;\n- motif size.\n\nIt then makes a couple of targeted fixes at most. It does not navigate the UI or act on unrelated screen content, and it says when a result could not be visually verified, for example when no screenshot is available or a high contrast theme hides the background. The Agents window accessibility help mentions the screenshot check.\n\n### Reviewer notes\n\n- The screenshot includes whatever the window shows (sessions list, chat, open content). It follows the same no-approval model as `getThemeColors` and `setChatBackground`. The resulting image appears as a thumbnail on the tool call in the Agents window.\n\n### How to test\n\n1. Run Code OSS on desktop and open the Agents window (or the workbench chat in agent mode).\n2. Ask the agent: \"Use the screenshotWindow tool to take a screenshot of this window, then describe what you see, including the chat background.\"\n3. Verify that the agent calls the tool and describes the window contents, including the chat background.\n4. Optionally run `/generate-chat-background` and verify that it takes a screenshot after applying the background.\n\n### Validation\n\n- `./scripts/test.sh --reporter dot --run src/vs/workbench/contrib/chat/test/browser/tools/screenshotWindowTool.test.ts --run src/vs/workbench/contrib/chat/test/browser/tools/toolSetsContribution.test.ts --run src/vs/sessions/contrib/chat/test/node/chatBackgroundSkill.test.ts --run src/vs/sessions/contrib/chat/test/browser/appearanceTools.test.ts`: **passed** (25 passing)\n- `npm run typecheck-client`: **passed**. The model description string was shortened afterwards, then transpiled and re-linted.\n- `npm run valid-layers-check`: **passed**\n- `npm run eslint -- \u003cchanged TypeScript files\u003e`: **passed**\n- Manual, in a Code OSS Agents window with Copilot CLI and GPT-6.1 Sol: the agent found the tool through tool search. The tool returned a 1351x768 JPEG (148 KB) of the 1512x859 window, and the model correctly described the chat background in its reply.\n- Not run: the full `/generate-chat-background` flow, because it spends image-generation credits.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344282",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "7b42fb1cdcd1f2e659b326e5dfeebaec6e8df059",
+    "HeadRef": "agents/screenshot-tool-for-chat-validation",
+    "HeadSHA": "96bc4bb415e7945f3c59ffc7ada262d3898081ef",
+    "CreatedAt": "2026-10-26T14:42:48Z",
+    "UpdatedAt": "2026-10-26T16:22:38Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-9CB8FC9354EB",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/tools/screenshotWindowTool.ts",
+      "Side": "RIGHT",
+      "Line": 97,
+      "Severity": "medium",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The main-process capture/encode, renderer transfer, DOM decode/draw/re-encode call path and one-to-several invocation cardinality are explicit in code. Exact stall duration varies by window resolution and hardware, which affects severity rather than the mechanism.",
+      "PerformanceCategory": "rendering",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "Full-resolution JPEG bytes, decoded image pixels, renderer-thread canvas CPU, and temporary image/canvas objects",
+      "PerformanceScaling": "Cost grows with the window's pixel area and is paid once per screenshot; the updated background skill mandates at least one capture and can repeat it for a couple of revision rounds.",
+      "PerformanceOutcome": "Increased tool latency plus renderer CPU/GC pressure and potential dropped frames while the full-window image is decoded, drawn, and JPEG-encoded.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The background-generation workflow did not capture or process the VS Code window, and no screenshotWindow tool invocation existed.",
+      "ChangedBehavior": "Each screenshotWindow call first receives a full-resolution quality-95 JPEG from the main process, then calls the DOM-based resizeImage helper in the workbench renderer, which decodes the full image, synchronously draws it to a canvas, and encodes a second JPEG.",
+      "CausalDiffEvidence": "Added line 97 performs the only size reduction after the full-resolution capture has already been JPEG-encoded and transferred into the renderer; before this PR the new tool and its mandatory background-validation calls did not exist.",
+      "Title": "Downscale screenshots before transferring them to the renderer",
+      "Impact": "On large or 4K windows, every post-background check transfers and decodes a multi-megapixel capture on the workbench UI side before the model can continue; repeated checks multiply that latency and can visibly stall chat rendering.",
+      "Evidence": "The added invoke path awaits IHostService.getScreenshot and then reaches this changed resizeImage call. The desktop implementation in nativeHostMainService.ts uses webContents.capturePage followed by captured.toJPEG(95), so full-resolution bytes cross main-process IPC. chatImageUtils.ts implements resizeImage with Image decoding, a synchronous canvas drawImage on the renderer thread, and canvas.toBlob/FileReader re-encoding. The changed SKILL.md requires a screenshot after setChatBackground and allows a couple of sequential revision checks.",
+      "Recommendation": "Add a bounded-size/quality screenshot option to the native host path and resize the Electron NativeImage before its first toJPEG/IPC transfer, returning the final JPEG so this tool can skip renderer-side resizeImage. Preserve the existing full-resolution default for other screenshot callers."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Desktop workbench or Agents window startup and screenshot tool registration",
+        "CriticalPath": "The new contribution is instantiated only at WorkbenchPhase.AfterRestored, so registration is off the startup/restoration critical path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One contribution and one tool instance per renderer window.",
+        "EffectiveConcurrency": "Single contribution construction per loaded module/window; ES module imports do not create duplicate registrations within a window.",
+        "CacheBehavior": "No capture or image cache is touched during registration; dynamic tool-set membership reconciles once and then only on tool-registry changes.",
+        "MechanismConfidence": "High: the phase and constructor contain only service resolution, tool construction, and registration.",
+        "MagnitudeUncertainty": "Negligible construction cost; no heavyweight capture is eager.",
+        "Verdict": "No reportable startup regression; heavyweight work remains invocation-driven."
+      },
+      {
+        "Scenario": "A model directly invokes screenshotWindow in a desktop chat",
+        "CriticalPath": "Native window capture, full-resolution JPEG encoding and main-to-renderer IPC, renderer decode/resize/re-encode, base64 conversion, agent-host transport, and model image consumption must complete before the tool result can advance the turn.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/native/electron-main/nativeHostMainService.ts:getScreenshot, reached from src/vs/workbench/contrib/chat/browser/tools/screenshotWindowTool.ts:invoke",
+            "Operation": "webContents.capturePage, quality-95 JPEG encoding, and transfer of the full-resolution VSBuffer from Electron main to the workbench renderer",
+            "Cardinality": "Exactly one main-process call per screenshotWindow invocation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The screenshotWindow tool and this invocation path did not exist.",
+            "CriticalPathEffect": "Blocks tool completion before resizing and model delivery."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/browser/tools/screenshotWindowTool.ts:downscale via src/vs/workbench/contrib/chat/browser/chatImageUtils.ts:resizeImage and agentHostSessionHandler.ts:toolResultToProtocol",
+            "Operation": "Decode the full JPEG, synchronously draw it into a renderer DOM canvas, encode a second JPEG, and base64-encode the result",
+            "Cardinality": "Once per successful invocation; payload size is bounded only after the full-resolution image has crossed IPC.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No screenshotWindow result required this full-resolution encode/decode/re-encode pipeline.",
+            "CriticalPathEffect": "Adds renderer CPU/allocation work and model-turn latency; synchronous canvas drawing can stall rendering."
+          },
+          {
+            "Kind": "network",
+            "Location": "Agent-host client-tool result protocol reached through agentHostSessionHandler.ts:toolResultToProtocol",
+            "Operation": "Send the embedded screenshot image to the selected agent/model host for visual interpretation",
+            "Cardinality": "One bounded image result per invocation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No screenshot image was sent for this tool because the tool did not exist.",
+            "CriticalPathEffect": "The model cannot evaluate the screenshot until image transfer/inference completes."
+          }
+        ],
+        "ScalingInput": "One full-window image per invocation; bytes and decode work scale with window pixel area. No deduplication applies because each capture must reflect current UI state.",
+        "EffectiveConcurrency": "A single invocation is sequential. The tool has no global limiter for unrelated concurrent calls, but the reviewed workflows provide no realistic burst trigger; the dominant established cardinality is one capture per call.",
+        "CacheBehavior": "No cache is appropriate for current-window state; every invocation is cold and captures a fresh frame. There is no positive, negative, or in-flight coalescing cache.",
+        "MechanismConfidence": "High: capture, IPC, renderer canvas processing, base64 conversion, and model delivery are explicit in the traced call path.",
+        "MagnitudeUncertainty": "Exact JPEG size and UI stall duration depend on window resolution, scene complexity, and hardware, but multi-megapixel windows are realistic.",
+        "Verdict": "Reportable serialization/rendering regression: size reduction occurs only after avoidable full-resolution JPEG transfer and renderer-side reprocessing."
+      },
+      {
+        "Scenario": "Generate and visually validate a chat background",
+        "CriticalPath": "Existing image generation and setChatBackground complete first; the changed skill then requires screenshotWindow and model visual evaluation before replying. If validation fails, each targeted revision and follow-up screenshot also remains on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/skills/generate-chat-background/SKILL.md",
+            "Operation": "Pre-existing image-generation request, with optional additional generation requests when screenshot validation identifies a concrete visual problem",
+            "Cardinality": "One initial generation as before; zero to roughly two optional additional generations under the newly bounded revision guidance.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The skill generated and applied once without a mandatory screenshot-driven revision loop.",
+            "CriticalPathEffect": "Generation must complete before applying and validating each regenerated background."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/skills/generate-chat-background/SKILL.md:65 through screenshotWindowTool.ts:invoke",
+            "Operation": "Capture and transfer the current desktop window for every validation round",
+            "Cardinality": "One initial validation capture plus at most a couple of sequential follow-up checks unless the user explicitly asks for more.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No mandatory post-application capture occurred.",
+            "CriticalPathEffect": "Each capture and image analysis delays the final skill response."
+          },
+          {
+            "Kind": "network",
+            "Location": "screenshotWindow tool result via the agent-host protocol",
+            "Operation": "Deliver each screenshot image to the agent/model for visual evaluation",
+            "Cardinality": "One model-visible image per validation round.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The model judged the generated image without a rendered-window screenshot.",
+            "CriticalPathEffect": "Visual evaluation is required before accepting or revising the result."
+          }
+        ],
+        "ScalingInput": "Normally one screenshot; up to a couple of sequential revision rounds. A round may only change layout or resize a tile, but can optionally trigger another image-generation request.",
+        "EffectiveConcurrency": "The skill explicitly requires setChatBackground and screenshotWindow to run sequentially. Revision rounds are also sequential, so no aggregate screenshot burst is introduced.",
+        "CacheBehavior": "Screenshots intentionally bypass caching to observe the newly applied state. Generated-image/provider caches are not established in the reviewed code; repeat generation is conditional on visual failure.",
+        "MechanismConfidence": "High for the newly mandatory sequential screenshot and model-evaluation path; medium for extra regeneration because it is conditional.",
+        "MagnitudeUncertainty": "Whether revisions regenerate an image and provider latency vary by visual result and model choice. The instruction caps normal revisions, so fan-out is bounded.",
+        "Verdict": "The extra validation latency and optional revisions are intentional, bounded product behavior, not a separate performance bug. The reported avoidable full-resolution screenshot processing affects every validation round."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 10 changed files. One medium-confidence-independent, high-mechanism-confidence issue was submitted for full-resolution JPEG transfer followed by renderer-side decode/draw/re-encode. Startup registration is lazy enough, and the skill's added screenshot/revision work is bounded and intentional rather than separately reportable."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-26T17:00:59.779602905Z",
+    "CompletedAt": "2026-10-26T17:03:28.047382277Z",
+    "WallClockMilliseconds": 148267,
+    "ModelCalls": 11,
+    "InputTokens": 389906,
+    "OutputTokens": 8381,
+    "TotalTokens": 398287,
+    "ReasoningTokens": 3757,
+    "CacheReadTokens": 330752,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 126634,
+    "ToolCalls": 63,
+    "NanoAIUnits": 53653680000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 330752,
+      "cache_write": 0,
+      "input": 59154,
+      "output": 8381
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
