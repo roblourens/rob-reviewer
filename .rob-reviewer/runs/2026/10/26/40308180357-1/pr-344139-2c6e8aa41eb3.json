@@ -1,0 +1,178 @@
+{
+  "PullRequest": {
+    "Number": 344139,
+    "Title": "Connect editor windows to workspace-configured remote agent hosts",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nToday, chat in a regular editor window can only use the local agent host. Remote agent hosts (agent host protocol servers reached over WebSocket) are only available in the Agents window. This PR lets a workspace bring its own remote agent hosts into the editor window, so you can chat with, and open sessions of, an agent host on another machine from the workspace that belongs to it.\n\n## What it does\n\n- Adds `chat.workspaceRemoteAgentHosts`, a restricted, window-scoped setting that lists WebSocket agent hosts the editor window connects to while the workspace is open:\n\n  ```jsonc\n  // .vscode/settings.json\n  \"chat.workspaceRemoteAgentHosts\": [\n      { \"name\": \"Devbox\", \"address\": \"127.0.0.1:8123/devbox\", \"connectionToken\": \"...\" }\n  ]\n  ```\n\n- Editor windows register the existing WebSocket connection factory against this setting, so these hosts connect like the Agents window's remote hosts. The existing `chat.remoteAgentHostsEnabled` and auto-connect settings still apply.\n- The remote agent host chat contribution surfaces the hosts' agents, models and session lists in editor Chat, reusing the session list store and controller that the cloud sandbox integration already uses. The host chooses the working directory, since local workspace folders don't exist there.\n- Untitled remote agent host sessions can start as drafts, like local agent host sessions, so a remote agent can be selected in editor Chat before the first message.\n\nLike other restricted settings, it is ignored in untrusted workspaces. A trusted workspace can already run arbitrary code, so connecting to a host it lists adds no new capability.\n\n## How to test\n\n1. Run an agent host that accepts WebSocket connections and add it to a workspace's `chat.workspaceRemoteAgentHosts`.\n2. Open that workspace in an editor window. The host's sessions appear in the Chat view's session list, and its agents and models can be picked for a new chat.\n3. Open an existing session of the host, and start a new one.\n4. Remove the entry: the window disconnects from the host and its sessions disappear.\n\n## Validation\n\n- `npm run typecheck-client`: passed.\n- `scripts\\test.bat --run src/vs/platform/agentHost/test/electron-browser/remoteAgentHostService.test.ts` (with two other chat suites): 115 passing, including a new test that an editor window connects to workspace-listed hosts, ignores user-level hosts, and disconnects when the entry is removed.\n- Used daily in Code OSS for three days with two remote hosts behind a local WebSocket export: listing, opening and continuing sessions works.\n\n## Known issues\n\n- Rarely, listing a host session fails with \"Conflicting backend identities\", after which sending silently does nothing. I couldn't reproduce it recently; both hosts' full session lists (420 sessions) contain no duplicate session IDs, so the conflicting registration comes from another path.\n- Not specific to this PR: when a host connection drops and comes back, an already open session tab stays read-only until it is reopened.",
+    "URL": "https://github.com/microsoft/vscode/pull/344139",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "hediet",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "f7afc37c672e41860ef43034f829911f7f13494b",
+    "HeadRef": "hediet/workspace-remote-agent-hosts",
+    "HeadSHA": "2c6e8aa41eb37afdf66091bd78e1716818deb7f3",
+    "CreatedAt": "2026-10-25T14:23:35Z",
+    "UpdatedAt": "2026-10-26T09:35:36Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-24422D50C7BD",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/remoteAgentHostChatContribution.ts",
+      "Side": "RIGHT",
+      "Line": 440,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The call path is explicit: the added registration synchronously starts initialRefresh; controller.refresh delegates to the shared store; the store coalesces agents to one call per host but calls AgentHostProtocolClient.listSessions over JSON-RPC. The protocol documents the catalog as arbitrarily large, while this client omits limit/cursor and the server handler computes and returns every session. The only magnitude uncertainty is each configured host's history size and remote storage speed.",
+      "PerformanceCategory": "network",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "One full-history WebSocket RPC per workspace host, remote catalog/provider/session-database reads, serialized session-summary bytes, and retained client objects.",
+      "PerformanceScaling": "For H workspace-configured hosts with N_h historical sessions, cold-open work and retained data grow with sum(N_h); host requests can overlap up to H-way concurrency. Per-agent refresh calls are coalesced by the shared store, but each full delta is additionally projected by each advertised provider.",
+      "PerformanceOutcome": "Increased post-restore latency and background CPU/GC, remote I/O, network transfer, and retained memory proportional to remote session history.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Editor windows did not create WebSocket remote-host connections or remote-host session-list controllers, so opening a normal workspace performed no remote listSessions RPC and retained no remote history. Session listing for these hosts was confined to the Agents-window flow.",
+      "ChangedBehavior": "Editor windows now register a session-list controller as soon as each workspace-configured remote host advertises an agent, which eagerly starts a full remote session catalog refresh even when Chat or session history has not been opened.",
+      "CausalDiffEvidence": "RIGHT line 440 newly calls registerChatSessionItemController for every advertised agent of each workspace remote host; ChatSessionsService.registerChatSessionItemController immediately invokes controller.refresh(), which reaches AgentHostSessionListStore.refresh() and connection.listSessions().",
+      "Title": "Defer the full remote session-history fetch",
+      "Impact": "Opening any workspace that lists a remote agent host immediately makes the remote machine enumerate its entire session history and transfers/materializes it in the editor, even if the user never opens Chat. Large histories or several configured hosts cause avoidable remote database/provider I/O, network bytes, CPU/GC, and retained memory; the requests can run concurrently across hosts and delay session-list readiness while contending with post-restore work.",
+      "Evidence": "registerChatSessionItemController immediately executes controller.refresh at chatSessions.contribution.ts:1177. AgentHostSessionListController.refresh delegates to AgentHostSessionListStore.refresh, whose cold path calls connection.listSessions. AgentHostProtocolClient.listSessions sends a WebSocket JSON-RPC listSessions request without the supported limit/cursor and maps every returned summary. The protocol explicitly says this list can be arbitrarily large and provides pagination; protocolServerHandler currently ignores pagination, calls AgentService.listSessions for the complete catalog, performs catalog/provider/session-database work, and serializes all summaries. The store then retains every entry and projects the full result through each provider controller. The store coalesces simultaneous per-agent refreshes, so effective boundary cardinality is one unbounded RPC per connected workspace host, not one per agent.",
+      "Recommendation": "Do not trigger the full catalog from controller registration. Defer the first list refresh until the session-history UI actually requests that provider, or implement the existing listSessions limit/cursor contract end-to-end so initial registration fetches only a bounded recent page and backfills on demand while preserving notification-driven updates."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "serialization-allocation",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open a workspace containing chat.workspaceRemoteAgentHosts",
+        "CriticalPath": "Workbench restoration completes before RemoteAgentHostContribution runs, so host connection and listing are off the core restore critical path. They begin automatically after restore and must complete before remote session items are ready; the listing competes for post-restore CPU/network even if Chat is never opened.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/remoteAgentHostServiceImpl.ts:266-269 RemoteAgentHostService constructor / EditorWindowRemoteAgentHostService.webSocketEntriesSettingId",
+            "Operation": "Create and auto-connect a WebSocket AgentHostProtocolClient for each workspace-configured host.",
+            "Cardinality": "One WebSocket connection/handshake per distinct normalized workspace host; H hosts can dial concurrently.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Editor windows overrode supportsWebSocketConnections to false, so they created no WebSocket factory and dialed no workspace hosts.",
+            "CriticalPathEffect": "Off the core restore path but required before that host's agents/models/sessions can be used and able to contend with post-restore work."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/remoteAgentHostChatContribution.ts:440 via ChatSessionsService.registerChatSessionItemController -\u003e AgentHostSessionListStore.refresh -\u003e AgentHostProtocolClient.listSessions",
+            "Operation": "Enumerate, serialize, transfer, map, and retain every remote session summary.",
+            "Cardinality": "One cold listSessions JSON-RPC per connected workspace host after per-agent calls coalesce; response cardinality is the host's complete visible session history because no limit/cursor is supplied and the server returns all items.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Normal editor windows did not register remote-host session list controllers, so workspace open caused no remote listSessions request.",
+            "CriticalPathEffect": "Required for the remote session list to become ready, but launched eagerly after host agent discovery even if the list is never requested. Remote computation can include catalog reads, provider metadata fallback, and session-database reads before all summaries are serialized and retained client-side."
+          }
+        ],
+        "ScalingInput": "H distinct workspace-configured hosts and N_h visible historical sessions per host; effective boundary count is H and work/bytes/memory scale with sum(N_h), with additional provider projection proportional to agents per host.",
+        "EffectiveConcurrency": "The service launches one dial for every configured workspace host without a shared limiter. As hosts connect, each gets one coalesced listSessions RPC; aggregate listing concurrency can reach the number of configured hosts. Multiple advertised agents share one store, so they do not multiply RPCs, though each controller projects the returned delta.",
+        "CacheBehavior": "Each AgentHostSessionListStore starts cold on every editor-window/connection lifetime. Its _refreshInFlight coalesces all provider-controller initial refreshes for one host, and _cacheValid makes later refreshes warm/no-op. No session catalog is persisted across workspace opens; failed listSessions calls leave the cache invalid and are retryable.",
+        "MechanismConfidence": "High: constructor registration immediately starts refresh; coalescing, the WebSocket request, omitted pagination, server full-catalog computation, and retained map are all explicit in code.",
+        "MagnitudeUncertainty": "Workspace host counts are expected to be small and the work starts after restore, but host history is explicitly unbounded by the protocol and remote storage/network duration varies. This uncertainty supports medium rather than high severity.",
+        "Verdict": "Reportable: the diff eagerly invokes an unbounded full-history network/storage path once per host on every cold workspace open, before the user requests Chat history."
+      },
+      {
+        "Scenario": "Add, rename, or remove workspace remote-host entries",
+        "CriticalPath": "The settings update itself returns through observable/configuration reconciliation; connection establishment and first listing for added hosts are asynchronous. Disconnect/removal immediately tears down in-memory contribution state.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/remoteAgentHostServiceImpl.ts:266-269 and :724-729",
+            "Operation": "Connect newly configured workspace hosts and disconnect removed hosts.",
+            "Cardinality": "One new WebSocket dial for each newly added distinct host and one close/disposal per removed host.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Editor windows ignored WebSocket host settings entirely.",
+            "CriticalPathEffect": "An added host cannot be used until its connection completes; removal does not wait on a new external operation."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/remoteAgentHostChatContribution.ts:440",
+            "Operation": "Fetch and retain the newly added host's complete session catalog.",
+            "Cardinality": "One full listSessions request for each newly connected added host, coalesced across its advertised agents.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No editor-window remote session list existed.",
+            "CriticalPathEffect": "Required before the added host's session history is populated, but not before the setting update itself completes."
+          }
+        ],
+        "ScalingInput": "Number of distinct added/removed addresses and complete history size of each newly added host.",
+        "EffectiveConcurrency": "All newly added hosts may dial concurrently. Each added host independently has at most one pending connect and one coalesced list refresh; existing hosts are deduplicated by normalized address.",
+        "CacheBehavior": "Changing the setting reparses the complete array. Existing normalized addresses preserve their connection and warm session-store cache; added addresses are cold, while removed addresses dispose their connection and ConnectionState, including the session list and per-agent registrations.",
+        "MechanismConfidence": "High: desired-address reconciliation, pending-connect deduplication, disposal, and controller-triggered refresh are explicit.",
+        "MagnitudeUncertainty": "Interactive edits normally add one host at a time; bulk workspace-setting replacement can add more. History size and remote latency remain host-dependent.",
+        "Verdict": "The eager catalog load is covered by the submitted finding. Connection-per-added-host and cleanup-per-removed-host are expected feature costs; no separate regression is warranted."
+      },
+      {
+        "Scenario": "Open or start a workspace remote-host chat session",
+        "CriticalPath": "Opening an existing session requires resolving/subscribing over the existing agent-host connection; starting a draft is local until materialization/message flow. These are user-requested boundaries and not made multiplicative by the changed hunks.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "Existing AgentHostSessionHandler/AgentHostProtocolClient paths reached by the newly registered contribution",
+            "Operation": "Load or create the selected remote session and exchange its state/actions.",
+            "Cardinality": "Typically one selected-session protocol subscribe/resolve flow or one create/send flow per user action.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same protocol paths existed for remote hosts in the Agents window; the diff makes them reachable from an editor window but does not increase per-action cardinality or alter the operation.",
+            "CriticalPathEffect": "On the user-requested open/send critical path."
+          }
+        ],
+        "ScalingInput": "One selected session and its transcript/action stream, not the complete configured-host collection.",
+        "EffectiveConcurrency": "Operations are per selected session. The diff does not add a loop over sessions or hosts on this interaction path.",
+        "CacheBehavior": "An already connected host reuses its warm list store and cached entries. A remote session notification updates one entry incrementally. New/open operations use existing connection/controller state rather than re-listing unless the store cache was invalidated.",
+        "MechanismConfidence": "High that the changed code only registers existing handlers/controllers for this per-session workflow.",
+        "MagnitudeUncertainty": "Session transcript size and network latency vary, but the diff does not change their scaling mechanism.",
+        "Verdict": "No additional performance finding: boundaries are user-initiated, per-session, and reuse cached connection/list state."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and traced editor-window connection setup, configuration reconciliation, session-list registration, controller refresh/coalescing, protocol serialization, remote catalog/database work, caching, concurrency, and disposal. Submitted one medium eager-work finding for the newly automatic unbounded remote session-history fetch. No regression-fix learning signal was present."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-26T10:36:58.797558882Z",
+    "CompletedAt": "2026-10-26T10:39:27.663520509Z",
+    "WallClockMilliseconds": 148865,
+    "ModelCalls": 13,
+    "InputTokens": 785096,
+    "OutputTokens": 8393,
+    "TotalTokens": 793489,
+    "ReasoningTokens": 2884,
+    "CacheReadTokens": 687616,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 120462,
+    "ToolCalls": 69,
+    "NanoAIUnits": 83282640000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 687616,
+      "cache_write": 0,
+      "input": 97480,
+      "output": 8393
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
