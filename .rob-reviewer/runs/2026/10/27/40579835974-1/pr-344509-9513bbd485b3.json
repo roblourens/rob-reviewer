@@ -1,0 +1,130 @@
+{
+  "PullRequest": {
+    "Number": 344509,
+    "Title": "build: retry server binary signing when Apple's timestamp service doesn't answer",
+    "Body": "#344512 retries Apple timestamp stalls (`A timestamp was expected but was not found`) when `sign.ts` signs the app. `build/darwin/sign-server.ts` signs each server Mach-O binary with its own `codesign --timestamp` call and still has no retry, so the \"Sign server binaries\" step can fail on the same stall. That step runs in the macOS Sign jobs and in every macOS test job.\n\nThis stall hit 7 official builds in 90 days, most recently 489688 (Oct 27, 05:00 release) and 489717 (release/1.144 stable).\n\n## Change\n\n`sign-server.ts` wraps each server `codesign` call in #344512's exported `retryOnTransientSignError`. It retries 5 attempts at 10/20/40/80 s on the keychain and timestamp errors. `--force` makes signing the same file again safe.\n\n- `@malept/cross-spawn-promise`'s `ExitCodeError` includes stderr in its message, so the `includes()` match sees codesign's error.\n- Importing `sign.ts` is side-effect free here. Its `main()` only runs under `import.meta.main`, and the module-level `product.json` read and `@electron/osx-sign` import are already available in that step.\n- #344512's unit tests cover the helper itself.\n\n## Validation\n\n- **Forced failure:** [489759](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=489759) ran this head on a throwaway branch with a `codesign` shim that fails the first `--timestamp` call on a server binary with Apple's exact error. **All 5 macOS arm64 \"Sign server binaries\" steps** (the Sign job and 4 test jobs) logged `Signing attempt 1/5 failed with a transient error, retrying in 10s...` and then succeeded in 14–16 s, against a 3–7 s baseline. App signing in the same jobs was untouched (78–106 s, no retry). I cancelled the run once those finished, so it doesn't hold up the macOS pool. x64 hadn't started yet.\n- **Normal path on x64:** [489769](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=489769), this head, non-publish, macOS x64 only, no shim. \"Sign server binaries\" took 4 s with no retry (baseline 4/6/4 s from 489688, 489571 and 489293). \"Set Hardened Entitlements\" took 53 s (baseline 53/76/53 s). Universal doesn't sign server binaries, so it's unaffected.\n- **Earlier proof on the previous version of this PR:** in [489720](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=489720), all 6 \"Sign server binaries\" steps retried once and succeeded, against a 3–7 s baseline.\n\n\u003e Authored with Copilot\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344509",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "566ba175f48464831bcfe17b28f147ba1ec31ff6",
+    "HeadRef": "copilot/vscode/sign-timestamp-retry",
+    "HeadSHA": "9513bbd485b31cb10dfdcabd577452f901410a35",
+    "CreatedAt": "2026-10-27T07:55:47Z",
+    "UpdatedAt": "2026-10-27T19:24:24Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "concurrency-burst",
+      "eager-work",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Healthy macOS server and web-server signing in package or product-test jobs",
+        "CriticalPath": "The pipeline's Sign server binaries step invokes sign-server.ts twice in sequence, once per server directory. Each process must finish its recursive scan and every Mach-O codesign call before the next invocation or later packaging/tests can proceed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "build/darwin/sign-server.ts:isMachOBinary and main",
+            "Operation": "Recursively enumerate each server tree, then open/read four bytes from each file to identify Mach-O binaries.",
+            "Cardinality": "Two recursive scans per pipeline step and one small file read per regular file across both trees.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same recursive scans and per-file reads occurred before the diff.",
+            "CriticalPathEffect": "The scan must complete as part of each serialized signing invocation."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/darwin/sign-server.ts:65",
+            "Operation": "Run codesign --timestamp for each detected Mach-O binary; codesign contacts Apple's timestamp service.",
+            "Cardinality": "On a healthy run, exactly one subprocess per Mach-O binary, M across each tree; retries do not execute.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Before the diff, each detected Mach-O binary already incurred exactly one awaited codesign subprocess.",
+            "CriticalPathEffect": "Each subprocess is awaited serially and blocks progress through the signing step."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/darwin/sign.ts:13, reached by build/darwin/sign-server.ts:9",
+            "Operation": "Synchronously read and parse product.json while evaluating the newly imported sign.ts module.",
+            "Cardinality": "One small synchronous read per sign-server process, therefore two reads per Sign server binaries step.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "sign-server.ts did not import sign.ts and therefore did not perform this product.json read or load @electron/osx-sign.",
+            "CriticalPathEffect": "Adds fixed process-startup work before argument validation and scanning."
+          }
+        ],
+        "ScalingInput": "For each of the two server trees, directory-entry count E controls the existing filesystem scan and Mach-O count M controls the existing codesign subprocess count. The diff adds only fixed import-time work on the healthy path.",
+        "EffectiveConcurrency": "Within a job, both directory invocations and all per-binary codesign calls are serialized. Separate package/test jobs can run on independent agents, but the diff does not increase healthy-path calls or local parallelism.",
+        "CacheBehavior": "There is no application-level cache for scans or signatures. Importing sign.ts newly reads and parses product.json once in each sign-server process; Node's module cache cannot span the two processes, while the OS filesystem cache may make the second read warm. Successful signing still performs one codesign call per Mach-O binary.",
+        "MechanismConfidence": "High confidence in the critical path and boundary counts from the script and pipeline template; high confidence that healthy codesign cardinality is unchanged.",
+        "MagnitudeUncertainty": "Exact module-load time is not measured, but the directly evidenced new filesystem work is a fixed two small reads per step and does not scale with server size. There is no evidence that this fixed startup cost is materially user-visible beside the existing multi-second signing work.",
+        "Verdict": "No reportable regression. The normal path preserves the existing per-binary subprocess count and serialization. The eager import adds fixed startup/module-loading work, but repository evidence establishes only two small synchronous reads and does not establish a concrete material performance impact."
+      },
+      {
+        "Scenario": "Server signing when codesign returns a recognized transient timestamp or keychain error",
+        "CriticalPath": "For the current Mach-O binary, the changed wrapper waits 10/20/40/80 seconds and retries before the scan can continue. A recovered call lets signing proceed; an exhausted or unrecognized error rejects, and set -e prevents the second directory invocation and later pipeline work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/darwin/sign-server.ts:65-74 via build/darwin/sign.ts:64-79",
+            "Operation": "Re-run codesign --timestamp after a recognized transient failure, crossing both the process boundary and Apple's timestamp network boundary.",
+            "Cardinality": "One initial call plus at most four additional calls for the affected current binary. With intermittent recoveries on multiple binaries, total calls are M + F; with a persistent recognized error, the script stops after five calls on the first affected binary.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The first codesign failure immediately rejected the script, so there were no retry subprocesses or explicit backoff and the build could not make further progress.",
+            "CriticalPathEffect": "Each retry and its preceding backoff is on the signing step's critical path; total explicit backoff before exhaustion is 150 seconds, in addition to subprocess duration."
+          }
+        ],
+        "ScalingInput": "Additional work is controlled by the number F of recognized transient failures: one extra codesign subprocess per failure, capped at four retries for a given current binary. Persistent failure stops the serialized loop at that binary rather than multiplying retries over all remaining binaries; intermittent failures can recur on later binaries.",
+        "EffectiveConcurrency": "Retries for one binary and binaries within one job are fully serialized. Multiple package/test jobs have independent retry loops and no shared limiter or jitter, but they reach this server step only after the pre-existing app-sign step, which uses the same timestamp service and retry policy; repository evidence does not establish synchronized server-stage retry bursts.",
+        "CacheBehavior": "There is no cache or cross-binary coalescing; retry state is local to a single codesign call. Successful prior signatures are retained because --force allows replacement, and a service recovery affects later calls naturally rather than through a cache.",
+        "MechanismConfidence": "High confidence in the retry count, serialization, backoff, and pipeline failure behavior. Confidence is lower that independent jobs synchronize enough to create harmful aggregate load because their phases and failure times are not established.",
+        "MagnitudeUncertainty": "The duration and prevalence of Apple/keychain failures and the degree of overlap among independent jobs are external and variable. Exact codesign internal timeout is unknown, while the added call cap and 150-second explicit delay are certain.",
+        "Verdict": "No reportable performance regression. The added work is bounded, executes only after a failure that previously terminated the scenario, and directly enables successful progress. A persistent error delays final failure by 150 seconds, but the code intentionally caps that tradeoff and no repository evidence shows an unacceptable latency or concurrency burst warranting a performance finding."
+      }
+    ],
+    "Summary": "Reviewed the complete one-file diff and traced healthy, transient-recovery, and exhausted-retry paths through filesystem, subprocess, and timestamp-service boundaries. Normal-path subprocess cardinality is unchanged; the only eager cost is fixed import-time module loading and two small product.json reads per pipeline step. Failure-path retries are sequential, capped, and intentional, with no proven harmful fan-out or burst. No high-confidence actionable performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-27T20:46:46.424448633Z",
+    "CompletedAt": "2026-10-27T20:48:20.997070964Z",
+    "WallClockMilliseconds": 94572,
+    "ModelCalls": 8,
+    "InputTokens": 121481,
+    "OutputTokens": 5836,
+    "TotalTokens": 127317,
+    "ReasoningTokens": 3453,
+    "CacheReadTokens": 98049,
+    "CacheWriteTokens": 23408,
+    "APIDurationMilliseconds": 76751,
+    "ToolCalls": 22,
+    "NanoAIUnits": 27307560000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 98049,
+      "cache_write": 23408,
+      "input": 24,
+      "output": 5836
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
