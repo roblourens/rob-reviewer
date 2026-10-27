@@ -1,0 +1,133 @@
+{
+  "PullRequest": {
+    "Number": 343395,
+    "Title": "build: cache Playwright browsers in product build test jobs",
+    "Body": "Caches Playwright's browsers in the product build's test jobs (ADO def 111), so a Playwright CDN outage no longer fails them. This is the ADO half of B11. The GitHub half is #343387.\n\n**Stacked on #343325**, which adds `retryCountOnTaskFailure` to the `Cache@2` steps. This PR targets that branch so the diff shows only this change. I'll retarget it to `main` once #343325 merges.\n\n## Why\n\nOn Oct 21, 4 Windows test jobs in def 111 failed in `Download Electron and Playwright` ([487426](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=487426), [487513](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=487513), [487556](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=487556), [487566](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=487566)). `playwright.download.prss.microsoft.com` returned `ENOTFOUND` and the fallback `cdn.playwright.dev/builds` reset the connection. The step's `retryCountOnTaskFailure: 3` was exhausted in under a minute. Those were the only Playwright download failures in 14 days (out of about 9,840 runs of that step), but they come in bursts.\n\n## What\n\nThere's a new step template, `build/azure-pipelines/common/restore-playwright-browsers.yml`, used by the Linux, macOS and Windows test step templates right before `Download Electron and Playwright`. It does two things:\n- It sets `PLAYWRIGHT_BROWSERS_PATH` to `$(Build.SourcesDirectory)/.build/ms-playwright`.\n- It restores that folder with `Cache@2` (`retryCountOnTaskFailure: 2`), keyed on `\"playwright\" | Agent.OS | VSCODE_ARCH | node_modules/playwright/package.json`. That's the pinned Playwright version, so the key only changes when Playwright does.\n\n`Download Electron and Playwright` itself is unchanged. On a hit, `playwright install` finds the browsers and downloads nothing. On a miss, it downloads as before, and `Cache@2`'s post-job step saves the folder. Electron comes from our Azure feed, so it doesn't need this.\n\n## Validation (full def 111, publish off)\n\n1. **Cold:** [487870](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=487870). I expect a cache miss, a download as today, and a post-job save.\n2. **Warm:** queued after 1 finishes. I expect a cache hit, and the install step showing no `Downloading` lines.\n\nResults will be posted here before I ask for signing.\n\n\u003e Authored with Copilot\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/343395",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "5c11ec924d3cde5019f03e38ccab5822e8ac3d71",
+    "HeadRef": "copilot/vscode/ado-playwright-cache",
+    "HeadSHA": "b3a9723a21056a74d955dce3b93672ceb03e91ce",
+    "CreatedAt": "2026-10-22T00:32:45Z",
+    "UpdatedAt": "2026-10-26T23:09:02Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-F5C37685827B",
+      "Focus": "performance-review",
+      "Path": "build/azure-pipelines/common/restore-playwright-browsers.yml",
+      "Side": "RIGHT",
+      "Line": 9,
+      "Severity": "medium",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The changed template explicitly documents that a miss saves the folder after the job, and the product-build template defines six sibling test jobs per platform with identical Agent.OS, VSCODE_ARCH, and Playwright package contents. All six begin only after the same compile dependency, so a new/evicted key is realistically missed by all before any one job can publish it. Exact upload deduplication is service-dependent, but each miss-side save must at least traverse/hash/archive the multi-browser directory independently.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "Filesystem reads, archive/hash CPU, and cache-service upload calls for the Playwright browser directory.",
+      "PerformanceScaling": "Cost grows with the browser cache size and the number of sibling test jobs sharing a cold key: six duplicate save attempts per OS/architecture in the current product-build fan-out, across multiple platform stages.",
+      "PerformanceOutcome": "Increased cold-run post-job latency and aggregate CPU/disk/network load, reducing CI throughput.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before the PR, each job could download Playwright browsers, but it did not additionally archive/hash and publish that browser tree in a post-job cache save; there was no same-key save burst.",
+      "ChangedBehavior": "Each test job now restores the Playwright cache and, after a miss, independently schedules a post-job save of the downloaded browser directory under the same key.",
+      "CausalDiffEvidence": "RIGHT line 9 adds a Cache@2 task to a template that RIGHT lines 21 of each OS test-step file now invoke from every product test job; RIGHT line 10 gives all jobs for one OS/architecture/version the same cache key.",
+      "Title": "Populate each cold Playwright cache only once",
+      "Impact": "A cold cache after a Playwright upgrade or eviction makes up to six sibling jobs per platform archive/hash and attempt to publish the same large multi-browser payload, consuming agent CPU, disk I/O, and cache-service bandwidth and delaying job/pipeline completion after tests finish.",
+      "Evidence": "`product-build-template.yml` creates six parallel UnitElectron, Unit, BrowserRemote, Integration, AgentHostE2E, and Smoke jobs for each tested platform. Each reaches the newly included restore template. The cache key contains only OS, architecture, and `node_modules/playwright/package.json`, so those six jobs share one key. On the first run after a Playwright update or cache eviction they all miss, then the existing `playwright-install` populates `.build/ms-playwright`; Cache@2 consequently runs six post-job saves for the same browser tree. Even if the cache backend deduplicates the final object, each agent performs the directory walk/archive/hash work and issues a save boundary call.",
+      "Recommendation": "Populate/save each OS/architecture Playwright cache in a single producer job before releasing the test-job fan-out (or otherwise designate one miss-side writer), while keeping the test jobs restore-only so warm behavior remains unchanged."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Initialize Playwright browsers for the six-way product-build test-job fan-out on Windows, Linux, and macOS.",
+        "CriticalPath": "The changed cache lookup/restore must complete before the existing parallel Electron/Playwright install step and therefore before tests. Warm restoration replaces the prior Playwright CDN transfer. Cold save work runs after tests, so it is off the test execution critical path but remains on each job's and the overall pipeline's completion path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/restore-playwright-browsers.yml:9 Cache@2",
+            "Operation": "Look up and restore `.build/ms-playwright` from Azure Pipelines Cache.",
+            "Cardinality": "One cache-service lookup/restore per test job: six for each tested OS/architecture in the product-build fan-out.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Playwright cache-service call occurred; each job proceeded directly to `playwright install`.",
+            "CriticalPathEffect": "Introduced before the browser install; it adds a cache-service round trip and archive restoration on hits, but removes the larger existing browser CDN download on warm runs."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/{linux,darwin,win32}/steps/product-build-*-test.yml:24 Download Electron and Playwright",
+            "Operation": "Run Playwright installation and download required browser binaries from the Playwright CDN when absent.",
+            "Cardinality": "One `npm exec playwright install` subprocess per test job, with browser CDN transfers once per job when its configured browser path is empty.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every job ran this subprocess against its default empty hosted-agent browser location and downloaded browsers; the diff redirects it to the restored cache path.",
+            "CriticalPathEffect": "Must complete before tests. On a warm cache it performs local discovery without downloading; on a cold cache its boundary cardinality remains the same as before the diff."
+          },
+          {
+            "Kind": "filesystem/network",
+            "Location": "build/azure-pipelines/common/restore-playwright-browsers.yml:9 Cache@2 post-job save",
+            "Operation": "Archive/hash `.build/ms-playwright` and publish it under the immutable cache key after a miss.",
+            "Cardinality": "On a shared cold key, up to six post-job save attempts per OS/architecture, all covering the same multi-browser directory.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Jobs did not archive or upload the Playwright browser directory after tests.",
+            "CriticalPathEffect": "Runs after tests but delays job and pipeline completion while the agent traverses/hashes/archives the directory and contacts the cache service."
+          }
+        ],
+        "ScalingInput": "The installed multi-browser payload size multiplied by six sibling test jobs for each cold OS/architecture key; multiple platform stages may perform their own six-way bursts concurrently.",
+        "EffectiveConcurrency": "For each tested OS/architecture, six sibling test jobs become runnable after the compile dependency and use the same cache key. They execute independently without a shared limiter or sequencer; platform stages can also overlap, although OS/architecture key partitioning yields separate cache objects. A cold key therefore has up to six same-key miss-side writers.",
+        "CacheBehavior": "The key separates Agent.OS, VSCODE_ARCH, and the installed Playwright package version. On a warm key, each job restores the same immutable browser cache and `playwright install` finds local browsers. On a cold/evicted key, every sibling job misses independently; there is no cross-job miss coalescing or single-writer selection, so each successful job schedules a save of the same populated directory. Empty/negative caching is not relevant because the install populates the path or fails.",
+        "MechanismConfidence": "High: the changed template states that every miss saves after the job, all six sibling jobs invoke it, and their key components are identical within an OS/architecture. The lack of a producer/limiter is explicit in the independent job topology.",
+        "MagnitudeUncertainty": "Exact browser-directory bytes and backend-side duplicate-upload deduplication are not available in the repository, and cold keys occur mainly after version changes or eviction. This limits severity, but not the six-way duplicate filesystem/archive work established by the job graph and Cache@2 miss semantics.",
+        "Verdict": "Warm builds trade per-job CDN downloads for cache restores and should improve latency/reliability. Cold builds introduce a reportable same-key concurrency burst because all six jobs independently save the same large browser tree; populate the cache once before fan-out or otherwise enforce one writer."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and traced the product-build job graph, Playwright install subprocess, cache key, warm/cold behavior, and post-job lifecycle. Reported one medium-severity cold-cache concurrency burst; no other changed mechanism established a performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-27T00:41:20.510604512Z",
+    "CompletedAt": "2026-10-27T00:43:29.413307264Z",
+    "WallClockMilliseconds": 128902,
+    "ModelCalls": 8,
+    "InputTokens": 203469,
+    "OutputTokens": 7417,
+    "TotalTokens": 210886,
+    "ReasoningTokens": 4283,
+    "CacheReadTokens": 162304,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 110766,
+    "ToolCalls": 37,
+    "NanoAIUnits": 37792160000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 162304,
+      "cache_write": 0,
+      "input": 41165,
+      "output": 7417
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

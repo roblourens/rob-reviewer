@@ -1,0 +1,217 @@
+{
+  "PullRequest": {
+    "Number": 344439,
+    "Title": "agentHost: fail refused artifact merges instead of blocking later attempts",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Problem\n\nClicking **Merge** on a pull request artifact could get permanently stuck. When GitHub refused a merge, for example with `405 Base branch was modified. Review and try the merge again.`, the artifact runtime recorded the run as `interrupted` with an unknown outcome, because the error happened after dispatch. Every later Merge click was then blocked with \"Another action on this resource is still running or has an unknown outcome\". **Reconcile Outcome** could not clear it either, since merge reconciliation only succeeded once the pull request was merged or queued.\n\nObserved on #344296: the 405 run stayed `interrupted`/`indeterminate`, and a live logpoint on the agent host showed the follow-up Merge run re-checked and blocked repeatedly.\n\n## Changes\n\n- `ArtifactActionRejectedError` lets a code action report that the external system definitively refused the effect. The execution service then fails the run with a known outcome instead of requiring reconciliation. Other post-dispatch errors still stay uncertain.\n- The GitHub pull request integration maps 4xx responses to merge, merge-queue enqueue and mark-ready mutations to that error. Network/5xx failures, `MutationUncertainError`, and indeterminate mission-control errors keep the existing reconciliation path.\n- Reconciling an uncertain direct merge reports `notExecuted` when a fresh snapshot shows the pull request still open at the recorded head, with known, non-required merge-queue state and no queue entry. Merge-queue runs stay uncertain because entries can leave the queue.\n- Documented the rejection error in the artifact integrations proposal.\n\n## Testing\n\n- `npx mocha test/unit/node/index.js --delay --ui=tdd --exit --run src/vs/platform/agentHost/test/node/githubPullRequestArtifactIntegration.test.ts --run src/vs/platform/artifactIntegrations/test/common/artifactIntegrations.test.ts`: passed (148 passing), including new tests for a 405 merge refusal, a rejected runtime code action, and reconciliation of uncertain direct-merge vs. merge-queue runs.\n- `npm run eslint -- \u003cchanged files\u003e`: passed.\n- `npm run typecheck-client`: no errors in the changed files. The worktree reports unrelated errors from a dependency mismatch with its symlinked `node_modules`.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344439",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "46bbfc5fed64cc87ef1c71c2c5b0ea1f24b619c8",
+    "HeadRef": "agents/artifact-integrator-merge-debug",
+    "HeadSHA": "88e320c000618aa579f2db5aba97dc264325d6b9",
+    "CreatedAt": "2026-10-26T21:47:10Z",
+    "UpdatedAt": "2026-10-27T00:45:28Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "missing-coalescing",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Manual or automated direct pull-request merge, including a definitive GitHub 4xx refusal",
+        "CriticalPath": "The action performs an authoritative artifact refresh, persists its initial checkpoint, refreshes again before execution, prepares the merge from authoritative GitHub fragments, persists the newly added operation-bearing checkpoint, then dispatches one merge request. All are awaited on the merge critical path. The diff adds only the second small checkpoint persistence; the remote refresh and mutation sequence already existed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:895 and :908, GitHubPullRequestArtifactResource.refresh",
+            "Operation": "Authoritatively refresh the pull request's subscribed fragments before preparation and execution",
+            "Cardinality": "Two fixed-set whole-resource refreshes per attempted action; each refresh covers core plus the effective subscribed fragment set, with fragment pagination determined by existing query behavior.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same authoritative refreshes occurred before the PR.",
+            "CriticalPathEffect": "Both refreshes must complete before merge dispatch."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/pullRequestMutationService.ts:193-216, PullRequestMutationService.prepareMerge",
+            "Operation": "Prepare merge by fetching core, checks, submitted reviews, review threads, mergeability, and top-level comments",
+            "Cardinality": "A fixed six-fragment sequence per merge preparation, with four middle fragments concurrent; pagination is fragment-specific and unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical preparation fan-out existed before the PR.",
+            "CriticalPathEffect": "All preparation reads must complete before dispatch."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:935, writeCheckpoint -\u003e $writeAutomationState",
+            "Operation": "Persist an operation-bearing artifact mutation checkpoint",
+            "Cardinality": "One additional small serialized state write per merge/enqueue attempt after preparation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the earlier mutation checkpoint without operation was persisted; there was no second checkpoint write after deciding merge versus enqueue.",
+            "CriticalPathEffect": "The write is awaited immediately before dispatch so reconciliation knows which operation crossed the effect boundary."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/pullRequestMutationService.ts:274-289, PullRequestMutationService.merge",
+            "Operation": "Dispatch GitHub direct-merge mutation",
+            "Cardinality": "One mutation request per dispatched attempt; manual users may explicitly retry a refused request, while automation permits one dispatched attempt per occurrence.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single merge request was dispatched; only the resulting run-state classification for definitive 4xx responses changed.",
+            "CriticalPathEffect": "The action completes or fails only after this request and any existing ambiguity reconciliation."
+          }
+        ],
+        "ScalingInput": "One pull request and one merge attempt. Authoritative whole-resource refreshes cover the fixed subscribed fragment set; merge preparation fetches core, checks, submitted reviews, review threads, mergeability, and top-level comments. Pagination inside individual fragment queries may scale with PR history, but the diff does not add or increase those queries. Automation is capped at one dispatched merge attempt per occurrence.",
+        "EffectiveConcurrency": "Artifact actions on the same related resource are serialized by run reservation; mutation-service work is serialized per pull-request key. Merge preparation fetches four middle fragments concurrently after core and before top-level comments. Checkpoint writes are sequenced. There is no aggregate unbounded concurrency introduced by the diff.",
+        "CacheBehavior": "The action deliberately requests authoritative refreshes, so warm fragment state does not eliminate these existing reads; fragment operations can otherwise be coordinated by the shared resource service. The added checkpoint write is not cached and occurs once per dispatched merge path. Refused runs become settled, but automatic merge has maxAttempts=1 for the same occurrence, preventing repeated automatic requests.",
+        "MechanismConfidence": "High: changed-line tracing proves one added serialized checkpoint write and no added GitHub requests; automation attempt limits and per-resource serialization are explicit.",
+        "MagnitudeUncertainty": "The exact latency of the added checkpoint IPC/storage write depends on host storage, but it is one small write on an infrequent user/automation action and does not scale with PR size or history. Existing GitHub fragment pagination can be costly for large PRs, but its cardinality is unchanged.",
+        "Verdict": "No reportable regression. The added write is bounded to one per merge attempt and is required before the external effect for reliable reconciliation; classifying definitive refusals as settled does not create automatic retry fan-out because merge automation has maxAttempts=1 per occurrence."
+      },
+      {
+        "Scenario": "Ambiguous direct merge followed by automatic recovery or user reconciliation",
+        "CriticalPath": "After an ambiguous merge transport failure, the mutation service performs one authoritative core refresh. The artifact run remains indeterminate. Recovery/reconciliation performs the existing whole-resource authoritative refresh, reads the checkpoint locally, and the new condition may classify an open PR at the same head as not executed; no additional boundary is introduced by that condition.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/pullRequestMutationService.ts:297-307",
+            "Operation": "Refresh the core fragment after an ambiguous merge response",
+            "Cardinality": "At most one core refresh for the ambiguous mutation attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same authoritative core refresh was attempted. The diff changes which error is rethrown when that read fails, not the boundary count.",
+            "CriticalPathEffect": "The merge call waits for this read to determine whether the merge completed; if the read fails, the original uncertain mutation error is propagated."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:949, codeAction.reconcile",
+            "Operation": "Refresh all subscribed pull-request fragments during artifact reconciliation",
+            "Cardinality": "One fixed-set whole-resource refresh per reconciliation invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same refresh occurred; an open direct-merge snapshot previously remained indeterminate instead of becoming notExecuted.",
+            "CriticalPathEffect": "Reconciliation waits for the snapshot before deciding completed, notExecuted, or indeterminate."
+          }
+        ],
+        "ScalingInput": "One uncertain run for one pull request. Recovery iterates uncertain runs, but related-resource gating prevents concurrent dispatched actions, and each affected run is reconciled once per explicit recovery invocation.",
+        "EffectiveConcurrency": "The mutation and its core reconciliation read are inside the mutation service's per-PR serializer. Artifact recovery awaits reconciliations sequentially for a binding. Existing resource refresh fans fragment requests out through the bounded scheduler.",
+        "CacheBehavior": "Both ambiguity reconciliation and artifact reconciliation use authoritative reads, intentionally bypassing stale warm state. Shared resource entries coordinate fragment work, but authoritative requests replace in-flight non-authoritative work. The new checkpoint field is a constant-size local read during reconciliation.",
+        "MechanismConfidence": "High: both network calls and serializers are directly visible, and the added reconciliation branch is local snapshot inspection only.",
+        "MagnitudeUncertainty": "Fragment query pagination varies with PR size, but the diff neither increases refresh frequency nor fragment cardinality.",
+        "Verdict": "No performance regression. The changed branch can clear an uncertain run without extra I/O and may reduce future blocked/reconciliation work."
+      },
+      {
+        "Scenario": "Merge-queue enqueue with a definitive refusal or ambiguous transport failure",
+        "CriticalPath": "The action uses the same existing action and merge-preparation refreshes, writes the new operation-bearing checkpoint, dispatches one enqueue mutation, and on an ambiguous failure performs one authoritative mergeability refresh. Later artifact reconciliation performs the existing whole-resource refresh and deliberately remains uncertain because queue entries can disappear.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/github/common/pullRequestMutationService.ts:329-364, PullRequestMutationService.enqueue",
+            "Operation": "Dispatch enqueue mutation and, only after an ambiguous failure, refresh mergeability authoritatively",
+            "Cardinality": "One enqueue request plus at most one mergeability refresh per ambiguous attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Both calls already occurred; the diff only preserves the original uncertain error if the reconciliation read itself fails.",
+            "CriticalPathEffect": "Both operations are awaited before the action result is known."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:935",
+            "Operation": "Persist operation='enqueue' in the artifact checkpoint",
+            "Cardinality": "One additional constant-size sequenced write per prepared enqueue attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The pre-run checkpoint did not identify whether merge or enqueue would be dispatched.",
+            "CriticalPathEffect": "Awaited before enqueue dispatch."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:949",
+            "Operation": "Refresh subscribed fragments during later artifact reconciliation",
+            "Cardinality": "One whole-resource refresh per reconciliation invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical refresh and indeterminate result for absent queue evidence.",
+            "CriticalPathEffect": "Required before preserving the indeterminate queue outcome."
+          }
+        ],
+        "ScalingInput": "One pull request and one enqueue attempt. Automatic merge/queue behavior is limited to one dispatched attempt for the occurrence; manual retries require explicit user actions.",
+        "EffectiveConcurrency": "Per-PR mutation serialization and related-resource run gating prevent overlapping queue mutations. Preparation fragment reads retain their existing bounded parallelism.",
+        "CacheBehavior": "Authoritative refreshes make cold/warm request counts equivalent for this path. Existing shared pull-request resources coordinate normal polling and fragment state. No new cache or retained collection is added.",
+        "MechanismConfidence": "High: call paths, one-attempt automation cap, and boundary counts are explicit.",
+        "MagnitudeUncertainty": "Storage-write latency and fragment pagination vary, but the sole added boundary remains one constant-size write per attempt.",
+        "Verdict": "No reportable regression. The added checkpoint write is bounded and queue reconciliation adds no remote work."
+      },
+      {
+        "Scenario": "Mark pull request ready for review when GitHub returns success or a definitive 4xx refusal",
+        "CriticalPath": "The action performs its existing authoritative refreshes and dispatches one GraphQL mark-ready mutation. The new mutate wrapper only examines the thrown error in process and changes the artifact run's persisted terminal state; it adds no network, filesystem, subprocess, or database operation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:918 -\u003e src/vs/platform/github/common/core/pullRequestsClient.ts:153",
+            "Operation": "Dispatch markReadyForReview GraphQL mutation",
+            "Cardinality": "One mutation per dispatched action attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same mutation was dispatched through withAuthentication; the diff wraps it with local refusal classification.",
+            "CriticalPathEffect": "The action waits for the mutation response."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/artifactIntegrations/common/artifactExecutionService.ts:369-373",
+            "Operation": "Persist final artifact run state in the integration ledger",
+            "Cardinality": "One terminal run-state transition on failure, as before.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A post-dispatch failure already wrote a terminal/interrupted transition; the diff changes the fields to failed/non-indeterminate for ArtifactActionRejectedError.",
+            "CriticalPathEffect": "Failure handling awaits the existing ledger update."
+          }
+        ],
+        "ScalingInput": "One pull request and one action attempt. Automatic mark-ready has maxAttempts=1 per occurrence; subsequent manual retries require distinct explicit requests.",
+        "EffectiveConcurrency": "Related-resource action gating prevents overlapping dispatched actions. The single GraphQL mutation uses the existing request scheduler.",
+        "CacheBehavior": "Existing authoritative refreshes do not rely on warm cache. A definitive refusal now settles the run instead of retaining an indeterminate blocker; no negative cache is added, but the one-attempt automation budget prevents repeated automatic misses.",
+        "MechanismConfidence": "High: the wrapper has no boundary calls and the automation option explicitly limits dispatched attempts to one.",
+        "MagnitudeUncertainty": "Remote request latency varies, but request count is unchanged and retries are bounded.",
+        "Verdict": "No performance regression. Error classification changes lifecycle semantics without increasing mutation frequency, retained state, or critical-path boundary count."
+      }
+    ],
+    "Summary": "Completed the performance pass over all nine changed files and all diff pages. Traced merge, enqueue, mark-ready, execution-state handling, automation retry budgets, checkpoint persistence, authoritative fragment refreshes, mutation serialization, and reconciliation. No actionable diff-introduced performance issue was found; no regression-fix signal was recorded because the PR addresses action-state correctness rather than a demonstrated shipped performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-27T00:45:47.277736767Z",
+    "CompletedAt": "2026-10-27T00:47:34.982552913Z",
+    "WallClockMilliseconds": 107704,
+    "ModelCalls": 12,
+    "InputTokens": 512800,
+    "OutputTokens": 6668,
+    "TotalTokens": 519468,
+    "ReasoningTokens": 1237,
+    "CacheReadTokens": 449024,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 85828,
+    "ToolCalls": 63,
+    "NanoAIUnits": 56807360000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 449024,
+      "cache_write": 0,
+      "input": 63776,
+      "output": 6668
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
