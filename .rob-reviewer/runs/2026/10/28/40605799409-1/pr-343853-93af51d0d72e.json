@@ -1,0 +1,165 @@
+{
+  "PullRequest": {
+    "Number": 343853,
+    "Title": "Engineering - retry the Copilot test environment setup",
+    "Body": "Retries the `Setup copilot test environment` step (AzureCLI@2 on `VS Code Development WIF`, then `npm run setup`) up to 2 times in both Copilot test templates.\n\n## Evidence (def 111, Sep 23 – Oct 23, 1,484 builds)\n\nThe step failed twice, both on main CI and both transient:\n\n| Build | Job | Error |\n|---|---|---|\n| [488663](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=488663) (Oct 23) | Copilot | `The subscription of '9b16b0df-…' doesn't exist in cloud 'AzureCloud'` (WIF login blip, didn't recur in the 17:00 insider) |\n| [483178](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=483178) (Oct 12) | Unit Tests | `get_env`: `ChainedTokenCredential … Connection reset by peer` |\n\nEach one turned main CI red for a run. Impact is low (2 in 30 days), but the fix is one line per template.\n\n## Safety\n\nAzureCLI@2 logs in again on each attempt, then reruns `npm run setup` (`get_env` + `get_token`). Both scripts read `.env`, drop the lines for the keys they set and append fresh values, and only write after a successful fetch. A failed attempt leaves no partial `.env` entry behind, and a retry replaces any earlier one rather than duplicating it. `get_token` exits early on non-TTY agents.\n\n## Proof and validation\n\n- The ADO preview API on def 111 Product shows all 4 `Setup copilot test environment` steps carrying `retryCountOnTaskFailure: 2`.\n- def 111 CI-mode run [488694](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=488694) succeeded. The baseline comparison is in the comments.\n\n\u003e Authored with Copilot",
+    "URL": "https://github.com/microsoft/vscode/pull/343853",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "f9ba073c04dd7f0d2b8ec4e9aa49dfdcd4d9c3ca",
+    "HeadRef": "copilot/vscode/copilot-setup-retry",
+    "HeadSHA": "93af51d0d72e5d1a91ad429e0ce378c08333465b",
+    "CreatedAt": "2026-10-23T17:28:57Z",
+    "UpdatedAt": "2026-10-27T22:23:37Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Copilot build/unit-test job setup via build/azure-pipelines/copilot/test-steps.yml",
+        "CriticalPath": "The AzureCLI@2 setup task must complete before dotnet setup, typecheck, lint, compilation, and tests. On a successful first attempt the critical path is unchanged; only a failed attempt adds retry time before the job can progress.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/copilot/test-steps.yml:7 AzureCLI@2",
+            "Operation": "Authenticate the AzureCLI task through the VS Code Development WIF service connection.",
+            "Cardinality": "Previously one login attempt per job; now up to three only when preceding task attempts fail.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A transient login failure ended the setup task and job after the first attempt.",
+            "CriticalPathEffect": "Authentication is on the setup critical path; retry delays a failed run but permits it to continue instead of terminating immediately."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/copilot/test-steps.yml:12 inlineScript and extensions/copilot/package.json:6889 setup",
+            "Operation": "Launch npm, then tsx getEnv and non-interactive getToken setup scripts.",
+            "Cardinality": "One command chain per attempt, increasing from at most one to at most three on failures; getToken exits before network access on CI because stdin is non-TTY.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The command chain ran once and any nonzero result ended setup.",
+            "CriticalPathEffect": "The scripts must finish before downstream test steps."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/script/setup/getEnv.mts:45 fetchSecrets",
+            "Operation": "Acquire an Azure credential and make sequential Key Vault getSecret requests for fixed secret names.",
+            "Cardinality": "Up to six fixed secret reads per attempt (four required-path reads and up to two optional reads), hence up to 18 only if two complete attempts fail late and a third is attempted. No input-sized fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "At most one fixed sequence of secret reads; a failure terminated the task.",
+            "CriticalPathEffect": "All required reads and attempted optional reads are awaited sequentially before tests can proceed."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/script/setup/getEnv.mts:69 main",
+            "Operation": "Read, filter, and rewrite extensions/copilot/.env after successful secret retrieval.",
+            "Cardinality": "At most one small .env read/write per completed attempt; failed attempts before secret completion perform no write.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "At most one .env rewrite.",
+            "CriticalPathEffect": "Synchronous but over a small fixed configuration file and on the setup critical path."
+          }
+        ],
+        "ScalingInput": "One setup task per Copilot test job. Each attempt performs a fixed-size setup independent of repository/test size; the diff raises failed-path attempts from 1 to at most 3.",
+        "EffectiveConcurrency": "Retries for a task are sequential and bounded by Azure Pipelines. Separate pipeline jobs may execute concurrently, but this template is instantiated once in the main Copilot job (and once in a separately invoked recovery test job), so the diff does not create intra-job parallelism.",
+        "CacheBehavior": "There is no secret cache: every attempt reacquires Azure credentials and fetches current Key Vault values. An existing .env is read and key entries are replaced, not used to skip remote reads. Warm and cold .env behavior therefore have the same remote-call cardinality; successful first attempts never retry.",
+        "MechanismConfidence": "High: the changed YAML directly enables two sequential retries, and the setup call path establishes the fixed network/subprocess/filesystem work repeated per failed attempt.",
+        "MagnitudeUncertainty": "Exact Azure task retry backoff and failure timing are not present in the repository. The added cost occurs only after a failure, is capped at two retries, and the PR evidence describes two transient failures across 1,484 builds.",
+        "Verdict": "No reportable performance regression. Normal successful-job latency and boundary count are unchanged; the bounded extra work occurs only on an already-failing path and intentionally trades additional setup latency for avoiding a full failed build/rerun."
+      },
+      {
+        "Scenario": "Cross-platform Copilot integration-test setup via build/azure-pipelines/copilot/test-integration-steps.yml",
+        "CriticalPath": "After Git LFS cache setup, AzureCLI authentication and npm setup must complete before executable-path discovery, Copilot compilation, and checkpointed integration tests. Retries affect this critical path only after setup failure.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/copilot/test-integration-steps.yml:17 AzureCLI@2",
+            "Operation": "Authenticate each selected OS test job using the WIF service connection.",
+            "Cardinality": "One login per OS job before the diff; now up to three per OS job only after failures. Across three enabled OS jobs, the maximum failed-path count rises from 3 to 9.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Each OS job attempted login once and stopped on transient failure.",
+            "CriticalPathEffect": "Each job is blocked until its own setup succeeds or exhausts retries."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/copilot/test-integration-steps.yml:25 inlineScript and extensions/copilot/package.json:6889 setup",
+            "Operation": "Run npm setup, spawning getEnv and the non-TTY no-op getToken command.",
+            "Cardinality": "Fixed one command chain per attempt, bounded at three per affected OS job after the change.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One command chain per OS job.",
+            "CriticalPathEffect": "Compilation and integration tests cannot start until the command succeeds."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/script/setup/getEnv.mts:45 fetchSecrets",
+            "Operation": "Perform sequential Azure credential and Key Vault secret retrieval for a fixed set of names.",
+            "Cardinality": "Up to six secret reads per attempt; across three concurrently enabled OS jobs, six normal-path reads per job remain unchanged, while repeated late failures can produce at most 18 reads per job over three attempts.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One fixed sequence per OS job with no retry.",
+            "CriticalPathEffect": "Secret retrieval is awaited before .env generation and all tests."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/script/setup/getEnv.mts:69 main",
+            "Operation": "Read and atomically replace key lines by rewriting the local .env file in each isolated agent workspace.",
+            "Cardinality": "One small local rewrite per completed attempt per job; no shared file contention across agents.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "At most one local rewrite per OS job.",
+            "CriticalPathEffect": "Small synchronous work before compilation; retry can repeat it only when a later command in the task fails, while getToken normally exits successfully in CI."
+          }
+        ],
+        "ScalingInput": "One setup task in each test job whose VSCODE_TEST_IDS contains copilot. Product pipelines schedule one such Unit job per enabled Windows, Linux, and macOS test stage, so effective aggregate cardinality can be three jobs, each with one normal attempt or at most three failed-path attempts.",
+        "EffectiveConcurrency": "Within each job, retries and the six secret reads are sequential. Enabled OS jobs can run concurrently, so a shared transient outage could produce a bounded cross-job burst of up to three retrying tasks; the PR does not add jobs or unbounded concurrency.",
+        "CacheBehavior": "No cross-job or per-attempt cache/coalescing exists for Azure login or Key Vault reads. Existing .env files do not avoid reads. The warm successful path remains one attempt; only failures trigger repeats.",
+        "MechanismConfidence": "High: template call sites establish up to one Copilot setup job per Windows/Linux/macOS stage, and changed line 30 directly bounds each failed task to two retries.",
+        "MagnitudeUncertainty": "The exact set of OS stages enabled in each pipeline invocation and retry backoff are configuration-dependent. A simultaneous service outage could align retries, but the job count and per-job attempts are statically bounded.",
+        "Verdict": "No finding. The diff can repeat fixed remote setup work during transient failures and modestly amplify an outage across existing parallel OS jobs, but it neither changes successful-path cost nor introduces unbounded fan-out; bounded retry is the intended resilience behavior and is cheaper than rerunning whole failed jobs."
+      }
+    ],
+    "Summary": "Reviewed both changed YAML hunks and traced their template call sites through AzureCLI authentication, npm/tsx subprocesses, sequential Key Vault reads, and .env filesystem updates. Considered repeated work, boundary fan-out, and concurrency burst behavior. The only added work is a maximum of two sequential retries after an already-failed setup attempt; successful paths are unchanged, cardinality is fixed, and no actionable performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-28T00:09:39.419910884Z",
+    "CompletedAt": "2026-10-28T00:10:56.399364385Z",
+    "WallClockMilliseconds": 76979,
+    "ModelCalls": 9,
+    "InputTokens": 189835,
+    "OutputTokens": 3957,
+    "TotalTokens": 193792,
+    "ReasoningTokens": 700,
+    "CacheReadTokens": 152980,
+    "CacheWriteTokens": 36828,
+    "APIDurationMilliseconds": 58961,
+    "ToolCalls": 36,
+    "NanoAIUnits": 32458000000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 152980,
+      "cache_write": 36828,
+      "input": 27,
+      "output": 3957
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
