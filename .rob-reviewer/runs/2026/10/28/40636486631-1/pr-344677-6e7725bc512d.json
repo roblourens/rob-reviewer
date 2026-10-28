@@ -1,0 +1,151 @@
+{
+  "PullRequest": {
+    "Number": 344677,
+    "Title": "Keep the selected Run dropdown action when the toolbar is rebuilt mid-run",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n🤖 Fixes #210410\n\n## What and why\n`DropdownWithDefaultActionViewItem` (the `editor/title/run` split button with `togglePrimaryAction: true`) recorded the chosen dropdown action on its private runner's `onDidRun`. `ActionRunner` fires that event only **after** the action's promise resolves.\n\nSlow commands, such as the first *Run Current File in Interactive Window* (which creates the Interactive Window and starts a kernel), change context while they run. The editor title menu then fires `onDidChange`, and `EditorTabsControl.updateEditorActionsToolbar` calls `toolbar.setActions`. `ActionBar.clear` disposes the old view item, including its runner and listener, before `onDidRun` fires. As a result:\n- the last-action ID is never stored;\n- the rebuilt button still shows the previous action.\n\nWhen the Interactive Window already exists, the command resolves before any rebuild. That is why reuse worked and first use didn't.\n\nThe fix listens to `onWillRun` instead. The choice is persisted, and the primary is swapped, before the action is awaited. Everything else is unchanged:\n- `onDidRun` already fired on errors, so the meaning of a \"selection\" is the same; only the timing moves earlier.\n- The storage key and scope are the same.\n- The `primaryActionIds` branch is untouched (`onDidExecuteCommand` fires synchronously).\n\n## Tests\nA new `DropdownWithDefaultActionViewItem` suite in `src/vs/platform/actions/test/browser/menuEntryActionViewItem.test.ts` uses real view items, a captured context-menu delegate and deferred commands. It covers:\n- the item being disposed while the selected action is still running (as the toolbar rebuild does): the recreated item restores and runs that action;\n- the primary swapping while the action is still pending;\n- ordinary defaults: first action when nothing is stored, unknown stored ID, and `togglePrimaryAction: false`.\n\nResults:\n- `./scripts/test.sh --run src/vs/platform/actions/test/browser/menuEntryActionViewItem.test.ts` **without** the product change: 8 passing, **2 failing** (the new regression tests).\n- With the product change: 10 passing.\n- Also run: `toolbar.test.ts` and `buttonbar.test.ts`, **24 passing** in total. `npm run eslint` on both changed files: clean. `npm run typecheck-client`: clean.\n\n## Manual verification\nmacOS, with the Python 2026.11.2026102101 and Jupyter 2026.6.2026071501 extensions, on a file containing `print(1)`:\n- **Insiders 1.145.0-insider (unfixed):** picking *Run Current File in Interactive Window* with no Interactive Window open leaves the primary as *Run Python File*. With the Interactive Window open, it does switch.\n- **Code OSS dev build with this change:**\n  - The first-use selection becomes the primary immediately.\n  - It survives *Developer: Reload Window*.\n  - Clicking the primary runs the file in the Interactive Window.\n  - Switching between *Run Python File* and *Run Python File in Dedicated Terminal* still updates the primary.\n  - The reused Interactive Window case still works.\n\nNot exercised: remote and web toolbars, which use the same view item.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344677",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sbatten",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "55d17505e74a349e2a03e5b0526e53a190f37a89",
+    "HeadRef": "agents/fix-vscode-dropdown-selected-action",
+    "HeadSHA": "6e7725bc512d6b47150f90af6d0061b56ac1ab45",
+    "CreatedAt": "2026-10-28T01:59:36Z",
+    "UpdatedAt": "2026-10-28T04:45:27Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "repeated-work",
+      "boundary-fanout",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Selecting a different action from a toggle-primary split-button, including an extension-provided editor-title Run action",
+        "CriticalPath": "The dropdown ActionRunner fires onWillRun synchronously; the changed listener performs one eligibility check, one cached storage read and at most one store scheduling, disposes/renders one primary action view, then ActionRunner invokes MenuItemAction.run and CommandService.executeCommand. The command/activation remains the dominant awaited work; database persistence is delayed and not awaited.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database/filesystem",
+            "Location": "src/vs/platform/actions/browser/menuEntryActionViewItem.ts:514 update; src/vs/base/parts/storage/common/storage.ts:264 Storage.set",
+            "Operation": "Persist the workspace-scoped last-action ID through Storage.set/doFlush.",
+            "Cardinality": "At most one scheduled write for a changed action ID per selection; repeated selection of the stored ID performs none, and writes within the delay are coalesced.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same conditional write and persistence scheduling occurred once from onDidRun after the command promise settled.",
+            "CriticalPathEffect": "The synchronous cache/event update now occurs before command dispatch, but the actual database update is delayed by 100 ms and is not awaited, so it remains off the command critical path."
+          },
+          {
+            "Kind": "IPC/other",
+            "Location": "src/vs/platform/actions/common/actions.ts:672 MenuItemAction.run; src/vs/workbench/services/commands/common/commandService.ts:49 CommandService.executeCommand",
+            "Operation": "Dispatch the selected command, potentially activating an extension and invoking extension-host or command-specific subprocess/network work.",
+            "Cardinality": "Exactly one command dispatch per selected action, with activation dependent on cold/warm registration state.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same command was dispatched once immediately after onWillRun; only the bounded primary-view/storage update previously happened after completion.",
+            "CriticalPathEffect": "Command activation and execution are awaited and can dominate latency; the diff does not add, duplicate, or increase concurrency of this boundary."
+          }
+        ],
+        "ScalingInput": "One selected MenuItemAction per user invocation. Cost does not scale with submenu size except the unchanged single primary-action instance/keybinding setup; rapid selections produce one update per selection, with unchanged total update cardinality versus the previous onDidRun listener.",
+        "EffectiveConcurrency": "Each view item owns one ActionRunner. A user can initiate overlapping commands, but every invocation performs one bounded update; storage writes are coalesced by the existing 100 ms ThrottledDelayer rather than issued concurrently.",
+        "CacheBehavior": "The current primary ID is read from the in-memory storage cache and identical IDs skip the store. Distinct selections update the cache immediately; persistence is coalesced. Cold command activation may await extension activation, while warm registered commands execute directly, unchanged by the diff.",
+        "MechanismConfidence": "High: ActionRunner ordering, update implementation, cached storage behavior, delayed flush, and command dispatch were traced directly. The diff only moves the existing one-per-selection update before the awaited command.",
+        "MagnitudeUncertainty": "The exact synchronous cost of storage-change listeners and creating one action view varies by host and extensions, but there is no collection-scaled work, synchronous database I/O, or increased operation count.",
+        "Verdict": "No reportable regression. The change adds a small constant amount of local UI/cache work before command dispatch, but does not introduce synchronous expensive boundaries, fan-out, retention, or additional repeated work."
+      },
+      {
+        "Scenario": "A long-running selected command changes context and rebuilds the editor-title toolbar before it completes",
+        "CriticalPath": "After the pre-run update, the existing command runs. A context/menu change can call updateEditorActionsToolbar, which recreates menu actions and calls toolbar.setActions. The new listener ensures the old view's selection has already reached the storage cache before disposal; rebuild work and command boundaries are otherwise unchanged.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database/filesystem",
+            "Location": "src/vs/platform/actions/browser/menuEntryActionViewItem.ts:514 update; src/vs/base/parts/storage/common/storage.ts:397 Storage.doFlush",
+            "Operation": "Eventually persist the selected action ID while the toolbar may be recreated.",
+            "Cardinality": "One conditional, coalesced write for the selection, independent of the number of toolbar rebuilds.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The write was scheduled only after command completion and could be skipped entirely if disposal removed the onDidRun listener.",
+            "CriticalPathEffect": "The cache is updated before rebuild; the delayed database flush is off both the command and toolbar-rebuild critical paths."
+          },
+          {
+            "Kind": "IPC/other",
+            "Location": "src/vs/workbench/services/commands/common/commandService.ts:49 CommandService.executeCommand",
+            "Operation": "Execute the long-running command whose context changes can trigger the toolbar rebuild.",
+            "Cardinality": "One command invocation; downstream boundary count is command-specific and unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same command and downstream work ran once, before the old post-run update.",
+            "CriticalPathEffect": "Its promise remains pending across the rebuild and determines command completion latency; no new downstream operation is introduced."
+          }
+        ],
+        "ScalingInput": "One editor action toolbar and one selected split-button for the triggering context change; rebuild cost scales with the existing editor-title action list, not with any collection introduced by this diff.",
+        "EffectiveConcurrency": "The toolbar rebuild executes on the UI event path while the command promise is pending. The PR neither starts another rebuild nor adds command concurrency; it changes only when the selected item updates.",
+        "CacheBehavior": "The recreated item reads the already-updated action ID from the storage cache. Warm reads require no boundary; persistent storage initialization and the menu/action caches are unchanged.",
+        "MechanismConfidence": "High: the editor toolbar rebuild path, view disposal behavior, cached storage read, and deferred persistence were inspected directly.",
+        "MagnitudeUncertainty": "The action count and command duration vary, but the added pre-run work remains one view replacement and one cache update regardless of duration or rebuild count.",
+        "Verdict": "No reportable performance regression. The toolbar rebuild and long-running command already existed, while the moved update is bounded and avoids neither batching nor cleanup."
+      },
+      {
+        "Scenario": "Recreating a split-button after a prior selection, including window reload or toolbar replacement",
+        "CriticalPath": "The constructor performs the unchanged workspace-storage cache read, finds at most one matching action, creates one default action view, and renders it. The diff changes which selections are available in cache before disposal but adds no constructor or reload work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database/filesystem",
+            "Location": "src/vs/platform/storage/common/storage.ts AbstractStorageService; DropdownWithDefaultActionViewItem constructor at src/vs/platform/actions/browser/menuEntryActionViewItem.ts:470",
+            "Operation": "Load workspace storage during the host's existing storage initialization before item construction.",
+            "Cardinality": "Existing storage initialization once per scope/session; item recreation itself performs only an in-memory lookup.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The constructor used the same cache lookup and fallback logic.",
+            "CriticalPathEffect": "No new storage read boundary is placed on item construction by this diff."
+          }
+        ],
+        "ScalingInput": "One cache read and a linear find over that split-button's existing action list per recreated item; the find and item creation are unchanged by the PR.",
+        "EffectiveConcurrency": "Toolbar creation is synchronous UI construction with no new parallelism. Persistence may flush independently through the existing storage delayer.",
+        "CacheBehavior": "Warm recreation reads the in-memory cached ID. On process reload, storage initialization populates the cache as before. Unknown or absent IDs fall back to the first eligible action; negative behavior is unchanged.",
+        "MechanismConfidence": "High: constructor and storage cache paths are unchanged; only event timing changed.",
+        "MagnitudeUncertainty": "Actual submenu sizes vary, but no changed loop or additional item creation exists in this path.",
+        "Verdict": "No reportable regression. The PR does not alter startup/recreation cardinality, cache lifecycle, or boundary behavior."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and traced dropdown selection, long-command toolbar rebuild, recreation, storage persistence, command activation, DOM disposal, caching, and concurrency. No high-confidence actionable performance regression was introduced, and the PR is a correctness timing fix rather than a demonstrated performance-regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-28T05:20:20.70449431Z",
+    "CompletedAt": "2026-10-28T05:22:11.058633568Z",
+    "WallClockMilliseconds": 110354,
+    "ModelCalls": 14,
+    "InputTokens": 299882,
+    "OutputTokens": 5482,
+    "TotalTokens": 305364,
+    "ReasoningTokens": 2043,
+    "CacheReadTokens": 262656,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 89191,
+    "ToolCalls": 40,
+    "NanoAIUnits": 36360640000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 262656,
+      "cache_write": 0,
+      "input": 37226,
+      "output": 5482
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
