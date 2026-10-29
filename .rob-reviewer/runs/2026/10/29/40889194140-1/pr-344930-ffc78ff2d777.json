@@ -1,0 +1,240 @@
+{
+  "PullRequest": {
+    "Number": 344930,
+    "Title": "agentHost: record a nested session's own conversation so it can move back out",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #344917\n\n## Problem\n\nA session nested under another session couldn't be moved back out. **Move to New Session** and **Undo** were both refused with \"This chat has no conversation of its own yet, so it can't be moved into a new session\" (`_checkPromotable`, `AgentChatMoveRefusal.Unsupported`), so the session stayed nested for good.\n\n## Cause\n\nRegression from #342904 (C15).\n\n- Older sessions record no backing for their main chat (`chats_v2.provider_data` is NULL). Their agent (Copilot, Claude or Codex) derives the backing from the session when the session is restored in full (`materializeChat` with no provider data), and the host then records it.\n- Since #342904, a move loads a session that isn't loaded with its data only, and its agent never sees it. So nothing recorded the backing, and the nest moved the chat without one. `_checkPromotable` then refused every later move to a new session.\n- Sessions that were loaded or that already had a backing were fine. Legacy (authority-1) catalogs are always restored in full, so they were fine too.\n- In the reporter's database, 118 of 774 normalized sessions (about 15%) have a main chat without a recorded backing.\n\n## Fix\n\nIn `agentService.ts`:\n\n1. `_movedSessionChat` loads the source with its data only when its main chat records a backing (`_recordsDefaultChatBacking`, which reads the recorded catalog and never derives anything from a chat URI). Otherwise it restores the source in full, where the agent derives the backing and the host records it, so the nest carries it.\n2. Safety net: before any session moves under another, `_checkChatMoveRequest` refuses the move (`NotMovable`) if the main chat still records no backing, and nothing changes. A read failure becomes the same refusal. With today's agents this shouldn't trigger, since all three derive a backing.\n\nAlready stuck sessions are not repaired (out of scope).\n\n**Cost.** The full restore only happens when nesting a session that isn't loaded and whose main chat has no recorded backing (about 15% of sessions in the reporter's database). It costs the same as opening that session once: the agent resumes its SDK session to read the history. The session is released again by the normal residency rules. Sessions that are loaded, or that already have a backing, take the C15 data-only path as before; a test assertion and the live log both show this.\n\n**Refusal text.** For a refused session nest, the sessions list shows \"Could not move session '{title}'. This chat can't be moved.\" There's no URI in it. This couldn't be triggered live because every current agent derives a backing, so the unit tests cover it.\n\n## Tests\n\nNew tests are in the C15 suite of `agentService.test.ts`:\n- **Old session (#344917):** a session that isn't loaded and has no backing nests with its backing recorded, and moves back out. Red before the fix: backing `undefined`, the move back refused `unsupported`.\n- **Legacy session:** an authority-1 session that isn't loaded does the same.\n- **Agent records no backing:** the nest is refused, loaded or not and via the `move_session` check, and nothing changes.\n- **Unreadable catalog:** a session whose chats can't be read is refused as `NotMovable`.\n- **C15 unchanged:** the existing test now asserts that a session with a backing still nests with its data only.\n\nTest agents now report a backing like the real agents do. `MockAgent.initialChatProviderData` is unset by default; `MovingAgent` and `ChatAgent` set it, and `MovingAgent.materializeChat` derives one for chats stored in their session's database. This removed four tests' hand-written `UPDATE chats_v2 SET provider_data` workarounds; their assertions are unchanged.\n\nMutation checks: dropping the full restore, the safety net, or the error conversion each fails its own test.\n\nRuns:\n- `./scripts/test.sh --runGlob \"vs/platform/agentHost/test/node/**/*.test.js\"`: **passed**, 13934 passing, 0 failing.\n- `npm run typecheck-client`: **passed**.\n- `npm run eslint -- \u003c4 changed files\u003e`: **passed**.\n\n## Live check\n\nCode - OSS Agents window, throwaway profile, Copilot only.\n\nTo make old sessions, I cleared the main chat's backing in that profile only and gave the SDK session the session's id, as in pre-backing sessions.\n\n- **Unfixed:** Move to New Session and Undo were refused with the reporter's message, and the nested rows had `provider_data` NULL, matching the reporter's logs.\n- **Fixed:**\n  - Nesting an old session that isn't loaded, then **Undo**, works; so does nesting one and then **Move to New Session**.\n  - The promoted session continues its old conversation, and it stays its own session after a restart.\n  - A fresh session with a backing still nests with no SDK resume (data-only).\n- **Not covered live:** the refusal, since no current agent leaves the backing unrecorded.\n\n## Review\n\nIndependent code review approved. It found that the error conversion was missing; that is fixed and covered by a test.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344930",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "8c26947d4b26896837a709218f15e68a2bf5f967",
+    "HeadRef": "agents/nested-chat-keeps-own-conversation",
+    "HeadSHA": "ffc78ff2d777e2efdd75fafd423c6d687262cb94",
+    "CreatedAt": "2026-10-29T09:51:54Z",
+    "UpdatedAt": "2026-10-29T10:24:11Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-0EB18142224A",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentService.ts",
+      "Side": "RIGHT",
+      "Line": 7842,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The two changed call sites, their shared helper, and the database implementation establish exact multiplicity and synchronous critical-path reachability. The catalog contract and `_checkMovedSession` establish that movable sessions may contain up to 1,000 private descendants. Exact wall-clock cost varies with catalog size and database contention, but the repeated full-row reads and decoding are certain.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "SQLite SELECTs, decoding CPU, and allocated chat-row objects",
+      "PerformanceScaling": "O(number of source catalog rows) per probe: two full scans per UI move and four per checked-and-applied self tool move, with up to 1,000 default/private-descendant rows per movable session",
+      "PerformanceOutcome": "increased critical-path move latency and shared database queue contention",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before the PR, `_movedSessionChat` restored with `dataOnly: true` and `_checkChatMoveRequest` did not perform a backing probe. Loaded/backed session moves therefore did not add these source-wide validation snapshots; cold restore and the move's existing catalog preparation performed only their pre-existing reads.",
+      "ChangedBehavior": "Every session move now reads and reconstructs the source's complete catalog once before restore and again during request validation just to determine whether the default chat has provider data. For the server tool's self-move flow, pre-check and scheduled apply each run both probes.",
+      "CausalDiffEvidence": "RIGHT line 7842 replaces the prior unconditional data-only restore with an awaited `_recordsDefaultChatBacking(session)` probe, and RIGHT lines 8079-8081 add the same probe again in `_checkChatMoveRequest`. `_recordsDefaultChatBacking` reaches `_readDefaultChatBacking`, whose `readCatalogSnapshot([session])` executes two SQL SELECTs and materializes every chat row before a separate `getChatV2ProviderDetail` SELECT.",
+      "Title": "Reuse the backing check instead of rescanning the full catalog",
+      "Impact": "Moving a long-running single-chat session with many subagent descendants waits for two unnecessary full catalog scans and allocations; a self `move_session` tool invocation waits for four across check/apply. This increases move latency and holds the shared SQLite transaction queue longer, delaying unrelated agent-host database work.",
+      "Evidence": "`moveSession` calls `_movedSessionChat`, which now awaits the first probe, then `_moveChat` calls `_checkChatMoveRequest`, which awaits the second. `_readDefaultChatBacking` calls `readCatalogSnapshot([session])`; `AgentHostDatabase.readCatalogSnapshot` performs two queued SELECTs, fetches all live `chats_v2` rows, and converts/groups each row. The catalog contract caps but permits 1,000 chats including private descendants, and `_checkMovedSession` explicitly allows the default chat plus all descendants. Each probe then queues another provider-detail SELECT. The `move_session` self flow calls `_checkServerToolMove` before scheduling and `_applyServerToolMove` when applying, repeating both probes twice.",
+      "Recommendation": "Carry the first probe result/default-chat identity through the same sequenced move and reuse it in `_checkChatMoveRequest`; for an already-loaded source, query provider detail directly for the known default chat instead of rebuilding the catalog. Re-read only after an initially missing backing triggers a full restore, because that restore may recover and persist the backing."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Move an already-loaded, backed session under another session from the sessions UI",
+        "CriticalPath": "The UI awaits one browser-to-agent-host request; the host's global move sequencer then runs `_movedSessionChat`, `_checkChatMoveRequest`, destination validation, and the existing move transaction before the UI can finish. Both newly added backing probes are on this critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:2183",
+            "Operation": "Send the existing `moveSession` extension request from the sessions UI to the agent host",
+            "Cardinality": "One request per user move",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single request was awaited before the diff.",
+            "CriticalPathEffect": "The UI awaits the complete host move"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:7842 and :8079 via `_recordsDefaultChatBacking`",
+            "Operation": "Read and reconstruct the complete source catalog, then read the default chat's provider-data row",
+            "Cardinality": "Two probes per UI session move; each probe is one two-SELECT snapshot transaction plus one provider-detail SELECT and decodes all source chat rows",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Loaded/backed moves had no backing probes at either call site.",
+            "CriticalPathEffect": "Both probes complete before validation and commit can progress"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_moveChat and AgentHostDatabase move APIs",
+            "Operation": "Prepare, validate, and atomically move source/target catalogs",
+            "Cardinality": "One bounded source/target move transaction per move, plus existing validation reads",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same move preparation and transaction occurred before the diff.",
+            "CriticalPathEffect": "Existing required commit work"
+          }
+        ],
+        "ScalingInput": "The source catalog's default chat plus private/subagent descendants; session moves permit the entire default-chat subtree and normalized catalogs allow up to 1,000 rows.",
+        "EffectiveConcurrency": "Moves are globally serialized by `_chatMoveSequencer`; each database probe is additionally serialized by the shared `_transactionSequencer`. The two source probes are sequential, not coalesced.",
+        "CacheBehavior": "Warm in-memory session state does not avoid either new authoritative backing probe. Provider data is persisted, but no positive result is reused between `_movedSessionChat` and `_checkChatMoveRequest`.",
+        "MechanismConfidence": "High: both added awaits and the full-snapshot database implementation are directly traced, and movable sessions explicitly allow private descendants.",
+        "MagnitudeUncertainty": "Most sessions have few descendants and local SQLite can be fast; exact delay and queue contention depend on catalog size and concurrent database activity.",
+        "Verdict": "Reportable repeated collection-wide work: two source-wide scans were added to the awaited move path even when loaded state and a positive first result are available."
+      },
+      {
+        "Scenario": "Move a cold normalized session whose default chat already records a backing",
+        "CriticalPath": "The first new backing probe completes, then the existing data-only restore loads source state without starting the agent; request validation performs the second new probe before destination loading and commit.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:7842",
+            "Operation": "Probe default backing before selecting restore mode",
+            "Cardinality": "One full source snapshot plus one provider-detail read",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The source entered `_restoreForMove(..., true)` directly.",
+            "CriticalPathEffect": "Must complete before the source can load"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_loadSessionDataForMove / `_restoreSessionState`",
+            "Operation": "Load normalized session data for the move",
+            "Cardinality": "One source load, with existing registry, catalog, state, and contribution reads",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Cold normalized sources already used this data-only load.",
+            "CriticalPathEffect": "Required before move validation"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:8079",
+            "Operation": "Repeat the backing probe after the positive pre-restore result",
+            "Cardinality": "A second full source snapshot plus provider-detail read",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No post-load backing check existed.",
+            "CriticalPathEffect": "Must complete before destination restore"
+          }
+        ],
+        "ScalingInput": "Source catalog row count, including private descendants; effective cardinality is one source session and one destination rather than per visible list item.",
+        "EffectiveConcurrency": "One move at a time; database reads and data-only restore steps are awaited serially. Residency leases coalesce ownership but do not coalesce backing reads.",
+        "CacheBehavior": "Cold state requires catalog loading. A recorded positive backing enables the existing data-only path, but the positive probe is not retained for the safety check, so a second full snapshot occurs.",
+        "MechanismConfidence": "High: tests establish this remains the data-only path, while production code shows both new probes surrounding it.",
+        "MagnitudeUncertainty": "The fixed database-call increase is certain; prevalence of large cold single-chat catalogs and measured SQLite duration is not known.",
+        "Verdict": "Same reported issue; the full restore is avoided as intended, but the positive result still causes a redundant second collection-wide probe."
+      },
+      {
+        "Scenario": "Move a cold old/legacy or normalized session with no recorded backing",
+        "CriticalPath": "The initial probe reports no backing, so restore proceeds in full. Agent restoration/materialization resumes or derives the conversation and persists provider data; the safety probe verifies persistence before destination loading and commit.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_readDefaultChatBackingProviderData",
+            "Operation": "Read normalized catalog/provider detail or legacy per-session metadata to detect missing backing",
+            "Cardinality": "One initial probe and one post-restore safety probe; legacy authority may open the chat and session databases",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No backing-specific preflight or safety read occurred.",
+            "CriticalPathEffect": "Selects restore mode and later gates the move"
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_restoreForMove / `_restoreSessionState`",
+            "Operation": "Fully restore the agent session and call `materializeChat`, potentially resuming the provider SDK conversation/history",
+            "Cardinality": "Once for a cold missing-backing source; no fan-out per chat",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A normalized cold source was loaded data-only and the agent did not see/materialize it.",
+            "CriticalPathEffect": "The move waits for full agent recovery"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_readDefaultChatBackingProviderData and `_persistDefaultChatBacking`",
+            "Operation": "Open legacy chat/session databases to read or persist backing metadata",
+            "Cardinality": "Bounded to the selected source and fallback metadata locations",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old move path did not probe these backing metadata locations specifically.",
+            "CriticalPathEffect": "Awaited as part of recovery and verification"
+          }
+        ],
+        "ScalingInput": "One selected source session; cost scales with its persisted history/provider resume cost and, for catalog probes, its chat rows. PR evidence estimates this path for roughly 15% of sessions in the reporter's database.",
+        "EffectiveConcurrency": "The move is globally serialized. Full restore and agent materialization are awaited; residency leases release the session after the move. No concurrency burst is introduced.",
+        "CacheBehavior": "A missing backing is a distinct negative state and intentionally triggers full restoration. Successful recovery is persisted, so future moves can use data-only restore; the safety re-read is necessary for this negative-to-positive transition.",
+        "MechanismConfidence": "High that the full restore is newly selected and awaited; provider-specific duration is uncertain.",
+        "MagnitudeUncertainty": "Provider resume/history duration varies by agent and history size; the exact share of affected users outside the supplied sample is unknown.",
+        "Verdict": "No separate finding: this expensive eager restore is the intentional, bounded correctness mechanism for sessions missing durable backing, and the post-restore verification is necessary on this branch."
+      },
+      {
+        "Scenario": "Agent invokes `move_session` for its current session, which is pre-checked and scheduled for application after the turn",
+        "CriticalPath": "Tool execution awaits `_checkServerToolMove`; later scheduled application awaits `_applyServerToolMove`. Each phase calls `_movedSessionChat` and `_checkChatMoveRequest`, so the new pair of backing probes runs in both phases.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_checkServerToolMove and `_applyServerToolMove` through lines 7842 and 8079",
+            "Operation": "Run the two new backing probes during tool pre-check and repeat both during scheduled apply",
+            "Cardinality": "Four complete source snapshot reads plus four provider-detail reads per successful self move",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Pre-check and apply still repeated validation, but neither phase performed backing-specific source snapshots.",
+            "CriticalPathEffect": "Two probes delay tool scheduling; two more delay actual application"
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/shared/sessionMoveTools.ts:433",
+            "Operation": "Invoke the in-process server-tool accessor and defer the actual move until the active turn completes",
+            "Cardinality": "One pre-check and one scheduled apply per self move",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two-phase ordering existed without the backing probes.",
+            "CriticalPathEffect": "Defines the two phases where the added database work repeats"
+          }
+        ],
+        "ScalingInput": "Four source catalog reconstructions per checked-and-applied self move, each scaling with private descendants. The process-wide tool guard allows up to 50 successful moved sessions.",
+        "EffectiveConcurrency": "Pre-check and apply are ordered rather than concurrent; actual moves use the global move sequencer. Aggregate database work is serialized through the shared transaction queue.",
+        "CacheBehavior": "No positive backing result survives from pre-check to scheduled apply, and no result is reused even within either phase. Persisted positive provider data therefore still incurs all four probes.",
+        "MechanismConfidence": "High: tool code explicitly checks before scheduling, and both check/apply call the same changed move helpers.",
+        "MagnitudeUncertainty": "Frequency of self-moves and typical descendant counts are unknown, but exact four-probe multiplicity is established.",
+        "Verdict": "Strengthens the reported repeated-work finding because the changed full-catalog probe is duplicated across both intentional validation phases."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files. One medium-severity repeated-work regression was reported: backing validation rebuilds the complete source catalog twice per UI move and four times for a checked-and-applied self tool move. The intentional full restore for cold sessions missing backing was evaluated separately and not reported because it is bounded, persisted, and necessary for the fix. Test-only provider-data changes introduce no production performance path."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-29T14:18:07.038348388Z",
+    "CompletedAt": "2026-10-29T14:20:17.886634859Z",
+    "WallClockMilliseconds": 130848,
+    "ModelCalls": 11,
+    "InputTokens": 504190,
+    "OutputTokens": 8986,
+    "TotalTokens": 513176,
+    "ReasoningTokens": 3318,
+    "CacheReadTokens": 424368,
+    "CacheWriteTokens": 79789,
+    "APIDurationMilliseconds": 109525,
+    "ToolCalls": 58,
+    "NanoAIUnits": 74854420000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 424368,
+      "cache_write": 79789,
+      "input": 33,
+      "output": 8986
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
