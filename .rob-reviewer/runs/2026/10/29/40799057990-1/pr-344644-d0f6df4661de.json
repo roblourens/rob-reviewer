@@ -1,0 +1,184 @@
+{
+  "PullRequest": {
+    "Number": 344644,
+    "Title": "workspace: Use canonical URIs for virtual workspace trust",
+    "Body": "## Summary\nUse repository-provided canonical URIs when evaluating Workspace Trust for virtual workspaces.\n\n- Resolve virtual workspace identities through the existing canonical URI provider API.\n- Retain resolved sources during provider restarts and refresh them when providers register again.\n- Add a source-lookup timeout, a **Retry Source Check** action, and improved completion/error handling for trust requests.\n- Honor declared Workspace Trust support for browser-only extensions.\n\n## Compatibility\n- PR workspaces use their source repository’s trust identity. Providers without PR source metadata leave those workspaces in Restricted Mode.\n- Enterprise identities include the server address; older approvals without that information need to be renewed.\n- Browser-only extensions without declared support remain unavailable in Restricted Mode, subject to existing overrides.\n- Requires the accompanying Remote Repositories update.\n\n## Validation\n- 117 focused Node tests passed.\n- 170 Chromium tests passed.\n- Scoped type-check, changed-file lint, and whitespace checks passed after merging main and retaining native-scroll coverage.\n- Live vscode.dev verification remains pending.\n\nCompanion PR: [microsoft/vscode-remotehub#916](https://github.com/microsoft/vscode-remotehub/pull/916)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344644",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "osortega",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6f3c6ed636430127221e842a3bcb11aa59259071",
+    "HeadRef": "agents/fork-pr-workspace-trust",
+    "HeadSHA": "d0f6df4661de91adea7196a5a51477c9df021ce2",
+    "CreatedAt": "2026-10-27T21:43:28Z",
+    "UpdatedAt": "2026-10-29T01:11:46Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cache-lifecycle",
+      "missing-coalescing",
+      "concurrency-burst",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open a virtual pull-request workspace and initialize Workspace Trust",
+        "CriticalPath": "Initial Workspace Trust resolution completes before extension hosts start. Because the extension-provided canonical URI provider is not registered yet in production startup ordering, the initial service lookup returns undefined without IPC and the workbench proceeds in Restricted Mode. After the provider registers, source re-resolution is off the original workspaceTrustInitialized critical path, though trust-dependent extension readiness waits for that late transition.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/workspaces/common/workspaceTrust.ts:getCanonicalUri and src/vs/workbench/api/browser/mainThreadWorkspace.ts:$registerCanonicalUriProvider",
+            "Operation": "Main thread invokes the extension-host canonical URI provider through $provideCanonicalUri.",
+            "Cardinality": "Normally one call for the encoded workspace URI after provider registration; plus one per distinct explicit startup file/folder. Promise.all permits those calls concurrently.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Encoded vscode-vfs authorities were stripped synchronously, with no extension-host IPC and immediate inheritance of the base repository identity.",
+            "CriticalPathEffect": "Not on the initial production workspaceTrustInitialized path because the provider is extension-host supplied and registers later. It is on the late trust-resolution path and gates enabling extensions that require trust."
+          }
+        ],
+        "ScalingInput": "Current virtual workspace folders, saved workspace configuration, and explicitly supplied startup files. Effective cardinality is one canonical lookup per distinct encoded vscode-vfs URI; ordinary single-folder PR startup is one workspace URI, with a small additional count for explicit diff/merge/open arguments.",
+        "EffectiveConcurrency": "Files and workspace folders are resolved with Promise.all within one update. Workspace-wide updates are globally serialized by the new Sequencer, so provider registrations do not overlap trust transitions.",
+        "CacheBehavior": "Cold encoded virtual URIs call the provider; exact repeated URIs use _resolvedVirtualUris. A missing provider returns immediately and remains retryable. Failed or timed-out lookups are not negative-cached, but automatic retries are limited to explicit trust checks, retry actions, workspace changes, or provider registration.",
+        "MechanismConfidence": "High confidence in the changed IPC path, startup ordering, exact cache, and sequenced concurrency; low confidence that realistic cardinality or provider cost creates a performance regression.",
+        "MagnitudeUncertainty": "The companion provider implementation is outside this repository, so whether a provider IPC performs network work and its duration cannot be established from the supplied change. Explicit startup-file cardinality can vary but is ordinarily small.",
+        "Verdict": "No finding. The new boundary is required to establish the correct source identity, is off initial workbench startup in normal ordering, and has bounded effective cardinality for the touched workflow."
+      },
+      {
+        "Scenario": "Check or mutate trust for virtual resources, including opening files and extension API trust checks",
+        "CriticalPath": "getUriTrustInfo awaits canonical provider resolution before returning trust. Trust mutations additionally await canonicalization before storage and workspace trust transition. Warm exact-URI lookups avoid the provider.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/workspaces/common/workspaceTrust.ts:getCanonicalUri",
+            "Operation": "Resolve each cold encoded virtual resource through the extension-host canonical URI provider.",
+            "Cardinality": "One IPC per distinct cold encoded URI in a request; exact warm hits perform zero IPC. Batch cardinality follows deduplicated resources/folders.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Trust lookup normalized the encoded authority locally and performed no provider IPC.",
+            "CriticalPathEffect": "Blocks trust lookup, resource-open validation, or trust persistence for that request, up to the explicit 30-second timeout."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/services/workspaces/common/workspaceTrust.ts:saveTrustInfo",
+            "Operation": "Serialize and store the trusted URI list after successful canonicalization.",
+            "Cardinality": "One storage write per mutation that changes trust, unchanged from before the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same trust-state serialization and storage write occurred for changed approvals.",
+            "CriticalPathEffect": "Occurs after the newly introduced canonical checks but is pre-existing and still blocks completion of a trust mutation."
+          }
+        ],
+        "ScalingInput": "Distinct encoded vscode-vfs resource paths supplied by callers. Batch callers use the number of deduplicated folders/files in their request; repeated checks of the exact URI are cached.",
+        "EffectiveConcurrency": "Batch callers and setUrisTrust use Promise.all, so unique cold resources fan out concurrently without a shared limiter. Workspace transition updates remain serialized.",
+        "CacheBehavior": "Successful exact URI mappings live for the service lifetime or until provider replacement. Query and fragment are removed from keys. Failures remain marked unresolved and retry on later checks. The maps are not explicitly size-bounded, but inspected production callers primarily check workspace/repository/folder identities, and the diff does not establish realistic unbounded file-level growth large enough for a high-confidence regression finding.",
+        "MechanismConfidence": "High confidence in per-cold-URI IPC and lifetime cache mechanics; insufficient evidence of a realistic high-cardinality trigger or material impact.",
+        "MagnitudeUncertainty": "Extensions can call isResourceTrusted on arbitrary URIs, but repository evidence does not show a hot built-in path generating a large number of unique encoded vscode-vfs file keys. The external provider's internal cache and network behavior are unknown.",
+        "Verdict": "No finding. The per-resource work is semantically necessary, exact repeats are cached, and available callers do not prove harmful fan-out or retained-state growth."
+      },
+      {
+        "Scenario": "Canonical URI provider registration, replacement, or extension-host restart",
+        "CriticalPath": "Registration synchronously invalidates resolved entries and schedules a workspace trust refresh. The refresh awaits current workspace canonicalization before publishing trust changes; provider-triggered refreshes queue behind any in-flight update.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/workspaces/common/workspaceTrust.ts:registerListeners",
+            "Operation": "Re-resolve current virtual workspace identities against the newly registered extension-host provider.",
+            "Cardinality": "One call per distinct current encoded workspace/startup URI per registration, with at most two bounded attempts if the provider changes during resolution.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Provider registration did not affect Workspace Trust and caused no trust refresh IPC.",
+            "CriticalPathEffect": "Blocks the provider-triggered trust refresh but not the already-completed initial workbench trust initialization."
+          }
+        ],
+        "ScalingInput": "Number of cached resolved virtual URI keys plus current workspace/startup URIs. Provider registration is typically once per extension-host lifetime.",
+        "EffectiveConcurrency": "Synchronous cache invalidation is single-threaded. All refreshes are serialized by _workspaceTrustUpdateSequencer; canonical lookups inside each refresh run concurrently per URI.",
+        "CacheBehavior": "On registration, resolved entries are moved to unresolved and the resolved map is cleared. Current workspace entries are refreshed and become resolved again. Provider disposal alone preserves the last verified mappings. Historical unresolved entries can remain, but provider replacement is infrequent and no realistic large retained key population was established.",
+        "MechanismConfidence": "High confidence in invalidation, serialization, and bounded retry behavior; low confidence of material cost at realistic registration frequency.",
+        "MagnitudeUncertainty": "Extension-host restart frequency and the number of prior virtual trust lookups vary. No evidence shows repeated registration on a hot path or a large cache in ordinary PR workspaces.",
+        "Verdict": "No finding. Registration-triggered work is infrequent, serialized, and bounded to current resources after invalidation."
+      },
+      {
+        "Scenario": "Use the Workspace Trust editor to retry source verification or edit trusted URIs",
+        "CriticalPath": "Retry and trust-list edits await canonical verification before UI completion. The clicked action is disabled while awaiting the request, and render is debounced.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/workspaces/common/workspaceTrust.ts:resolveWorkspaceTrust/setTrustedUris",
+            "Operation": "Canonicalize unresolved workspace or newly added encoded virtual trust entries through the extension host.",
+            "Cardinality": "One call per unresolved current workspace URI on retry, or per newly introduced encoded trust entry; unchanged stored entries perform zero calls.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Retry did not exist and trust-list edits used local authority normalization without provider IPC.",
+            "CriticalPathEffect": "Directly gates action completion, with the button disabled during the await."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/services/workspaces/common/workspaceTrust.ts:setTrustedUris/saveTrustInfo",
+            "Operation": "Persist the updated trusted URI list.",
+            "Cardinality": "One storage write for a successful changed list, as before.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Trust-list edits already serialized and stored the resulting approvals.",
+            "CriticalPathEffect": "Blocks completion of a successful edit after source verification."
+          }
+        ],
+        "ScalingInput": "Current workspace URI count for retry, or number of trusted URI entries submitted by the editor. Typical lists are small; unchanged approvals bypass provider resolution.",
+        "EffectiveConcurrency": "A single action button prevents duplicate clicks while pending. New URIs are canonicalized concurrently, while workspace updates are sequenced.",
+        "CacheBehavior": "Retry reuses successful mappings and re-attempts unresolved mappings. Trust-list replacement recognizes unchanged stored identities and avoids provider calls for them.",
+        "MechanismConfidence": "High confidence in the action critical path and bounded call count.",
+        "MagnitudeUncertainty": "Provider latency is unknown because implementation is external, but user actions are low-frequency and duplicate clicks are suppressed.",
+        "Verdict": "No finding. Added latency is bounded, required for verification, and duplicate UI-triggered work is suppressed."
+      },
+      {
+        "Scenario": "Evaluate browser-only extension enablement in Restricted Mode",
+        "CriticalPath": "Extension manifest enablement checks run during extension filtering; late transition from untrusted to trusted recomputes enablement states and notifies changed extensions.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Installed extension count. The changed manifest predicate is constant work per extension.",
+        "EffectiveConcurrency": "Enablement-state recomputation is synchronous over the installed extension collection. No new subprocess, IPC, filesystem, database, or network boundary is introduced by the predicate change.",
+        "CacheBehavior": "No cache behavior changes in this path.",
+        "MechanismConfidence": "High confidence that the manifest change does not introduce a material performance mechanism.",
+        "MagnitudeUncertainty": "The number of browser-only extensions whose state changes varies, but the changed predicate itself adds only constant field checks.",
+        "Verdict": "No finding. The change is O(1) per extension and does not add an expensive boundary."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 19 changed files and relevant callers. Investigated provider IPC fan-out, startup/extension ordering, lifetime URI caches, retry sequencing, editor rendering, trust persistence, and browser-extension filtering. No high-confidence actionable performance regression met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-29T01:21:27.114580707Z",
+    "CompletedAt": "2026-10-29T01:24:24.032244481Z",
+    "WallClockMilliseconds": 176917,
+    "ModelCalls": 11,
+    "InputTokens": 683497,
+    "OutputTokens": 10426,
+    "TotalTokens": 693923,
+    "ReasoningTokens": 5118,
+    "CacheReadTokens": 585216,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 159040,
+    "ToolCalls": 67,
+    "NanoAIUnits": 83573040000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 585216,
+      "cache_write": 0,
+      "input": 98281,
+      "output": 10426
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

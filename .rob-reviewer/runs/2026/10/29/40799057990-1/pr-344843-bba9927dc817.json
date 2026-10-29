@@ -1,0 +1,145 @@
+{
+  "PullRequest": {
+    "Number": 344843,
+    "Title": "Agent host BYOK: report real prompt cache usage instead of fabricated zero",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Problem\n\nThe agent host's BYOK proxy turns renderer LM API results into OpenAI Responses payloads for the Copilot runtime. It always set `usage.input_tokens_details.cached_tokens` to `0`. The runtime treats a non-null `cached_tokens` as provider-reported cache details, so every BYOK call was recorded as a confirmed cache miss. In telemetry, about 99.9% of VS Code agent-host BYOK calls show zero cache reads and writes, which inflates VS Code's no-cache-hit rate.\n\n## Changes\n\n- `IByokLmChatResult.usage` (`agentHostByokLm.ts`): adds optional `cacheReadTokens` and `cacheWriteTokens`.\n- `AgentHostByokLmHandler` (renderer): `_decodeUsage` now also reads `prompt_tokens_details.cached_tokens` and `prompt_tokens_details.cache_creation_input_tokens` from the LM API `usage` data part. The Copilot extension already emits these fields, so no API change is needed.\n- `byokResponsesTranslation.ts`: drops the hard-coded `cached_tokens: 0`. `input_tokens_details` is only emitted when the provider reported cache data, and then contains `cached_tokens` and/or `cache_write_tokens`. When it is absent, the runtime records cache details as \"not reported\" instead of a miss. Streamed SSE and non-streamed bodies share the same code path.\n\n## Testing\n\n- `npx mocha test/unit/node/index.js --delay --ui=tdd --exit --run src/vs/platform/agentHost/test/node/byokResponsesTranslation.test.ts --run src/vs/platform/agentHost/test/node/byokLmProxyService.test.ts`: passed (43 tests). This includes a new test for cache read 0, read+write, write only, and no usage.\n- `scripts\\test.bat --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts`: passed (15 tests). The usage-decoding test now covers the cache fields.\n- `eslint` on the changed files: passed.\n- `npm run typecheck-client`: no errors in the changed files. The run did report errors elsewhere, all from Electron typings that were missing locally because dependencies were installed with `--ignore-scripts`. Native module builds fail on this machine because Visual Studio's Spectre-mitigated libraries are not installed.\n\n## Follow-up (not in this PR)\n\nSome code in `extensions/copilot` still turns a missing value into `0` (`responsesApi.ts`, `anthropicProvider.ts`, `geminiNativeProvider.ts`, and the `extChatEndpoint.ts` fallback). For those providers, \"not reported\" can still reach the runtime as an explicit `0`.",
+    "URL": "https://github.com/microsoft/vscode/pull/344843",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "jbayardo",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "a06ee7abd434f965049eac20895cf16a8c1fffd5",
+    "HeadRef": "jbayardo-fix-byok-cache-usage",
+    "HeadSHA": "bba9927dc817ff6a3f2264036e6b120b5c5a4aa1",
+    "CreatedAt": "2026-10-28T20:50:56Z",
+    "UpdatedAt": "2026-10-28T22:15:20Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Agent-host BYOK chat completion returned through the non-streaming Responses endpoint",
+        "CriticalPath": "A loopback HTTP request is translated, one renderer IPC chat RPC awaits the existing LM API completion, the renderer parses the existing terminal usage data part once, then the node proxy serializes one JSON response. The changed cache-field extraction and two optional numeric properties are on this terminal critical path but are constant-size work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts:_handleResponsesRequest around lines 302-335",
+            "Operation": "Receive one loopback OpenAI Responses HTTP request and write one JSON response.",
+            "Cardinality": "One request and one response per BYOK turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same loopback request/response occurred, with input_tokens_details always containing cached_tokens: 0.",
+            "CriticalPathEffect": "The HTTP response waits for the renderer chat RPC and final serialization as before; the diff changes only constant-size response metadata."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/common/agentHostClientByokLmChannel.ts:createAgentHostClientByokLmConnection",
+            "Operation": "Send the translated chat request to the renderer and return the buffered IByokLmChatResult.",
+            "Cardinality": "Exactly one IPC call and one result per HTTP request; the result gains zero, one, or two numeric fields.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same result crossed IPC without cacheReadTokens/cacheWriteTokens.",
+            "CriticalPathEffect": "The IPC round trip remains mandatory before the HTTP response; no call or round trip is added."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts:chat",
+            "Operation": "Invoke the selected extension-registered language model through ILanguageModelsService and consume its response stream.",
+            "Cardinality": "One model request per BYOK turn and one parse of the terminal usage data part in the normal provider response.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same model request and usage JSON parse occurred; prompt_tokens_details was ignored.",
+            "CriticalPathEffect": "Provider completion dominates the path; the diff performs constant-time property reads after the already-existing JSON parse and adds no provider call."
+          }
+        ],
+        "ScalingInput": "One usage object per completed BYOK request, independent of prompt length, output chunk count, output item count, and cache-token count; effective added cardinality is at most two numeric fields per completion.",
+        "EffectiveConcurrency": "The proxy continues to await one connection.chat call per HTTP request; concurrent HTTP requests remain independently concurrent. The diff adds no queue, limiter, burst, or additional asynchronous operation.",
+        "CacheBehavior": "There is no local cache or changed cache lifecycle. Cold and warm provider prompt-cache outcomes use the same single usage decode; provider-reported cache values only alter two optional serialized numbers, and missing details omit the object.",
+        "MechanismConfidence": "High: changed lines and callers show one terminal usage decode and one prepareResponse invocation per response branch, with no data-dependent loop introduced.",
+        "MagnitudeUncertainty": "Exact BYOK request volume and provider support for cache details vary, but added bytes and CPU are strictly bounded to two property reads and two optional numeric fields per completed request.",
+        "Verdict": "No reportable regression: constant-size metadata work is negligible relative to the pre-existing model, IPC, and HTTP boundaries, and does not change boundary cardinality or concurrency."
+      },
+      {
+        "Scenario": "Agent-host BYOK completion emitted as synthesized SSE Responses events",
+        "CriticalPath": "The same single model request and renderer IPC completion must finish before the proxy synthesizes existing SSE frames. prepareResponse runs once, and the changed optional cache details appear only in the final response.completed envelope.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts:_handleResponsesRequest around lines 323-332",
+            "Operation": "Write synthesized server-sent events to the loopback HTTP client.",
+            "Cardinality": "Existing frame count is based on output structure; the diff adds no frame and only a constant-size field set to the final completed frame.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same frames were written, with the final completed envelope always reporting cached_tokens: 0.",
+            "CriticalPathEffect": "All frames are produced after the buffered model/IPC result as before; changed metadata has only bounded serialization cost."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/common/agentHostClientByokLmChannel.ts:createAgentHostClientByokLmConnection",
+            "Operation": "Return the buffered LM completion from renderer to agent host before SSE synthesis.",
+            "Cardinality": "One IPC round trip per streaming HTTP request, despite multiple synthesized SSE frames.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same buffered completion crossed IPC without cache-detail numbers.",
+            "CriticalPathEffect": "Mandatory pre-existing completion boundary; the diff adds at most two numeric properties to its result payload."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts:chat",
+            "Operation": "Execute one provider-backed LM request through ILanguageModelsService.",
+            "Cardinality": "One model request and one terminal usage-part decode per BYOK turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider request and usage parse occurred, while cache detail properties were not read.",
+            "CriticalPathEffect": "The existing provider request and full stream consumption remain the dominant prerequisite for synthesized SSE; no boundary is added or moved."
+          }
+        ],
+        "ScalingInput": "Existing SSE frame count scales with output items and content/reasoning parts, but the diff's added work remains one usage decode and one constant-size details object per completed request rather than per frame or token.",
+        "EffectiveConcurrency": "Frames are synchronously written in the existing per-response loop after one awaited renderer RPC. The diff neither increases frame count nor changes cross-request concurrency/backpressure behavior.",
+        "CacheBehavior": "No application cache is read or populated. Provider cache-hit/cache-write values only change terminal metadata; cold, warm, absent, and explicit-zero states all retain one decode and one completed event.",
+        "MechanismConfidence": "High: bridgeResultToResponsesSseFrames calls prepareResponse exactly once and embeds its completed envelope once, so the changed details do not multiply across frames.",
+        "MagnitudeUncertainty": "Output sizes and frame counts vary, but those pre-existing scaling costs are unchanged; the new metadata remains constant-size.",
+        "Verdict": "No reportable regression: the final-event payload grows by only a bounded pair of numbers when supplied, without added frames, calls, repeated parsing, or retained state."
+      }
+    ],
+    "Summary": "Reviewed all five changed files and both response branches. The PR changes usage metadata only: it reads two properties from an already-parsed terminal usage object, carries at most two numbers across the existing IPC result, and conditionally serializes them once. No actionable performance regression or qualifying regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-29T01:17:21.135279312Z",
+    "CompletedAt": "2026-10-29T01:18:27.800990282Z",
+    "WallClockMilliseconds": 66665,
+    "ModelCalls": 6,
+    "InputTokens": 112058,
+    "OutputTokens": 3236,
+    "TotalTokens": 115294,
+    "ReasoningTokens": 580,
+    "CacheReadTokens": 79360,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 47417,
+    "ToolCalls": 25,
+    "NanoAIUnits": 22725600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 79360,
+      "cache_write": 0,
+      "input": 32698,
+      "output": 3236
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
