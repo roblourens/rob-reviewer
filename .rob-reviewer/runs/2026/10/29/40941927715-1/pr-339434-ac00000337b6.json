@@ -1,0 +1,169 @@
+{
+  "PullRequest": {
+    "Number": 339434,
+    "Title": "base: avoid Base64 encoding string-chain amplification",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nEncodes into one sized byte buffer instead of building a chain of tiny strings. For the same **4 MiB input**, output is byte-for-byte identical with much less blocking and retained memory.\r\n\r\n| Measured operation | Before | After |\r\n|---|---:|---:|\r\n| Encoding time | 254.2 ms | 13.6 ms |\r\n| Memory while output lives | 106.67 MiB | 5.33 MiB |\r\n\r\n![Recorded before and after measurements for Base64 - less memory and renderer blocking](https://raw.githubusercontent.com/karthiknadig/vscode/8a50bfd61d53df3579025ef6b9f0e58ab1fbbd95/brief-performance-proof/base64-proof.png)\r\n\r\n**Proof scope:** Memory includes heap plus backing storage. Encoder probe, not a full plugin-sync test. 44 codec tests passed in each of Node and Electron; 37 RPC/resource-transfer tests passed.\r\n\r\nTiny inputs can be slower because of allocation overhead. The table measures storage with the output alive after GC, **not peak or temporary allocation**. [Independent renderer/RPC measurements](https://github.com/microsoft/vscode/pull/339434#issuecomment-6003860282) confirm the large-buffer improvement and these limits.\r\n\r\n\u003cdetails\u003e\r\n\u003csummary\u003eReproduction clips (startup removed), implementation, and full validation commands\u003c/summary\u003e\r\n\r\nThe clips below are brief measured-result excerpts. The comparison above is the primary performance proof; clip duration is not a benchmark.\r\n\r\nAddresses the encoder memory-amplification path in #334892.\r\n\r\n## Root cause\r\n\r\n`encodeBase64` concatenates four individual characters for every three input bytes. The resulting string chain can retain far more memory than the encoded payload and blocks the renderer synchronously. The Agent Host client's reverse `resourceRead` path invokes this helper on complete resource contents, including plugin binaries.\r\n\r\nIn a bounded renderer reproduction, a **4 MiB** input produced a **5.33 MiB** Base64 result but retained **106.7 MiB** while that result was alive, even after garbage collection.\r\n\r\n## Change\r\n\r\nWrite the same Base64 ASCII characters into one exact-size `VSBuffer`, then convert it to a string once. The public signature and output remain unchanged:\r\n\r\n- Standard and URL-safe alphabets.\r\n- Padded and unpadded output.\r\n- Empty input and all input-length remainders.\r\n- Buffer views with nonzero offsets, without encoding surrounding bytes.\r\n\r\nThis uses existing portable buffer/string primitives, not `Uint8Array.toBase64`, which is available in the tested renderer but absent in the supported Node 24.20 runtime. No protocol, permission, plugin-discovery, or enablement behavior changes.\r\n\r\n## Before / after evidence\r\n\r\nSame scenario, actual production encoder, synthetic buffers capped at 4 MiB. One warm-up followed by five measured samples per size. Every result is checked byte-for-byte against the renderer's native encoder.\r\n\r\nWindows 11 x64, AMD EPYC 7763 (32 logical processors), 128 GiB RAM, Code OSS 1.141.0 Dev. Benchmark runs were sequential, without concurrent builds.\r\n\r\n| 4 MiB input | Before | After |\r\n|---|---:|---:|\r\n| Median encode time | 254.2 ms | 13.6 ms |\r\n| Worst encode time | 318.4 ms | 21.9 ms |\r\n| Retained memory, output alive after GC | 106.7 MiB | 5.33 MiB |\r\n| Encoded characters | 5,592,408 | 5,592,408 |\r\n| Matches native output | Yes | Yes |\r\n\r\nApproximately **19x faster** and **95% less retained memory** for this case. The unchanged scenario fails the memory budget before the fix and passes **3/3** after it; after-run medians were 13.7, 13.4, and 13.6 ms.\r\n\r\nMemory includes **both JavaScript heap and CDP-reported backing storage**. The fixed `TextDecoder` result is externally backed in Chromium, so counting only JS heap would incorrectly report nearly zero memory. These are retained-result measurements, not whole-process RSS or peak memory.\r\n\r\n### Independent validation\r\n\r\n[dmitrivMS independently tested this PR](https://github.com/microsoft/vscode/pull/339434#issuecomment-6003860282) on main `bd64649b` with only this PR's delta, using Electron 43.7.7. Their 4 MiB renderer results were 249.4 ms versus 13.5 ms and 106.67 MiB versus 5.33 MiB of combined output-alive storage. A real reverse `resourceRead` RPC also preserved exact decoded bytes and permission/error behavior. Those are separate measurements, not replacements for the runs above.\r\n\r\nThe independent run observed **10.67 MiB of backing storage immediately after encoding**, consistent with the temporary ASCII buffer and resulting string; after GC with the output alive, 5.33 MiB remained. This is an aggregate sample, not a continuously measured peak. The full plugin-sync workflow, original large-file crash, and concurrent large transfers remain unverified.\r\n\r\n### Before\r\n\r\n![Before: a 4 MiB input retains 106.7 MiB and blocks for 254.2 ms - measured-result excerpt, startup removed](https://raw.githubusercontent.com/karthiknadig/vscode/8a50bfd61d53df3579025ef6b9f0e58ab1fbbd95/brief-performance-proof/base64-before-short.gif)\r\n\r\n### After\r\n\r\n![After: the same input retains only its 5.33 MiB output and encodes in about 14 ms - measured-result excerpt, startup removed](https://raw.githubusercontent.com/karthiknadig/vscode/8a50bfd61d53df3579025ef6b9f0e58ab1fbbd95/brief-performance-proof/base64-after-short.gif)\r\n\r\nThe recordings contain clearly labeled test instrumentation, not a simulated plugin-sync UI. The after GIF records the first successful run; the table uses the saved final after-run data.\r\n\r\n[Scenario](https://github.com/karthiknadig/vscode/blob/5275e62deff89293f8a453431f4a2249295744d7/base64-334892/base64.scenario.cjs) · [Before raw measurements](https://github.com/karthiknadig/vscode/blob/5275e62deff89293f8a453431f4a2249295744d7/base64-334892/base64-before-results.json) · [After raw measurements](https://github.com/karthiknadig/vscode/blob/5275e62deff89293f8a453431f4a2249295744d7/base64-334892/base64-after-results.json)\r\n\r\nBaseline: `dcb81648f8a8f1863d2577f8fec98e805e5f95a0`. Fixed: `7741eed6c238c3ef6829e4c8ca9f92fa736267af`, based on `51860071a3853d3d08c0e5be743ce5dad0825a0d`. The encoder and original codec tests are unchanged between the baseline and the fix's parent.\r\n\r\n## Validation\r\n\r\n```powershell\r\nnpm run compile-client\r\n# PASSED: zero compilation/type errors.\r\n\r\n.\\scripts\\test.bat --run src\\vs\\base\\test\\common\\buffer.test.ts --reporter dot\r\n# PASSED: 44 tests in Electron/browser.\r\n\r\nnpm run test-node -- --run src\\vs\\base\\test\\common\\buffer.test.ts --reporter dot\r\n# PASSED: 44 tests in Node, including the Buffer-backed path.\r\n\r\ncmd.exe /d /s /c '.\\scripts\\test.bat --run src\\vs\\workbench\\services\\extensions\\test\\common\\rpcProtocol.test.ts --run src\\vs\\platform\\agentHost\\test\\electron-browser\\agentHostProtocolClient.test.ts --grep \"RPCProtocol|resourceRead|resourceWrite|reverse\" --reporter dot'\r\n# PASSED: 37 RPC and Agent Host resource-transfer compatibility tests.\r\n\r\nnpm run eslint -- src\\vs\\base\\common\\buffer.ts src\\vs\\base\\test\\common\\buffer.test.ts\r\n# PASSED: both changed files.\r\n\r\ngit diff origin/main --check\r\n# PASSED.\r\n```\r\n\r\nExact performance commands (with local path aliases for readability):\r\n\r\n```powershell\r\n$runner = 'C:\\Users\\kanadig\\.copilot\\skills\\bug-swarm\\scripts\\run-scenario.mjs'\r\n$evidence = 'C:\\Users\\kanadig\\.copilot\\session-state\\5be74984-e914-4843-8a16-9065f861cc4a\\files\\perf-hunt-round2'\r\n$scenario = \"$evidence\\base64.scenario.cjs\"\r\n\r\n$env:BASE64_RESULTS_FILE = 'base64-before-results.json'\r\nnode $runner --scenario $scenario --checkout 'Q:\\GIT\\vscode' --isolation perf-5be-b64-before --gif \"$evidence\\base64-before.gif\"\r\n# EXPECTED FAILURE: 106.7 MiB retained for a 5.33 MiB result.\r\n\r\n$env:BASE64_RESULTS_FILE = 'base64-after-results.json'\r\nnode $runner --scenario $scenario --checkout 'Q:\\GIT\\vscode.worktrees\\perf-fixes-5be74984' --isolation perf-5be-b64-after --repeat 3 --gif \"$evidence\\base64-after.gif\"\r\n# PASSED 3/3: bounded retained memory and exact output.\r\n```\r\n\r\n### Scope and tradeoffs\r\n\r\n- The encoder temporarily allocates an output-sized byte buffer rather than millions of concatenated strings. Tiny inputs have measurable sub-microsecond overhead. The independent renderer probe measured 1 byte at 0.060 versus 0.335 microseconds and 64 bytes at 0.670 versus 0.975 microseconds. The crossover is runtime-dependent: the earlier Node probe improved at 64 bytes, while the renderer probe improved at 4 KiB. This is not a speedup at every input size.\r\n- This proves the reported encoder mechanism at bounded sizes; it does not recreate the original 4 GiB crash, copy a real large plugin, or guarantee unlimited-size transfers. Resource reads and transport serialization still materialize complete payloads.\r\n- The issue's separate plugin-disablement concern is not changed.\r\n- macOS/Linux UI runs and the full repository suite were not run locally.\r\n\r\n\u003c/details\u003e\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/339434",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e1eafb38b7179f09c61af3482d63dd2aac021784",
+    "HeadRef": "karthiknadig/fix-base64-memory",
+    "HeadSHA": "ac00000337b6f4b41b1a0af65ea27245eea48870",
+    "CreatedAt": "2026-10-02T23:48:57Z",
+    "UpdatedAt": "2026-10-29T15:23:49Z",
+    "MergedAt": null,
+    "Labels": [
+      "perf"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/base/common/buffer.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 434,
+      "BasePath": "src/vs/base/common/buffer.ts",
+      "BaseLine": 443,
+      "IntroducingPath": "src/vs/base/common/buffer.ts",
+      "IntroducingCommit": "29bde3176c7451e966797931aa8a1f7c3fce2983",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceCategory": "memory",
+      "Mechanism": "The old loop appended four individual character strings per three source bytes, producing millions of concatenations and a retained string chain for multi-megabyte resource payloads.",
+      "Symptom": "Large Base64 resource reads incurred excessive retained memory and synchronous encoding latency before their RPC response could be sent.",
+      "FixedBehavior": "The encoder now allocates one exact-size byte buffer, writes Base64 character codes directly, and converts to a string once, eliminating per-character string-chain construction.",
+      "Evidence": "Deleted base line 443 is one of four single-character appends performed for every three input bytes; the neighboring deleted loop therefore creates O(input bytes) string nodes. Added line 434 allocates one exact-size byte result which is filled in place and converted once. The synchronous encoder is called on complete filesystem results before resourceRead replies in src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:3254-3257, placing that work directly on large-file RPC latency.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "synchronous-ui-work",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Agent Host reverse resourceRead of binary files, including multi-megabyte plugin/resource payloads",
+        "CriticalPath": "Permission gating and one filesystem read must complete, then encodeBase64 runs synchronously over the complete result before sendResult can issue the RPC response. The changed encoding work is therefore on the response critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/agentHost/common/agentHostResourceService.ts:143",
+            "Operation": "Read the complete requested resource into a VSBuffer.",
+            "Cardinality": "One readFile per authorized resourceRead request, with a virtual-resource fallback only after read failure.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one filesystem read occurred before the diff.",
+            "CriticalPathEffect": "The read must complete before encoding and response delivery."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:3256",
+            "Operation": "Send the Base64 payload in the resourceRead JSON-RPC response.",
+            "Cardinality": "One response per resourceRead request after one full-buffer encoding.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same response and payload cardinality existed; only Base64 construction changed from per-character concatenation to one exact-sized byte buffer plus one conversion.",
+            "CriticalPathEffect": "Response serialization/delivery follows the synchronous encoder and cannot begin until it returns."
+          }
+        ],
+        "ScalingInput": "One full byte buffer per resourceRead request; encoding work and output bytes scale linearly with file size. A 4 MiB file produces about 5.33 MiB of Base64 output. There is no deduplication across repeated reads.",
+        "EffectiveConcurrency": "Each request performs its own synchronous encoding. The inspected path has no encoder cache or coalescing; incoming RPC concurrency can create multiple live results, but JavaScript encoding itself runs serially on the event loop.",
+        "CacheBehavior": "encodeBase64 has no cache. Warm filesystem/OS caches may shorten readFile, but do not change encoding cardinality or bytes. Repeated reads are re-encoded before and after the diff.",
+        "MechanismConfidence": "High: deleted lines append four one-character strings per three input bytes, while added lines allocate one exact-sized output and fill it in place. The complete-file call path is directly traced.",
+        "MagnitudeUncertainty": "Exact latency and retained-memory savings vary by runtime and payload size, and concurrent large transfers were not measured in repository evidence. The large-input scaling mechanism and critical-path placement are explicit.",
+        "Verdict": "No reportable regression. This scenario is improved by eliminating string-chain amplification; the concrete fixed regression was recorded with its introducing commit."
+      },
+      {
+        "Scenario": "Frequent Base64 encoding of streamed audio and chunked Agent Host transport data",
+        "CriticalPath": "Each PCM or transport chunk is synchronously Base64-encoded before it can be handed to the transcription client or delivery channel. Encoding remains on each chunk's send path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/speechToText/chatSpeechToTextService.ts:1616",
+            "Operation": "Send each encoded PCM chunk to the transcription backend.",
+            "Cardinality": "One send per 4096-sample capture callback while MAI transcription is active.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same per-callback network send and one encoding occurred; the old encoder constructed the result through per-character string appends.",
+            "CriticalPathEffect": "Synchronous Base64 encoding must finish before sendPttAudioChunk is invoked."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/common/agentHostTcpConnection.ts:228",
+            "Operation": "Deliver each Base64 TCP data chunk through the Agent Host delivery channel.",
+            "Cardinality": "ceil(write bytes / configured chunk bytes) deliveries per write, serialized and bounded by the existing queue limits.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same chunk splitting, encoding cardinality, delivery count, and serialization existed.",
+            "CriticalPathEffect": "Each chunk's encoding completes before its awaited delivery; writes remain serialized."
+          }
+        ],
+        "ScalingInput": "Speech capture uses 4096 samples per callback, producing multi-kilobyte PCM chunks; TCP writes split up to 4 MiB of queued data into configured chunks, and Web PubSub envelopes are bounded near 900 KiB. Cost scales with bytes and callback/chunk count.",
+        "EffectiveConcurrency": "Audio callbacks arrive sequentially on the renderer event loop. Agent Host TCP writes are serialized by _enqueue and bounded to 64 pending writes/4 MiB; the diff adds no parallelism or burst. Web PubSub chunk creation is synchronous.",
+        "CacheBehavior": "Chunks are unique and never cached; each is encoded once. Cold and warm behavior are equivalent except for runtime allocator/decoder initialization.",
+        "MechanismConfidence": "High: chunk sizes, queue bounds, and synchronous call sites are explicit; the diff does not alter boundary cardinality or concurrency.",
+        "MagnitudeUncertainty": "Runtime-specific crossover for very small inputs is uncertain, but these callers use multi-kilobyte or larger chunks rather than the tiny-input cases where an extra allocation could cost more.",
+        "Verdict": "No reportable regression. The exact-sized allocation removes repeated string construction for realistic streaming chunks without increasing sends or concurrency."
+      },
+      {
+        "Scenario": "Small metadata encodes such as WebSocket handshakes, credential key IDs, notebook schemes, and URI/session identifiers",
+        "CriticalPath": "Encoding is synchronous before constructing a header, URI, or metadata string; subsequent network or storage work may depend on it, but inputs are fixed-size or short and operations are low-frequency.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/remote/common/managedSocket.ts:17",
+            "Operation": "Use a 16-byte random nonce encoded into the WebSocket upgrade header.",
+            "Cardinality": "One Base64 encode and one network handshake per managed-socket connection.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same handshake and one encode occurred; the prior implementation avoided the temporary byte buffer but performed per-character string appends.",
+            "CriticalPathEffect": "The tiny synchronous encode precedes socket write, but is bounded to 24 output characters."
+          }
+        ],
+        "ScalingInput": "Typical inputs are 8-32 byte digests/nonces or short scheme/session strings. Work remains linear, with one temporary output buffer per call.",
+        "EffectiveConcurrency": "One encode per handshake or metadata construction; no changed queueing, fan-out, or parallelism was found.",
+        "CacheBehavior": "No encoder cache exists before or after. Inputs are generally unique; negative caching is not applicable.",
+        "MechanismConfidence": "High for the additional bounded allocation, but low that it could create meaningful product impact because input and call cardinality are tightly bounded.",
+        "MagnitudeUncertainty": "The exact sub-microsecond overhead on tiny inputs is runtime-dependent. There is no realistic multiplicity or measured user-visible impact in the inspected callers.",
+        "Verdict": "No finding. The tiny-input allocation tradeoff is real but does not establish an actionable user-visible performance regression on these low-cardinality paths."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and all diff pages. Traced large resource RPC, streaming/chunk transport, and small metadata scenarios, including filesystem/network/IPC boundaries, cache behavior, and effective concurrency. No diff-introduced performance issue met the reporting threshold; the PR's removal of Base64 string-chain amplification was recorded as a regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-29T19:43:21.990186539Z",
+    "CompletedAt": "2026-10-29T19:45:13.602234722Z",
+    "WallClockMilliseconds": 111612,
+    "ModelCalls": 9,
+    "InputTokens": 274919,
+    "OutputTokens": 6375,
+    "TotalTokens": 281294,
+    "ReasoningTokens": 2449,
+    "CacheReadTokens": 230640,
+    "CacheWriteTokens": 44252,
+    "APIDurationMilliseconds": 80692,
+    "ToolCalls": 34,
+    "NanoAIUnits": 44112400000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 230640,
+      "cache_write": 44252,
+      "input": 27,
+      "output": 6375
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

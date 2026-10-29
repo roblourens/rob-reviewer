@@ -1,0 +1,241 @@
+{
+  "PullRequest": {
+    "Number": 343139,
+    "Title": "Fix extension-host access to agent-host language models",
+    "Body": "**Summary**\n\nFixes #340176 \n\n-- Fixes failures when extension participants or tools access a selected agent-host model.\n-- Enables extensions to discover explicitly selected agent-host language models and call `LanguageModelChat.sendRequest()` on supported models.\n-- Resolves model metadata registered outside the extension host.\n-- Forwards extension requests to an exact matching Copilot or BYOK model.\n-- Preserves account-specific consent and refreshes authorization metadata before requests.\n-- Preserves supported model configuration and token-count message serialization.\n-- Adds regression coverage for discovery, forwarding, authorization, token counting, and configuration changes.\n\n**Scope and limitations**\n\n-- Forwarded extension requests run outside the agent-host session and use the target provider’s normal billing.\n-- Auto and models without an exact counterpart reject direct extension `sendRequest()` calls rather than silently selecting another model. Ordinary agent-host chat, including Auto, remains unaffected.\n\n**How to test**\n\n1. Build and launch this branch with GitHub Copilot enabled and signed in.\n2. Open agent-host chat and select an explicit supported model with an exact Copilot or BYOK counterpart, such as Claude Opus 5.5.\n3. Invoke an extension tool from that chat. Inspect `options.model` and confirm it matches the selected model.\n4. Call `options.model.sendRequest()` from the extension host. Confirm that the request succeeds using the matching model and that any required consent is requested.\n5. Verify that denied or revoked consent prevents requests.\n6. Verify that Auto and models without counterparts reject direct extension `sendRequest()` calls without falling back. Ordinary agent-host chat with Auto should remain unaffected.\n\n**Validation**\n\n• All 893 tests in the affected suites pass.\n• Source typechecking, changed-file ESLint, and whitespace checks pass.\n• Built and launched a portable Windows build.\n• Manually verified that extension code could access the selected Claude Opus 5.5 model and successfully call `sendRequest()`.",
+    "URL": "https://github.com/microsoft/vscode/pull/343139",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "zhen9910",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "03b85f6c9a70635272264b574a5dc02b867e1494",
+    "HeadRef": "fix/agent-host-lm-bridge",
+    "HeadSHA": "dd521108f7d99959f05331db8c07fbbcfe7ffae1",
+    "CreatedAt": "2026-10-21T05:30:48Z",
+    "UpdatedAt": "2026-10-29T19:22:59Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-69658ADDFE67",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/api/common/extHostLanguageModels.ts",
+      "Side": "RIGHT",
+      "Line": 540,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The changed call path is explicit and unconditional for external models. Repository callers establish realistic multiplicity: `ExtensionContributedChatTokenizer.countMessagesTokens` iterates conversation messages sequentially and `countMessageTokens` calls `languageModel.countTokens` once per message. The only uncertainty is absolute IPC duration, which affects severity rather than the mechanism.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "extension-host/main-thread IPC calls and metadata serialization",
+      "PerformanceScaling": "For N messages/token-count operations, the path adds N metadata lookup RPCs; the Copilot tokenizer awaits them sequentially, so latency accumulates linearly with conversation length.",
+      "PerformanceOutcome": "increased latency on the request critical path",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Local model token counts dispatch directly to their provider without re-resolving metadata, and external models were not usable before this PR. In the new external bridge, the API object already holds cached metadata and the count RPC itself is authoritative, but the changed line adds a separate lookup before every count.",
+      "ChangedBehavior": "External-model token counting now performs a metadata-lookup IPC round trip on every invocation, then performs the actual token-count IPC round trip.",
+      "CausalDiffEvidence": "The added `await that._ensureModel(modelId);` on RIGHT line 540 runs before every `countTokens` call. `_ensureModel` calls `_lookupExternalModels([modelId])` for every non-local model, and `_lookupExternalModels` excludes only `_localModels`, not cached `_externalModels`, so this always invokes the new `$lookupChatModels` RPC before `_computeTokenLength` invokes the separate `$countTokens` RPC.",
+      "Title": "Avoid a metadata RPC before every token count",
+      "Impact": "Extensions using a selected agent-host model block prompt construction on one extra extension-host/main-thread IPC round trip per history message. Longer conversations therefore incur linearly increasing latency before the model request can start.",
+      "Evidence": "`countTokens` awaits `_ensureModel` at `extHostLanguageModels.ts:540`; `_ensureModel` refreshes every non-local model, while `_lookupExternalModels` filters only local models and calls `$lookupChatModels`. It then calls `_computeTokenLength`, whose external branch calls `$countTokens`. In `extensions/copilot/src/platform/endpoint/vscode-node/extChatTokenizer.ts`, `countMessagesTokens` awaits `countMessageTokens` inside a loop, and each message calls this API, making the extra round trips serial on prompt construction. The main-thread `$countTokens` path already performs the authoritative model lookup through `LanguageModelsService.computeTokenLength`, so a separate freshness lookup is not required to discover a removed model.",
+      "Recommendation": "Do not call `_ensureModel` from `countTokens`; dispatch `_computeTokenLength` directly and translate the authoritative main-thread missing-model failure if needed. If metadata freshness is required elsewhere, retain it for request authorization or coalesce/cache it across operations rather than refreshing once per token count."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "An extension discovers an explicitly selected agent-host language model",
+        "CriticalPath": "The extension host first awaits `$selectChatModels`; for an explicit vendor it then awaits one batched `$lookupChatModels` before constructing API objects. Provider resolution must finish before discovery returns.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostLanguageModels.ts:583",
+            "Operation": "Extension host requests model selection from the main thread.",
+            "Cardinality": "One call per selection; provider resolution is coalesced per vendor.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Selection already crossed this boundary, but external identifiers could not be materialized in this extension host.",
+            "CriticalPathEffect": "Must complete before identifiers are known."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostLanguageModels.ts:477",
+            "Operation": "Extension host fetches metadata for all selected external identifiers.",
+            "Cardinality": "One batched call containing the effective selected model set.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No metadata lookup RPC existed; models registered outside this host were omitted.",
+            "CriticalPathEffect": "Must complete before external `LanguageModelChat` objects are returned."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadLanguageModels.ts:120",
+            "Operation": "Main thread may ask an extension-host-owned provider for its model catalogue while resolving selection.",
+            "Cardinality": "At most one provider call per configured group in one coalesced vendor resolution.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Existing provider discovery already used this boundary.",
+            "CriticalPathEffect": "Provider resolution precedes selection completion."
+          }
+        ],
+        "ScalingInput": "Number of selected models after vendor filtering and configured provider groups; the new metadata boundary remains one batched IPC.",
+        "EffectiveConcurrency": "Selection is one RPC; metadata lookup batches all returned identifiers into one RPC. Main-thread provider resolution is serialized/coalesced per vendor by `SequencerByKey` and `_queuedResolutions`.",
+        "CacheBehavior": "External metadata is cached by identifier; a lookup deletes requested stale entries before repopulating them. Selection deliberately refreshes all selected identifiers. Negative results are not retained, so later discovery retries.",
+        "MechanismConfidence": "High: both RPCs and vendor-level coalescing are explicit in the changed and surrounding code.",
+        "MagnitudeUncertainty": "Catalogue sizes and provider response time vary, but batching prevents per-model IPC fan-out in this scenario.",
+        "Verdict": "No additional finding: the new lookup is a single batched boundary necessary to materialize externally registered models."
+      },
+      {
+        "Scenario": "An extension counts tokens for an external agent-host model while building a prompt",
+        "CriticalPath": "For every `countTokens`, the extension host awaits metadata lookup and only then starts the count RPC. Copilot's extension tokenizer awaits one count per conversation message in sequence, so all lookup round trips are on the prompt/request critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostLanguageModels.ts:540",
+            "Operation": "Refresh external model metadata through `$lookupChatModels` before counting.",
+            "Cardinality": "One call per token-count invocation, including one per history message; cached external metadata does not suppress it.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Local counts dispatch directly to the provider; no separate freshness RPC preceded each count.",
+            "CriticalPathEffect": "Serially blocks each actual count operation."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostLanguageModels.ts:735",
+            "Operation": "Route the actual token count through main-thread `$countTokens`.",
+            "Cardinality": "One call per token-count invocation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "External models could not be counted from this extension host; local models called their provider directly.",
+            "CriticalPathEffect": "Provides the requested count and must complete before prompt sizing proceeds."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadLanguageModels.ts:191",
+            "Operation": "If the exact target belongs to another extension host, main thread forwards token counting to that owner.",
+            "Cardinality": "One additional provider IPC per count in the cross-host target case.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This owner-provider bridge already served models registered from that extension host.",
+            "CriticalPathEffect": "Adds another required round trip behind the main-thread count call."
+          }
+        ],
+        "ScalingInput": "Conversation/history message count N or other token-count invocations; the added lookup count is N after model deduplication because all calls use the same model but are not coalesced.",
+        "EffectiveConcurrency": "No coalescing is present for metadata refreshes. The established history-tokenization caller serializes calls in a loop; concurrent callers would independently issue duplicate lookups.",
+        "CacheBehavior": "The external metadata map is populated, but `_lookupExternalModels` checks only `_localModels`; therefore warm external entries still incur lookup. Missing results delete the old entry. There is no in-flight coalescing.",
+        "MechanismConfidence": "Very high: the unconditional call chain and sequential production caller are both directly traced.",
+        "MagnitudeUncertainty": "Exact IPC latency depends on host placement, but the N serialized extra round trips are certain.",
+        "Verdict": "Reportable medium-severity IPC latency regression; submitted as a boundary-fanout finding."
+      },
+      {
+        "Scenario": "An extension sends a request through an external agent-host alias to an exact Copilot or BYOK target",
+        "CriticalPath": "The extension host refreshes metadata, may resolve account-specific consent, then starts the request on main thread. The agent-host provider resolves the exact target and forwards to its normal provider; provider network work and response streaming then determine completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostLanguageModels.ts:544",
+            "Operation": "Refresh metadata before sending, then call `$tryStartChatRequest`.",
+            "Cardinality": "One metadata RPC and one start RPC per direct request.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Requests for models outside the extension host failed instead of forwarding.",
+            "CriticalPathEffect": "Both complete before request dispatch; refresh supplies current authorization metadata."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostLanguageModels.ts:682",
+            "Operation": "Query or prompt the main-thread authentication service for the account-specific model grant when required.",
+            "Cardinality": "A silent query per protected request, plus a prompt call when no grant exists.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The consent bridge existed for local extension-host models; the diff supplies account-specific metadata for external targets.",
+            "CriticalPathEffect": "Authorization must complete before billing/provider dispatch."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadLanguageModels.ts:153",
+            "Operation": "If the exact target is extension-host-owned, main thread forwards the chat request to the owning provider and streams response parts back.",
+            "Cardinality": "One provider request per extension request, with response chunks proportional to generated output.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The provider bridge already served direct requests to its own registered models; the diff makes an agent-host alias reach it.",
+            "CriticalPathEffect": "This is the model request itself and remains on the critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "Exact Copilot/BYOK provider reached via AgentHostLanguageModelProvider.sendChatRequest",
+            "Operation": "Send the language-model request through the target provider's existing network implementation.",
+            "Cardinality": "One model request per extension API request.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "External alias requests were rejected, so no provider network request occurred for this workflow.",
+            "CriticalPathEffect": "Dominates response latency and is the intended operation."
+          }
+        ],
+        "ScalingInput": "One chain per extension request; message and response byte volume scale normally with prompt/output size.",
+        "EffectiveConcurrency": "One forwarding chain per extension request. There is no aggregate burst introduced by the changed code; cancellation is propagated with one CTS/listener per in-flight request and disposed on failure or completion.",
+        "CacheBehavior": "External metadata is refreshed even when warm to reflect authorization changes. Main thread independently checks current authorization at dispatch. Target resolution reads the current in-memory catalogue and does not retain a stale target.",
+        "MechanismConfidence": "High: forwarding and authorization checks are explicit in both extension-host and main-thread paths.",
+        "MagnitudeUncertainty": "Provider/network latency varies widely, but no changed loop multiplies network calls per request.",
+        "Verdict": "No separate finding: the constant metadata refresh is an intentional freshness tradeoff for request authorization, and the single provider/network call is required by the new feature."
+      },
+      {
+        "Scenario": "Language-model catalogues and consent accounts refresh after provider metadata changes",
+        "CriticalPath": "Background/provider change handling re-resolves the changed vendor, republishes agent-host aliases that reference it, rebuilds tracked consent metadata, and notifies model consumers. This work is off the model-request critical path but runs on the workbench event path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadLanguageModels.ts:120",
+            "Operation": "Resolve catalogues owned by an extension host through `$provideLanguageModelChatInfo`.",
+            "Cardinality": "One call per vendor group in a coalesced resolution; repeated metadata changes may cause repeated completed resolutions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Extension-owned provider refreshes already crossed this boundary.",
+            "CriticalPathEffect": "Background catalogue availability waits for it, but active model requests do not."
+          }
+        ],
+        "ScalingInput": "Agent-host model count A, total workbench catalogue count C, tracked provider/model count P, source metadata-change rate K; the added target lookup work grows approximately K*A*(A+C), while consent reconciliation scans tracked metadata.",
+        "EffectiveConcurrency": "Vendor resolutions are serialized and queued duplicates with matching provider/silent mode are coalesced. Different vendors may resolve independently. Agent-host aliases ignore agent-host vendor events to avoid feedback loops.",
+        "CacheBehavior": "LanguageModelsService replaces each vendor's cache after resolution and coalesces queued resolutions. MainThreadLanguageModels additionally tracks complete per-vendor metadata for auth accounts and rebuilds it after change events. Agent-host target matching is recomputed rather than cached to preserve current metadata.",
+        "MechanismConfidence": "High for the work and coalescing mechanism; lower only for real-world magnitude.",
+        "MagnitudeUncertainty": "The synchronous scans are certain, but typical A and C appear bounded to model-catalogue sizes; no evidence establishes enough cardinality to turn the added scans into a user-visible regression.",
+        "Verdict": "No finding: the diff adds repeated catalogue scans, but with vendor coalescing and currently bounded model counts there is insufficient evidence of concrete user-visible impact."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 12 changed files. One actionable regression was reported: external token counting performs an uncached metadata IPC before every count, producing serialized per-message fan-out. Discovery batching, request forwarding, authorization lifecycle, catalogue refresh, cleanup, allocation, and concurrency paths were traced; no other changed mechanism met the evidence threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-29T19:47:57.631619752Z",
+    "CompletedAt": "2026-10-29T19:50:26.74284953Z",
+    "WallClockMilliseconds": 149111,
+    "ModelCalls": 10,
+    "InputTokens": 553152,
+    "OutputTokens": 10264,
+    "TotalTokens": 563416,
+    "ReasoningTokens": 5086,
+    "CacheReadTokens": 470997,
+    "CacheWriteTokens": 82125,
+    "APIDurationMilliseconds": 129401,
+    "ToolCalls": 53,
+    "NanoAIUnits": 80442380000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 470997,
+      "cache_write": 82125,
+      "input": 30,
+      "output": 10264
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

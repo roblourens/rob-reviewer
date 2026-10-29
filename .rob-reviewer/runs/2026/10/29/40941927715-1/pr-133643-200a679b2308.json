@@ -1,0 +1,221 @@
+{
+  "PullRequest": {
+    "Number": 133643,
+    "Title": "debug: read/write memory support",
+    "Body": "This implements the core memory \"model\" for debugging that reflects\r\nDAP, in `debugModel.ts`. It also implements a filesystem provider based\r\non that in `debugMemory.ts`, for application in the hex editor.\r\n\r\nFinally it adds context menu items for these. This works with changes in\r\nmock debug and https://github.com/microsoft/vscode-hexeditor/pull/309\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/133643",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "connor4312",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "a3482c39bc57ebab1318db3708a777753f956248",
+    "HeadRef": "connor4312/debug-read-memory",
+    "HeadSHA": "200a679b2308a5149e1f998be696f9a75a5cba66",
+    "CreatedAt": "2021-09-22T23:44:03Z",
+    "UpdatedAt": "2022-02-19T23:24:39Z",
+    "MergedAt": "2022-01-05T00:41:35Z",
+    "Labels": [
+      "feature-request",
+      "debug"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-0C14E04E4505",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/debug/browser/variablesView.ts",
+      "Side": "RIGHT",
+      "Line": 433,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed per-row call site, repeated render path, prior singleton behavior, and Menu's unconditional global registry subscription are directly visible in the repository; only the exact rate at which users step or scroll is workload-dependent.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "unbounded-retention",
+      "PerformanceResource": "Menu instances, overlay maps, RunOnceSchedulers, emitters, and MenuRegistry event subscriptions",
+      "PerformanceScaling": "Retention grows by one menu for every rendered variable row on each variables-tree refresh, rerender, or newly visible row; repeated stepping and scrolling therefore accumulate O(rendered rows × refreshes) live subscriptions over the debug session.",
+      "PerformanceOutcome": "Retained memory and increasing event fan-out/CPU and GC pressure during long debugging sessions",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The Variables view created one DebugVariablesContext menu in its constructor and registered it with the view's lifetime disposable store, so menu state and its registry listener stayed bounded to one instance.",
+      "ChangedBehavior": "Each VariablesRenderer.renderActionBar call now creates a fresh DebugVariablesContext menu for an individual row, but only the extracted actions are added to elementDisposable; the menu itself is never disposed.",
+      "CausalDiffEvidence": "The added `const menu = this.menuService.createMenu(MenuId.DebugVariablesContext, contextKeyService);` at line 433 replaces the deleted view-owned singleton menu but does not register or dispose the new per-render instance.",
+      "Title": "Dispose the per-row menu after extracting inline actions",
+      "Impact": "While stepping or switching stack frames, the variables tree repeatedly renders all visible rows. Every render leaves another MenuRegistry listener alive, so a long session can retain thousands of menu objects and make later menu-contribution changes fan out across all of them, causing memory growth and UI/GC overhead.",
+      "Evidence": "VariablesView refreshes the tree on debug view updates and resets input while stepping; renderActionBar is called for each rendered variable. MenuService.createMenu constructs Menu, whose constructor unconditionally adds a MenuRegistry.onDidChangeMenu subscription to its DisposableStore, and that subscription is removed only by menu.dispose(). Here createAndFillInContextMenuActions is the sole disposable retained, so row disposal cannot release the menu. Nearby testing action providers use try/finally and menu.dispose() immediately after extracting actions, establishing that the actions do not require the menu to remain alive.",
+      "Recommendation": "Wrap action extraction in try/finally and call menu.dispose() immediately afterward, as the testing action providers do (or otherwise add the menu to a disposable that is guaranteed to run for every row render)."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "unbounded-retention",
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation",
+      "cleanup-lifecycle",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Refresh and interact with the Variables view while paused, stepping, switching frames, and scrolling",
+        "CriticalPath": "A stop/view update refreshes or resets the variables tree, then synchronously renders each visible variable row and constructs its inline action state before the view is usable. A right-click separately awaits dataBreakpointInfo before showing the context menu when data breakpoints are supported.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/debug/browser/variablesView.ts:getContextForVariableMenuWithDataAccess -\u003e debugSession.ts:dataBreakpointInfo",
+            "Operation": "DAP dataBreakpointInfo request for context-menu data-breakpoint capabilities",
+            "Cardinality": "At most one request per context-menu invocation on a variable when the session supports data breakpoints; inline action rendering does not issue this request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The previous onContextMenu implementation issued the same single dataBreakpointInfo request under the same capability condition.",
+            "CriticalPathEffect": "The request must complete before the right-click menu is shown."
+          }
+        ],
+        "ScalingInput": "Effective cardinality is the number of visible/newly visible variable rows per render multiplied by tree refreshes and scroll churn across the debug session; virtualization bounds live rows but does not bound the newly leaked menus.",
+        "EffectiveConcurrency": "Row rendering is synchronous and serial. Focus-frame refreshes are partly coalesced by a 400 ms RunOnceScheduler, while onWillUpdateViews calls updateChildren directly; context-menu DAP requests are one awaited request per user invocation.",
+        "CacheBehavior": "Tree templates are reused/virtualized and extracted row actions are disposed, but the new per-render Menu instances are neither cached as a bounded singleton nor disposed, so warm rerenders accumulate rather than reuse state. No negative-cache behavior applies.",
+        "MechanismConfidence": "High: the per-row createMenu call, repeated renderer path, deleted singleton ownership, and MenuRegistry subscription retained until menu.dispose() are directly traced.",
+        "MagnitudeUncertainty": "The exact retained-object count depends on session length, stop frequency, viewport size, and scrolling, but repeated stepping with tens of visible rows makes growth realistic.",
+        "Verdict": "Reportable unbounded retention: each row render leaves a globally subscribed Menu alive, causing memory growth and later menu-event fan-out."
+      },
+      {
+        "Scenario": "Choose View Memory for a variable when the hex editor is installed, then read or edit target memory",
+        "CriticalPath": "The command waits for installed-extension registration/lookup, opens the hex editor, and the editor's file operations synchronously depend on the debug-memory provider. Each provider read/write awaits a DAP request and base64 decode/encode before that chunk can be consumed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/debug/common/debugModel.ts:MemoryRegion.read -\u003e debugSession.ts:readMemory -\u003e rawDebugSession.ts:send",
+            "Operation": "DAP readMemory request and base64 response transfer",
+            "Cardinality": "One adapter request per provider read/page requested by the consumer; no loop in the changed provider multiplies a single chunk into additional requests.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no debug-memory filesystem or View Memory workflow.",
+            "CriticalPathEffect": "The requested memory chunk cannot render until the adapter response arrives and is decoded."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/debug/common/debugModel.ts:MemoryRegion.write -\u003e debugSession.ts:writeMemory -\u003e rawDebugSession.ts:send",
+            "Operation": "DAP writeMemory request with base64 payload",
+            "Cardinality": "One adapter request per provider write call.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no debug-memory write path.",
+            "CriticalPathEffect": "The edit cannot complete until the adapter acknowledges the write."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/debug/browser/debugMemory.ts:DebugMemoryFileSystemProvider",
+            "Operation": "Open/read/write/close operations on the vscode-debug-memory virtual filesystem provider",
+            "Cardinality": "One open and close per file handle; one provider call per consumer chunk or write, with open descriptors bounded by consumer lifetime and closed at session end.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The scheme and provider did not exist.",
+            "CriticalPathEffect": "These virtual filesystem calls are the bridge to the DAP requests and are on the editor's memory-I/O critical path."
+          }
+        ],
+        "ScalingInput": "Memory I/O scales with bytes/pages requested by the hex editor. Through FileService's buffered path the nominal chunk size is 256 KiB, giving approximately one DAP read per requested chunk; writes produce one DAP write per provider write call.",
+        "EffectiveConcurrency": "The provider adds no parallel fan-out, limiter, or coalescer: each read/write maps to one awaited DAP request, with aggregate concurrency determined by the hex editor/FileService caller. File-descriptor regions are disposed on close and session end.",
+        "CacheBehavior": "Installed-extension lookup uses the in-memory extension registry after readiness. Memory data has no cache or request coalescing, so cold and warm reads both reach the adapter; this is appropriate for mutable debuggee memory and invalidation semantics.",
+        "MechanismConfidence": "High for the call path and cardinality; the provider performs no hidden per-byte or per-range DAP fan-out.",
+        "MagnitudeUncertainty": "Actual page size, read-ahead, and concurrent request count are controlled by the external hex editor version, but the one-boundary-call-per-provider-call mapping is certain.",
+        "Verdict": "No additional reportable regression: the new boundary work is explicitly requested feature work and is one-for-one with consumer chunks, with descriptor cleanup present."
+      },
+      {
+        "Scenario": "Choose View Memory when the hex editor is not installed",
+        "CriticalPath": "The command waits for the installed-extension registry, opens the Extensions sidebar, and initiates an @id search; gallery results may require network access after the pane search starts.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/debug/browser/variablesView.ts:VIEW_MEMORY_ID handler -\u003e workbench.extensions.search",
+            "Operation": "Extension gallery search for ms-vscode.hexeditor through the existing Extensions view",
+            "Cardinality": "One @id search per explicit click when the extension is absent.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no View Memory command that initiated this search.",
+            "CriticalPathEffect": "The command opens the search UI immediately; remote results are needed only to offer installation, not to continue an existing memory editor."
+          }
+        ],
+        "ScalingInput": "One extension lookup and one search per explicit command invocation; no collection-sized loop is introduced.",
+        "EffectiveConcurrency": "The command is serial through registry readiness and pane opening. Repeated user invocations could repeat searches, but there is no automatic or per-variable trigger.",
+        "CacheBehavior": "Installed-extension presence is read from the initialized in-memory registry. Extension gallery caching is owned by the existing Extensions view and unchanged by this diff.",
+        "MechanismConfidence": "High for command routing; medium for a cold network fetch because the Extensions subsystem controls caching.",
+        "MagnitudeUncertainty": "Whether a network request occurs depends on gallery availability and existing Extensions-view caches, but invocation cardinality is bounded to the explicit action.",
+        "Verdict": "No reportable regression: this is bounded, user-initiated discovery work on the missing-dependency path."
+      },
+      {
+        "Scenario": "Save a notebook output data URL to disk and open the saved file",
+        "CriticalPath": "After the user accepts the save dialog, the entire base64 payload is decoded synchronously, then one filesystem write and one opener operation are awaited in sequence.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/notebook/browser/view/renderers/backLayerWebView.ts:_onDidClickDataLink",
+            "Operation": "Write the decoded notebook output to the selected URI",
+            "Cardinality": "Exactly one write per accepted save action.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one write occurred after atob plus a byte-copy loop.",
+            "CriticalPathEffect": "Opening the saved resource waits for the write to finish."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/workbench/contrib/notebook/browser/view/renderers/backLayerWebView.ts:_onDidClickDataLink",
+            "Operation": "Open the newly saved resource through IOpenerService",
+            "Cardinality": "Exactly one open per accepted save action.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one open followed the write.",
+            "CriticalPathEffect": "Runs after the write and completes the user workflow."
+          }
+        ],
+        "ScalingInput": "CPU and allocation scale linearly with the data URL payload size; boundary cardinality remains one write and one open regardless of size.",
+        "EffectiveConcurrency": "The decode, write, and open are serialized for one explicit click; no burst or per-item loop crosses an external boundary.",
+        "CacheBehavior": "No cache is used before or after the diff. Repeating the action decodes again because the destination and payload are user-selected.",
+        "MechanismConfidence": "High: before/after code has identical filesystem/open cardinality and replaces atob plus a full copy loop with one linear decoder.",
+        "MagnitudeUncertainty": "Payload sizes vary widely, but the changed decoder is explicitly designed to reduce Chromium decode/copy CPU and does not add allocation scale or boundary calls.",
+        "Verdict": "No regression; the changed path reduces local decode overhead while preserving external boundary count and ordering."
+      },
+      {
+        "Scenario": "Workbench/debug-service initialization with no memory editor opened",
+        "CriticalPath": "DebugService construction now synchronously instantiates and registers one virtual filesystem provider and one debug-session-end listener; no adapter, filesystem, subprocess, or network operation is triggered.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Fixed one provider per DebugService lifetime, independent of variables, sessions, or memory size.",
+        "EffectiveConcurrency": "No asynchronous work or concurrency is introduced during registration.",
+        "CacheBehavior": "The provider is a lifetime singleton registered by scheme; there are no memory regions or descriptors until explicit opens.",
+        "MechanismConfidence": "High: constructor registration is direct and does not call an external provider.",
+        "MagnitudeUncertainty": "Object construction cost is tiny and fixed.",
+        "Verdict": "No reportable eager-work regression; startup adds only bounded lightweight registration."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 21 changed files and all diff pages. One medium-severity unbounded-retention issue was reported in per-row Variables menu creation. DAP memory I/O, extension discovery, provider lifecycle, base64 serialization, notebook save behavior, startup registration, cache behavior, and effective concurrency were traced; no other high-confidence diff-introduced performance regression or qualifying regression fix was established."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-29T19:45:19.362649704Z",
+    "CompletedAt": "2026-10-29T19:47:54.977896334Z",
+    "WallClockMilliseconds": 155615,
+    "ModelCalls": 19,
+    "InputTokens": 1195258,
+    "OutputTokens": 11483,
+    "TotalTokens": 1206741,
+    "ReasoningTokens": 4148,
+    "CacheReadTokens": 1106577,
+    "CacheWriteTokens": 88624,
+    "APIDurationMilliseconds": 146483,
+    "ToolCalls": 115,
+    "NanoAIUnits": 111563880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1106577,
+      "cache_write": 88624,
+      "input": 57,
+      "output": 11483
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
