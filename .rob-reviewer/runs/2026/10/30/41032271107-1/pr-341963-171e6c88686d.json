@@ -1,0 +1,147 @@
+{
+  "PullRequest": {
+    "Number": 341963,
+    "Title": "Skip laying out the outgoing transcript when switching sessions",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nRefs #341282\r\n\r\n## Summary\r\n\r\nIn the Agents window, switching between two existing sessions with large responses blocks the window. This PR removes one cause: work spent laying out the **chat you are leaving**, just before it is replaced.\r\n\r\n| Switching between two large sessions (median of 3 runs × 4 switches) | `main` | This PR |\r\n|---|---:|---:|\r\n| Time from clicking a session until its response is visible | 2,860 ms | **2,690 ms (−170 ms, −6%)** |\r\n\r\nThese numbers are from `main` at `cd2259b` and this change rebased on it. When this PR was opened (on `main` at `f935039`), the same scenario measured 2,662 ms vs 2,289 ms (−373 ms).\r\n\r\nSwitching is still far slower than it should be: the remaining time is spent rendering the incoming chat, with markdown, table scrollbars and code-block editors. Those are separate costs and are left for follow-up PRs, so this PR does not close #341282.\r\n\r\n## What was slow\r\n\r\nThe Agents window reuses one chat view for every session. When you switch, the view is re-attached while it still contains the previous chat's full transcript. Before that transcript is cleared, two pieces of code read layout values from the DOM. Both still do on current `main`:\r\n\r\n1. The chat tab strip measures its width ([`ChatCompositeBar._updateScrollDimensions`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/sessions/browser/parts/chatCompositeBar.ts#L336-L341) reads `clientWidth`/`scrollWidth`, called from `_updateActiveTab`). It does this even when the strip is hidden, which is the usual case with one chat per session.\r\n2. The response-selection controller checks for a text selection when it is bound to the incoming chat ([`_hasTranscriptSelection`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/workbench/contrib/chat/browser/responseSelectionSideChatController.ts#L353-L363) reads `getSelection().isCollapsed`/`toString()`). `ChatView.setChat` binds it before `_loadChat` clears the old transcript.\r\n\r\nReading a layout value forces Chromium to finish any pending layout first. Here that means laying out the entire outgoing transcript, which is thrown away a moment later. For a response of about 100 KB that cost about 380 ms on every switch when this PR was opened. Fixing only the first read just moves the cost to the second, so both are addressed.\r\n\r\n## Fix\r\n\r\n- The chat tab strip measures itself only while it is visible, and once when it becomes visible. Its existing resize observer still handles size changes.\r\n- `ChatView.setChat` releases the previous transcript (cancels its in-flight load, then clears the widget) right after saving its scroll state, before anything else reads layout. `_loadChat` no longer clears the transcript, so its now-unused `previousChatResource`/`previousSession` options are removed. The path for sessions that are still being created is unchanged.\r\n- Releasing the transcript also unbinds the response-selection controller. Because the release now comes first, the controller is unbound from the old chat and then bound to the new one; before, the release ran after the controller had been bound to the new chat.\r\n\r\n## How it was measured\r\n\r\n- **Input:** a dev build of the Agents window, connected to the scripted mock agent host (`agentHostServerMain --enable-mock-agent`, added through `chat.remoteAgentHosts`). It has two completed sessions, each with one response of about 100 KB: 50 sections, each with a list, a 20-line TypeScript code block and a table. Two tiny sessions are the control. For the current numbers the mock host lists these sessions with their history already in place, instead of creating them by sending prompts, because the new-session composer has changed since this PR was opened; the response content is the same. The window is signed out and its sign-in dialog is closed.\r\n- **Run:** open both large sessions once to warm up, then switch between them 4 times. Repeat in 3 runs on each build, on the same Windows machine. Every run used `VSCODE_DEV_DISABLE_DISPOSABLE_TRACKING=1`, because dev-only disposable tracking otherwise doubles the cost. Current measurements were taken on `main` at `cd2259b` and on this change rebased on it.\r\n- **Switch time:** time from the click on the session row until the incoming chat's request and response text are both visible.\r\n- **Wasted layout** (measured when this PR was opened, at `f935039`; not re-measured after the rebase): we wrapped the two layout reads above (`clientWidth`/`scrollWidth` on the tab strip, and `Selection.isCollapsed`/`toString()`) with `performance.now()` and summed the time spent inside them during each switch. On `main`, those reads trigger the forced layout of the outgoing transcript.\r\n\r\n| Per switch, median of 4 switches in each of 3 runs, on `cd2259b` | `main` | This PR |\r\n|---|---|---|\r\n| Whole switch, large sessions | 3,003 / 2,860 / 2,765 ms | 2,741 / 2,690 / 2,671 ms |\r\n| Whole switch, tiny sessions (control) | 314 / 208 / 179 ms | 212 / 170 / 178 ms |\r\n\r\n| Per switch, median of 4 switches in each of 3 runs, on `f935039` (when this PR was opened) | `main` | This PR |\r\n|---|---|---|\r\n| Time inside the two layout reads | 378 / 380 / 381 ms | under 1 ms in every run |\r\n| Number of those reads | 10 | 4 |\r\n| Whole switch, large sessions | 2,733 / 2,662 / 2,613 ms | 2,393 / 2,289 / 2,232 ms |\r\n| Whole switch, tiny sessions (control) | 181 / 169 / 168 ms | 172 / 160 / 157 ms |\r\n\r\n\"Under 1 ms\" means the measured time rounded to 0 ms: with this change, those reads no longer have a transcript to lay out. The tab strip is hidden, so it skips its measurement entirely. The 4 remaining reads are the selection checks, and they now run after the outgoing transcript has been cleared, so they are cheap. A CPU profile of a switch confirms that the ~380 ms forced-layout block before the transcript is cleared is gone on this branch. Tiny-session switches are unchanged, within noise. On the current base the whole-switch saving is smaller (about 170 ms instead of 373 ms); the large-session switches also vary more from switch to switch (single switches from 2,572 to 3,732 ms), so this difference has a wide margin of error.\r\n\r\n### Before\r\n\r\n![Before: the on-screen overlay shows about 380 ms per switch spent laying out the chat being left, and each switch taking about 2.6 seconds](https://github.com/karthiknadig/vscode/blob/61a51fbbf23c4d642e9ad82c4927c3942beb70cc/20261015-171820-C2-F1-pr1/pr1-before.gif?raw=true)\r\n\r\n### After\r\n\r\n![After: the overlay shows under 1 ms (rounded to 0) spent on the chat being left, and each switch taking about 2.3 seconds](https://github.com/karthiknadig/vscode/blob/61a51fbbf23c4d642e9ad82c4927c3942beb70cc/20261015-171820-C2-F1-pr1/pr1-after.gif?raw=true)\r\n\r\nIn each recording, the overlay at the top right shows, for every switch, the time spent in the two layout reads (\"layout of OUTGOING transcript\") and the whole switch time. The recordings were made when this PR was opened, on `f935039`.\r\n\r\n## How to test\r\n\r\n1. Open the Agents window and connect it to an agent host that has two completed sessions with long responses containing lists, code blocks and tables.\r\n2. Open both sessions once, then alternate between them in the Sessions list.\r\n3. Record a performance profile of one switch. On `main`, a forced layout of roughly 380 ms appears under `ChatCompositeBar._updateScrollDimensions` or `ResponseSelectionSideChatController._hasTranscriptSelection`, before the transcript is cleared. With this PR it no longer appears.\r\n4. Check that behavior is unchanged:\r\n   - A draft typed in one chat is still there when you switch back.\r\n   - Focus lands in the chat input after switching.\r\n   - A text selection in the transcript is cleared when you switch.\r\n   - Tables and code blocks render as before.\r\n\r\n## Validation\r\n\r\n| What was checked | Command | Result |\r\n|---|---|---|\r\n| New tests fail without the fix (when this PR was opened, on `f935039`) | `scripts\\test.bat --grep \"does not measure the tab strip while hidden\\|releases the outgoing transcript before\"`, with the source change stashed | Both fail as expected. The hidden tab strip is measured 4 times, and the selection controller still sees the old transcript. |\r\n| Chat view and tab strip tests on `main` @ `cd2259b` | `scripts\\test.bat --run src/vs/sessions/contrib/chat/test/browser/chatView.test.ts --run src/vs/sessions/test/browser/chatCompositeBar.test.ts` | 187 passing, 10 failing. All 10 are pixel-geometry or computed-style checks that fail on this 125% scaled display (a 1 px border, outline or stroke measures 0.8 px, or a position is off by a fraction of a pixel). |\r\n| Same tests with this PR, rebased on `cd2259b` | same command | 189 passing, the same 10 failing. The 2 extra passing tests are the new ones. The chat view test now uses `main`'s `setChat(resource, isReadOnly)` signature for the selection controller and also records the release in between: old chat bound, released, then new chat bound, with no transcript rendered at any of those points. |\r\n| Type check | `npm run typecheck-client` | Passed (rebased on `cd2259b`) |\r\n| Lint | `npm run eslint -- \u003c4 changed files\u003e` | Passed |\r\n| Wasted-layout timing (on `f935039`) | Instrumented switch run described above, 3 runs per build | `main`: about 380 ms per switch. This PR: under 1 ms. |\r\n| End-to-end switch timing on `cd2259b` | Same scenario, 3 runs per build | `main` median 2,860 ms; this PR 2,690 ms. |\r\n| End-to-end switch timing on `f935039` | Same scenario, 3 runs per build | `main` median 2,662 ms; this PR 2,289 ms. |\r\n| Behavior checks, `main` vs this PR in the same setup (on `f935039`) | Scripted switch run with checks | Same on both builds: drafts stay with their chat, focus is in the input, the selection is cleared on switch, all 44 tables and 45 code-block editors render, and scroll is restored. After garbage collection, the heap changed by −0.05 MB per cycle on `main` and −0.6 MB with this PR over 6 switch cycles. DOM node count is stable. |\r\n\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341963",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "cd2259bdf72ec7421e70ae80999ceb46f8bd86fe",
+    "HeadRef": "karthiknadig/bug-swarm/c2-f1-avoid-stale-transcript-layout",
+    "HeadSHA": "171e6c88686d33932da0eb0a0172c7609329f0f3",
+    "CreatedAt": "2026-10-16T07:25:34Z",
+    "UpdatedAt": "2026-10-30T04:06:48Z",
+    "MergedAt": null,
+    "Labels": [
+      "perf"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/sessions/browser/parts/chatCompositeBar.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 844,
+      "BasePath": "src/vs/sessions/browser/parts/chatCompositeBar.ts",
+      "BaseLine": 846,
+      "IntroducingPath": "src/vs/sessions/browser/parts/chatCompositeBar.ts",
+      "IntroducingCommit": "32ca9719c90b527b0ffa96b288bd2964256e5ac3",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceCategory": "layout",
+      "Mechanism": "A hidden chat tab bar synchronously read clientWidth/scrollWidth on every active-chat update, forcing Chromium to lay out the full window, including a large outgoing transcript that was immediately discarded.",
+      "Symptom": "Switching between existing sessions with roughly 100 KB transcripts blocked the Agents window; measured time in the two outgoing-transcript layout-read sites was about 380 ms per switch before the fix and under 1 ms after both sites were fixed.",
+      "FixedBehavior": "_updateActiveTab now updates DOM state while hidden but defers width measurement and active-tab reveal until the bar becomes visible, eliminating the hidden synchronous layout read from the session-switch critical path.",
+      "Evidence": "In the base revision, _updateActiveTab unconditionally called _updateScrollDimensions, which reads clientWidth and scrollWidth. setGroup wires _updateActiveTab to activeChatResource while the bar may be display:none, and the session-switch path updates that observable before replacing the reused ChatView transcript. The added visibility guard at RIGHT:844 skips those synchronous geometry reads while hidden; the new test instruments both properties and proves zero reads for hidden active-chat/tab-list updates. The PR's measured large-transcript switch scenario attributes the prior reads to a forced-layout block and reports the combined layout-read time falling from about 380 ms to under 1 ms after both fixes.",
+      "Confidence": 0.99
+    },
+    {
+      "FixedPath": "src/vs/sessions/contrib/chat/browser/chatView.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 768,
+      "BasePath": "src/vs/sessions/contrib/chat/browser/chatView.ts",
+      "BaseLine": 949,
+      "IntroducingPath": "src/vs/sessions/contrib/chat/browser/chatView.ts",
+      "IntroducingCommit": "6dfc9e40fbf801efd2e471c25021075ba44d161a",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceCategory": "layout",
+      "Mechanism": "Transcript clearing occurred only inside _loadChat, after incoming-chat selection-controller rebinding synchronously inspected the DOM selection; with a large outgoing transcript attached, that selection read forced layout of content about to be removed.",
+      "Symptom": "Switching reused ChatView instances with large completed responses blocked the UI; instrumentation of the hidden-bar and selection reads measured about 380 ms of wasted outgoing-transcript layout per switch before the ordering fix and under 1 ms after both fixes.",
+      "FixedBehavior": "A genuine chat switch now cancels the outgoing load and clears/releases the reused widget before rebinding selection behavior or other incoming-chat consumers that synchronously inspect layout.",
+      "Evidence": "In the base revision, setChat called _selectionSideChatController.setChat for the incoming resource before _loadChat reached the old _clearCurrentChat at base line 949. ResponseSelectionSideChatController.setChat force-dismisses on a resource change; _dismiss calls _updateAutoScrollHold, whose _hasTranscriptSelection reads Selection.isCollapsed and Selection.toString while the old widget transcript is still attached. The added _clearCurrentChat at RIGHT:768 now removes the outgoing model and unbinds the controller before the incoming setChat call. The new ordering test proves the controller observes an empty rendered transcript during release and rebinding; the measured large-transcript scenario reports the two prior forced-layout sites dropping from about 380 ms to under 1 ms.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "cleanup-lifecycle",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Switch from one existing Agents session/chat with a large rendered transcript to another existing session/chat",
+        "CriticalPath": "The active resource changes, hidden composite-bar state is updated, ChatView.setChat saves outgoing view state, cancels the prior load, clears/releases the old widget, rebinds incoming-chat consumers, then acquireOrLoadSession resolves the incoming model and the widget renders it. The diff removes hidden-bar and selection-triggered layout of the outgoing transcript before the incoming load/render; incoming model resolution and rendering remain on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts:816 acquireOrLoadSession -\u003e loadRemoteSession/getOrCreateChatSession",
+            "Operation": "On a cold remote-session open, resolve the content provider and obtain/replay the remote chat session history; an existing model is acquired locally on a warm open.",
+            "Cardinality": "At most one cold load for the selected destination resource; concurrent consumers of the same resource are coalesced in _remoteSessionLoads. Warm existing-model acquisition performs no provider boundary call.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single acquireOrLoadSession call occurred after clearing the outgoing chat in _loadChat. The PR moves cancellation/clearing earlier but does not add, duplicate, or move the provider load onto a new path.",
+            "CriticalPathEffect": "A cold provider resolution/history load must complete before the incoming transcript can bind and render; warm acquisition avoids that boundary. Superseded ChatView consumers are cancelled."
+          }
+        ],
+        "ScalingInput": "Outgoing DOM/layout cost scales with transcript size (the measured scenario uses about 100 KB with lists, tables, and code blocks); incoming restore/render scales with destination history size. Boundary cardinality is one destination resource after cache/coalescing, not per message or history item.",
+        "EffectiveConcurrency": "ChatView owns one current CancellationTokenSource and cancels a superseded navigation. ChatService coalesces cold loads per resource; switching can abandon the old resource and begin one load for the new resource, with no new aggregate burst introduced by the diff.",
+        "CacheBehavior": "Warm sessions reuse an existing model reference and avoid provider resolution; simultaneous cold opens for one resource join _remoteSessionLoads. Cancellation abandons a load only after all consumers release it. The diff preserves these cache keys, positive-cache behavior, coalescing, and cancellation semantics.",
+        "MechanismConfidence": "High: the changed ordering and DOM geometry/selection call paths are explicit, tests instrument the hidden reads and release order, and the model-loading call count is unchanged.",
+        "MagnitudeUncertainty": "Exact savings vary with transcript complexity, pending style/layout state, platform, and Chromium behavior; the supplied measured scenario reports a large but variable reduction. This uncertainty affects the size of the improvement, not the absence of a new regression mechanism.",
+        "Verdict": "No reportable regression. The change removes synchronous forced layout of an outgoing transcript and performs the same cancellation, clear, and single incoming model acquisition as before. Two concrete regression fixes were recorded for learning."
+      },
+      {
+        "Scenario": "Switch chats within a session or reveal the multi-chat tab strip",
+        "CriticalPath": "When the strip is already visible, active-tab changes still update scroll dimensions and reveal the active tab synchronously. While hidden, active/tab-list updates now skip geometry reads; on the hidden-to-visible transition, _setVisible reads height, updates scroll dimensions, and reveals the active tab before firing visibility change.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "DOM work scales linearly with the number of chat tabs for active-state updates; geometry/reveal work is one bounded operation per visible active-tab update or hidden-to-visible transition. It does not scale with transcript history once hidden reads are skipped.",
+        "EffectiveConcurrency": "All tab DOM and geometry work is synchronous on the UI thread; ResizeObserver callbacks are browser-scheduled. The diff adds no queue, parallel operation, IPC, filesystem, database, subprocess, or network work.",
+        "CacheBehavior": "No cache or remote data access is involved. Scroll dimensions are refreshed on reveal and remain maintained by the existing ResizeObserver while visible.",
+        "MechanismConfidence": "High: all geometry reads and visibility guards are directly visible in ChatCompositeBar, and the new test verifies no clientWidth/scrollWidth reads while hidden plus a refresh when shown.",
+        "MagnitudeUncertainty": "A reveal may also receive a later ResizeObserver callback, but visibility transitions are bounded and the synchronous reveal follows an offsetHeight layout read; there is no realistic scaling regression established from the added refresh.",
+        "Verdict": "No reportable regression. Deferring hidden measurements avoids transcript-wide forced layout, while the one reveal-time refresh preserves visible scroll state with bounded tab-strip work."
+      },
+      {
+        "Scenario": "Select a session that is still being created and shows preparation input",
+        "CriticalPath": "setChat checks the observable preparation state and performs an O(1) lookup in the in-flight request map. For a changed chat with preparation input, it keeps the existing special path: cancel the prior load, construct/show the preparation ChatModel, set loading false, and lay out the widget; it does not call acquireOrLoadSession.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "The lookup is one map access per genuine chat change; preparation-model construction scales with the single request query and attachment list. The new chatChanged short-circuit avoids the lookup on same-chat reactive reruns.",
+        "EffectiveConcurrency": "The prior transcript load is cancelled and no replacement provider load is started on this path. Preparation UI work is synchronous and singular; no boundary fan-out or concurrency burst is introduced.",
+        "CacheBehavior": "The in-flight request registry is an in-memory map keyed by session resource. No cold/warm provider cache transition occurs until the normal transcript-loading path is entered later.",
+        "MechanismConfidence": "High: the guard, map lookup implementation, and branch are explicit in the changed and transitive code.",
+        "MagnitudeUncertainty": "Query and attachment sizes vary, but the branch's construction and layout behavior is unchanged; only the lookup was moved and additionally short-circuited for unchanged chats.",
+        "Verdict": "No reportable regression. The special preparation path remains behaviorally and computationally equivalent for real chat changes, while repeated same-chat updates do less work."
+      }
+    ],
+    "Summary": "Completed the performance pass over all four changed files and all diff pages. No diff-introduced performance issue met the reporting threshold. The PR removes two synchronous outgoing-transcript layout mechanisms, preserves one coalesced/cancellable incoming session load per destination, and adds only bounded reveal-time tab-strip measurement. Recorded both concrete shipped-regression fixes with blame-resolved introducing commits."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-30T09:25:58.569619722Z",
+    "CompletedAt": "2026-10-30T09:29:06.393905955Z",
+    "WallClockMilliseconds": 187824,
+    "ModelCalls": 17,
+    "InputTokens": 617026,
+    "OutputTokens": 6961,
+    "TotalTokens": 623987,
+    "ReasoningTokens": 2904,
+    "CacheReadTokens": 564664,
+    "CacheWriteTokens": 52311,
+    "APIDurationMilliseconds": 95811,
+    "ToolCalls": 44,
+    "NanoAIUnits": 62684460000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 564664,
+      "cache_write": 52311,
+      "input": 51,
+      "output": 6961
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

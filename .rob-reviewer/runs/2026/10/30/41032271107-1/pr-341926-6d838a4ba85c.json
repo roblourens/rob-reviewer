@@ -1,0 +1,241 @@
+{
+  "PullRequest": {
+    "Number": 341926,
+    "Title": "Batch stored shell output lookups when restoring Agent Host chats",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\n## Summary\r\n\r\nWhen the Agent Host restores a long session, it looks up stored shell output **one database query at a time**, once per completed shell command, even when nothing is stored. This PR replaces those lookups with **one batched query** for Copilot, Claude, and Codex chats.\r\n\r\n| Restoring a Copilot CLI session with 2,000 turns and 8,000 shell commands (median of 3 runs) | `main` | This PR |\r\n|---|---:|---:|\r\n| Total restore time (`AgentService.restoreSession`), re-measured on current `main` (`cd2259b`) | 2,350 ms | **1,191 ms** |\r\n| SQLite queries for stored shell output, re-measured on current `main` (`cd2259b`) | 8,000 (one per command) | **1 (batched)** |\r\n| Opening the session in the Agents window: click until its last turn is visible (recordings below, original base `d2e71a5`) | 5,278 ms | **3,159 ms** |\r\n| History reconstruction inside the restore (original base `d2e71a5`) | 2,041 ms | **151 ms** |\r\n\r\nOn current `main`, this change roughly halves the restore and saves about 1.2 s. On the original base, the restore went from 3,045 ms to 1,290 ms and the time a user waits dropped by about 2.1 s, matching the faster restore; the roughly 1.7 s spent rendering the transcript afterwards was unchanged. The gap grows with every shell command a session contains. The per-command lookup was introduced with stored shell output in 95dce80d5e3 (#335016).\r\n\r\n## Root cause\r\n\r\nAfter `mapSessionEvents` rebuilds the turns, [`_restoreStoredShellOutputs`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts#L6879-L6884) calls [`restoreStoredShellOutputsForChat`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/platform/agentHost/node/copilot/copilotSessionHistory.ts#L56-L83) for the parent chat and then for every subagent chat. The same helper also runs when a chat's history is read without a live Copilot runtime. For each completed shell call that has no terminal content of its own, it calls [`await db.getTerminalOutputSize(toolCallId)`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/platform/agentHost/node/copilot/copilotSessionHistory.ts#L68) in sequence. Each call is queued behind the database's [`_queueTurnData`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/platform/agentHost/node/sessionDatabase.ts#L561-L563) and runs a separate async SQLite query ([`getTerminalOutputSize`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/platform/agentHost/node/sessionDatabase.ts#L1164-L1169)). A session with N shell commands therefore waits for N sequential round trips. The CPU is mostly idle meanwhile: a profile of the 2,000-turn restore spends only about 160 ms mapping events.\r\n\r\nThe neighboring lookups in `mapSessionEvents` already use one query each: [`getFileEdits`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/platform/agentHost/node/copilot/mapSessionEvents.ts#L596) and [`getToolResultResources`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/platform/agentHost/node/copilot/mapSessionEvents.ts#L616). Two other providers have the same per-command pattern:\r\n- Claude: [`ClaudeTerminalOutputs.restore`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts#L117-L142)\r\n- Codex: [`_restoreRetainedCommandOutputs`](https://github.com/microsoft/vscode/blob/cd2259bdf72ec7421e70ae80999ceb46f8bd86fe/src/vs/platform/agentHost/node/codex/codexAgent.ts#L7315-L7345)\r\n\r\n## Fix\r\n\r\n- **New batched query.** `ISessionDatabase.getTerminalOutputSizes(toolCallIds)` returns the stored output sizes for many tool calls in one query, without loading the output itself. Tool calls without stored output are absent from the result.\r\n  - The ids are bound as one JSON array (`tool_call_id IN (SELECT value FROM json_each(?))`). That is one bound parameter, so sessions with more calls than SQLite's parameter limit still work; a test uses 40,000 ids.\r\n  - The query runs through the same `_queueTurnData` ordering as the single lookup.\r\n- **Copilot.** The shared helper in `copilotSessionHistory.ts` (now `restoreStoredShellOutputs`) first collects the candidate calls from the parent chat and every subagent chat, remembering which chat owns each one. Both callers use it: session restore and reading a chat's history without a live runtime. It uses the same filter as before, so PTY terminal content still takes precedence. Then it runs one lookup and attaches the full-output terminal link only to calls that have stored output. With no candidates, no query runs. A failed lookup still fails history reconstruction, as before.\r\n- **Claude and Codex.** Each looks up all of a chat's restored shell calls in one query and otherwise behaves as before:\r\n  - Claude only adds terminal content for calls with a stored row.\r\n  - Codex still reads the stored content only when the replayed output was cut short.\r\n  - A failed lookup is still logged as a warning and leaves the replayed content as is. Previously, a failure could happen partway through, after some calls had already been updated.\r\n\r\nThe single-item `getTerminalOutputSize` remains. No Agent Host Protocol shapes change.\r\n\r\n## How it was measured\r\n\r\n- **Input:** a generated, persisted Copilot CLI session in an empty temporary `COPILOT_HOME`. It has 2,000 turns, each with 4 completed `powershell` calls, and no stored terminal output. A 200-turn session with 800 calls is the smaller control.\r\n- **Builds:** Code OSS dev builds with the bundled runtime. Each build ran one warm-up and 3 timed restores, one at a time on the same Windows machine.\r\n  - **Current base:** `main` at `cd2259b`, and this branch rebased onto it. Disposable tracking was off (`VSCODE_DEV_DISABLE_DISPOSABLE_TRACKING=1`), the log level was the default, and every restore used its own freshly generated copy of the session. Only the restore time and the query count were measured again.\r\n  - **Original base:** `main` at `d2e71a5`, and this change applied on top of it, with `--log trace`. The history reconstruction times, the 200-turn control, the Claude and Codex numbers, and the recordings are from this base.\r\n- **Restore time:** wall-clock time of `AgentService.restoreSession`, the call the Agents window waits on when you open a session. It was called directly through the Agent Host inspector, because the test profile was not signed in.\r\n- **History reconstruction:** time between the Agent Host trace lines `Read N persisted event(s)` and `Reconstructed N turn(s)`.\r\n- **Query count:** a counting, non-pausing breakpoint on `getTerminalOutputSize`, and on `getTerminalOutputSizes` when it exists, during one extra restore after the timed runs.\r\n\r\nCurrent base (`main` at `cd2259b`):\r\n\r\n| Session | Build | Shell-output queries | Restore ms (3 runs → median) |\r\n|---|---|---|---|\r\n| 2,000 turns / 8,000 shell calls | `main` | 8,000 single | 2,391, 2,331, 2,350 → **2,350** |\r\n| 2,000 turns / 8,000 shell calls | this PR | 1 batched, no single | 1,205, 1,191, 1,172 → **1,191** |\r\n\r\nOriginal base (`main` at `d2e71a5`):\r\n\r\n| Session | Build | Shell-output queries | Restore ms (3 runs → median) | Reconstruction ms (3 runs → median) |\r\n|---|---|---|---|---|\r\n| 2,000 turns / 8,000 shell calls | `main` | 8,000 single | 3,045, 2,958, 3,768 → **3,045** | 2,041, 2,017, 2,436 → **2,041** |\r\n| 2,000 turns / 8,000 shell calls | this PR | 1 batched | 1,343, 1,290, 1,074 → **1,290** | 162, 151, 121 → **151** |\r\n| 200 turns / 800 shell calls | `main` | 800 single | 1,373, 664, 610 → **664** | 374, 214, 206 → **214** |\r\n| 200 turns / 800 shell calls | this PR | 1 batched | 444, 466, 447 → **447** | 21, 20, 18 → **20** |\r\n\r\nThe remaining restore time is mainly the runtime resuming the session and returning its events. That part is unchanged.\r\n\r\n**Claude and Codex.** These were measured on the original base at the provider level with a temporary harness, which is not committed. The input was a real in-memory `SessionDatabase` with 8,000 completed shell calls, 2 of which had stored output. The harness ran 3 times each against this PR and against the `main` provider modules. For Codex the time covers the whole `getMessages` call, including replay. The large drop is because almost all of the old time was spent waiting on 8,000 queued queries.\r\n\r\n| Provider | Build | Shell-output queries | Restore ms (3 runs → median) |\r\n|---|---|---|---|\r\n| Claude `restore` | `main` | 8,000 single | 1,278, 1,308, 1,281 → **1,281** |\r\n| Claude `restore` | this PR | 1 batched | **10** |\r\n| Codex `getMessages` | `main` | 8,000 single | 1,303, 1,317, 1,315 → **1,315** |\r\n| Codex `getMessages` | this PR | 1 batched | 26, 24, 19 → **24** |\r\n\r\n### Before\r\n\r\n![Before (main): in the Agents window, opening the 2,000-turn session takes 5.3 s from the click until its last turn is visible; history reconstruction alone takes 2.2 s](https://github.com/karthiknadig/vscode/blob/3eb3f37bf5d6a3ad2a54d1a8425cbec3fbbe0882/20261015-171820-C4-F1-product/before.gif?raw=true)\r\n\r\n### After\r\n\r\n![After (this PR): the same session opens in 3.2 s; history reconstruction takes 0.2 s instead of 2.2 s](https://github.com/karthiknadig/vscode/blob/3eb3f37bf5d6a3ad2a54d1a8425cbec3fbbe0882/20261015-171820-C4-F1-product/after.gif?raw=true)\r\n\r\nIn both recordings, the timer runs from the click on the session in a freshly launched Agents window until the last turn of its transcript is visible, and each shows the median of 3 such opens after a warm-up. Both were recorded on the original base.\r\n\r\n## How to test\r\n\r\n1. Build this branch. Point `COPILOT_HOME` at an empty temporary folder that contains a persisted Copilot CLI session with many completed shell calls.\r\n2. Launch Code OSS with `--agents --log trace` and open that session from the Agents window.\r\n3. In `agenthost.log`, compare the timestamps of `Read N persisted event(s); reconstructing turns` and `Reconstructed N turn(s)`. For a 2,000-turn session the gap is about 2 s on `main` and about 150 ms with this PR.\r\n4. Regression check: in a real session, run a shell command with large output in both the parent chat and a subagent, so the full output is stored. Reload the session. Each completed call should still show its full-output terminal link, pointing at the chat that ran it.\r\n\r\n## Validation\r\n\r\n| What was checked | Command | Result |\r\n|---|---|---|\r\n| Copilot restore, query count and timing, on the final branch rebased onto `main` at `cd2259b` | The measurement above, 3 timed runs and 1 counted run per build | `main`: 8,000 single queries. This PR: 1 batched query and no single queries. Restore median 2,350 ms on `main` and 1,191 ms with this PR. |\r\n| Smaller 200-turn control (original base) | Same measurement | `main`: 800 queries. This PR: 1 batched query. |\r\n| New tests fail without the fix (original base) | The new Copilot, Claude, and Codex batching tests run against the `main` provider code | All fail, because no batched lookup is made; all pass with this PR |\r\n| Session database and Agent Host tests, rebased onto `cd2259b` | `scripts\\test.bat --run src\\vs\\platform\\agentHost\\test\\node\\agentHostPeerChatStore.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\sessionDatabase.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\copilotAgentSession.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\claudeTerminalOutput.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\codex\\codexChatDiscovery.test.ts` | 1,715 passing, 0 failing |\r\n| All affected providers, rebased onto `cd2259b` | The command above plus `--run src\\vs\\platform\\agentHost\\test\\node\\copilotAgent.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\codex\\codexAgent.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\claude\\claudeSavedChatReader.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\claudeAgent.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\claudeSdkMessageRouter.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\sessionDataService.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\mapSessionEvents.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\codex\\codexCreateChat.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\codex\\codexPrewarmEviction.test.ts`, in one run | 3,543 passing, 0 failing |\r\n| Type check | `npm run typecheck-client` | Passed |\r\n| Lint | `npm run eslint -- \u003cthe 14 files changed by this PR\u003e` | Passed |\r\n\r\nNew tests:\r\n- **Session database:** looks up output sizes for 40,000 tool calls, more than SQLite can bind as separate parameters. Covers stored, missing, duplicate, and empty inputs.\r\n- **Copilot:** stored output in the parent chat and in a subagent chat is restored with a link to the right chat. 500 calls without output are left alone. Each history read makes one batched lookup and no single lookups. An existing disposal test now stubs the batched lookup, so a failed lookup still rejects reconstruction. The existing test for reading history without a live runtime now also checks that it makes one batched lookup and no single lookups.\r\n- **Claude:**\r\n  - 502 Bash calls are looked up in one call, in order.\r\n  - A non-shell `Read` call with stored output is not looked up.\r\n  - Only Bash calls with stored output get terminal content.\r\n  - A failed lookup leaves content unchanged and logs a warning.\r\n- **Codex:**\r\n  - 503 commands are looked up in one call.\r\n  - Covers stored large output, a stored row whose replayed output is short (the only case that reads stored content), and a missing row.\r\n  - A failed lookup keeps the replayed output.\r\n\r\n---\r\n\u003csub\u003eFound and fixed with automated exploratory performance testing. Draft until reviewed by a human.\u003c/sub\u003e\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/341926",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "cd2259bdf72ec7421e70ae80999ceb46f8bd86fe",
+    "HeadRef": "karthiknadig/bug-swarm/c4-f1-batch-shell-output-restore-lookup",
+    "HeadSHA": "6d838a4ba85cfcf43ecaecf4fc2f254e2a4328be",
+    "CreatedAt": "2026-10-16T01:53:23Z",
+    "UpdatedAt": "2026-10-30T03:55:13Z",
+    "MergedAt": null,
+    "Labels": [
+      "perf"
+    ]
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/node/copilot/copilotSessionHistory.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 80,
+      "BasePath": "src/vs/platform/agentHost/node/copilot/copilotSessionHistory.ts",
+      "BaseLine": 68,
+      "IntroducingPath": "src/vs/platform/agentHost/node/copilot/copilotSessionHistory.ts",
+      "IntroducingCommit": "9dcad803e562f8fdfaad889ef0dfa765d955e5ea",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceCategory": "io",
+      "Mechanism": "The base implementation awaited getTerminalOutputSize inside the nested turn/response-part scan. Each lookup entered SessionDatabase._queueTurnData and issued a separate SQLite SELECT, so restoring N eligible shell calls required N serialized database round trips; callers also repeated the helper for parent and subagent chats.",
+      "Symptom": "Opening or restoring a long Copilot chat is blocked on serialized SQLite work proportional to the number of completed non-PTY shell calls, including the common case where no retained output row exists.",
+      "FixedBehavior": "The changed helper collects candidates across the parent and subagent chats and performs one getTerminalOutputSizes query before attaching terminal resources, reducing the critical-path size lookup count from N to one (or zero with no candidates).",
+      "Evidence": "The deleted base line 68 awaited getTerminalOutputSize in the per-tool loop; SessionDatabase.getTerminalOutputSize executes one SELECT through _queueTurnData. RIGHT line 80 performs a single batched lookup over all collected candidates, and the changed Copilot session callers pass parent and subagent turns together. The added test exercises 501 parent candidates plus a child and asserts one batched call per reconstruction and zero single calls.",
+      "Confidence": 0.98
+    },
+    {
+      "FixedPath": "src/vs/platform/agentHost/node/codex/codexAgent.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 7325,
+      "BasePath": "src/vs/platform/agentHost/node/codex/codexAgent.ts",
+      "BaseLine": 7325,
+      "IntroducingPath": "src/vs/platform/agentHost/node/codex/codexAgent.ts",
+      "IntroducingCommit": "170bef5d325ee4172618757e7fe0dd1ee959e9e0",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceCategory": "io",
+      "Mechanism": "The base retained-output restore loop awaited getTerminalOutputSize for every replayed command. The database sequences each lookup and executes an individual SQLite SELECT, so full history reads and changed-history refreshes paid one round trip per command.",
+      "Symptom": "Opening a Codex thread with many commands, or refreshing a changed history containing many commands, is blocked on serialized database latency proportional to the command count.",
+      "FixedBehavior": "The changed code sends all replayed command IDs through one getTerminalOutputSizes query and checks the resulting map locally. Reads of full output remain limited to stored calls whose replayed output needs replacement, as before.",
+      "Evidence": "Codex _getChatMessages and _refreshChatHistory both await _restoreRetainedCommandOutputs. Deleted base line 7325 performed one awaited size lookup per command; RIGHT line 7325 performs one batched query outside the loop. The added 503-command test asserts one batch, no single calls, and only one unchanged full-content read.",
+      "Confidence": 0.99
+    },
+    {
+      "FixedPath": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 129,
+      "BasePath": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts",
+      "BaseLine": 130,
+      "IntroducingPath": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts",
+      "IntroducingCommit": "b05f1ac43ae69b6a8713b7dc9dd6e191df020233",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceCategory": "io",
+      "Mechanism": "The base restore loop awaited getTerminalOutputSize once for every restored Bash call. Each call was serialized by SessionDatabase._queueTurnData and ran its own SQLite SELECT, making history restoration wait for N database round trips.",
+      "Symptom": "Reading a saved or materialized Claude chat with many Bash calls incurs restore latency that grows with every shell call, even when almost none have retained output.",
+      "FixedBehavior": "The changed code maps all restored Bash call IDs into one getTerminalOutputSizes query, then uses the returned map in memory, reducing N serialized size queries to one while preserving zero-query behavior when there are no shell calls.",
+      "Evidence": "ClaudeTerminalOutputs.restore gathers all completed Bash calls, and both ClaudeSavedChatReader.read and ClaudeAgent history reconstruction await it before returning turns. Deleted base line 130 performed the size lookup in the loop; RIGHT line 129 performs one lookup before the loop. The new 502-call test asserts one batched lookup and zero single lookups.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "serialization-allocation",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Restore or open a persisted Copilot Agent Host chat, including parent and subagent transcripts with many completed non-PTY shell calls",
+        "CriticalPath": "Persisted event pages are read and mapped, then retained shell output metadata must be restored before getMessages or session reconstruction returns. The changed SQLite lookup is therefore on the cold reconstruction critical path; memoized primary/all mapped events and isolated persisted-history promises avoid repeating it on warm reads.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:_computeMappedEvents and src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_doReadPersistedChatHistory",
+            "Operation": "Read persisted Copilot event-log pages through the SDK/control-plane RPC",
+            "Cardinality": "One RPC per up-to-1000-event page, unchanged by this diff",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same paginated event reads occurred before the diff",
+            "CriticalPathEffect": "All pages must be available before mapping and output restoration can complete"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts:getTerminalOutputSizes",
+            "Operation": "Look up length(output) for all eligible tool call IDs using json_each over one bound JSON array and the terminal_outputs primary-key index",
+            "Cardinality": "One SQLite query per cold reconstruction with candidates, zero with none; previously one queued query per eligible shell call and separate helper invocations per chat",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Each candidate awaited getTerminalOutputSize, issuing N serialized indexed SELECTs",
+            "CriticalPathEffect": "Awaited before reconstructed turns are returned, but replaces N serialized boundary calls with one"
+          }
+        ],
+        "ScalingInput": "The effective batch cardinality is the number of eligible completed shell calls across the parent and included subagent chats after filtering out PTY terminal content. A realistic long session can contain thousands; IDs are normally unique, while SQL IN semantics prevent duplicate result rows.",
+        "EffectiveConcurrency": "Event pages are fetched sequentially by readCopilotSessionEvents as before. Database turn-data operations are serialized by _turnUsageSequencer and the shared mutation sequencer; the diff replaces N serialized size queries (and formerly separate per-chat passes) with one queued query, with no concurrency burst.",
+        "CacheBehavior": "Cold primary and all-scope reconstructions each perform at most one batch lookup when they contain candidates. CopilotAgentSession memoizes reconstruction by scope, and isolated history reads cache their promise by chat identity. Missing output rows are represented by absence from the returned map for the current batch rather than a persistent negative cache.",
+        "MechanismConfidence": "High: changed loops, database sequencers, indexed schema, callers, and tests establish the before/after boundary cardinality.",
+        "MagnitudeUncertainty": "Exact latency depends on session size, SQLite/runtime overhead, and how often a scope is reconstructed, but the reduction from N serialized queries to one is directly established.",
+        "Verdict": "This is a concrete boundary-fanout regression fix, not a new performance regression. The temporary candidate array and JSON parameter are O(N), but they replace O(N) objects plus N serialized database operations and are bounded by the already-loaded history."
+      },
+      {
+        "Scenario": "Read or materialize a saved Claude chat containing many completed Bash tool calls",
+        "CriticalPath": "The SDK transcript is read and mapped first; ClaudeTerminalOutputs.restore is then awaited before turns are returned. Its database lookup is on the cold history-read critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeSavedChatReader.ts:read",
+            "Operation": "Load Claude session or subagent transcript through the local SDK",
+            "Cardinality": "One session transcript read, plus a subagent message read when opening a subagent; unchanged",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same SDK transcript reads occurred before this diff",
+            "CriticalPathEffect": "Transcript content must arrive before mapping and retained-output restoration"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeTerminalOutput.ts:restore",
+            "Operation": "Query stored terminal-output sizes for all restored Bash call IDs",
+            "Cardinality": "One SQLite batch query when at least one Bash call exists; previously one serialized query per Bash call",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The restore loop issued and awaited getTerminalOutputSize separately for every Bash call",
+            "CriticalPathEffect": "Awaited before saved/materialized turns return, with greatly reduced boundary count"
+          }
+        ],
+        "ScalingInput": "Effective cardinality is completed Bash calls only; non-shell tools are filtered before the batch. Stored and missing IDs share the same single query.",
+        "EffectiveConcurrency": "The changed lookup is one operation serialized by the session database sequencers. There is no Promise.all fan-out or aggregate burst; before the diff the loop awaited one serialized query at a time.",
+        "CacheBehavior": "No provider-level retained-output lookup cache is added. Each actual transcript reconstruction performs one current-state query, preserving invalidation naturally; calls with no Bash candidates perform no query. The surrounding chat/history ownership determines whether reconstruction itself is reused.",
+        "MechanismConfidence": "High: both saved-chat and materialized-chat callers await restore, and the new multi-call test verifies one batch for 502 shell candidates with zero single lookups.",
+        "MagnitudeUncertainty": "The exact user-visible saving varies with Bash-call count and storage speed; the scaling and critical-path placement are certain.",
+        "Verdict": "The diff removes per-command database fan-out. JSON serialization and the result map add linear CPU/allocation but do not constitute a regression relative to the prior linear loop plus serialized I/O."
+      },
+      {
+        "Scenario": "Open a persisted Codex thread or refresh changed Codex history containing replayed commands",
+        "CriticalPath": "The Codex thread/rollout is read and replayed, then _restoreRetainedCommandOutputs is awaited before the full history returns or a changed-history event is published. The size batch is on this critical path; full content is additionally read only for stored commands whose replayed output is not already retainable.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_getChatMessages and _refreshChatHistory",
+            "Operation": "Read persisted Codex rollout/thread state through _readSession",
+            "Cardinality": "One logical thread read per cold open or accepted refresh, unchanged by this diff",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same thread read occurred before the diff",
+            "CriticalPathEffect": "Thread data must be available before replay and retained-output restoration"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_restoreRetainedCommandOutputs",
+            "Operation": "Batch-query stored output sizes, then conditionally read full output for qualifying stored commands",
+            "Cardinality": "One size query for all replayed commands; full BLOB reads only for stored rows whose replayed output is short. Previously there were N size queries plus the same conditional BLOB reads",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Every replayed command caused its own awaited getTerminalOutputSize query",
+            "CriticalPathEffect": "Awaited before returning/publishing history; the diff reduces serialized query count without increasing content reads"
+          }
+        ],
+        "ScalingInput": "For a full open, effective batch size is all replayed commands. For refresh, it is commands in changed non-host turns only. Subsequent full-output reads scale with the subset that both has a stored row and needs replacement, unchanged from before.",
+        "EffectiveConcurrency": "History refreshes are sequenced by _chatHistoryReads and terminal database operations are serialized. The diff performs one size query, followed by the same sequential conditional content reads as before; it does not introduce concurrent SQLite work.",
+        "CacheBehavior": "A 30-second equality check and history snapshots can skip unchanged refresh processing. On a real cold/open or changed refresh, current stored sizes are queried once; absence is local to that batch. Existing snapshots cache mapped turns, not stale database size results.",
+        "MechanismConfidence": "High: both callers and filtering are explicit, and the 503-command test verifies one size batch and only the expected unchanged content read.",
+        "MagnitudeUncertainty": "Refresh batches may be much smaller than full histories because unchanged turns are filtered, but the full-open path can contain hundreds or thousands of commands; duration depends on local database overhead.",
+        "Verdict": "This is a high-confidence reduction in critical-path database fan-out with no actionable performance regression introduced."
+      },
+      {
+        "Scenario": "Execute the new session-database batched terminal-output-size lookup with a very large ID set",
+        "CriticalPath": "Provider history restoration awaits the query. JSON.stringify occurs synchronously before the native SQLite dbAll call within the queued operation, so both serialization and SQL execution are on the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts:getTerminalOutputSizes",
+            "Operation": "Serialize all tool call IDs into one JSON array parameter",
+            "Cardinality": "One JSON serialization containing N IDs per non-empty batch; previously N individual one-element SQL parameter bindings across N calls",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No aggregate JSON allocation; each ID was separately bound in its own query",
+            "CriticalPathEffect": "Linear synchronous allocation precedes the query, but is outweighed by eliminating N queued SQLite crossings for realistic long histories"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/sessionDatabase.ts:getTerminalOutputSizes",
+            "Operation": "Use json_each(?) to probe terminal_outputs by tool_call_id and compute BLOB lengths without loading output",
+            "Cardinality": "One query with N virtual-table values and up to matching-row count results; terminal_outputs.tool_call_id is the primary key",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "N getTerminalOutputSize calls each executed a separate SELECT",
+            "CriticalPathEffect": "One indexed batch remains on the critical path instead of N serialized indexed queries"
+          }
+        ],
+        "ScalingInput": "CPU and transient bytes grow linearly with candidate ID count; the test covers 40,003 array entries including a duplicate, above ordinary SQLite bound-parameter limits. Returned map size is bounded by matching terminal_outputs rows.",
+        "EffectiveConcurrency": "One operation holds the turn-data/mutation sequence while serializing parameters and running the query. This is intentionally serialized for ordering and replaces many acquisitions/queries rather than adding contention.",
+        "CacheBehavior": "There is no cross-call cache; each batch observes current database state. Empty input returns before serialization or SQLite. Missing IDs create no retained map entries, so negative results are not pinned.",
+        "MechanismConfidence": "High: query text, schema primary key, empty guard, queueing, and large-input test are directly visible.",
+        "MagnitudeUncertainty": "Extremely large histories allocate a correspondingly large JSON string and candidate array, but those histories are already fully resident and the test establishes practical 40,000-ID support; no realistic threshold indicates a regression versus N database calls.",
+        "Verdict": "The linear serialization/allocation is bounded by loaded history size and is a deliberate batching tradeoff; it does not create a reportable regression."
+      }
+    ],
+    "Summary": "Reviewed all 14 changed files and complete diff pages for the performance focus. The change replaces per-shell-call, sequenced SQLite size lookups with one indexed batch across Copilot, Claude, and Codex restore paths. No actionable diff-introduced performance issue was found. Three concrete boundary-fanout regression fixes were recorded with base blame attribution."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-30T09:21:23.077150442Z",
+    "CompletedAt": "2026-10-30T09:23:31.197237056Z",
+    "WallClockMilliseconds": 128120,
+    "ModelCalls": 7,
+    "InputTokens": 221328,
+    "OutputTokens": 7410,
+    "TotalTokens": 228738,
+    "ReasoningTokens": 2189,
+    "CacheReadTokens": 173128,
+    "CacheWriteTokens": 48179,
+    "APIDurationMilliseconds": 80870,
+    "ToolCalls": 45,
+    "NanoAIUnits": 45843020000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 173128,
+      "cache_write": 48179,
+      "input": 21,
+      "output": 7410
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
