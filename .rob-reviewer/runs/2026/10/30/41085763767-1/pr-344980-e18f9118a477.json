@@ -1,0 +1,186 @@
+{
+  "PullRequest": {
+    "Number": 344980,
+    "Title": "files: support `!` exclude exceptions in files.exclude and search.exclude",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #869. Implements the approach discussed in #134415.\n\n## What changed\n\nA `!`-prefixed key in `files.exclude` or `search.exclude` is now an **exclude exception**:\n\n```jsonc\n\"files.exclude\": {\n  \"node_modules\": true,\n  \"!node_modules/@types\": true // shown, including everything inside it\n}\n```\n\n**Rule:** a path is excluded if it, or one of its parent folders, matches an exclude pattern, and neither the path nor any parent folder matches an exception.\n\n- **Order doesn't matter.** Settings scopes merge as before, and an exception key can be set to `false` in another scope to disable it.\n- **Exceptions only show things.** They never add exclusions, so `{\"!*.js\": true}` alone has no effect. This avoids the \"negations match everything\" problem raised in #134415.\n- **`false` is unchanged.** It still disables a key.\n- **No exceptions, no change.** `parseExcludeExpression` returns exactly what `glob.parse` returns.\n- **Exceptions override `.gitignore`**, both for `explorer.excludeGitIgnore` and for search ignore files.\n- **Exceptions are relative to the folder.** Absolute `!` keys are ignored. They still apply when an absolute exclude pattern matches.\n- **Version control folders stay excluded.** `.git`, `.svn`, `.hg` and `.jj` are not re-included or walked under an exception unless an exception names them, for example `!.git/hooks`.\n- **Only these two settings are affected.** `files.watcherExclude`, `files.readonly*`, `explorer.autoRevealExclude`, `workbench.localHistory.exclude` and the extension API keep treating `!` literally. Exclude patterns from the search view input and from the API are escaped to `{!}`.\n\n### Where it applies\n- **`glob.ts`:** new `parseExcludeExpression`, which exposes `matches`, `matchesExclude`, `isExcepted` and `couldExceptionMatchBeneath`.\n- **Explorer:** shows excepted items and the folders that lead to them. Those folders are not dimmed. An exception that starts with `**` shows every folder that could contain a match.\n- **Search, Node (ripgrep):** ripgrep cannot express exceptions and does not descend into excluded folders. After the normal run, the file and text engines run ripgrep once more per folder, with `--no-ignore` and these `-g` globs:\n  - `!*`, then folder-only globs for the folders that lead to each exception (for example `/node_modules/`), then the exceptions themselves. Only those folders are walked.\n  - If an exception starts with `**`, only the exceptions are whitelisted, because the whole folder has to be walked anyway.\n  - The results are checked against the exceptions with VS Code's glob matcher, because ripgrep globs can match more (ripgrep matches `**.js` at any depth). Results already reported by the normal run are skipped, the query's includes are applied, and folders of the query that are inside the searched folder are skipped.\n- **Tree walks, everywhere else:** the explorer, breadcrumbs, the web-worker search, the file-system provider search, the file walkers and the Agents window file search all share `glob.evaluateExcludeTreeEntry`, which decides whether an entry is excluded and whether to walk into it. This also fixes `QueryGlobTester.includedInQuery` ignoring synchronous exclude matches when it evaluates sibling clauses asynchronously.\n- **Extension search providers** receive the same excludes as today, without exceptions, so exceptions aren't honored there yet.\n- **Other readers of these settings:** the Problems view and quick open history.\n- **Settings:** the schemas for both settings accept `!` keys with their own description. The Settings editor and `settings.json` diagnostics are in the follow-up #345013.\n- **Telemetry:** `searchComplete` and `textSearchComplete` now report exception counts, and `searchComplete` also reports exception run count and time. All new fields are measurements.\n\n### Known limits\n- **No re-excluding inside an exception.** That needs ordered rules, which settings objects can't express.\n- **Exceptions starting with `**`** make the explorer show every folder in excluded regions, and make search walk the whole folder without ignore files.\n\n## How to test\n1. Add `\"files.exclude\": { \"node_modules\": true, \"!node_modules/@types\": true }` to workspace settings. In the explorer, only `node_modules/@types` should be visible under `node_modules`, and `node_modules` should not be dimmed.\n2. Quick open and text search should find files under `node_modules/@types` only. This should also work when `node_modules` is gitignored.\n3. Replace the exception with `!**/node_modules/@types` and check that nested `node_modules/@types` folders are found too.\n\n## Performance\nMeasured on this repo (about 21k files, gitignored `node_modules`), median of 7 warm runs with the built-in ripgrep engines. The extra runs were measured again for the single run per folder: 8 ms for `!node_modules/@types` and 1190 ms for `!**/node_modules/@types`.\n\n| Configuration | File search | Text search |\n|---|---|---|\n| Default excludes, no exceptions | 164 ms | 944 ms |\n| `!node_modules/@types` | 170 ms (extra run: 8 ms) | 931 ms |\n| `!**/node_modules/@types` | 1210 ms (extra run: 1035 ms) | 1208 ms |\n\n- **No exceptions:** no change. `parseExcludeExpression(...).matches` is the plain `glob.parse` result, ripgrep runs once with the same arguments, and no deduplication set is created. Micro-benchmark: 25.1 vs 25.7 ms per 10k parses of the default excludes; identical matching speed over 200k paths.\n- **Exceptions with a folder path:** one extra ripgrep run that only walks the folders leading to the exceptions.\n- **Exceptions starting with `**`:** one extra run over the whole folder, including gitignored folders. This is the cost of making `!**/node_modules/@types` work when `node_modules` is gitignored. To limit the cost:\n  - Exceptions don't look into `.git`, `.svn`, `.hg` or `.jj` unless an exception names them. This applies to search and the explorer, and saved about 110 ms with a 2 GB `.git`.\n  - `settings.json` shows an info hint on these exceptions (#345013).\n  - The `unanchoredExcludeExceptionCount` and `excludeExceptionTime` telemetry fields track how often this happens and what it costs.\n- **Memory:** only paths that match an exception are kept for deduplication.\n\n## Validation\nRun on the branch merged with current `main`:\n- `npm run typecheck-client`: passed\n- `npm run valid-layers-check`: passed\n- `npm run eslint -- \u003cchanged files\u003e`: passed\n- `./scripts/test.sh --runGlob \"**/{base/test/common/glob,workbench/test/common/resources,services/search/test/**/*,contrib/search/test/**/*,contrib/files/test/**/*,contrib/markers/test/**/*,services/history/test/**/*,api/test/node/extHostSearch}.test.js\"`: 615 passing, 4 pending\n- `./scripts/test-integration.sh --run src/vs/workbench/services/search/test/node/{fileSearch,textSearch,search,rawSearchService}.integrationTest.ts`: 100 passing. These run real ripgrep and cover exceptions, `.gitignore`, nested roots, folder includes, existence queries, result limits, casing, symbolic links, `..` segments, nested folders with different casing, and exception results that ripgrep matches but VS Code globs don't.\n- The regression tests for the review findings fail without the fixes and pass with them. A second review by GPT-6 Astra and Claude Opus 5.5 found no remaining issues.\n- Manual check in a Code OSS build with `{\"**/node_modules\": true, \"!node_modules/@types\": true, \"!build/keep.txt\": true}` and a gitignored `build/`:\n  - **Explorer:** shows only `node_modules/@types/**` and `build/keep.txt`, without dimming the folders leading to them.\n  - **Quick open and text search:** find only the excepted files.\n  - **Settings changes:** disabling and re-enabling the exception updates the explorer without a reload.\n- CI: passed on Windows, macOS and Linux for the previous commit.\n- Not run: remote or virtual workspaces.\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344980",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0d958c41dd9dbfb1da6cff3469d5990b46fa2212",
+    "HeadRef": "agents/vscode-negated-globs-explanation",
+    "HeadSHA": "e18f9118a4771a360b30ab40f516ca9371988c67",
+    "CreatedAt": "2026-10-29T14:48:46Z",
+    "UpdatedAt": "2026-10-30T16:07:08Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-A2E459D641FD",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts",
+      "Side": "RIGHT",
+      "Line": 82,
+      "Severity": "high",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed subprocess call, parser limit, omitted include globs, outer acceptance counter, and optional per-result readdir path are all directly traced. Exact duration depends on workspace contents and query selectivity, but the unbounded scaling and critical-path reachability are deterministic.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "ripgrep subprocess output, JSON parsing/allocation, queued result-filter promises, and conditional sibling-check filesystem reads",
+      "PerformanceScaling": "Cost grows with every raw text match under the exception globs, including duplicate and include-rejected matches, rather than with the configured 20,000 accepted-result limit.",
+      "PerformanceOutcome": "Unbounded CPU/GC and I/O pressure can greatly delay or hang text search.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Text search passed include/exclude globs to a single ripgrep run and constructed RipgrepParser with options.maxResults (default 20,000), so the subprocess was killed once that bounded number of matches was parsed.",
+      "ChangedBehavior": "When any exclude exception is present, the added second run omits normal include globs and sets maxResults to Number.MAX_SAFE_INTEGER; only after each ripgrep JSON match is parsed does the callback deduplicate and the outer TextSearchManager apply query includes/excludes.",
+      "CausalDiffEvidence": "The added call at line 82 explicitly replaces the configured parser bound with Number.MAX_SAFE_INTEGER for the new exception run; the same diff's getRgArgs exception branch supplies only exception globs and defers includes to result filtering.",
+      "Title": "Keep exception text-search runs bounded before parsing",
+      "Impact": "With a broad exception (for example !**/*.js), a narrow files-to-include filter, and a common term in a workspace containing generated or ignored dependencies, search can consume a full core, produce heavy GC/subprocess traffic, and remain busy long after the configured result limit would previously have stopped it.",
+      "Evidence": "searchWithRipgrep constructs RipgrepParser from options.maxResults and kills ripgrep only on its hitLimit event. For the new exception call, that limit is Number.MAX_SAFE_INTEGER. getRgArgs also skips pushIncludeAndExcludeGlobs for exception runs, while TextSearchManager increments its limit only after QueryGlobTester accepts a result. Thus a narrow files-to-include filter plus a broad exception such as !**/*.js and a common query can make ripgrep emit and VS Code JSON-parse every matching line in regular and ignored JS trees even though almost all are discarded. If a sibling-clause exclude is configured, each forwarded candidate can additionally create a pfs.readdir-backed promise retained in testingPs until provider completion.",
+      "Recommendation": "Preserve a finite candidate bound by applying the intersection of exception and include/query filters before text matches reach RipgrepParser/TextSearchManager—for example, partition exception runs by anchored include roots or synthesize intersected globs—and bound any unavoidable post-filter pipeline/concurrency rather than using Number.MAX_SAFE_INTEGER."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Text search with files/search exclude exceptions",
+        "CriticalPath": "The normal ripgrep search must finish before the new exception ripgrep run starts; both runs and all post-filtering must complete before search completion. Accepted results stream earlier, but the exception run remains on the completion critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:provideTextSearchResultsWithRgOptions/searchWithRipgrep",
+            "Operation": "Spawn ripgrep for the normal text search and, when exceptions exist, a second ripgrep with --no-ignore and exception globs.",
+            "Cardinality": "Two sequential ripgrep processes per searched folder when at least one enabled exception exists; one before the diff.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One ripgrep process per folder with includes/excludes and the configured/default parser result limit.",
+            "CriticalPathEffect": "The second run is required before the search promise completes and may walk broad ignored regions."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:82 and RipgrepParser.handleLine",
+            "Operation": "Decode ripgrep JSON lines and allocate TextSearchMatch2 objects before deduplication and query include filtering.",
+            "Cardinality": "One parse/allocation per raw match emitted by the exception run; line 82 raises the parser limit from the default 20,000 to Number.MAX_SAFE_INTEGER.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The single provider run stopped parsing and killed ripgrep at the configured/default result limit.",
+            "CriticalPathEffect": "All rejected raw candidates still consume CPU/GC and delay completion."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/search/common/textSearchManager.ts:158; src/vs/workbench/services/search/node/textSearchManager.ts:16",
+            "Operation": "Read a result's parent directory to evaluate conditional sibling exclude clauses.",
+            "Cardinality": "Up to one pfs.readdir per raw forwarded result that evaluates a sibling clause; no shared directory cache, and the new unbounded exception stream can materially increase this beyond the previous parser cap.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This boundary existed but provider output was bounded by maxResults; the diff materially amplifies its possible cardinality for exception runs.",
+            "CriticalPathEffect": "Promises are retained and awaited before search completion; large bursts add I/O and memory pressure."
+          }
+        ],
+        "ScalingInput": "Workspace-folder count, files reachable by exception globs, raw text-match count, query include selectivity, and conditional sibling-clause count. Broad ** exceptions can make the effective candidate set the whole folder including ignored trees.",
+        "EffectiveConcurrency": "Normal and exception runs are serialized within each searched folder. Folder searches use the provider's existing multi-folder scheduling; inside post-filtering, sibling-clause checks can accumulate many asynchronous per-result promises without a limiter.",
+        "CacheBehavior": "Parsed exception globs and the per-run reportedPaths set are reused only within one search. There is no result cache or cross-search coalescing; warm OS filesystem cache may reduce traversal time but not subprocess output or JSON parsing.",
+        "MechanismConfidence": "High: subprocess sequencing, omitted include globs, Number.MAX_SAFE_INTEGER parser limit, post-filter placement, and filesystem sibling checks are directly traced.",
+        "MagnitudeUncertainty": "Exact slowdown depends on exception breadth, ignored dependency size, query frequency, and include selectivity; broad exceptions and common terms make the worst case realistic.",
+        "Verdict": "Reportable high-severity regression: the required second run is acceptable, but removing the candidate cap before post-filtering makes CPU/allocation and optional filesystem work scale with all raw matches rather than accepted results."
+      },
+      {
+        "Scenario": "File/Quick Open search with exclude exceptions using native ripgrep",
+        "CriticalPath": "A normal file-listing ripgrep run completes, then one exception listing run executes per folder before file search completes unless the normal run already hits the result limit.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/search/node/fileSearch.ts:folderTraversal; src/vs/workbench/services/search/node/ripgrepFileSearch.ts:spawnRipgrepCmd",
+            "Operation": "Run ripgrep --files normally and once more with --no-ignore plus grouped exception globs.",
+            "Cardinality": "Two sequential subprocesses per folder with exceptions versus one before the diff; all exceptions in that folder share the second process.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "One ripgrep --files invocation per folder; ignored/excluded folders were not revisited.",
+            "CriticalPathEffect": "The second listing/filter pass delays completion but can stop when accepted file results hit the existing search limit."
+          }
+        ],
+        "ScalingInput": "Workspace-folder count and number of files reachable by exception globs after version-control-folder pruning; broad ** exceptions approach all files in a root.",
+        "EffectiveConcurrency": "The two runs for one folder are serialized. Existing folder traversals can run concurrently across roots; no additional per-exception subprocess fan-out occurs because all exceptions for a folder are grouped into one run.",
+        "CacheBehavior": "A per-search seenPaths set deduplicates paths that can be reported by both runs. Only excepted normal paths are retained, bounded in practice by the file-search result limit; there is no cross-query cache.",
+        "MechanismConfidence": "High: grouping, sequential order, deduplication, and result-limit checks are explicit.",
+        "MagnitudeUncertainty": "Anchored exceptions prune traversal strongly, while an exception beginning with ** can require a full walk; repository measurements in PR metadata do not establish all workspace sizes.",
+        "Verdict": "No additional finding: the extra process is intrinsic to the feature, grouped once per folder, deduplicated, and remains bounded by accepted file results."
+      },
+      {
+        "Scenario": "Explorer, breadcrumbs, virtual/web, and filesystem-provider tree traversal with exclude exceptions",
+        "CriticalPath": "Each discovered tree entry is synchronously glob-evaluated to decide visibility and whether an excluded directory must still be traversed. Filesystem enumeration remains the dominant boundary and occurs only for directories marked visitable.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/search/common/fileSystemFileSearchProvider.ts:visit and src/vs/workbench/services/search/worker/localFileSearch.ts:processDirectory",
+            "Operation": "Enumerate child directories while walking explorer/search trees.",
+            "Cardinality": "One read per visited directory; anchored exceptions visit only leading folders, while ** exceptions may make all otherwise-excluded directories visitable.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The enumeration boundary already existed, but excluded/ignored directories were pruned and therefore not read; the diff intentionally revisits only regions needed for exceptions.",
+            "CriticalPathEffect": "Directory reads are required before tree/search results can be produced; provider search remains limited to 16 concurrent reads."
+          }
+        ],
+        "ScalingInput": "Number of discovered entries, folder depth, exception count/pattern complexity, and breadth of excluded regions that a ** exception can potentially match beneath.",
+        "EffectiveConcurrency": "Explorer filtering is synchronous on the tree path. Filesystem-provider search keeps its existing Limiter(16); the worker traversal batches directory promises as before. Exceptions intentionally widen traversal only along possible matching paths, or across the root for unanchored patterns.",
+        "CacheBehavior": "Parsed expressions are cached per workspace root and refreshed on configuration changes. Explorer tracks folders leading to exceptions in a WeakSet, avoiding retention after model nodes die. No exceptions uses the plain parsed matcher fast path.",
+        "MechanismConfidence": "High: evaluator decisions and provider limiter are directly visible in changed paths.",
+        "MagnitudeUncertainty": "Cost for broad ** exceptions depends on excluded tree size, but this traversal expansion is the documented semantic cost and version-control folders are pruned unless explicitly named.",
+        "Verdict": "No finding: added traversal is necessary for re-inclusion, cached evaluators avoid reparse-per-entry, anchored patterns prune branches, and existing filesystem concurrency remains bounded."
+      },
+      {
+        "Scenario": "Problems/history/resource filtering and breadcrumb picker visibility",
+        "CriticalPath": "Resource paths are matched synchronously during list filtering or history exclusion; breadcrumb entries with exceptions additionally check ancestor folders before deciding visibility.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of list/history resources and, in breadcrumbs, path depth times displayed entries.",
+        "EffectiveConcurrency": "Synchronous in-memory work only; no subprocess, IPC, network, database, or filesystem boundary is added by these changed matchers.",
+        "CacheBehavior": "Resource and breadcrumb parsed expressions are cached per workspace folder and invalidated on relevant configuration/workspace changes. Breadcrumb ancestor exclusion results are not separately memoized.",
+        "MechanismConfidence": "High for the added synchronous matching; low evidence of material magnitude.",
+        "MagnitudeUncertainty": "Very deep, very large breadcrumb trees could increase ancestor glob checks, but realistic picker populations and depths do not establish a user-visible regression.",
+        "Verdict": "No finding: work is in-memory and cached at expression level, with insufficient evidence that the depth-dependent ancestor checks cause concrete latency."
+      }
+    ],
+    "Summary": "Completed the performance pass across all 32 changed files. One high-confidence issue was submitted for the unbounded exception text-search parser/post-filter pipeline. The intentional extra file-search process and widened tree traversal were checked for grouping, limits, cache lifecycle, and concurrency and did not justify additional findings."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-30T16:09:12.293608424Z",
+    "CompletedAt": "2026-10-30T16:12:05.884963579Z",
+    "WallClockMilliseconds": 173591,
+    "ModelCalls": 8,
+    "InputTokens": 508242,
+    "OutputTokens": 10117,
+    "TotalTokens": 518359,
+    "ReasoningTokens": 5060,
+    "CacheReadTokens": 417792,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 150805,
+    "ToolCalls": 62,
+    "NanoAIUnits": 73125680000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 417792,
+      "cache_write": 0,
+      "input": 90450,
+      "output": 10117
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

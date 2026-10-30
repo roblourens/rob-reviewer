@@ -1,0 +1,233 @@
+{
+  "PullRequest": {
+    "Number": 344141,
+    "Title": "update: opt-in restart to apply updates while the screen is locked",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nAdds an opt-in, experimental `update.restartWhenIdle` setting (off by default, experiment-controlled, managed by the new `UpdateRestartWhenIdle` policy). When a downloaded update is ready, the machine is on power and the screen has been locked for a minute, VS Code restarts to apply it, keeping the machine from going to sleep until then, but only when the restart is invisible to the user:\n\n- **Never takes focus:** if VS Code was the active app when the screen was locked, it comes back active. Otherwise the windows are restored in the background: no app activation, windows shown inactive and behind the active app's windows.\n- **Exact restore:** the windows come back as they were, including minimized windows, a hidden app (macOS), fullscreen windows and floating windows. Every window must also confirm that its content can be restored exactly; anything unknown, failing or slow blocks the restart.\n\nThere is no tracking issue yet.\n\n## How it works\n\n- **Renderer:** the new `IUnattendedRestartService` (`src/vs/workbench/services/lifecycle/common/unattendedRestart.ts`) collects quick, side-effect-free checks that feature areas register. Each check returns a stable blocker ID or nothing, optionally with what exactly blocks for the logs (for example which editors can't be restored); telemetry only gets the IDs. A check that throws, or doesn't answer within 5 seconds, blocks. Each window, including the Agents window, exposes the result over a new `unattendedRestart` IPC channel, together with the effective value of the setting. Windows report `workbench.starting` until all contributions up to `AfterRestored` exist, so checks register by then.\n- **Main:** `UnattendedRestartScheduler` (`src/vs/platform/update/electron-main/unattendedRestartScheduler.ts`) waits for the update to be `Ready`. As soon as the screen gets locked, it checks system and window state and asks every window; that check trusts the lock event, because macOS reports the session as locked only shortly after it. If nothing blocks and the setting is on, it keeps the machine from going to sleep (`powerSaveBlocker`'s `prevent-app-suspension`: the display still turns off, and closing a laptop's lid still puts it to sleep), because with default settings a MacBook goes to sleep about a minute after locking. Power, heat and window state are checked after the windows answered, which can take a while, and a lock or wake during a check starts a new one. Once the screen has been locked for a minute, it checks again and only then calls `IWindowsMainService.restoreExactlyOnNextStartup({ inBackground })` and `quitAndInstall({ unattended: true, relaunchInBackground })`. While the screen stays locked it retries every minute, and logs the blockers when they change. `unattended` makes the check for a newer update before quitting behave like the background checks, so it doesn't download one on a metered connection, and the scheduler cancels `quitAndInstall` through its new `token` option when the screen is unlocked during that check. If an unattended restart didn't install the update, the scheduler doesn't restart again for that version while the same version runs. The machine may sleep again as soon as the screen is unlocked, it switches to battery, it reports thermal pressure, something blocks, or after 3 minutes; resuming from sleep while locked starts over. On macOS, unattended restarts also run `caffeinate -i -t 60`, because ShipIt keeps the machine awake for only 10 seconds while installing.\n- **Exact restore (windows layer):** `restoreExactlyOnNextStartup` makes `WindowsStateHandler` write a one-time marker once no window vetoed the shutdown; the next startup reads and removes it. Window state now records whether a window is minimized (only applied with the marker). With the marker:\n  - minimized windows are restored minimized;\n  - in the background, windows are created hidden and shown with `showInactive()`, on macOS ordered behind the active app (`blur()`), and the last active window is moved in front of the other VS Code windows (`moveAbove`), so switching back to VS Code focuses the same window as before;\n  - in the background, fullscreen (all platforms) and maximizing (Windows, where maximizing a hidden window activates it) wait until the window gets focus, so no new Space is entered while the user is away. A pending mode is still saved, so a second restart keeps it;\n  - if the app was hidden (macOS), it is hidden again after its windows are shown;\n  - floating windows that open during a background restore are shown the same way;\n  - the background mode ends when the user activates the app (`did-become-active`, `browser-window-focus`).\n- **Background relaunch (macOS):** Squirrel's own relaunch always activates the app, because ShipIt calls `launchApplicationAtURL:options:` with `NSWorkspaceLaunchDefault` (`0x10000`, verified in the ShipIt binary). So `DarwinUpdateService` instead quits normally, which lets Squirrel install the update on quit, and spawns a detached `/bin/sh` helper (`relaunchInBackground.ts`) that:\n  - waits for the process to exit;\n  - then waits until `product.json` contains the new commit, or until ShipIt (found by its launchd job `\u003cbundle id\u003e.ShipIt`) has been gone for 5 seconds, longer than its 2 second launchd restart throttle;\n  - then runs `open -g -a \u003cbundle\u003e`. There is no timeout: the waits resume after sleep, and the app is only relaunched once the installer is done.\n- **Experiment:** the setting has `experiment: { mode: 'auto' }`. Experiments only resolve in windows, so the scheduler takes the effective value from the windows. The experiment trigger is logged when the countdown starts (screen locked while an update is ready, or an update gets ready while locked), in every arm, before anything diverges.\n- **Platforms:** macOS only for now (`isUnattendedRestartSupported`). The Windows paths are implemented but turned off until verified: a restored window shown with `showInactive()` might appear on top of the app the user was in, and since the setting syncs, opting in on a Mac would turn it on for synced Windows machines. Linux reports no screen locks and doesn't install updates on restart. The setting is hidden on web.\n\n## What blocks a restart\n\n| Area | Blocks when |\n|---|---|\n| Terminals | anything but an interactive shell that shell integration reports idle at an empty prompt: a child process or a command made of shell builtins (e.g. a loop, or a script waiting at `read`) is running, the terminal runs a REPL, ssh or agent CLI, text is typed but not run, or shell integration is unavailable. Also when a terminal can't be revived, or `confirmOnExit` is `always` |\n| Tasks, debug, tests | any running task (including watch tasks); any debug session; a test run in progress, or continuous test mode on (it isn't turned back on after a restart) |\n| Chat, agents | a request in flight, or any non-cloud session in progress or waiting for input, in the workbench and in the Agents window |\n| Unsaved files | a backup isn't current, hot exit is off, or auto-save would save on quit |\n| Workspace | the workspace is transient or temporary, so the window wouldn't be reopened |\n| Editors | an editor's serializer doesn't produce a value (e.g. a notebook output tab that was never opened), `workbench.editor.restoreEditors` is false, or a modal editor (e.g. Settings) is open |\n| Integrated Browser, webviews | an Integrated Browser page is live, including embedded pages such as canvases, because a reload loses its state (tabs that were never loaded don't block); a loaded webview that retains its context when hidden (Simple Browser, video player, MCP apps, Markdown and Mermaid editors, extension webviews that opt in), since webviews do that when their state can't be saved and restored |\n| Notebooks | a notebook has a kernel selected |\n| Interaction in progress | a dialog (custom or native) or quick pick is open, a `code --wait` caller is waiting, Settings Sync is being turned on, or a bulk edit (e.g. a refactoring) is being performed: the last two would ask for confirmation during the shutdown |\n| Windows | remote, extension development, temporary profile, or not fully started; a floating window that isn't an editor window (the issue reporter, the voice window), since only editor windows are restored; a minimized floating window (floating windows don't remember being minimized), or one that still waits to go fullscreen after a background restore (it would be saved without that); when restoring in the foreground, a fullscreen floating window (restored maximized) or two native fullscreen windows on one macOS display, including windows that still wait to go fullscreen (only one is restored fullscreen) |\n| Launch arguments | arguments the relaunch would drop (macOS drops all of them), `--disable-extensions`, in-memory secret storage and similar, or `--disable-layout-restore` (kept on Windows, but it discards the saved layout), for the process or for a window |\n| Started from a terminal (macOS) | VS Code, or one of its windows, was opened with `code` from a terminal: it uses that terminal's environment (an activated venv, `nvm use`, exported variables), while the relaunch goes through LaunchServices and resolves the login shell's environment instead |\n| Update | the last unattended restart didn't install this update, while the same version runs |\n| System | on battery, under thermal pressure, or the screen isn't actually locked |\n\n## With the setting off\n\nNothing can restart: a restart requires every window to report the setting as on. Compared to `main`:\n- **Floating windows** apply their initial state again once they exist (the bounds on multiple displays, and showing maximized floating windows), which #320785 broke. See \"Two fixes along the way\" below. This is the only behavior change.\n- **Window state** is saved and restored exactly as before. Minimized windows, and whether a minimized window is maximized, are only recorded right before an unattended restart.\n- **Measurement:** with telemetry on, on macOS, while the screen is locked and an update is ready, the main process checks whether a restart would be possible as soon as the screen gets locked, after a minute, and then every minute while something blocks. It never keeps the machine awake. It sends at most one `update:unattendedRestart` event per locked period, when the screen is unlocked or once a restart would have been possible, and logs only when the blockers change. Each window also sends the `experimentTrigger` event at most once. Without telemetry nothing is checked.\n- **New surface:** the setting and the `UpdateRestartWhenIdle` policy. The setting is experiment-controlled; no experiment exists yet.\n\n## Notes for reviewers\n\n- **Measurement mode:** with the setting off (the default) and telemetry enabled, the scheduler still runs the checks while the screen is locked and an update is ready, and reports whether it *would* have restarted. Nothing restarts. It sends one `update:unattendedRestart` event per locked period with the outcome, the sorted IDs of everything that blocked the last attempt, whether the restart would be in the background, the attempt count and the minutes locked (owner `alexdima`). The windows that are ready are asked even when a main-process check (for example battery) already blocks, so the IDs show how often a single reason was the only one. An actual restart is remembered in the state service once the shutdown can no longer be vetoed and is reported on the next launch, as `restarted` or `restartedWithoutUpdate`: main-process telemetry is relayed through the shared process, which exits when the shutdown starts. A vetoed shutdown is retried after a minute. A locked period in which everything would have worked but the machine went to sleep before the restart was due, for example because the lid got closed, is reported as `asleep`; locked periods shorter than a minute without sleep aren't reported.\n- **Existing behavior is unchanged:**\n  - `quitAndInstall()` without options and \"Restart to Update\" still use Squirrel's relaunch, and restarts that don't restore exactly still restore minimized windows as normal windows.\n  - Existing shutdown vetoes are untouched; existing classes only gain a check registration (`BulkEditService` became a `Disposable` for that, and `WebviewElement` exposes its options like `OverlayWebview` does).\n  - `IDialogMainService` gains `hasOpenDialogs()`, `IUpdateService.quitAndInstall` gains an optional options argument (`unattended`, `relaunchInBackground`, `token`), `IBaseWindow` gains `hasPendingMode`, and `IAuxiliaryWindowsMainService.createWindow` an optional background argument.\n  - `TestingContinuousRunService` registers its own check, so it is still only created once testing is used.\n- **Two fixes along the way:**\n  - `AuxiliaryWindow` applied its state (bounds on multiple displays, maximized) when it was registered, before its `BrowserWindow` existed, so the state was lost (since #320785). It now applies it once the window is created (`did-create-window`), as before; otherwise floating windows that are created hidden would never show.\n  - The dev-only fallback that shows and focuses windows that are still invisible after 10 seconds doesn't fire while windows are restored in the background, where it would take focus.\n- **Policy:** `UpdateRestartWhenIdle` (from 1.145) is exported to `build/lib/policies/policyData.jsonc` and marked `enforced` in `agentHostPolicySupport`, like `UpdateMode`.\n\n## Known limitations and follow-ups\n\n- **Windows is off until verified.** macOS orders the restored windows behind the active app. On Windows, a window shown with `showInactive()` most likely appears on top of the active app's windows, without focus, so VS Code could cover the app the user was in after unlocking. Turning it on needs that verified and fixed, then `isUnattendedRestartSupported` and the setting and policy texts. Consider `ignoreSync` then, so that an opt-in on one platform doesn't decide for the other.\n- **Started from a terminal (macOS):** these sessions don't restart unattended, because their environment wouldn't survive. Telemetry shows how often this blocks; if it's common, a follow-up could carry the environment over, which LaunchServices' `open --env` allows for the background relaunch, but not per window.\n- **Keeping the machine awake isn't verified with a real update yet.** Real signed updates were verified on macOS with Exploration builds of this branch and a local update server: the regular **Restart to Update** and unattended restarts in the background installed the update. In the first real test with keeping the machine awake, the check right after locking still saw the session as not locked, so the machine wasn't kept awake; the restart came just before it would have gone to sleep. That is fixed, with a test fixture that reports the lock late like macOS, but not yet verified with a real update.\n- **Closing the lid:** a laptop goes to sleep within seconds when its lid closes, which no app can prevent, so leaving by closing the lid doesn't update. Telemetry reports these locked periods as `asleep`.\n- **Spaces and stacking:** windows come back in the current Space (macOS) and behind the active app; their stacking relative to other inactive apps' windows isn't restored. A window that was fullscreen enters fullscreen (and its own Space) when it first gets focus.\n- **Repeated background restores:** until the user activates VS Code after a background restore, the last opened window counts as the last active one, so a second background restore in a row may bring a different window to the front.\n- **Floating windows** don't persist being minimized, nor (outside background restores) fullscreen; those cases still block. Persisting it needs minimize events from main to the floating window.\n- **A floating window that waits to go fullscreen** after a background restore enters fullscreen once it gets focus. Another unattended restart waits until then (`window.auxiliaryPendingMode`), but quitting VS Code before focusing that window loses its fullscreen mode, because floating windows save their actual mode, in the renderer. Saving the waiting mode needs the renderer to know that the window was restored in the background, so that nothing changes otherwise.\n- **The quit isn't all-or-nothing yet.** Every shutdown veto that can show UI has a matching check, but the checks run immediately before `quitAndInstall()`: if state changes in between, one window could veto after another has already closed. A vetoed shutdown is retried, but windows that already closed stay closed until the next restart. Follow-up: an unattended mode in the shutdown flow that blocks silently and closes nothing until every window agrees.\n- **Visible after a restart:** terminals print \"History restored\" and start a fresh shell, undo/redo history is lost (persistent undo/redo should land before this could be on by default), and release notes may open as after any update.\n- **Not covered yet:** an extension API so extensions such as Live Share can block, and a wider trigger than \"locked for a minute\".\n- **Not unit tested:** the macOS pass that brings the last active window in front of the other restored windows, and the fallback to Squirrel's relaunch when the background relaunch helper can't be spawned; both need real windows or a signed build.\n\n## How to test\n\nManually, on a signed macOS build for which an update is available (e.g. an Insiders build from this branch that is one commit behind):\n\n1. Set `\"update.restartWhenIdle\": true` and wait until **Restart to Update** is offered.\n2. With VS Code in the background (another app in front, some windows minimized, one fullscreen), on power, lock the screen and keep it locked for more than a minute. The Mac stays awake until VS Code restarts.\n3. Unlock: the other app should still be in front with focus, and VS Code should be running the new version behind it, with the same windows, editors, layout and unsaved files; minimized windows stay minimized, and the fullscreen window enters fullscreen once you switch to it.\n4. Repeat with a VS Code window focused when locking: VS Code should come back in front.\n5. Repeat with something running (a terminal process, a task, a debug session, a chat request or agent session): VS Code must not restart, and the main log contains `update#unattendedRestart - not restarting: \u003cblockers\u003e`.\n\n## Validation\n\nRun locally on macOS 26.7.1 (arm64):\n\n- **ShipIt relaunch:** `objdump --macho --objc-meta-data -d` of `Squirrel.framework/.../ShipIt` shows `launchApplicationAtURL:options:configuration:error:` called with `w3 = 0x10000` (`NSWorkspaceLaunchDefault`, which activates the app).\n- **Exact restore with a real dev build:** `Code - OSS` launched with `open -g -a \".build/electron/Code - OSS.app\" --env VSCODE_DEV=1 … --args \u003crepo\u003e` and a seeded session (a normal, a minimized and a fullscreen window, plus the restore marker), sampled with `lsappinfo front` every second, the main process (`BrowserWindow` state over the inspector) and `CGWindowListCopyWindowInfo` for stacking:\n  - `Code - OSS` was never the frontmost app (16 samples; the reviewer's apps stayed in front), and no window was focused;\n  - the minimized window came back minimized, the fullscreen one was shown at its maximized size with fullscreen pending, and the marker was removed;\n  - with the last active window opening last, it was stacked in front of the other VS Code windows, all behind every other app's windows;\n  - with the app hidden, it stayed hidden with no window on screen;\n  - floating windows opened during the restore (normal 500×400, and maximized) were shown unfocused, at the back, with the right bounds;\n  - quitting saved the pending fullscreen mode and the minimized flag.\n  These runs found the three bugs fixed in this round: an ordering pass that un-minimized a window still animating into the Dock, the floating window state that was never applied, and the dev-only fallback that focused windows of a hidden app.\n- `./scripts/test.sh --run src/vs/platform/update/test/electron-main/unattendedRestartScheduler.test.ts --run src/vs/platform/update/test/electron-main/relaunchInBackground.test.ts --run src/vs/platform/update/test/electron-main/abstractUpdateService.test.ts --run src/vs/workbench/services/lifecycle/test/common/unattendedRestart.test.ts --run src/vs/workbench/contrib/chat/test/electron-browser/chatLifecycle.test.ts --run src/vs/workbench/services/workingCopy/test/electron-browser/workingCopyBackupTracker.test.ts --run src/vs/workbench/contrib/terminal/test/browser/terminalUnattendedRestart.test.ts --run src/vs/workbench/contrib/update/test/browser/unattendedRestartParticipants.test.ts --run src/vs/workbench/contrib/update/test/browser/unattendedRestartExperimentTrigger.test.ts --run src/vs/workbench/contrib/browserView/test/electron-browser/browserViewWorkbenchService.test.ts --run src/vs/sessions/contrib/sessions/test/browser/sessionsUnattendedRestart.test.ts --run src/vs/sessions/contrib/sessions/test/browser/sessions.contribution.test.ts --run src/vs/platform/workspaces/test/electron-main/workspacesManagementMainService.test.ts --run src/vs/platform/environment/test/node/argv.test.ts --run src/vs/platform/windows/test/electron-main/windowImpl.test.ts --run src/vs/platform/windows/test/electron-main/windowsFinder.test.ts --run src/vs/platform/windows/test/electron-main/windowsStateHandler.test.ts --run src/vs/platform/windows/test/electron-main/agentsWindow.test.ts`: 214 passing, 3 pending (existing platform-specific skips). `relaunchInBackground.test.ts` runs the real helper script against a fake `open` and a fake ShipIt process: it doesn't relaunch while ShipIt runs and the old commit is installed, and relaunches with `open -g -a \u003cbundle\u003e` once the commit is installed, or once ShipIt is gone when the commit is unknown. The experiment trigger test covers both arms.\n- `node_modules/.bin/tsc --noEmit --skipLibCheck -p src/tsconfig.json` (what `npm run typecheck-client` runs): no errors in the files this PR touches. The remaining errors (`fusionTier`, `setParentWindow`) are in unrelated files and appear to come from out-of-date local `node_modules`.\n- `npm run eslint -- \u003cchanged .ts files\u003e`: no problems.\n- `npm run valid-layers-check`: passed.\n- `npm run check-cyclic-dependencies`: \"No cyclic dependencies found in 10873 files.\"\n- `npm run export-policy-data -- --skip-transpile`: only changes the `UpdateRestartWhenIdle` description.\n- Pre-commit hygiene: passed.\n- After the review notes (`e0bfbca0f4e`): `./scripts/test.sh --run src/vs/platform/update/test/electron-main/unattendedRestartScheduler.test.ts --run src/vs/platform/update/test/electron-main/relaunchInBackground.test.ts --run src/vs/platform/update/test/electron-main/abstractUpdateService.test.ts --run src/vs/workbench/services/lifecycle/test/common/unattendedRestart.test.ts --run src/vs/workbench/contrib/chat/test/electron-browser/chatLifecycle.test.ts --run src/vs/workbench/services/workingCopy/test/electron-browser/workingCopyBackupTracker.test.ts --run src/vs/workbench/contrib/terminal/test/browser/terminalUnattendedRestart.test.ts --run src/vs/workbench/contrib/update/test/browser/unattendedRestartParticipants.test.ts --run src/vs/workbench/contrib/update/test/browser/unattendedRestartExperimentTrigger.test.ts --run src/vs/workbench/contrib/testing/test/browser/testingUnattendedRestart.test.ts --run src/vs/workbench/contrib/browserView/test/electron-browser/browserViewWorkbenchService.test.ts --run src/vs/sessions/contrib/sessions/test/browser/sessionsUnattendedRestart.test.ts --run src/vs/sessions/contrib/sessions/test/browser/sessions.contribution.test.ts --run src/vs/platform/workspaces/test/electron-main/workspacesManagementMainService.test.ts --run src/vs/platform/environment/test/node/argv.test.ts --run src/vs/platform/windows/test/electron-main/windowImpl.test.ts --run src/vs/platform/windows/test/electron-main/windowsFinder.test.ts --run src/vs/platform/windows/test/electron-main/windowsStateHandler.test.ts --run src/vs/platform/windows/test/electron-main/agentsWindow.test.ts --run src/vs/workbench/api/test/browser/mainThreadEditors.test.ts --run src/vs/workbench/contrib/bulkEdit/test/browser/bulkEditPreview.test.ts --run src/vs/workbench/contrib/notebook/test/browser/notebookViewModel.test.ts --run src/vs/workbench/contrib/relauncher/test/browser/relauncher.test.ts`: 247 passing, 3 pending (existing platform-specific skips). The bulk edit and debug session tests: 41 passing. The new `windowImpl` tests check the native window calls when restoring in the foreground and in the background (normal, maximized, full screen, minimized), before and once the window gets focus. Type check, ESLint on the changed files, `npm run valid-layers-check` and `npm run check-cyclic-dependencies` (\"No cyclic dependencies found in 10876 files.\") passed. A dev build restored in the background with the new checks loaded: no errors in the main or renderer logs, Microsoft Edge stayed in front, and the minimized window stayed minimized.\n- After merging `main` (`e163c6bca62`; the conflicts in `sessions.contribution.ts` and `browserViewWorkbenchService.ts` keep both sides) and moving the policy to 1.145 (`e39692fe26e`): `node_modules/.bin/tsc --noEmit --skipLibCheck -p src/tsconfig.json` reports no errors. The targeted tests above plus the bulk edit tests pass (259 passing, 3 pending). ESLint on the 62 changed TypeScript files, `npm run valid-layers-check` and `npm run check-cyclic-dependencies` (\"No cyclic dependencies found in 10962 files.\") passed, and `npm run export-policy-data -- --skip-transpile` only changes the `UpdateRestartWhenIdle` entry. `main` added no shutdown veto without a matching check.\n\nNot run: `npm run build-fast` (its dependency check fails on this machine's out-of-date `node_modules`, which can't be refreshed because the local Node is 24.22.0 and `.nvmrc` requires 24.22.1), integration and smoke tests, and an end-to-end run with a real signed update or on Windows.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/344141",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ead52bdd2be7098b8e9a9e3ea122d55e5076d816",
+    "HeadRef": "agents/electron-stealth-update-implementation",
+    "HeadSHA": "1af8c843cc150d55dd6f12a1efd721751062efed",
+    "CreatedAt": "2026-10-25T14:55:16Z",
+    "UpdatedAt": "2026-10-30T12:33:40Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-26BD3E0A73D1",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/update/electron-main/unattendedRestartScheduler.ts",
+      "Side": "RIGHT",
+      "Line": 533,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The scheduler condition, one-minute retry, IPC fan-out, and per-editor serialization are directly traced in changed code. The only magnitude variable is how long users remain locked and how large their editor state is; the repeated mechanism and opt-out reachability are explicit.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Per-window IPC calls plus renderer CPU and temporary strings/arrays produced by every registered readiness participant, including serialization of every open editor",
+      "PerformanceScaling": "After the screen has been locked for one minute, cost grows as locked minutes × ready windows × open editors; each retry fans out concurrently to all ready windows, with no result cache or coalescing across minutes",
+      "PerformanceOutcome": "Recurring CPU wakeups and serialization/GC pressure while the machine is idle, increasing background energy use for users who did not enable the feature",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "With `update.restartWhenIdle` absent, locking the screen after an update was downloaded did not periodically contact every workbench window or serialize open editors.",
+      "ChangedBehavior": "The PR adds a telemetry measurement path for disabled users and reschedules the entire readiness pipeline every minute whenever any blocker is present.",
+      "CausalDiffEvidence": "The new line `this.evaluation.schedule(isDue ? RETRY_INTERVAL : ...)` runs in the blocker branch regardless of the computed `enabled` value; before this PR there was no unattended-restart readiness loop, per-window IPC fan-out, or repeated editor serialization for opted-out users.",
+      "Title": "Stop retrying full readiness checks for opted-out users",
+      "Impact": "On macOS with a downloaded update and usage telemetry enabled, the default `update.restartWhenIdle: false` still enters this branch whenever any blocker remains and repeats the complete check every 60 seconds until unlock. A terminal or other common blocker left overnight therefore causes hundreds of cross-process scans even though no restart can occur.",
+      "Evidence": "`evaluate()` only skips disabled users when telemetry is below USAGE (line 504), then this added line schedules another evaluation every `RETRY_INTERVAL` whenever blockers exist without checking `enabled`. Every evaluation calls `getBlockers`, which uses `Promise.all` to send one IPC request per ready window (line 592). In each renderer, `WorkbenchUnattendedRestartParticipants.getEditorsBlocker` filters all open editors (line 90), and `isRestorableEditor` calls `serializer.serialize(editor)` (line 115). Concrete serializers JSON-stringify arbitrary webview state, while the search-editor serializer traverses and copies all match decorations, so this is not just a cheap flag read.",
+      "Recommendation": "In measurement-only mode, take at most the initial/due eligibility sample and do not schedule `RETRY_INTERVAL` polling when `enabled` is false. Keep retries for enabled users, or separately make those retries event-driven/backed off without repeatedly serializing unchanged editor state."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation",
+      "eager-work",
+      "cleanup-lifecycle",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Screen locks while a downloaded update is ready",
+        "CriticalPath": "The lock event schedules `evaluate()` immediately. It must collect readiness from every ready workbench window and main-process blockers before deciding whether to inhibit sleep, wait until the one-minute threshold, restart, or retry. When blocked after the threshold, the new one-minute retry loop repeats this full critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/code/electron-main/app.ts:809 and src/vs/platform/update/electron-main/unattendedRestartScheduler.ts:592",
+            "Operation": "Main process calls `canRestartUnattended()` in each ready workbench window",
+            "Cardinality": "One call per ready window at lock, at the due threshold, and every minute thereafter while blockers remain",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No lock-screen readiness IPC existed before this PR",
+            "CriticalPathEffect": "All window replies or their 10-second timeouts must complete before the scheduler can decide whether to restart or sleep"
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/update/browser/unattendedRestartParticipants.ts:90-115",
+            "Operation": "Each renderer checks all open editors and invokes each editor serializer, including JSON encoding webview state and copying search match decorations",
+            "Cardinality": "Once per open editor per window per readiness round",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Editor serialization occurred on persistence paths, not from a new minute-based lock-screen poll",
+            "CriticalPathEffect": "Synchronous renderer CPU/allocation occurs before that window can answer IPC"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/update/electron-main/abstractUpdateService.ts:543-598",
+            "Operation": "Checks whether the pending update is still latest before unattended shutdown",
+            "Cardinality": "At most once per quit attempt, with a two-second timeout; skipped on metered connections",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Explicit quit-and-install already used this check; the PR introduces a new automatic caller rather than multiplying it within one attempt",
+            "CriticalPathEffect": "Blocks shutdown initiation for up to two seconds but is cancellable when the screen unlocks"
+          }
+        ],
+        "ScalingInput": "Effective cardinality is one IPC request per ready top-level window per evaluation, then one participant check per registered subsystem and serialization of every open editor in each window. With blockers, evaluations scale with locked minutes; rounds do not overlap because `isEvaluating` guards them.",
+        "EffectiveConcurrency": "Ready windows are queried concurrently with `Promise.all`; each renderer also runs all participants concurrently with `Promise.all`. There is no global limiter, but one scheduler evaluation is serialized and window/participant checks have 10s/5s timeouts.",
+        "CacheBehavior": "Readiness and editor-serialization results are not cached across minute retries. Only log text is deduplicated. The update overwrite/latest-version check is guarded to run once per quit attempt and skips metered connections for unattended restarts.",
+        "MechanismConfidence": "High: retry cadence, IPC fan-out, per-editor serialization, lack of cache, and default-disabled telemetry reachability are all directly established in changed code.",
+        "MagnitudeUncertainty": "Typical window/editor counts and serialized-state sizes vary, but a common persistent blocker such as a terminal makes the minute-based multiplicity explicit. Exact CPU and energy impact depends on lock duration and editor types.",
+        "Verdict": "Reportable regression for opted-out users: the blocker branch reschedules full readiness work every minute even when `enabled` is false and only telemetry is being collected."
+      },
+      {
+        "Scenario": "Unattended update shutdown, installation, and background relaunch on macOS",
+        "CriticalPath": "After readiness and the one-minute threshold, the scheduler performs the latest-version check, requests lifecycle shutdown, persists exact-restore metadata, and only after veto-free shutdown starts detached keep-awake and relaunch helpers. Squirrel installation happens as the application exits; the relaunch shell waits for process exit and installation completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/update/electron-main/abstractUpdateService.ts:594",
+            "Operation": "Request latest update metadata through `doIsLatestVersion`",
+            "Cardinality": "Once per unattended quit attempt, bounded by two seconds",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only user-triggered quit-and-install reached this existing check",
+            "CriticalPathEffect": "Must finish or time out before lifecycle shutdown starts"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/update/electron-main/relaunchInBackground.ts:115",
+            "Operation": "Launch detached `/usr/bin/caffeinate -i -t 60`",
+            "Cardinality": "Once after veto-free unattended shutdown",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No outliving keep-awake helper was launched",
+            "CriticalPathEffect": "Off the shutdown critical path; it keeps the machine awake while installation/restoration completes"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/update/electron-main/relaunchInBackground.ts:85",
+            "Operation": "Launch detached shell which polls the main PID, `product.json`, and ShipIt, then executes `open -g -a`",
+            "Cardinality": "One shell per background relaunch; after main-process exit it performs one grep/pgrep round per second until installation completion",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Foreground updater directly used Electron/Squirrel quit-and-install without this background relaunch helper",
+            "CriticalPathEffect": "Controls relaunch timing but does not block the exiting application"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/update/electron-main/relaunchInBackground.ts:40",
+            "Operation": "Shell reads `product.json` while waiting for the installed commit",
+            "Cardinality": "At most once per second during installation",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No relaunch-side polling of `product.json`",
+            "CriticalPathEffect": "A matching commit permits immediate background relaunch"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/update/electron-main/unattendedRestartScheduler.ts:383 and src/vs/platform/windows/electron-main/windowsStateHandler.ts:150",
+            "Operation": "Persist pending restart, failed update, exact-restore, and window state through the main state service",
+            "Cardinality": "Constant metadata plus one serialized state per open window at shutdown",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Window state was already saved; the small pending/exact-restore records are new",
+            "CriticalPathEffect": "Runs during shutdown so the next process can restore and report accurately"
+          }
+        ],
+        "ScalingInput": "One shutdown attempt, one `caffeinate`, and one detached relaunch shell per successful unattended restart. The shell polls once per second until the commit appears or ShipIt has been absent for five checks.",
+        "EffectiveConcurrency": "Latest-version checking is single-flight per quit attempt. The two detached subprocesses run concurrently with application exit/installation; no burst scales with window or editor count.",
+        "CacheBehavior": "`_hasCheckedForOverwriteOnQuit` prevents duplicate latest-version checks. Pending/failed update versions are persisted across one restart, and a failed update version is negatively cached to prevent repeated unattended restarts for the same update.",
+        "MechanismConfidence": "High: subprocess launch points, polling interval, storage writes, and lifecycle ordering are explicit and tested.",
+        "MagnitudeUncertainty": "Installer duration and ShipIt failure behavior vary, but normal cardinality is fixed at one helper pair and polling ends when installation completes.",
+        "Verdict": "No additional finding: helper concurrency is fixed, launch occurs only after shutdown vetoes clear, and polling serves the required install/relaunch ordering."
+      },
+      {
+        "Scenario": "Startup after an unattended restart restores windows exactly and in the background",
+        "CriticalPath": "The main process reads and consumes the one-shot exact-restore state, creates the same saved windows, applies bounds/mode/minimized state, and uses inactive showing/order changes so restoration does not take focus. Renderer startup remains the normal per-window path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/windows/electron-main/windowsStateHandler.ts:102-119",
+            "Operation": "Read/remove exact-restore metadata and read normal persisted window state",
+            "Cardinality": "One state-service read at startup and one removal only when metadata exists",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only normal window state was read; no one-shot exact-restore metadata existed",
+            "CriticalPathEffect": "Required before choosing how initial windows are shown"
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/windows/electron-main/windowImpl.ts:345-430 and src/vs/platform/windows/electron-main/windowsMainService.ts:490-507",
+            "Operation": "Create/show/minimize/order Electron BrowserWindows through native window APIs",
+            "Cardinality": "Constant native operations per restored window",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Windows were restored normally and were not shown with the new background/exact semantics",
+            "CriticalPathEffect": "Part of startup restoration; fullscreen/maximize can be deferred until focus to avoid activation"
+          }
+        ],
+        "ScalingInput": "Work scales with the number of windows that already had to be restored; each saved window receives a constant number of native window-state operations.",
+        "EffectiveConcurrency": "Window creation follows the existing startup/open flow. Native maximize/fullscreen operations may be deferred until focus; there is no new unbounded concurrent work.",
+        "CacheBehavior": "Exact-restore metadata is one-shot and removed when read. Background-restore state is released on the first browser-window focus or application activation. Saved window state uses existing state-service persistence.",
+        "MechanismConfidence": "High for the changed native/state operations; no evidence shows multiplicative work beyond existing window cardinality.",
+        "MagnitudeUncertainty": "Users with many windows incur proportionally more native operations, but that same window count already controlled restoration cost and the diff adds only constant work per window.",
+        "Verdict": "No reportable regression: added work is bounded per already-restored window and required to preserve exact/background state."
+      },
+      {
+        "Scenario": "Ordinary workbench startup and subsystem participant registration",
+        "CriticalPath": "Core participant registration at `BlockRestore` is synchronous but only installs listeners/check callbacks. Other terminal, task, debug, testing, notebook, and webview participants are created in idle `AfterRestored` cycles. No readiness checks run until the main scheduler sees a ready update and a screen lock.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One participant object per enabled subsystem per window. Most injected delayed services were already instantiated by existing contributions at the same or earlier phase; the participant set remains bounded by registered subsystems.",
+        "EffectiveConcurrency": "Contributions are instantiated sequentially in idle slices; readiness callbacks later run concurrently only when queried.",
+        "CacheBehavior": "Participants remain registered for the owning contribution/service lifetime and are disposed with it. No unbounded key or history cache is introduced.",
+        "MechanismConfidence": "High that registration is bounded and lifecycle-owned; lower on exact micro-cost, which is why no startup finding is reported.",
+        "MagnitudeUncertainty": "Contribution construction timings vary, but inspected registrations show idle scheduling and no new startup boundary sufficient for a high-confidence regression.",
+        "Verdict": "No reportable startup regression: the new registrations are bounded and mostly reuse services already eagerly reached by existing contributions."
+      }
+    ],
+    "Summary": "Completed the performance review of all 66 changed files. Submitted one medium-severity repeated-work finding for full minute-based readiness polling in the default opt-out telemetry path; no other changed subprocess, startup, restore, cache, or lifecycle mechanism met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-30T16:04:31.399723605Z",
+    "CompletedAt": "2026-10-30T16:09:05.625015769Z",
+    "WallClockMilliseconds": 274225,
+    "ModelCalls": 19,
+    "InputTokens": 2317010,
+    "OutputTokens": 17297,
+    "TotalTokens": 2334307,
+    "ReasoningTokens": 6957,
+    "CacheReadTokens": 2146304,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 241956,
+    "ToolCalls": 179,
+    "NanoAIUnits": 188728560000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 2146304,
+      "cache_write": 0,
+      "input": 170706,
+      "output": 17297
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

@@ -1,0 +1,189 @@
+{
+  "PullRequest": {
+    "Number": 328317,
+    "Title": "Fix multi-diff and native host event leaks",
+    "Body": "## Problem\n\nThis fixes two independent leaks surfaced by disposable and event-buffer diagnostics.\n\n### Failed multi-diff model resolution\n\nOpening the Agents window Changes multi-diff can attempt to resolve entries that cannot be opened as text, such as a directory or binary file. If either `createModelReference` call rejected, the surrounding `Promise.all` returned immediately without disposing the per-item `DisposableStore`. A reference acquired by the other call could also be lost without disposal, including when that call completed after its sibling had already rejected.\n\nThis produced `[LEAKED DISPOSABLE]` warnings rooted in `MultiDiffEditorInput._createModel` and could retain text model references after failed multi-diff item resolution.\n\n### Unconsumed native host blur buffer\n\n`ProxyChannel.fromService` eagerly subscribes to and buffers service events so startup events can be replayed when an IPC client attaches. `onDidBlurMainWindow` has no IPC consumer, so every main-window blur was retained indefinitely and the eager proxy subscription was unnecessary. In dev builds this produced an `[Event.buffer][onDidBlurMainWindow] potential LEAK detected` warning after buffered events remained unconsumed.\n\nThis is long-standing rather than a recent regression:\n\n- [`42f5594892`](https://github.com/microsoft/vscode/commit/42f5594892084c2db0e08fa52d19288d87698779) (2023-11-02) split focus/blur into main-only and main-or-auxiliary events. Renderer consumers moved to the combined event, leaving the main-only blur buffer without an IPC listener.\n- [`a837f16fbe`](https://github.com/microsoft/vscode/commit/a837f16fbe459f3a067aa94da0ddb9b9ae04ebe0) (2026-02-28) added `Event.buffer` leak diagnostics, making the existing unbounded buffer visible.\n\nThe main-only focus event remains buffered intentionally because Settings Sync consumes it through the shared-process native host channel.\n\n## Fix\n\n- wait for both model-reference acquisitions with `Promise.allSettled`\n- dispose the multi-diff item store when either acquisition fails or when its cached item is removed while resolution is pending\n- preserve handling for synchronous model-reference failures\n- add an opt-in `unbufferedEvents` proxy-channel option that subscribes only when an IPC client listens\n- make `onDidBlurMainWindow` lazy/unbuffered while preserving the event API for future consumers\n- cover lazy subscription, lack of replay, and listener cleanup with an IPC unit test\n\nCC @hediet, who authored the original multi-diff model-resolution path.\n\n## Validation\n\n- `npm run gulp compile`\n- `npm run typecheck-client`\n- `./scripts/test.sh --run src/vs/base/parts/ipc/test/common/ipc.test.ts` (23 passing)\n- `npm run precommit`\n\n(Written by Copilot)",
+    "URL": "https://github.com/microsoft/vscode/pull/328317",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "35341ebe12c424bf316fcfbcd7991f9030180c6e",
+    "HeadRef": "roblou/agents/do-you-see-any-legitimate-memory-leaks-in",
+    "HeadSHA": "dd2949bd1bee6fc1b15d6e3da8b904c6c862894a",
+    "CreatedAt": "2026-07-30T23:23:35Z",
+    "UpdatedAt": "2026-09-14T23:24:38Z",
+    "MergedAt": "2026-07-31T09:33:47Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-29E5EC241222",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts",
+      "Side": "RIGHT",
+      "Line": 195,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The before/after Promise semantics, the setInput-to-Promise.all critical path, and the transitive file/content-provider boundary are directly established in repository code. Only prevalence and provider duration are uncertain, which limits severity rather than mechanism confidence.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceResource": "A pending text-model acquisition backed by filesystem, remote-file-provider, or virtual-content-provider work.",
+      "PerformanceScaling": "The added delay for a failed item is the remaining duration of its sibling acquisition; because the aggregate document load waits for every item, one slow or non-settling sibling among the multi-diff resources gates the entire editor.",
+      "PerformanceOutcome": "Increased editor-open latency and potentially an indefinitely blocked critical path.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Promise.all rejected as soon as either model-reference acquisition rejected; the catch returned undefined for that item immediately, allowing the aggregate document load to progress without waiting for the sibling request.",
+      "ChangedBehavior": "Each item's two model-reference acquisitions are now awaited with Promise.allSettled, so a rejection no longer releases that item until the other acquisition has also settled.",
+      "CausalDiffEvidence": "The deleted Promise.all failed fast on the first rejection, while added line 195 explicitly waits for both acquisitions to settle before the rejection branch can return undefined.",
+      "Title": "Do not await the sibling model after this item has already failed",
+      "Impact": "Opening an SCM/Chat/Agents multi-diff can remain blank or loading after one side is already known to be unusable whenever the other side is slow; a stalled remote or virtual-document provider can prevent the editor from opening indefinitely.",
+      "Evidence": "MultiDiffEditor.setInput awaits input.getViewModel(); _createModel awaits updateDocuments.get(); updateDocuments awaits Promise.all of every item promise. createModelReference resolves file-backed resources through textFileService.files.resolve/fileService and virtual resources through async content providers. Therefore line 195 puts the slower sibling request on the editor-open critical path even after the other request has rejected.",
+      "Recommendation": "Keep fail-fast completion for the item, but attach disposal handlers to both acquisition promises so any reference that fulfills after its sibling rejects (or after the item store is disposed) is disposed asynchronously rather than awaited on the editor-open path."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 218,
+      "BasePath": "src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts",
+      "BaseLine": 194,
+      "IntroducingPath": "src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts",
+      "IntroducingCommit": "48e7527ada52bdc8855d727096e492218f640390",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "memory",
+      "Mechanism": "When one Promise.all branch rejected, the callback returned without retaining or disposing an IReference later produced by the sibling createModelReference call; AsyncReferenceCollection keeps the underlying ResourceModelCollection reference count until that handle is disposed.",
+      "Symptom": "Failed multi-diff item resolution could retain text model references and their resolved models for the process lifetime.",
+      "FixedBehavior": "The change waits for both acquisitions, adds every fulfilled reference to a DisposableStore, and disposes that store when either acquisition failed or the cached item was removed while resolution was pending.",
+      "Evidence": "Base line 194 starts the fail-fast Promise.all whose catch had no handle to a late sibling result. AsyncReferenceCollection.acquire returns the sole disposable decrement for ResourceModelCollection's counter. Added fulfilled-result registration followed by disposal at line 218 closes that failure path. Blame identifies commit 48e7527ada52bdc8855d727096e492218f640390 as introducing the base line.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open an SCM, Chat, or Agents multi-diff when all original/modified models resolve successfully",
+        "CriticalPath": "MultiDiffEditor.setInput awaits getViewModel; _createModel resolves the source, starts model acquisition for every resource, awaits Promise.all of all item promises, and then view-model initialization waits for diff computation or 1 second before the widget is attached. The changed Promise.allSettled remains on this path but has the same successful completion condition as the prior Promise.all.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/textmodelResolver/common/textModelResolverService.ts:54",
+            "Operation": "Resolve a file-backed text model through textFileService.files.resolve, which reads through the file service and may target a remote file provider.",
+            "Cardinality": "At most one underlying resolve per unique canonical URI while references overlap; up to U unique resolutions for N items.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same references were started concurrently and Promise.all also waited for both sides on the all-success path.",
+            "CriticalPathEffect": "All cold resolves must settle before the multi-diff model and widget can be shown."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/services/textmodelResolver/common/textModelResolverService.ts:187",
+            "Operation": "Resolve virtual text through an async ITextModelContentProvider.",
+            "Cardinality": "At most one provider resolution per unique canonical virtual URI while references overlap.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider resolutions were started and awaited before the diff.",
+            "CriticalPathEffect": "Provider completion is part of editor opening for cold virtual resources."
+          }
+        ],
+        "ScalingInput": "N diff items produce up to 2N model-reference requests and U unique resource resolutions, where U is reduced by missing sides and canonical-URI deduplication.",
+        "EffectiveConcurrency": "Both sides of each item and all items are launched concurrently with no shared limiter; ResourceModelCollection coalesces simultaneous acquisitions of the same canonical URI. This concurrency existed before the diff.",
+        "CacheBehavior": "A live ResourceModelCollection entry shares one promise/model among same-URI references. Cold unique URIs resolve through the text-file or virtual-content provider; warm/live URIs reuse the entry. Disposing the last reference removes the collection entry and schedules model disposal. The diff does not alter successful cache behavior.",
+        "MechanismConfidence": "High: call flow, acquisition coalescing, and all-success Promise semantics are explicit in the inspected code.",
+        "MagnitudeUncertainty": "File count, provider latency, and cache warmth vary, but successful-path scheduling and boundary cardinality are unchanged.",
+        "Verdict": "No reportable regression on successful opens; the change adds cleanup bookkeeping but neither adds boundary work nor delays all-success settlement."
+      },
+      {
+        "Scenario": "Open a multi-diff containing an item where one side rejects while the sibling model acquisition is slow or stalled",
+        "CriticalPath": "setInput -\u003e getViewModel -\u003e _createModel -\u003e updateDocuments.get -\u003e Promise.all(item promises) now cannot progress past the failed item until Promise.allSettled also receives the sibling result. Before the diff, Promise.all rejected immediately and the catch returned undefined for the item.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/network/IPC",
+            "Location": "src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts:195 -\u003e src/vs/workbench/services/textmodelResolver/common/textModelResolverService.ts:54",
+            "Operation": "Resolve the surviving sibling model through the file service/file provider after the other side has already rejected.",
+            "Cardinality": "One residual sibling request is sufficient to block the editor; there can be one for each failed item, with URI coalescing when keys match.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The boundary call was already launched, but Promise.all failed fast and did not await its residual duration before excluding the failed item and progressing.",
+            "CriticalPathEffect": "The diff moves the residual duration of this already-started request onto the editor-open critical path after failure is known."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts:195 -\u003e src/vs/workbench/services/textmodelResolver/common/textModelResolverService.ts:187",
+            "Operation": "Await a virtual ITextModelContentProvider for the surviving sibling.",
+            "Cardinality": "At most one underlying call per unique sibling URI while acquisitions overlap.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Its work could continue in the background, but its residual duration did not gate failed-item completion.",
+            "CriticalPathEffect": "A slow or non-settling provider can now keep the entire multi-diff from rendering after the paired side rejected."
+          }
+        ],
+        "ScalingInput": "The trigger is one mixed-outcome item among N resources. Added latency equals the remaining duration of that item's sibling acquisition; one non-settling sibling gates the entire aggregate regardless of N.",
+        "EffectiveConcurrency": "Both acquisitions still start concurrently, as do acquisitions for other items; there is no limiter. The regression is not extra concurrency but newly awaiting residual boundary work after the item outcome is known.",
+        "CacheBehavior": "A warm/live sibling may settle quickly and mask the regression. A cold file or virtual resource exposes it. Rejected AsyncReferenceCollection acquisitions release their own reference; the fulfilled sibling is disposed by the new store after both settle.",
+        "MechanismConfidence": "Very high: fail-fast Promise.all was replaced directly by wait-for-all Promise.allSettled on a proven editor-open critical path.",
+        "MagnitudeUncertainty": "The frequency of mixed fast-failure/slow-sibling items and real provider latency is uncertain; remote files, binary/directory failures, and async virtual resources make the trigger realistic.",
+        "Verdict": "Reportable medium-severity latency regression; submitted as a finding."
+      },
+      {
+        "Scenario": "A dynamic multi-diff resource is removed or the owning observable is disposed while model references are still resolving",
+        "CriticalPath": "The removed entry's old async callback continues settling off the current document-list critical path. The new store.isDisposed branch disposes fulfilled references once both acquisitions settle and returns no document.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/virtual-provider",
+            "Location": "src/vs/workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.ts:195",
+            "Operation": "Complete already-started text-model resolutions for removed entries.",
+            "Cardinality": "Up to two pending acquisitions per removed item, reduced by canonical-URI coalescing.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same requests continued, but a late successful reference could be lost without disposal when its sibling failed or the item disappeared.",
+            "CriticalPathEffect": "After removal these completions are generally off the current document-list critical path, though their resources remain active until settlement."
+          }
+        ],
+        "ScalingInput": "Cost and retained state scale with the number of entries removed while their one or two model acquisitions are pending.",
+        "EffectiveConcurrency": "Pending acquisitions continue with the pre-existing per-item/all-item concurrency; the diff adds no cancellation or additional requests.",
+        "CacheBehavior": "On settlement, fulfilled references are placed in multiDiffItemStore and disposed, decrementing ResourceModelCollection counts; rejected acquisitions self-release in AsyncReferenceCollection. This closes the prior lost-reference lifecycle.",
+        "MechanismConfidence": "High: ArrayMap disposes the per-entry store on removal, AsyncReferenceCollection requires disposing returned handles to decrement counts, and the new branch does so.",
+        "MagnitudeUncertainty": "How often resources are removed during cold resolution is unknown; the cleanup mechanism and retained-reference risk are directly established.",
+        "Verdict": "This scenario fixes retained model references rather than introducing a performance regression; the introducing commit was recorded through report_regression_fix."
+      }
+    ],
+    "Summary": "Completed the performance pass over the sole changed file and all diff pages. Traced editor opening, dynamic resource removal, model-reference ownership, filesystem/virtual-provider boundaries, cache coalescing, and concurrency. Submitted one critical-path latency finding for waiting on a slow sibling after failure, and recorded the concrete reference-leak regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-30T16:15:34.626073013Z",
+    "CompletedAt": "2026-10-30T16:18:27.417608904Z",
+    "WallClockMilliseconds": 172791,
+    "ModelCalls": 10,
+    "InputTokens": 310998,
+    "OutputTokens": 7498,
+    "TotalTokens": 318496,
+    "ReasoningTokens": 3190,
+    "CacheReadTokens": 263168,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 124501,
+    "ToolCalls": 44,
+    "NanoAIUnits": 44654720000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 263168,
+      "cache_write": 0,
+      "input": 47830,
+      "output": 7498
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

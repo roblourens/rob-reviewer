@@ -1,0 +1,158 @@
+{
+  "PullRequest": {
+    "Number": 345181,
+    "Title": "Agent host gateway: accept frames up to 100 MiB and close peers on errors",
+    "Body": "Refs #339997\n\nThe protocol-v6 selection gateway in `cli/src/tunnels/agent_host.rs` opens its WebSocket streams with tungstenite's default limits. The 16 MiB frame limit rejects chat snapshots that the agent host sends as a single frame:\n\n```text\nGateway proxy: target connection error: Capacity(MessageTooLong { size: 17128534, max_size: 16777216 })\n```\n\nWhen that happens, `proxy_gateway_frames` returns without closing the client. The client notices only after its 25 s liveness timeout, reconnects, subscribes to the same chat, and fails again about every 30 s.\n\n## Changes\n\n- Configure the client-facing gateway socket and both target dial paths (TCP and socket) with a 100 MiB frame and message limit. This matches `defaultMaxPayloadLength` in `webSocketOverDuplex.ts`, so the gateway accepts every frame the client accepts.\n- When either side of the proxy fails, send a Close frame to the other side: 1009 for size errors, 1011 for other errors. A 5 s timeout bounds the close so a stalled peer cannot hold the streams open. The client sees the failure right away.\n\n## Tests\n\nTwo new tests drive the real `/agent-host/select` route:\n\n- `gateway_proxies_frames_larger_than_16_mib` echoes a 17 MiB frame through the gateway.\n- `gateway_closes_client_when_target_frame_exceeds_limit` has the target announce a frame above the limit and expects the client to receive Close 1009 within 5 s.\n\nBoth fail without the change. `cargo test gateway_` passes (18 tests).\n\n## Out of scope\n\nSnapshots keep growing, and the issue reports chats estimated at 60 to 80 MiB, so the higher limit gives headroom for most sessions. Long-lived sessions still need the protocol changes discussed in the issue: honouring `view.turns` in `subscribe`, paging in `fetchTurns`, and sending large tool results and images by reference.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/345181",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "torerik81",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "a02c2a0233e20e8451f48a3e05b79751406a621c",
+    "HeadRef": "agent-host-gateway-frame-limit",
+    "HeadSHA": "df8de293ff9f538f516057a872fe5e1c064d529b",
+    "CreatedAt": "2026-10-30T13:47:43Z",
+    "UpdatedAt": "2026-10-30T15:13:34Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "cli/src/tunnels/agent_host.rs",
+      "FixedSide": "RIGHT",
+      "FixedLine": 2281,
+      "BasePath": "cli/src/tunnels/agent_host.rs",
+      "BaseLine": 1919,
+      "IntroducingPath": "cli/src/tunnels/agent_host.rs",
+      "IntroducingCommit": "f5b3eba94e565baf60f563b8e13b3b6647dde4a1",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "network",
+      "Mechanism": "A gateway-specific 16 MiB frame cap rejected otherwise-supported chat snapshot messages; the silent proxy return left the tunnel client idle until its liveness watchdog reconnected and restored subscriptions, repeatedly serializing and retrying the same large snapshot.",
+      "Symptom": "Large tunnel-backed chats stall for roughly one 25-second liveness window and then repeatedly reconnect, recreating and retrying a 16+ MiB snapshot instead of completing the subscription.",
+      "FixedBehavior": "The shared gateway WebSocket config raises both frame and assembled-message limits to 100 MiB and is applied to the client-facing socket and both target dial variants, so realistic large chat snapshots pass once instead of entering the liveness/reconnect/snapshot retry cycle. The added peer Close propagation also makes remaining over-limit failures visible without waiting for the 25-second watchdog.",
+      "Evidence": "The introducing commit created the protocol-v6 gateway with `WebSocketStream::from_raw_socket(..., None)`, leaving tungstenite's 16 MiB frame cap in place, while the only browser tunnel socket factory uses `connectWebSocketOverDuplex`, whose established cap is 100 MiB. Agent-host `subscribe`/reconnect responses contain state snapshots (including chat `turns`) and `WebSocketProtocolTransport.send` JSON-stringifies each response into one WebSocket message. On a frame between 16 and 100 MiB, the gateway therefore rejected a message that both endpoint transports permit. The client liveness path waits 5 s before ping plus 20 s before forcing a close, and its transport-close path schedules another reconnect that restores current subscriptions, causing the host to rebuild and attempt the same snapshot again. Blame identifies f5b3eba94e565baf60f563b8e13b3b6647dde4a1 as introducing the default-config gateway line.",
+      "Confidence": 0.96
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open or reconnect a tunnel-backed chat whose subscription snapshot is between 16 MiB and 100 MiB.",
+        "CriticalPath": "The browser must open the dev-tunnel relay, upgrade `/agent-host/select`, select an endpoint, dial the endpoint, complete protocol initialization/subscription, and receive the snapshot before the chat is usable. The large snapshot serialization and both WebSocket hops are on this critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/common/tunnelAgentHostConnector.ts::prepareSelection/completeSelection and cli/src/tunnels/agent_host.rs::dial_gateway_target/proxy_gateway_frames",
+            "Operation": "Open the tunnel relay WebSocket, dial the selected agent host over TCP or a local socket, and forward the JSON snapshot frame.",
+            "Cardinality": "One dev-tunnel relay/forwarded-port connection and one gateway WebSocket per connection attempt; one TCP or local-socket target dial after selection; one target-to-client WebSocket message per snapshot. Before the fix, each liveness-triggered reconnect repeated these boundaries and rebuilt the subscription snapshot.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same boundaries existed, but tungstenite's default 16 MiB gateway cap rejected snapshots above 16 MiB even though the browser endpoint accepts 100 MiB, leading to another connection attempt after liveness recovery.",
+            "CriticalPathEffect": "All connection boundaries and the snapshot message must complete before the remote chat subscription is restored."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/webSocketTransport.ts::WebSocketProtocolTransport.send",
+            "Operation": "JSON-stringify the protocol response and send it as one WebSocket message.",
+            "Cardinality": "One JSON serialization and WebSocket send for each subscribe or snapshot-based reconnect response; payload scales with the subscribed chat state, including its turns.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "For 16-100 MiB snapshots, the host performed this work on every retry, but the gateway then rejected the frame before the browser could consume it.",
+            "CriticalPathEffect": "Serialization and transmission are synchronous prerequisites to delivering the subscription response."
+          }
+        ],
+        "ScalingInput": "Serialized chat snapshot size and the number of liveness/reconnect attempts. The changed successful path remains one target dial and one forwarded frame per snapshot; memory scales linearly with a single payload up to 100 MiB.",
+        "EffectiveConcurrency": "Each gateway session forwards one surfaced WebSocket message at a time through a single `tokio::select!`; client-to-target and target-to-client compete in that loop, while different gateway sessions run in independent Tokio tasks. No additional fan-out or concurrency burst is introduced by the new limits.",
+        "CacheBehavior": "No payload cache exists on the gateway. The selected endpoint inventory is read once and the registry is reread for an existing selection; chat subscription snapshots are rebuilt by the agent host. Warm reconnects may use protocol replay when available, but a fresh/baseline restore sends snapshots again, so the old frame rejection could repeatedly recreate the same large response.",
+        "MechanismConfidence": "High: the old 16 MiB default, established 100 MiB browser cap, single-message JSON transport, 25-second liveness path, and reconnect subscription restoration are all directly traced in code.",
+        "MagnitudeUncertainty": "The exact prevalence and distribution of 16-100 MiB chats are not measured in the repository. The O(payload) buffering cost remains bounded at 100 MiB per active message and is intentional to match the pre-existing browser and Node transport limit.",
+        "Verdict": "No introduced performance regression. The diff fixes a concrete repeated-work regression by accepting the already-supported payload range; the larger cap does not eagerly allocate 100 MiB, and processing remains bounded by the configured maximum."
+      },
+      {
+        "Scenario": "A client or selected target errors, including a frame above the new 100 MiB cap.",
+        "CriticalPath": "After either proxy side errors, notifying the peer is now on the session cleanup path. It is not on successful message forwarding; the timeout bounds cleanup to five seconds if the peer cannot accept the close.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "cli/src/tunnels/agent_host.rs::close_gateway_peer and proxy_gateway_frames",
+            "Operation": "Send close code 1009 for capacity failures or 1011 for other proxy errors to the surviving peer.",
+            "Cardinality": "At most one WebSocket Close write per proxy failure.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The proxy returned without explicitly notifying the opposite peer; on the tunnel client path this could leave the client silent until liveness timeout.",
+            "CriticalPathEffect": "It delays destruction of that failed session by only the close write duration, bounded at five seconds; it removes the client's prior wait for its 25-second liveness watchdog."
+          }
+        ],
+        "ScalingInput": "Number of simultaneously failing gateway sessions; cost is one small close frame and one bounded task lifetime per failed session.",
+        "EffectiveConcurrency": "At most one close handshake is attempted for the surviving peer of a failed session. Failed sessions can close concurrently, but each is independently bounded by one timeout and no retry loop is added.",
+        "CacheBehavior": "No cache applies. Error handling is per connection, and the close frame is generated from the immediate tungstenite error.",
+        "MechanismConfidence": "High: all four changed error branches call the bounded close helper, and the helper wraps the close future in a five-second timeout.",
+        "MagnitudeUncertainty": "How often peers stall during close is unknown, but retained work is strictly one failed session for at most five seconds and replaces a longer observed liveness wait.",
+        "Verdict": "No reportable regression. The added bounded close is cleanup work only on failure and reduces stale-session/reconnect latency; it neither retries nor retains resources without a limit."
+      },
+      {
+        "Scenario": "Forward ordinary gateway traffic at or below 16 MiB.",
+        "CriticalPath": "The successful forwarding critical path remains read one frame from one side and send it to the other. Configuration changes only validation bounds; the close helper is not reached.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "cli/src/tunnels/agent_host.rs::proxy_gateway_frames",
+            "Operation": "Forward ordinary WebSocket frames bidirectionally between tunnel client and target.",
+            "Cardinality": "One existing target dial per selected session and one send per received frame.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical forwarding cardinality and ordering; only the accepted maximum payload differed.",
+            "CriticalPathEffect": "Unchanged for frames at or below the old 16 MiB cap."
+          }
+        ],
+        "ScalingInput": "Number and size of ordinary frames and active sessions, unchanged from the base revision.",
+        "EffectiveConcurrency": "Unchanged single-session forwarding loop and independent per-session tasks; no new parallel operations or queues.",
+        "CacheBehavior": "No cache or coalescing behavior changes for ordinary frames. Gateway configuration is a small value constructed once per accepted or dialed WebSocket, with no payload-sized eager allocation evidenced.",
+        "MechanismConfidence": "High: the normal forwarding branches are unchanged except for failure-only close calls.",
+        "MagnitudeUncertainty": "No material uncertainty: the changed config does not add boundary calls on this path.",
+        "Verdict": "No performance change on the successful hot path."
+      }
+    ],
+    "Summary": "Reviewed the complete one-file diff and traced gateway setup, endpoint dialing, frame forwarding, browser tunnel limits, protocol serialization, subscription restoration, liveness, and reconnect behavior. No diff-introduced performance issue met the reporting threshold. Recorded the PR's concrete fix for the prior 16 MiB rejection/reconnect repeated-work regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-30T16:18:31.082134527Z",
+    "CompletedAt": "2026-10-30T16:20:55.685491357Z",
+    "WallClockMilliseconds": 144603,
+    "ModelCalls": 13,
+    "InputTokens": 567449,
+    "OutputTokens": 7114,
+    "TotalTokens": 574563,
+    "ReasoningTokens": 2509,
+    "CacheReadTokens": 488960,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 110849,
+    "ToolCalls": 64,
+    "NanoAIUnits": 65182000000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 488960,
+      "cache_write": 0,
+      "input": 78489,
+      "output": 7114
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

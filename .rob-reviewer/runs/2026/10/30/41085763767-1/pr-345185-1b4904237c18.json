@@ -1,0 +1,198 @@
+{
+  "PullRequest": {
+    "Number": 345185,
+    "Title": "agentHost: route Auto to the on-device model when the cloud fallback serves only /responses",
+    "Body": "Fixes #344974\r\n\r\n## What\r\n\r\nWhen Auto (or Copilot Fusion) picks the on-device model, CAPI's `/auto` answer includes a `cloud_fallback_model` for the case where the local model fails before its first output. The local model bridge only accepted a fallback that lists `/chat/completions` in `supported_endpoints`. Current Auto fallbacks, such as GPT-6 Luna, list only `/responses`. So every local pick was rejected with `fallbackNotChat`, `/auto` was sent again cloud-only, and the on-device model was never used.\r\n\r\n- `readFallbackModel` accepts a fallback that supports `/chat/completions` (preferred, unchanged path) or `/responses`, and records which one on the route.\r\n- For a Responses-only fallback, `buildFallbackResponsesRequest` translates the runtime's chat completions request into a non-streaming `/responses` request with the route's `Copilot-Session-Token`. It covers messages, images, tool calls and results, function tools, `tool_choice`, `max_output_tokens` (clamped to the fallback's limit), the mapped reasoning effort and `store: false`.\r\n- `toChatCompletionFromResponses` turns the answer back into a `chat.completion`. If the runtime asked for a stream, it gets the whole answer as one chunk followed by `[DONE]`. CAPI errors such as a 401 still reach the runtime unchanged, and a response that did not complete returns a 502.\r\n- `fallbackNotChat` now applies only when the fallback supports neither endpoint.\r\n\r\n## Notes for reviewers\r\n\r\n- The translation runs only on the fallback path: the local model failing before output, ancillary work, image requests, full slots and so on. A healthy on-device turn is unchanged.\r\n- Earlier reasoning is not sent to a Responses fallback, because the history doesn't record which model produced it.\r\n- The fallback is deliberately non-streaming and minimal. The bundled runtime sends its `-local` chat requests without streaming today. It does not request reasoning summaries and does not pass on `response_format`, a `tool_choice` naming one function, or images inside tool results.\r\n- Longer term, the runtime has its own on-device Auto routing (`session.autoLocalModels.set`, behind `AUTO_LOCAL_ROUTING`) that builds the fallback through its normal Responses path. The SDK doesn't expose that method yet. Once it does, this translation and most of the `/auto` patching could be removed.\r\n\r\n## How to test\r\n\r\nAutomated:\r\n\r\n- `npm run test-node -- --runGlob \"**/agentHost/test/node/localModelBridge/*.test.js\"`: passed (280 passing). Includes new tests for the request translation, the answer translation and an end-to-end handler run (streamed, JSON and 401).\r\n- `npm run test-node -- --run src/vs/platform/agentHost/test/node/providerIntegration/copilotLocalModel.integrationTest.ts`: passed (10 passing). The new case runs the bundled Copilot runtime against loopback fakes with a `/responses`-only fallback. Without this change it fails with `cloudOnlyReissue:fallbackNotChat`; with it, the local model is tried first and the turn completes through `/responses`.\r\n- `npm run typecheck-client`: passed.\r\n- `npm run eslint -- \u003cchanged .ts files\u003e`: passed.\r\n\r\nManual (verified end to end in a local build):\r\n\r\n1. Set `chat.copilot.localModel.enabled`, `chat.copilot.localModel.useInAuto` and `chat.copilot.localModel.llamaServerPath`. To match the issue, also set `chat.copilot.dynamicAutoTiers.enabled` to `false`.\r\n2. Start the on-device MAI model and wait for `Ready ... Auto eligible` in `agenthost.log`.\r\n3. In a Copilot harness chat, pick Auto and send a trivial prompt.\r\n4. `agenthost.log` shows `/auto: local pick routed`, not `local pick without a usable fallback (fallbackNotChat)`, and the response shows as on-device.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/345185",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0d958c41dd9dbfb1da6cff3469d5990b46fa2212",
+    "HeadRef": "agents/fix-local-model-routing-auto-fusion",
+    "HeadSHA": "1b4904237c18ebf7ad9fdc3b0fb5f5ee23dc22a3",
+    "CreatedAt": "2026-10-30T14:19:10Z",
+    "UpdatedAt": "2026-10-30T16:15:07Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-C3F2F2C1A727",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/localModelBridge/shim/requestRouter.ts",
+      "Side": "RIGHT",
+      "Line": 668,
+      "Severity": "medium",
+      "Confidence": 0.95,
+      "ConfidenceRationale": "The branch is reached only for the newly accepted `/responses` fallback endpoint; the streaming request path is explicit in `_sendResponsesFallback`, the unit test sends the default `stream: true` request and asserts a single completed chunk, and fallback limits permit up to 64,000 output tokens. The current bundled integration happens to request JSON, so prevalence is lower, but the route advertises streaming support and handles streaming callers as a supported scenario.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "cloud response bytes, parsed response objects, and serialized SSE bytes retained until completion",
+      "PerformanceScaling": "Latency is the full generation duration rather than first-token latency, and peak allocations scale with the generated output (configured up to 64,000 tokens) before one large SSE chunk is emitted.",
+      "PerformanceOutcome": "blocked time-to-first-token plus output-size-proportional memory and GC pressure",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff, a Responses-only fallback was rejected as a local route and `/auto` was reissued cloud-only; the runtime then used its ordinary HTTP Responses path, so the bridge did not force a streaming cloud request into a buffered non-streaming one.",
+      "ChangedBehavior": "Responses-only fallbacks now suppress upstream streaming and hold the entire generated response before returning a synthetic one-chunk stream.",
+      "CausalDiffEvidence": "Added line 668 hard-codes `stream: false` for every Responses fallback, even when the incoming chat request has `body.stream === true`; added lines 748-759 then await `response.arrayBuffer()`, parse the completed body, and serialize the entire answer into one SSE frame.",
+      "Title": "Preserve streaming for Responses fallbacks",
+      "Impact": "When a streaming Auto turn selects the on-device model and it fails before first output (or falls back for image, ancillary, full-slot, or endpoint-down reasons), the user receives no cloud token until the fallback finishes. Long responses can delay visible output by the entire generation and require the agent host to retain and reserialize the complete response.",
+      "Evidence": "`buildFallbackResponsesRequest` always sends `stream: false`. `_sendResponsesFallback` awaits `response.arrayBuffer()` before constructing any downstream `Response`, then JSON-parses and JSON-stringifies the whole result. The added handler test at lines 1040-1091 exercises an incoming streaming request and expects no output until one full `chat.completion.chunk`; model fixtures expose `max_output_tokens: 64000`. Thus latency grows with full cloud generation time and retained/allocated bytes grow with the complete output.",
+      "Recommendation": "For `body.stream === true`, send `stream: true` to `/responses` and incrementally translate Responses SSE text/tool-call events to chat-completions chunks, forwarding completion and usage in order; keep the current completed-body conversion only for non-streaming callers."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "boundary-fanout",
+      "eager-work",
+      "concurrency-burst",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Auto session selection with a Responses-only cloud fallback",
+        "CriticalPath": "The runtime's `/auto` request crosses CAPI and must complete before a model route is known. The diff accepts `/responses` as a usable fallback and records the token route; route-table bookkeeping is in-process and negligible.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/localModelBridge/shim/copilotRequestHandler.ts `_handleCapiAuto` / `_completeCapiAuto`",
+            "Operation": "POST the injected `/auto` request to CAPI and consume its JSON response",
+            "Cardinality": "One injected request; for Responses-only fallbacks the diff avoids the prior second cloud-only `/auto` reissue.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The injected `/auto` response was rejected as `fallbackNotChat`, then the original `/auto` request was sent again cloud-only.",
+            "CriticalPathEffect": "Selection cannot proceed until `/auto` returns; the diff reduces this path from two sequential `/auto` calls to one when the fallback is Responses-only."
+          }
+        ],
+        "ScalingInput": "Number of session/model-selection events, effectively one route entry per active session token.",
+        "EffectiveConcurrency": "One `/auto` selection request per session/model-selection event; no new fan-out or limiter change. Route records are independently keyed by session token.",
+        "CacheBehavior": "The accepted route is cached by session token, bounded by a 1024-entry soft cap and expiry/grace sweeping. Warm inference requests acquire the cached route; misses do not trigger a new boundary in this code path.",
+        "MechanismConfidence": "High: changed endpoint validation directly changes reissue versus patch behavior.",
+        "MagnitudeUncertainty": "Actual `/auto` latency varies by network, but call cardinality and the removed reissue are explicit.",
+        "Verdict": "No regression: this scenario removes one sequential network request for Responses-only fallback metadata."
+      },
+      {
+        "Scenario": "Healthy Auto turn served by the on-device model after a Responses-only fallback route is accepted",
+        "CriticalPath": "After a warm route-table lookup, one loopback `llama-server` inference is the turn's critical path. Responses translation is not reached when local output commits.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/localModelBridge/shim/copilotRequestHandler.ts `_dispatchLocal` reached from `_serveRoutedAuto`",
+            "Operation": "POST one chat-completions request to loopback `llama-server`",
+            "Cardinality": "One request per model invocation; tool-use turns can issue sequential model invocations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "For a Responses-only fallback, this local route was rejected and the runtime selected and invoked the cloud model instead.",
+            "CriticalPathEffect": "The local inference must produce first output before the turn advances."
+          }
+        ],
+        "ScalingInput": "One local request per model invocation, bounded by serving slots.",
+        "EffectiveConcurrency": "Local serving remains bounded by the existing slot allocator; no changed concurrency policy.",
+        "CacheBehavior": "The session-token route is a warm in-memory lookup. Prompt caching remains owned by `llama-server`; this diff does not alter its cache keys or invalidation.",
+        "MechanismConfidence": "High: the route acceptance and unchanged local dispatch are explicit.",
+        "MagnitudeUncertainty": "Relative local-versus-cloud generation latency depends on hardware and model, but this is the intended routing behavior rather than duplicated work.",
+        "Verdict": "No reportable regression; the behavior change intentionally enables local inference and preserves existing slot/backpressure behavior."
+      },
+      {
+        "Scenario": "Current bundled runtime falls back through `/responses` after local failure using a non-streaming chat request",
+        "CriticalPath": "A loopback attempt must fail before first output, then one translated CAPI `/responses` request must finish because the caller requested JSON. Translation and full-body parsing are on the critical path but match the caller's non-streaming response contract.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/localModelBridge/shim/copilotRequestHandler.ts `_serveRoutedAuto` then `_sendResponsesFallback`",
+            "Operation": "Attempt loopback local inference, then POST one non-streaming `/responses` fallback to CAPI",
+            "Cardinality": "At most one local attempt and one cloud request per failed model invocation; tool turns can repeat sequentially.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The route was rejected during `/auto`; the runtime incurred a second `/auto` and then invoked the selected cloud model through its native Responses path.",
+            "CriticalPathEffect": "Local failure and the complete cloud generation are sequential on the turn's critical path."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/copilot/localModelBridge/shim/requestRouter.ts `buildFallbackResponsesRequest` and `toChatCompletionFromResponses`",
+            "Operation": "Translate the complete message/tool history to Responses JSON and translate the completed answer back to chat-completions JSON",
+            "Cardinality": "One O(history-size) request conversion and one O(output-size) response conversion per fallback.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The bridge did not perform this translation; the runtime used its native cloud endpoint representation.",
+            "CriticalPathEffect": "Both conversions run synchronously around the cloud request, but only once per fallback."
+          }
+        ],
+        "ScalingInput": "Conversation history/tool schema size and generated output size, once per fallback invocation.",
+        "EffectiveConcurrency": "The local slot/resources are disposed before fallback. Each concurrent session may issue one independent cloud fallback; the diff adds no shared burst beyond the ordinary per-session cloud inference.",
+        "CacheBehavior": "The route is reused while valid; there is no response cache or coalescing, appropriately because each inference body is session-specific. No negative-cache retry loop is introduced.",
+        "MechanismConfidence": "High for the sequential boundaries and O(input/output) translation; lower concern because the current caller is non-streaming.",
+        "MagnitudeUncertainty": "Prompt and output size vary; the integration test establishes that the current runtime asks for JSON, so complete-response waiting is expected in this default scenario.",
+        "Verdict": "No separate finding for the default JSON caller: the extra translation is bounded to one fallback and the diff also removes the prior second `/auto` request."
+      },
+      {
+        "Scenario": "Streaming Auto request falls back through a Responses-only cloud model",
+        "CriticalPath": "After any local pre-output failure, the cloud fallback is critical. The new request builder forces `stream: false`, and the handler awaits and parses the entire response before returning one synthetic SSE chunk, blocking downstream progress until generation completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/localModelBridge/shim/requestRouter.ts:668 and copilotRequestHandler.ts:748-759",
+            "Operation": "POST a forced non-streaming `/responses` request, buffer the full response, then emit one chat-completions SSE frame",
+            "Cardinality": "One per fallback invocation; a tool loop may encounter this once per sequential model call, and multiple sessions may do so concurrently.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Responses-only fallback metadata caused cloud-only `/auto` reissue, leaving cloud Responses transport to the runtime; the bridge did not suppress streaming or buffer the cloud answer.",
+            "CriticalPathEffect": "No token can reach the runtime until all cloud output is generated and downloaded."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/copilot/localModelBridge/shim/copilotRequestHandler.ts:753-759",
+            "Operation": "Allocate the complete response byte buffer, parsed object graph, concatenated output text, and one JSON/SSE serialization",
+            "Cardinality": "One full-output copy chain per fallback, with model fixtures permitting up to 64,000 output tokens.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No bridge-owned full-response conversion existed for this fallback endpoint.",
+            "CriticalPathEffect": "Parsing and serialization occur only after the full network body arrives and before any downstream chunk is returned."
+          }
+        ],
+        "ScalingInput": "Cloud generation duration and output size (up to the configured 64,000 tokens), multiplied in memory by concurrent fallback requests.",
+        "EffectiveConcurrency": "One cloud request per failed invocation; concurrent sessions remain independent. Each in-flight request retains its full completed response and translated copies, so aggregate memory scales with concurrent fallbacks.",
+        "CacheBehavior": "Route caching avoids repeated `/auto` selection but cannot reduce per-generation output buffering; no response cache is applicable.",
+        "MechanismConfidence": "Very high: `stream: false`, `arrayBuffer()`, and the single-chunk assertion directly prove the mechanism.",
+        "MagnitudeUncertainty": "The bundled runtime currently sends the local chat request non-streaming, so streaming prevalence depends on caller/runtime evolution. However, streaming is explicitly advertised in the patched selected-model capabilities and covered by the added handler test.",
+        "Verdict": "Reportable medium-severity latency and allocation regression; finding submitted."
+      }
+    ],
+    "Summary": "Completed the performance pass over all eight changed files. The route-cache lifecycle remains bounded, boundary cardinality is one local attempt plus one cloud inference per fallback, and accepting Responses-only metadata removes a duplicate `/auto`. One valid regression was found: streaming callers are forced onto a fully buffered non-streaming Responses fallback, delaying time-to-first-token and scaling peak allocations with complete output size."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-30T16:21:00.592491708Z",
+    "CompletedAt": "2026-10-30T16:23:13.086602797Z",
+    "WallClockMilliseconds": 132494,
+    "ModelCalls": 10,
+    "InputTokens": 468133,
+    "OutputTokens": 7901,
+    "TotalTokens": 476034,
+    "ReasoningTokens": 3103,
+    "CacheReadTokens": 394240,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 111353,
+    "ToolCalls": 50,
+    "NanoAIUnits": 61128800000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 394240,
+      "cache_write": 0,
+      "input": 73893,
+      "output": 7901
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
