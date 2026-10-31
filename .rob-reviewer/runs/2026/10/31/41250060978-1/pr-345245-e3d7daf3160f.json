@@ -1,0 +1,144 @@
+{
+  "PullRequest": {
+    "Number": 345245,
+    "Title": "Fix Remove Keybinding for the chat steer and queue Enter bindings",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nFixes #338834\r\n\r\n## Problem\r\n\r\nIn the Keyboard Shortcuts editor, **Remove Keybinding** on the default \u003ckbd\u003eEnter\u003c/kbd\u003e binding of **Chat: Steer with Message** or **Chat: Add to Queue** adds a removal rule to `keybindings.json`, but the binding stays active: pressing Enter in the chat input during a running request still steers or queues the message. A removal rule without a `when` clause does work, which is the only workaround today.\r\n\r\n## Root cause\r\n\r\n\"Remove Keybinding\" writes the default's `when`, serialized ([keybindingEditing.ts#L157](https://github.com/microsoft/vscode/blob/c8a3f819b4a13366d5846a02288ab53b4d89ac50/src/vs/workbench/services/keybinding/common/keybindingEditing.ts#L157)), and that string is parsed again when `keybindings.json` is read. `KeybindingResolver._isTargetedForRemoval` removes the default only if the default's `when` implies the rule's `when` ([keybindingResolver.ts#L91-L116](https://github.com/microsoft/vscode/blob/c8a3f819b4a13366d5846a02288ab53b4d89ac50/src/vs/platform/keybinding/common/keybindingResolver.ts#L91-L116)). `implies` compares OR terms and AND terms one by one and assumes both sides are normalized the same way ([contextkey.ts#L2115-L2177](https://github.com/microsoft/vscode/blob/c8a3f819b4a13366d5846a02288ab53b4d89ac50/src/vs/platform/contextkey/common/contextkey.ts#L2115-L2177)).\r\n\r\nThey are not. The steer and queue Enter bindings combine nested ORs ([chatQueueActions.ts#L25-L47](https://github.com/microsoft/vscode/blob/c8a3f819b4a13366d5846a02288ab53b4d89ac50/src/vs/workbench/contrib/chat/browser/actions/chatQueueActions.ts#L25-L47)) with the action precondition ([actions.ts#L770](https://github.com/microsoft/vscode/blob/c8a3f819b4a13366d5846a02288ab53b4d89ac50/src/vs/platform/actions/common/actions.ts#L770)). `ContextKeyAndExpr._normalizeArr` distributes each OR over its neighbouring term. Some of the resulting branches are contradictions such as `chatEditingSentRequest == 'st' \u0026\u0026 chatEditingSentRequest != 'st'`, which become `false`, so the OR collapses into a single AND. That AND is pushed back into the outer AND as one term instead of being flattened ([contextkey.ts#L1715-L1741](https://github.com/microsoft/vscode/blob/c8a3f819b4a13366d5846a02288ab53b4d89ac50/src/vs/platform/contextkey/common/contextkey.ts#L1715-L1741)). The default `when` then holds terms like `chatInputHasText \u0026\u0026 inChatInput \u0026\u0026 … \u0026\u0026 (chatEditingSentRequest == 'st' \u0026\u0026 chatEditingSentRequest != 's')`. The serialized string has no parentheses, so the parsed rule is flat, `implies` finds different OR terms, and the default is kept.\r\n\r\nMaking ANDs flat exposes two related gaps in the same loop, so this PR fixes them too:\r\n\r\n- The loop distributes an OR only when it is the last term after sorting, but `in`, `not in` and comparison terms (`\u003e`, `\u003c=`, …) sort after ORs. `ContextKeyExpr.and(a || b, c \u003e 1)` stays undistributed and serializes as `a || b \u0026\u0026 c \u003e 1`, which parses to a different expression. On `main`, the nested AND sometimes hid such terms and let the OR be distributed. With flat ANDs it no longer does, so the loop now picks the last OR wherever it sorts.\r\n- When every branch of a distributed OR is `false`, the result was kept as `false \u0026\u0026 …` instead of `false`.\r\n\r\nDistributed ORs started collapsing like this when #163841 (85f62d7aca6, 2022) made `A \u0026\u0026 !A` normalize to `false`; the loop that pushes the result back without flattening is older.\r\n\r\n## Fix\r\n\r\n`ContextKeyAndExpr._normalizeArr` now:\r\n\r\n1. distributes the last OR term wherever it sorts, not only when it is the last term;\r\n2. returns `false` as soon as a distributed OR collapses to `false`;\r\n3. flattens an AND left behind by a collapsed OR into the outer AND and drops duplicate terms.\r\n\r\nEvery AND it produces is flat, so the default `when` equals the rule parsed from its own serialization, and `KeybindingResolver` needs no change.\r\n\r\n`serialize()` output is persisted in user `keybindings.json`, so I checked what changes. It only changes for expressions that, on `main`, held a nested AND, an undistributed OR before an `in` or comparison term, or a `false \u0026\u0026 …` AND. For the first two, the old string never parsed back to the same expression, so removal rules generated from them never matched. A `false \u0026\u0026 …` AND already parsed back to `false`. All other expressions serialize exactly as before (see the randomized check below).\r\n\r\nNot changed: #337659 (1.140) added `!chatInputBlocked` to both preconditions. Removal rules saved before 1.140, including the two in the issue, describe the old defaults, so they still won't match the new ones. Removing the binding again from the Keyboard Shortcuts editor writes a rule that works. Making old rules follow later changes to a default `when` is out of scope here.\r\n\r\n## Before / after\r\n\r\nNo recordings; the effect was checked by hand in a Code OSS dev build of this branch, signed in, with the default `\"chat.requestQueuing.defaultAction\": \"steer\"`:\r\n\r\n- In Keyboard Shortcuts, **Remove Keybinding** on the Enter row of `workbench.action.chat.steerWithMessage` removed the row; only the Alt+Enter row was left. On `main`, the removal rule is ignored and the Enter binding stays in effect (unit test below).\r\n- While a chat request was running (Stop button shown), typing a message and pressing Enter added a new line to the input and sent nothing.\r\n- After deleting the removal rule from `keybindings.json`, pressing Enter in the same running request sent the message as steering again.\r\n\r\n## How to test\r\n\r\n1. In a dev build, open **Preferences: Open Keyboard Shortcuts** and search for `workbench.action.chat.steerWithMessage`.\r\n2. Right-click the row bound to \u003ckbd\u003eEnter\u003c/kbd\u003e and choose **Remove Keybinding**. The Enter row disappears. On `main` it stays, and the `-workbench.action.chat.steerWithMessage` rule is ignored.\r\n3. Start a long chat request, type a message in the chat input, and press \u003ckbd\u003eEnter\u003c/kbd\u003e. The message is no longer sent as steering.\r\n4. Repeat with `workbench.action.chat.queueMessage` and `\"chat.requestQueuing.defaultAction\": \"queue\"`.\r\n\r\n## Validation\r\n\r\n| Check | Command | Result |\r\n|-------|---------|--------|\r\n| New tests on `main` @ `c8a3f81` | `scripts\\test.bat --run src/vs/platform/contextkey/test/common/contextkey.test.ts --run src/vs/platform/keybinding/test/common/keybindingResolver.test.ts --grep 338834` | ❌ fails as expected: both Enter defaults survive their removal rules, and the collapsed AND serializes as `a \u0026\u0026 a \u0026\u0026 b \u0026\u0026 c` and does not equal its parsed form. The `in` and comparison test was added later; with `main`'s `contextkey.ts`, its three expressions serialize as `a \\|\\| b \u0026\u0026 c \u003e 1`, `a \\|\\| b \u0026\u0026 c in 'd'` and `false \u0026\u0026 a` instead of the expected values |\r\n| Same tests with this PR | same | ✅ pass |\r\n| Context key, parser, keybinding resolver, keybinding editing and Keyboard Shortcuts model suites | `scripts\\test.bat --run src/vs/platform/contextkey/test/common/contextkey.test.ts --run src/vs/platform/contextkey/test/common/parser.test.ts --run src/vs/platform/contextkey/test/browser/contextkey.test.ts --run src/vs/platform/keybinding/test/common/keybindingResolver.test.ts --run src/vs/workbench/services/keybinding/test/browser/keybindingEditing.test.ts --run src/vs/workbench/services/preferences/test/browser/keybindingsEditorModel.test.ts` | ✅ 181 passing |\r\n| Wider unit tests: all of `vs/platform`, `vs/workbench/services` and `vs/sessions`, plus the preferences, keybindings, canvases and multi-diff editor contributions and the chat tests that serialize context keys | `scripts\\test.bat --runGlob \"{vs/platform/**/test/**/*.test.js,vs/workbench/services/**/test/**/*.test.js,vs/sessions/**/test/**/*.test.js,…}\"` | ✅ no new failures: 34,491 passing, 204 pending. 64 layout tests fail on this machine, which runs at 125% display scaling (for example a 1px border measures 0.8px). The same 64 tests fail with `main`'s `contextkey.ts` |\r\n| Chat queue and steer action tests | `scripts\\test.bat --run src/vs/workbench/contrib/chat/test/browser/actions/chatQueueActions.test.ts` | ✅ 10 passing |\r\n| Randomized normalization check (scratch script, not committed) | 24,000 random expressions over 4 keys built from `has`, `!`, `==`, `!=` and `\u003e` terms with AND, OR and NOT up to 3 levels deep, built once with `main`'s `contextkey.ts` and once with this PR's, and evaluated on all 625 combinations of the values `0`, `1`, `2`, `'1'` and `'2'` for the 4 keys | ✅ The two builds evaluate identically for every expression. With this PR, every `serialize()` output parses back to an expression with the same truth table; on `main`, 2,318 of the 24,000 (9.7%) parse to a different one, all from an OR left before a comparison term. In a second set of 24,000 without `\u003e` terms, 627 had a nested AND on `main`; `serialize()` changed for 529 of them and for 460 `false \u0026\u0026 …` ANDs that now read `false`, and for no other expression. With non-numeric values such as `true`, 3 of 24,000 expressions with `\u003e` evaluate differently, because both builds already rewrite `!(c \u003e 1)` as `c \u003c= 1`, which is false for non-numbers, and the new distribution order applies that rewrite in different places |\r\n| Type check, lint and formatting | `npm run typecheck-client`, `npm run eslint -- \u003cchanged files\u003e`, `node build/hygiene.ts \u003cchanged files\u003e` | ✅ no errors |\r\n\r\n---\r\n\u003csub\u003eFound and fixed with automated exploratory testing. Draft until reviewed by a human.\u003c/sub\u003e\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/345245",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "251dcbf808afd0edbb00f13e149d0bc1aed68015",
+    "HeadRef": "karthiknadig/bug-swarm/c21-f1-removing-the-default-enter-keybinding",
+    "HeadSHA": "e3d7daf3160f5c9977becedbc034972d05c2fdba",
+    "CreatedAt": "2026-10-30T18:41:53Z",
+    "UpdatedAt": "2026-10-31T19:55:00Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-18EBD56F54C1",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/contextkey/common/contextkey.ts",
+      "Side": "RIGHT",
+      "Line": 1718,
+      "Severity": "high",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The exponential branch construction follows directly from the recursive distribution code and parser grammar, and the synchronous extension-menu/keybinding call paths plus absent complexity limit are explicit. Only the prevalence of large real-world conditions is uncertain, which affects severity rather than the mechanism.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "CPU work and allocated ContextKeyOrExpr/ContextKeyAndExpr branch objects",
+      "PerformanceScaling": "For N independent two-way OR groups followed by an `in` or comparison term, normalization now materializes 2^N conjunction branches; each installed extension contribution or user keybinding supplies another independently parsed expression.",
+      "PerformanceOutcome": "Main-thread startup can stall and the renderer can exhaust memory while registering extension menus or keybindings.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Because comparison and `in` nodes sort after OR nodes, the old loop inspected the final comparison, stopped distribution, and retained this expression in O(N) AST nodes.",
+      "ChangedBehavior": "`findLastIndex` now selects an OR even when a comparison or `in` term follows it. After distributing that OR over the trailing term, subsequent iterations recursively combine the remaining ORs and form their Cartesian product.",
+      "CausalDiffEvidence": "The added `expr.findLastIndex(e =\u003e e.type === ContextKeyExprType.Or)` at RIGHT line 1718 bypasses the previous guard on the final element, newly entering distribution for expressions whose final sorted term is an `in` or numeric comparison.",
+      "Title": "Bound OR distribution before materializing extension conditions",
+      "Impact": "An installed extension with a condition such as `(a0 || b0) \u0026\u0026 ... \u0026\u0026 (a19 || b19) \u0026\u0026 count \u003e 0` now causes over one million conjunction branches to be created synchronously during contribution registration, blocking workbench startup and risking OOM; the same shape is accepted in user keybindings.",
+      "Evidence": "The parser accepts parenthesized expressions and normalizes every AND through this loop. `menusExtensionPoint.setHandler` synchronously calls `ContextKeyExpr.deserialize(menuItem.when)` for every installed extension menu, while validation checks only that `when` is a string and imposes no size or complexity bound; keybinding contribution registration does the same before updating the resolver. The recursive `ContextKeyAndExpr.create` at lines 1732-1734 distributes each selected OR against the next term, and `ContextKeyOrExpr.create` flattens the resulting branches, so N binary ORs produce 2^N retained branches.",
+      "Recommendation": "Avoid converting unrestricted conditions to full DNF: preserve grouping with a parenthesis-aware AST and serializer, or compute and enforce a small branch budget before distribution and reject/report over-budget extension or user expressions without first materializing them."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold workbench startup or extension-set refresh registers contributed menus and keybindings with parenthesized OR conditions followed by `in` or numeric comparisons.",
+        "CriticalPath": "The extension-point handlers synchronously deserialize every `when` string before menu registration completes or the keybinding resolver is updated; normalization is therefore on the main-thread critical path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Installed contribution count times expression complexity. For one expression with N binary OR groups before a comparison, effective branch cardinality is 2^N; there is no deduplication that avoids distinct combinations.",
+        "EffectiveConcurrency": "All contributions are parsed serially in the extension-point handler with no yielding, worker offload, limiter, or backpressure.",
+        "CacheBehavior": "No parsed-expression cache or coalescing applies inside the handler; each handler invocation reparses each contribution. Cold registration and extension-set refresh both perform the work.",
+        "MechanismConfidence": "High: parser grammar, normalization recursion, synchronous handlers, and unbounded string validation were all traced directly.",
+        "MagnitudeUncertainty": "Large grouped conditions are less common than short menu clauses, but extension-provided strings have no length or complexity limit; 20 groups are sufficient to exceed one million branches.",
+        "Verdict": "Reportable high-severity startup regression: the diff changes this expression class from linear retained AST size to exponential synchronous allocation."
+      },
+      {
+        "Scenario": "Initial user-keybindings load and later keybindings.json reload after a write or profile switch.",
+        "CriticalPath": "One file read completes first; then every item is mapped through `KeybindingIO.readUserKeybindingItem` and `ContextKeyExpr.deserialize` before the reload publishes changed keybindings and rebuilds the resolver.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/keybinding/browser/keybindingService.ts:UserKeybindings.readUserKeybindings",
+            "Operation": "Read the current profile's keybindings.json.",
+            "Cardinality": "One file read per initial load or coalesced reload, regardless of keybinding count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one-file read occurred, but affected expressions retained linear ASTs because normalization stopped at the trailing comparison or `in` term.",
+            "CriticalPathEffect": "The read precedes parsing and resolver publication; exponential normalization can dominate after I/O completes."
+          }
+        ],
+        "ScalingInput": "Number of user keybindings, with exponential 2^N normalization for any one condition containing N binary grouped ORs and a trailing higher-sorting term.",
+        "EffectiveConcurrency": "Reloads are coalesced by a 50 ms RunOnceScheduler, but parsing within a reload is serial and synchronous after the file read.",
+        "CacheBehavior": "Raw-object equality skips remapping only when file contents are unchanged after the read. Initial load and any changed file parse all entries; there is no expression cache or negative cache.",
+        "MechanismConfidence": "High for the changed parse cost and serialized reload path.",
+        "MagnitudeUncertainty": "A manually authored pathological keybinding condition is uncommon, but accepted without a complexity bound and can block reload or startup.",
+        "Verdict": "The same reported exponential-allocation mechanism is reachable from user configuration; the filesystem cardinality itself is unchanged."
+      },
+      {
+        "Scenario": "Remove the default Chat: Steer with Message or Chat: Add to Queue Enter keybinding in the Keyboard Shortcuts editor.",
+        "CriticalPath": "Default chat conditions are normalized during action/keybinding registration; removal serializes the default condition, persists one edit, then the keybinding reload parses it before resolver matching can reflect the removal.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/keybinding/common/keybindingEditing.ts:removeDefaultKeybinding and src/vs/workbench/services/keybinding/browser/keybindingService.ts:UserKeybindings.reload",
+            "Operation": "Persist and subsequently reload the edited keybindings.json model.",
+            "Cardinality": "One persisted edit and one coalesced file reload for a removal action.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same edit and reload boundaries occurred; only the normalized expression shape differed.",
+            "CriticalPathEffect": "Persistence/reload is required before the user configuration and resolver reflect the removal."
+          }
+        ],
+        "ScalingInput": "Two affected default bindings with a small fixed number of context terms and OR branches; effective cardinality stays small for this built-in scenario.",
+        "EffectiveConcurrency": "Registration and expression normalization are synchronous; keybindings file change notifications are coalesced before reload.",
+        "CacheBehavior": "The resolver is cached until keybindings update; file reload uses raw-object equality. The changed normalizer does not add a new cache or invalidate one more often.",
+        "MechanismConfidence": "High: tests and construction paths show the intended bounded case.",
+        "MagnitudeUncertainty": "None material for the fixed built-in expressions; their term count is fixed and small.",
+        "Verdict": "No additional performance finding for the target chat workflow itself; local normalization cost is bounded, while the generic unbounded-input path is covered by the submitted finding."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files. One diff-introduced exponential normalization/allocation issue was submitted; no regression-fix learning signal applied."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-31T22:55:35.157608775Z",
+    "CompletedAt": "2026-10-31T22:58:00.571629381Z",
+    "WallClockMilliseconds": 145414,
+    "ModelCalls": 14,
+    "InputTokens": 666933,
+    "OutputTokens": 7895,
+    "TotalTokens": 674828,
+    "ReasoningTokens": 2923,
+    "CacheReadTokens": 587776,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 119810,
+    "ToolCalls": 63,
+    "NanoAIUnits": 70963840000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 587776,
+      "cache_write": 0,
+      "input": 79157,
+      "output": 7895
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

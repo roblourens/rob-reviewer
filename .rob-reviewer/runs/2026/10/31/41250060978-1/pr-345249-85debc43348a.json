@@ -1,0 +1,118 @@
+{
+  "PullRequest": {
+    "Number": 345249,
+    "Title": "Keep idle sash gripper styling from restyling the whole workbench",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nRefs #341282\r\n\r\n## Problem\r\n\r\nSince sash grippers started hiding while the mouse is idle (#343441), two moments make Chromium recompute the style of every element in the window: the first mouse movement after 2 seconds without movement (the grippers appear), and 2 seconds after the mouse stops (they hide again). With a large chat open, each of these takes about 0.4 s, and the window does not respond in the meantime. This happens in every window with the default settings, not only in the Agents window.\r\n\r\nSwitching sessions in the Agents window runs into both: moving the mouse to the Sessions list shows the grippers, and they hide again while the next chat is still rendering. In a dev build, switching between two sessions with large responses took **2,739 ms on `main` and 1,903 ms with this change (−836 ms, −31%)**, median of 3 runs × 4 switches each. Switching is still slower than it should be, so this does not close #341282; the remaining costs are listed at the end.\r\n\r\n## Root cause\r\n\r\n`SashGrippersController` toggles the `sash-grippers-hidden` class on the workbench container ([sash.ts#L103-L110](https://github.com/microsoft/vscode/blob/c8a3f819b4a13366d5846a02288ab53b4d89ac50/src/vs/workbench/contrib/sash/browser/sash.ts#L103-L110)). The rule for that class ([style.css#L69-L72](https://github.com/microsoft/vscode/blob/c8a3f819b4a13366d5846a02288ab53b4d89ac50/src/vs/workbench/browser/media/style.css#L69-L72)) sets `--sash-grip-opacity` and `--sash-grip-transition-duration` on `.monaco-workbench` itself. Custom properties are inherited, so every time the class changes, every element in the workbench gets a new computed style and Chromium has to recalculate all of them, even though only the sash grip dots read these properties.\r\n\r\nIn a trace of one session switch on `main`, these two toggles show up as the two largest style recalculations, each covering about 34,300 elements:\r\n\r\n- **393 ms** when the mouse moves onto the session row. Chromium applies it while processing the click, before any of the switch code runs. A trace with style invalidation tracking attributes it to `showGrippers` removing the class from the workbench root.\r\n- **400 ms** about 2 s after the mouse stopped, which matches the hide timer adding the class back while the incoming chat is being rendered. It runs inside whichever code reads layout next: `ChatBackgroundRenderer` reading `clientWidth` in one recording, the measurement script's visibility check in another. It is gone with this change.\r\n\r\n## Fix\r\n\r\nSet the two custom properties on the `.monaco-sash` elements inside a workbench with hidden grippers, instead of on the workbench element. The grip dots are `::after` pseudo-elements of the sashes, so they inherit the same values and fade exactly as before. When the class changes, Chromium now only restyles the sashes. The controller, the settings and the timing are unchanged, and no TypeScript changed.\r\n\r\nThe new unit test reads `--sash-grip-opacity` on a plain element inside the workbench while the grippers are hidden. On `main` it is `0` (inherited from the workbench); with this change it is empty, and the sash itself still gets `0`. Existing tests for gripper opacity, hover and drag feedback, fade durations, reduced motion and the Agents window sashes pass unchanged.\r\n\r\n## Before / after\r\n\r\nNo recordings: the change is only a difference in timing, so it is documented with the measurements and profiles below rather than GIFs.\r\n\r\n## How it was measured\r\n\r\n- **Input:** a dev build of the Agents window with `VSCODE_DEV_DISABLE_DISPOSABLE_TRACKING=1`, connected to the scripted mock agent host (`agentHostServerMain --enable-mock-agent`, added through `chat.remoteAgentHosts`). The host lists two completed sessions, each with one response of about 115 KB: 50 or 51 sections, each with a list, a 20-line TypeScript code block and a table. Two tiny sessions are the control. The window is signed out and its sign-in dialog is closed. Default settings, so `workbench.sash.autoHideGrippers` is on with a 2 s delay.\r\n- **Builds:** one compiled build of `main` at `c8a3f81`. Because the change touches no TypeScript, the `main` runs used that build with `main`'s `style.css` copied into `out/`, and the runs for this change used this change's `style.css`. The two batches ran back to back on the same Windows machine.\r\n- **Run:** open each large session once to warm up, then switch between them 4 times. 3 runs per build, each in a fresh window. Switch time is the time from the click on the session row until the incoming chat's request and response text are both visible.\r\n\r\n| Switching between the two large sessions | `main` | This change |\r\n|---|---:|---:|\r\n| Median of the 3 per-run medians | **2,739 ms** | **1,903 ms** |\r\n| Per-run medians | 2,878 / 2,739 / 2,731 ms | 2,018 / 1,842 / 1,903 ms |\r\n| Every switch, run 1 | 2,833, 2,922, 3,628, 2,775 ms | 1,889, 2,147, 2,781, 1,878 ms |\r\n| Every switch, run 2 | 2,668, 2,797, 2,681, 2,871 ms | 1,844, 2,887, 1,809, 1,840 ms |\r\n| Every switch, run 3 | 2,766, 2,695, 2,669, 2,803 ms | 1,851, 1,954, 2,633, 1,842 ms |\r\n| Tiny sessions (control), per-run medians | 206 / 203 / 181 ms | 375 / 205 / 184 ms |\r\n\r\nAn earlier batch on `main` before the change was made (same input, 3 runs) measured 2,792 / 2,714 / 2,687 ms. In each run with this change, one of the four switches still took 2.6 to 2.9 s; `main` also has an occasional slow switch (3,628 ms in run 1). That variation was not investigated here. The tiny-session control was slower in the first run with this change (375 ms) than in all other runs (181 to 206 ms); those switches have very little to restyle either way, so this is treated as noise.\r\n\r\n**Profile of one switch**, recorded after the scenario runs in the same windows. Each recording starts after the previous switch has settled, with the mouse not moved for more than 2 seconds, and ends 0.8 s after the response is visible:\r\n\r\n| Per switch | `main` | This change |\r\n|---|---:|---:|\r\n| Style recalculations covering the whole window (about 34,300 elements) | 2 (393 ms + 400 ms) | none |\r\n| Total time in style recalculation (trace) | 1,752 ms | 961 ms |\r\n| CPU profile, `(program)` self time, where the click's hit test does the style work (2 switches) | 650 / 887 ms | 216 / 218 ms |\r\n| CPU profile, self time of the layout read that applied the hide toggle (2 switches) | 460 ms (measurement script) / 472 ms (`ChatBackgroundRenderer`) | 3.0 / 3.7 ms (measurement script; `ChatBackgroundRenderer` under 1 ms) |\r\n| CPU profile, busy time (not idle) of the whole recording (2 switches) | 3,110 / 3,512 ms | 2,566 / 2,498 ms |\r\n\r\nTime per switch in the CPU profile is higher than in the table above because the profiler adds overhead.\r\n\r\n## What remains\r\n\r\nWith this change, the remaining time in one switch is mostly:\r\n\r\n- About 450 ms of script to render the incoming chat: markdown, 50 code-block editors and tables.\r\n- A 344 ms style recalculation plus 47 ms layout of the **outgoing** transcript. It is forced by `ChatListWidget.updateScrollDownButtonPosition`, reached from `ChatWidget.setTranscriptProgress` early in `ChatView.setChat`, before the previous transcript is released.\r\n- About 370 ms of style and 120 ms of layout the first time the incoming chat is measured, forced by the code-block editors' first render.\r\n\r\nThese are separate changes.\r\n\r\n## How to test\r\n\r\n1. Open a window with a long chat (or the Agents window with a session that has a long response with code blocks and tables).\r\n2. Keep the mouse still for more than 2 seconds, then move it. In **Developer: Toggle Developer Tools** \u003e Performance, record this. On `main`, a \"Recalculate style\" covering the whole document appears at the first movement, and again 2 seconds after the mouse stops. With this change those recalculations only cover the sashes.\r\n3. Check the grippers still behave the same, in the editor window with Modern UI and in the Agents window: the dots between parts fade out after 2 seconds idle and fade back in on mouse movement, hovering or dragging a sash still shows the full highlight, and with reduced motion they change without a fade.\r\n4. In the Agents window, switch between two sessions with long responses and compare with `main`.\r\n\r\n## Validation\r\n\r\n| Check | Command | Result |\r\n|---|---|---|\r\n| New test fails with `main`'s stylesheet | Built this change, copied `main`'s `style.css` into `out/`, then `scripts\\test.bat --run src/vs/workbench/contrib/sash/test/browser/sash.test.ts` | ❌ as expected: 15 passing, 1 failing. The plain element inherits `--sash-grip-opacity: 0`. |\r\n| Sash gripper and Agents window grid tests with this change | `scripts\\test.bat --run src/vs/workbench/contrib/sash/test/browser/sash.test.ts --run src/vs/sessions/test/browser/sessionGridLayout.test.ts` | ✅ all 16 sash gripper tests pass, including the existing checks of gripper opacity, hover and drag feedback, fades and reduced motion, and the Agents window test \"idle grippers recede across session, side-pane and panel sashes\". 2 grid layout tests fail, and the same 2 fail with `main`'s stylesheet: they check pixel geometry that differs on this 125% scaled display (0.8 px instead of 1 px borders, 396 px instead of 397 px). |\r\n| Type check | `npm run typecheck-client` | ✅ passed |\r\n| Formatting and lint | `node build/hygiene.ts \u003c2 changed files\u003e`, `npm run eslint -- \u003cchanged test file\u003e`, `npm run stylelint -- src/vs/workbench/browser/media/style.css` | ✅ passed. Stylelint only lists existing design-token suggestions for other lines in the file. |\r\n| Switch timing | Measurement above, 3 runs per build | `main` 2,739 ms, this change 1,903 ms |\r\n\r\n---\r\n\u003csub\u003eFound and fixed with automated exploratory testing. Draft until reviewed by a human.\u003c/sub\u003e\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/345249",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "700a617a4b59f8025d46ad3a3162570f0e301424",
+    "HeadRef": "karthiknadig/bug-swarm/c19-f1-large-session-switch-render",
+    "HeadSHA": "85debc43348a8b650fadf7d1e7270ea4588d5710",
+    "CreatedAt": "2026-10-30T19:03:55Z",
+    "UpdatedAt": "2026-10-31T19:55:03Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/browser/media/style.css",
+      "FixedSide": "RIGHT",
+      "FixedLine": 70,
+      "BasePath": "src/vs/workbench/browser/media/style.css",
+      "BaseLine": 69,
+      "IntroducingPath": "src/vs/workbench/browser/media/style.css",
+      "IntroducingCommit": "f5d95e4ba024c912a62793b3167eeb119fb150dc",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceCategory": "rendering",
+      "Mechanism": "Frequently toggling inherited CSS custom properties on the workbench root invalidated computed style for every descendant and forced large synchronous browser style recalculations on mouse activity and idle transitions.",
+      "Symptom": "With large chat/session DOMs, showing or hiding sash grippers blocked the renderer main thread for roughly 0.4 seconds per transition and materially delayed session switching.",
+      "FixedBehavior": "The added descendant selector at style.css:70 places the custom properties directly on `.monaco-sash` descendants. Root class toggles now invalidate and recompute only sash elements while preserving inheritance to each sash pseudo-element, as covered by the added computed-style test and existing gripper transition tests.",
+      "Evidence": "In the base revision, style.css:69 assigns two inherited custom properties on `.monaco-workbench.sash-grippers-hidden`. `SashGrippersController.registerContainer` removes that root class on mouse movement and re-adds it after the idle timer (sash.ts:103-109), so each idle/active transition invalidates inherited style across the entire workbench even though searches show the properties are consumed only by sash `::after` rules in sashHandles.css and sessions workbench.css. The PR's measured scenario reports synchronous 393-400 ms style recalculations over about 34,300 elements during these toggles. Blame identifies f5d95e4ba024c912a62793b3167eeb119fb150dc as introducing the base selector.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Showing and hiding sash grippers on mouse activity and the two-second idle timeout in a normal workbench window",
+        "CriticalPath": "`SashGrippersController` synchronously removes the root class on the first changed mouse position and adds it from the idle timer; browser selector invalidation/style resolution must complete before subsequent hit testing, painting, or a layout read can progress. The diff changes only the CSS invalidation scope on this renderer-main-thread path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "The base behavior scaled with every DOM descendant in the workbench because the changed custom properties were inherited from the root; the new behavior scales with the much smaller effective set of `.monaco-sash` descendants. Each activity-to-idle cycle has one show toggle and one hide toggle after mouse positions are deduplicated by the controller.",
+        "EffectiveConcurrency": "Class toggling and style recalculation are synchronous on the renderer main thread; there is no parallelism, limiter, queue, or backpressure. Independent workbench/auxiliary-window containers have independent controllers and browser documents.",
+        "CacheBehavior": "Browser computed-style caches for descendants were invalidated by the base root-level inherited-property change on every toggle, including warm UI state. The new selector confines invalidation to matching sashes; there is no application cache, cache key, negative cache, or request coalescing involved.",
+        "MechanismConfidence": "High: the controller call path, inheritance behavior, property consumers, changed selector, focused test, measured trace, and introducing blame all align.",
+        "MagnitudeUncertainty": "Exact element and sash counts vary by open editors and views, but the supplied large-chat trace establishes about 34,300 formerly affected elements and approximately 393-400 ms per toggle. The narrower selector's cost varies only with sash count.",
+        "Verdict": "No reportable regression. The diff removes synchronous whole-tree style work and leaves only sash-scoped style invalidation while preserving the pseudo-element consumers."
+      },
+      {
+        "Scenario": "Switching between large Agents sessions while mouse movement shows grippers and the idle timer hides them during chat rendering",
+        "CriticalPath": "The first mouse movement can trigger the show-class removal before click/session-switch code, and the hide timer can leave style invalidation pending until chat rendering performs a geometry read. In the base behavior that synchronous style recalculation blocked the session-switch/render critical path; the changed selector removes whole-transcript invalidation. Chat rendering itself is pre-existing and not changed here.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Effective scale is the rendered session DOM (reported around 34,300 elements for large responses) before the change versus only the handful of session, side-pane, panel, and nested sash elements after it. One movement-triggered show and one delayed hide can overlap each switch; repeated same-position events are deduplicated.",
+        "EffectiveConcurrency": "Session rendering, class toggles, style resolution, and layout reads contend serially on the renderer main thread. No concurrency burst is added; the change reduces synchronous work on that serialized path.",
+        "CacheBehavior": "Warm session/model state does not avoid inherited-style invalidation in the base behavior. After the diff, cached/computed styles for non-sash transcript elements remain valid across gripper toggles; no data cache or cold network fetch is introduced or modified.",
+        "MechanismConfidence": "High: the root class toggles, forced browser style/layout path, property consumer scope, session sash tests, and before/after traces provide direct evidence.",
+        "MagnitudeUncertainty": "Session transcript size and timing overlap vary, but the changed mechanism is certain and the supplied measurements show the two largest recalculations disappear and median switching improves from 2,739 ms to 1,903 ms. Remaining markdown/editor render costs are outside this diff.",
+        "Verdict": "No reportable regression. This is a concrete performance fix; it narrows an inherited CSS invalidation that previously amplified with transcript DOM size."
+      },
+      {
+        "Scenario": "Sash gripper transitions in auxiliary workbench windows",
+        "CriticalPath": "Each registered auxiliary container receives the same mouse/idle class toggles in its own window. Browser style resolution for that document is the only affected critical work; the diff confines it to sashes just as in the main container.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Cost previously scaled with all descendants of each independently toggled auxiliary workbench container and now scales with matching sashes in that container. Container registration and event cardinality are unchanged.",
+        "EffectiveConcurrency": "Each window has an independent event loop and timer; within a window the style work is synchronous. The CSS change adds no fan-out or scheduling.",
+        "CacheBehavior": "The selector change preserves computed styles for non-sash descendants across toggles. No application cache, cache miss, coalescing, or negative-cache behavior is involved.",
+        "MechanismConfidence": "High: the controller explicitly registers all layout containers, while the changed stylesheet applies per `.monaco-workbench` root.",
+        "MagnitudeUncertainty": "Auxiliary-window DOM sizes and usage frequency are unknown, so aggregate benefit varies, but no new cost mechanism appears.",
+        "Verdict": "No reportable regression. The same bounded invalidation improvement applies independently to auxiliary windows."
+      }
+    ],
+    "Summary": "Completed the performance pass over the full two-file diff and traced the mouse/idle, large-session-switch, and auxiliary-window scenarios. No performance finding was introduced by the PR. Recorded the selector change as a high-confidence fix for the synchronous whole-workbench style invalidation introduced by f5d95e4ba024c912a62793b3167eeb119fb150dc."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-10-31T23:01:01.246905238Z",
+    "CompletedAt": "2026-10-31T23:02:08.799302119Z",
+    "WallClockMilliseconds": 67552,
+    "ModelCalls": 7,
+    "InputTokens": 165917,
+    "OutputTokens": 3398,
+    "TotalTokens": 169315,
+    "ReasoningTokens": 1006,
+    "CacheReadTokens": 132608,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 48224,
+    "ToolCalls": 20,
+    "NanoAIUnits": 25423920000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 132608,
+      "cache_write": 0,
+      "input": 33309,
+      "output": 3398
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
