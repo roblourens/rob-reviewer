@@ -1,0 +1,157 @@
+{
+  "PullRequest": {
+    "Number": 345737,
+    "Title": "search_code_subagent encouragement in first 2 turns",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nEncourages the call rate of the `search_code_subagent` tool with the following behavior (gated behind a feature flag): \n\nIf the search_code_subagent tool is available for the user in copilot chat, and if they're within the first 2 user turns of a conversation and the model calls `grep`, rather than immediately fulfilling the grep search, it returns a message back to the model essentially asking it \"are you sure?\" and suggest it may want to use the search subagent instead. \n\nThis will encourage usage of the search subagent. After moving from the local harness to the SDK, the call rate dropped from ~15% to ~1%. ",
+    "URL": "https://github.com/microsoft/vscode/pull/345737",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "24anisha",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "12feed2779c5536cca975e7b78f466c205a90cf5",
+    "HeadRef": "anisha/searchsub_grep_force",
+    "HeadSHA": "f1729a7914f467f190d8048f298504f598d11f8b",
+    "CreatedAt": "2026-11-03T08:00:11Z",
+    "UpdatedAt": "2026-11-03T09:14:15Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-88590232FF76",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotGrepSearchNudge.ts",
+      "Side": "RIGHT",
+      "Line": 104,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The changed hook is directly awaited by `_handlePreToolUse`, the SDK call is explicit, history alone is memoized, and retry detection is visibly ordered after the metadata call. Tests establish realistic parallel grep calls and a subsequent identical retry. Actual RPC duration and tool-list size vary, which affects severity but not the mechanism.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "SDK RPC calls plus serialization/allocation of the complete current tool metadata list and schemas",
+      "PerformanceScaling": "Cost grows linearly with the number N of eligible grep/rg tool calls during the first two user messages; parallel calls produce an N-wide RPC burst, and each nudged exact retry adds another RPC.",
+      "PerformanceOutcome": "increased pre-tool latency and excessive IPC/serialization work",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, grep/rg pre-tool handling did not call `rpc.tools.getCurrentMetadata`; it proceeded directly through existing hooks and permissions. The new experiment path adds one full metadata RPC per eligible attempt.",
+      "ChangedBehavior": "With the experiment enabled during either of the first two user messages, every primary grep/rg pre-tool hook now fetches and serializes the session's complete current tool metadata before it can deny or allow the call. Parallel grep calls issue independent RPCs, and an identical retry after a nudge performs the same RPC again before discovering the pending retry.",
+      "CausalDiffEvidence": "Added line 104 unconditionally awaits `session.rpc.tools.getCurrentMetadata()` for every eligible grep/rg evaluation; the added retry lookup (`_pendingRetries.get(key)`) does not occur until lines 139-145, so even a retry already authorized to continue pays another metadata RPC. The added parallel-call test invokes three eligible calls together, while only history initialization is memoized.",
+      "Title": "Coalesce tool-metadata RPCs before handling grep calls",
+      "Impact": "A model response containing several grep searches bursts one full tool-metadata IPC per call, and each call remains blocked on that RPC for up to 500 ms before tool execution or the nudge can proceed. The required exact retry is also unnecessarily delayed, increasing interactive agent latency and IPC/serialization load when the experiment is enabled.",
+      "Evidence": "`CopilotAgentSession._handlePreToolUse` awaits `CopilotGrepSearchNudge.evaluate` before normal tool checks. In `evaluate`, line 104 calls the full `session.rpc.tools.getCurrentMetadata()` on every eligible invocation. `_historyInitialization` coalesces only event-log reads; there is no corresponding metadata promise/cache. `_pendingRetries` is consulted only after this RPC. Therefore N grep/rg calls from one model response create N full-metadata RPCs, and the next model response's exact retry creates one more. The 500 ms shared-per-call deadline bounds individual delay but not aggregate concurrent RPC count.",
+      "Recommendation": "Coalesce/cache one metadata snapshot per model response (invalidating when the response or tool set changes), and compute/check the pending-retry key before fetching metadata so an exact retry can continue immediately. This preserves current-availability checks for new calls while reducing same-response calls to one RPC and retries to zero."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "serialization-allocation",
+      "concurrency-burst",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Enabled experiment: first or second user message produces primary-agent grep/rg calls, including resumed sessions and exact retries",
+        "CriticalPath": "The pre-tool hook is awaited before normal plugin hooks, permissions, or grep execution. History initialization and then tool-metadata retrieval must complete before the call can proceed or return the nudge; each invocation is bounded by a shared 500 ms deadline. The subsequent model round trip after a nudge is intentional feature behavior, while the repeated metadata RPC is avoidable critical-path work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotGrepSearchNudge.ts:180 `_initializeUserMessages`",
+            "Operation": "Reads backward pages of persisted primary user-message events from the Copilot SDK event log.",
+            "Cardinality": "One to three sequential event-log RPCs once per initialized history generation; concurrent first calls share them. Rewind/truncation invalidates the cache and can cause another bounded initialization.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No event-log RPC was performed by grep/rg pre-tool handling.",
+            "CriticalPathEffect": "Blocks the first eligible grep/rg pre-tool hook, within the 500 ms total lookup budget."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotGrepSearchNudge.ts:104 `evaluate`",
+            "Operation": "Fetches and serializes all current tool metadata and schemas, then searches it for `search_code_subagent`.",
+            "Cardinality": "One full metadata RPC per eligible grep/rg invocation: N parallel calls produce N concurrent RPCs, and an exact retry adds another call.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Grep/rg pre-tool handling did not fetch current tool metadata.",
+            "CriticalPathEffect": "Every invocation waits for the metadata response before denial, retry detection, normal permission handling, or execution; timeout can consume the remaining 500 ms budget."
+          }
+        ],
+        "ScalingInput": "The effective multiplicity is the number N of primary-agent grep/rg calls made during the first two real user messages. History reads remain O(1) bounded and coalesced; metadata RPCs are O(N), including parallel calls and retries.",
+        "EffectiveConcurrency": "History initialization is single-flight per session and its pages are serialized. Each eligible grep/rg invocation independently starts `getCurrentMetadata`; parallel tool calls therefore create an N-wide RPC burst with no shared promise or limiter.",
+        "CacheBehavior": "When disabled, no eligibility data is read. When enabled, the first eligible call initializes one shared history promise; concurrent calls coalesce this read, successful history remains cached, and failures clear it for retry. Up to three backward pages of 100 user-message events are read sequentially. Tool metadata has no cache or coalescing, so every eligible call is cold even within one model response and on an exact retry.",
+        "MechanismConfidence": "High: the awaited call path, independent metadata RPC per invocation, shared history-only promise, parallel test scenario, and retry ordering are all directly evidenced.",
+        "MagnitudeUncertainty": "The normal local SDK RPC duration, tool-list size, and frequency of multi-grep model responses vary; this limits severity to medium. The per-invocation boundary and its placement before retry detection are explicit.",
+        "Verdict": "Reportable regression: the necessary bounded history lookup is coalesced, but full tool-metadata IPC fans out per call and repeats before an already-known retry can proceed."
+      },
+      {
+        "Scenario": "Default/control arm or child-agent/non-grep tool invocation",
+        "CriticalPath": "Only input checks, experiment-trigger reporting, and a root configuration read precede the pre-existing normal tool path. No changed subprocess, filesystem, database, or SDK RPC must complete.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Primary grep/rg attempt count, but only constant local checks are added per attempt.",
+        "EffectiveConcurrency": "Parallel calls perform local checks independently; no new expensive boundary concurrency occurs in the disabled arm.",
+        "CacheBehavior": "No history or metadata cache is touched because the configuration check occurs before the lookup path. Experiment-trigger telemetry is documented and implemented as process-deduplicated; there is no per-call remote eligibility lookup.",
+        "MechanismConfidence": "High: the early false-setting return precedes both SDK RPC sites.",
+        "MagnitudeUncertainty": "Local configuration and deduplicated trigger overhead is negligible relative to tool execution.",
+        "Verdict": "No reportable performance regression; the feature defaults off and ineligible calls avoid the new SDK boundaries."
+      },
+      {
+        "Scenario": "Workbench registers or changes the grep-nudge experiment setting",
+        "CriticalPath": "A user or experiment configuration change dispatches one root-config update to Agent Host. This is configuration propagation and is off the chat/tool execution critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostCopilotCliSettingsContribution.ts:114",
+            "Operation": "Forwards the application setting as `SearchSubagentGrepNudge` root configuration.",
+            "Cardinality": "One Agent Host configuration action when this setting is initially synchronized or changed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This setting and its corresponding configuration action did not exist.",
+            "CriticalPathEffect": "Off the grep execution path; it only enables/disables future behavior."
+          }
+        ],
+        "ScalingInput": "Number of user/experiment changes to this single setting, normally zero or one per process/session lifecycle.",
+        "EffectiveConcurrency": "One existing trigger/dispatch path per setting change; no loop or burst is introduced by the new key.",
+        "CacheBehavior": "Forwarding uses the existing settings contribution mechanism; the current setting value is computed on initial synchronization and on matching configuration changes. No cache, negative lookup, or repeated polling is introduced.",
+        "MechanismConfidence": "High: the contribution registers one existing setting-change trigger for the new key.",
+        "MagnitudeUncertainty": "None material; setting changes are infrequent and cardinality is fixed.",
+        "Verdict": "No reportable regression; the single infrequent configuration dispatch is bounded and outside the interactive tool critical path."
+      }
+    ],
+    "Summary": "Reviewed the complete nine-file diff and traced production call paths, tests, lifecycle invalidation, cache states, parallel calls, retries, settings propagation, and SDK boundaries. Submitted one medium-severity boundary-fanout finding for uncached full tool-metadata RPCs on every eligible grep/rg call; no other changed mechanism met the performance evidence threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-03T16:35:11.940534037Z",
+    "CompletedAt": "2026-11-03T16:37:07.734868089Z",
+    "WallClockMilliseconds": 115794,
+    "ModelCalls": 7,
+    "InputTokens": 199449,
+    "OutputTokens": 6030,
+    "TotalTokens": 205479,
+    "ReasoningTokens": 2855,
+    "CacheReadTokens": 155462,
+    "CacheWriteTokens": 43966,
+    "APIDurationMilliseconds": 83119,
+    "ToolCalls": 26,
+    "NanoAIUnits": 40269880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 155462,
+      "cache_write": 43966,
+      "input": 21,
+      "output": 6030
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

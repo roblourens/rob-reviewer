@@ -1,0 +1,267 @@
+{
+  "PullRequest": {
+    "Number": 345802,
+    "Title": "perf: reduce renderer memory usage when reading large agentHost plugin files",
+    "Body": "Fixes #334892\nFixes #342278\nRelated to #343385\n\nWhen syncing or reading large files (such as plugin binaries or workspace files) between the renderer and `agent-host` over `AgentHostProtocolClient._handleReverseRequest`, the renderer experienced a **~38.5x (`+1,733 MiB`) `VirtualAlloc(MEM_COMMIT)` spike** and peaked at **`2,150.4 MiB`** private memory for a single 45 MiB file read — driving the renderer past the 4 GiB V8 heap limit on larger plugin directories\n\nProfiling the renderer and `agent-host` identified four compounding allocation bottlenecks on the file-read, base64, and IPC serialization paths, which this PR fixes without any behavioral changes:\n\n1. **Native `Uint8Array` base64 and hex encoding in `VSBuffer`**\n   - `encodeBase64` previously built the output string via 4 per-character concatenations per 3 input bytes (~60 million string concatenations for a 45 MiB payload), causing **`1,181.82 MiB` of `VirtualAlloc(MEM_COMMIT)` across `10,604` events**.\n   - Delegate to V8's native `Uint8Array.prototype.toBase64` and `Uint8Array.prototype.toHex` when available.\n\n2. **Avoid intermediate buffer copies in `VSBuffer.fromString` and `streamToBuffer`**\n   - `ChannelClient.sendRequest` and `AgentHostProtocolClient._handleReverseRequest` incurred **`505.04 MiB` of `VirtualAlloc(MEM_COMMIT)`** when reading and UTF-8 encoding the JSON-RPC payload:\n     - `streamToBuffer` unconditionally called `VSBuffer.concat(chunks)`, allocating and copying a duplicate 45 MiB `Uint8Array` even when the file stream emitted a single chunk. Add a single chunk fast path returning directly.\n     - `VSBuffer.fromString` used `TextEncoder.encode(str)`, which in Blink builds a full intermediate UTF-8 buffer on the PartitionAlloc fast malloc heap before copying into a new V8 `Uint8Array` backing store. For strings `\u003e= 64 KiB` without Node `Buffer`, encode in 64 KiB chunks via `TextEncoder.encodeInto` directly into the target `Uint8Array` (using a `maxByteLength` resizable `ArrayBuffer` when supported so the buffer shrinks in-place without copying).\n\n3. **Avoid oversized protocol log serialization and bound concurrent client file reads**\n   - `AhpJsonlLogger` ran `JSON.stringify(msg)` on full `resourceRead` / `resourceWrite` messages (allocating another ~60 MiB string) even when the file logger's level was above `Trace`, and wrote multi-megabyte base64 blobs into `agentHostProtocol.jsonl`. Guard on `this._logger.getLevel() \u003c= LogLevel.Trace` and replace `data` strings `\u003e 1,024` chars with a length placeholder in the log clone.\n   - Bound concurrent `connection.resourceRead` RPC calls in `AgentHostFileSystemProvider.readFile` with `Limiter(4)` so bulk plugin/directory syncs cannot fan out dozens of simultaneous large file reads in the renderer.\n\n4. **Avoid duplicate base64 decoding in chat image helpers**\n   - Use `decodeBase64(base64)` directly in `convertStringToUInt8Array` and `cleanupBase64Image` instead of `atob()` followed by per-byte `charCodeAt` loops or `Buffer.from(..., 'base64')` -\u003e `Uint8Array.from(...)` double allocations.\n\n---\n\n## Measured Memory \u0026 CPU Impact\n\nWorkload: Syncing a directory containing a **45.0 MiB** plugin binary from the renderer to `agent-host` over `AgentHostProtocolClient._handleReverseRequest`.\n\n| Metric | Baseline | After All Commits | Total Improvement |\n|---|---:|---:|---:|\n| **`encodeBase64``VirtualAlloc` Commit** | `1,181.82 MiB` (`10,604` events) | **`60.25 MiB` (`1` event)** | **`-1,121.57 MiB` (`-94.9%`)** |\n| **`encodeBase64` CPU Samples** | `5,446` samples | **`20` samples** | **`-99.6%` CPU** |\n| **`ChannelClient.sendRequest` Commit** | `507.75 MiB` (`4,617` events) | **`206.98 MiB` (`4,681` events)** | **`-300.77 MiB` (`-59.2%`)** |\n| **Renderer Total `VirtualAlloc(MEM_COMMIT)`** | `2,248.14 MiB` (`23,040` events) | **`748.98 MiB` (`11,297` events)** | **`-1,499.16 MiB` (`-66.7%`)** |\n| **Renderer Net Commit Delta (`Commit - Decommit`)** | `+1,733.24 MiB` (`38.5x` file size) | **`+179.96 MiB` (`4.0x` file size)** | **`-1,553.28 MiB` (`-89.6%`)** |\n| **Renderer Total CPU Samples (`PerfInfo:SampleProf`)** | `7,942` samples | **`2,223` samples** | **`-72.0%` CPU** |\n| **Renderer Peak Working Set / Private Memory** | `2,150.4 MiB` | **`731.7 MiB` (settled: `457.0 MiB`)** | **`-1,418.7 MiB` (`-66.0%`)** |\n\n---",
+    "URL": "https://github.com/microsoft/vscode/pull/345802",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "deepak1556",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3ccc6356e0afbda08cf523beac1858a98aed665d",
+    "HeadRef": "robo/fix-memory-agents-window",
+    "HeadSHA": "9f44db2139acd78d779d0c4c9625227f9722abdc",
+    "CreatedAt": "2026-11-03T11:31:16Z",
+    "UpdatedAt": "2026-11-03T16:13:14Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-9F0ECEF43C04",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/common/agentHostFileSystemProvider.ts",
+      "Side": "RIGHT",
+      "Line": 497,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The singleton ownership, multi-authority registrations, global limiter field, and FIFO implementation are directly traced. The exact delay depends on bulk-sync size and remote read duration, but the cross-authority critical-path blocking mechanism is deterministic once more than 10 reads overlap.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "queued `resourceRead` IPC calls and limiter slots",
+      "PerformanceScaling": "Waiting time for an unrelated authority grows with the number of earlier queued reads and their RPC duration; ten slow or hung active reads consume all execution slots.",
+      "PerformanceOutcome": "Interactive file-read latency and blocked critical-path progress across otherwise independent agent-host connections.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Each `readFile` immediately called `_readFromConnection` for its own authority, so traffic on one connection did not queue an unrelated authority before its IPC began.",
+      "ChangedBehavior": "Every `readFile` now enters a single provider-wide FIFO limiter before authority selection and the `resourceRead` IPC.",
+      "CausalDiffEvidence": "Added line 497 wraps the entire authority-specific read operation in `this._readLimiter.queue(...)`; the limiter is a single instance field shared by all registered authorities.",
+      "Title": "Scope the read limiter to avoid cross-host head-of-line blocking",
+      "Impact": "When one agent-host authority starts a bulk plugin/directory read, its first 10 RPCs run and all later reads queue in this FIFO. A user-visible file, log, or attachment read from a different local/remote authority is appended behind that backlog, so its latency grows with the number and duration of unrelated reads and can stall indefinitely behind hung RPCs.",
+      "Evidence": "`AgentHostFileSystemService` owns one singleton `AgentHostFileSystemProvider`, while local and each remote connection register distinct authorities on that same provider. This added wrapper sends every authority through one `Limiter(10)`, and `Limiter.consume()` drains its single `outstandingPromises` array FIFO. Therefore 10 active plus N queued reads for host A prevent a later host B `resourceRead` IPC from even starting until earlier entries complete.",
+      "Recommendation": "Keep the aggregate memory cap but schedule by authority (for example, per-authority queues feeding a fair/round-robin global limiter, or reserved capacity for unrelated authorities) so one host's backlog cannot monopolize all slots."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/base/common/buffer.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 502,
+      "BasePath": "src/vs/base/common/buffer.ts",
+      "BaseLine": 439,
+      "IntroducingPath": "src/vs/base/common/buffer.ts",
+      "IntroducingCommit": "29bde3176c7451e966797931aa8a1f7c3fce2983",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceCategory": "memory",
+      "Mechanism": "The fallback base64 encoder appends four one-character strings for every three input bytes, creating O(n) concatenation operations and substantial transient string/rope allocation for large binary resource payloads.",
+      "Symptom": "Large agent-host `resourceRead` responses encoded tens-of-megabyte files through this loop, producing severe transient memory growth and CPU time proportional to millions of JavaScript concatenations.",
+      "FixedBehavior": "The added `Uint8Array.prototype.toBase64` fast path performs the encoding natively and bypasses the per-character JavaScript concatenation loop when the runtime supports it.",
+      "Evidence": "Agent-host filesystem resource providers call `encodeBase64(content.value)` for Base64 reads, and the old loop performs four `output +=` operations per three bytes. Added line 502 returns the native typed-array encoding before that loop. The PR's supplied 45 MiB profile reports the corresponding allocation and CPU spike collapsing after this path is used.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "serialization-allocation",
+      "repeated-work",
+      "unbounded-retention"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Bulk plugin/directory reads through the shared agent-host filesystem provider while another local or remote authority performs an interactive file/log/attachment read",
+        "CriticalPath": "For each file, `IFileService.readFile` must enter `AHPFileSystemProvider.readFile`, acquire limiter capacity, complete the authority-specific `resourceRead` RPC, and decode its response. The newly shared limiter is before authority selection and is therefore on every read's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/common/agentHostFileSystemProvider.ts:readFile",
+            "Operation": "Agent-host `resourceRead` request and Base64 response",
+            "Cardinality": "One RPC per file; a realistic plugin/directory sync can enqueue more than 10 files, with no coalescing across distinct resources.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The RPC already existed once per file, but it started immediately rather than waiting behind a provider-wide queue.",
+            "CriticalPathEffect": "The requested file cannot complete until its RPC runs and returns; under the diff, an unrelated authority's RPC cannot start until earlier global FIFO entries free a slot."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/resourceProviders/fileSystemResources.ts",
+            "Operation": "Read the requested resource on the agent-host side",
+            "Cardinality": "One underlying file read per successful filesystem resource RPC.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same filesystem read occurred, without consuming shared limiter capacity that blocks other authorities.",
+            "CriticalPathEffect": "The remote filesystem duration holds one limiter slot for the full request."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/base/common/buffer.ts:encodeBase64/decodeBase64",
+            "Operation": "Base64 encode, JSON transport serialization, and renderer-side Base64 decode",
+            "Cardinality": "One encode/decode over the full payload per Base64 resource response.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same full payload was transformed, but the encoder used per-character concatenation and the decoder lacked the native fast path.",
+            "CriticalPathEffect": "Encoding, transport serialization, and decode must complete before the file is returned."
+          }
+        ],
+        "ScalingInput": "Number of overlapping files after deduplication is still one per distinct resource; the global concurrency is 10 and queued wait grows with all earlier reads across every registered authority.",
+        "EffectiveConcurrency": "A single singleton-provider `Limiter(10)` controls all local and remote authorities FIFO. There is no per-authority fairness, priority, cancellation, or reserved slot.",
+        "CacheBehavior": "No result cache or request coalescing is present on this path; cold and repeated reads each issue an RPC. Connection lookup/retry does not cache file content.",
+        "MechanismConfidence": "High: singleton ownership, multi-authority registration, the shared limiter, and FIFO drain behavior are all explicit in repository code.",
+        "MagnitudeUncertainty": "The delay depends on how often users have multiple authorities active, backlog size, and remote file latency. The mechanism is deterministic for more than 10 overlapping reads, so uncertainty affects severity rather than confidence.",
+        "Verdict": "Reportable medium-severity latency regression: the diff bounds aggregate memory but newly lets one host's bulk backlog block unrelated hosts. Preserve the cap with authority-aware fair scheduling."
+      },
+      {
+        "Scenario": "Large agent-host protocol messages and file payloads are encoded, measured, optionally logged, and transported",
+        "CriticalPath": "Filesystem bytes are Base64 encoded and serialized before the response can cross IPC/network. Protocol log metadata/truncation is computed synchronously before delivery in transport handlers, while queued log file writes drain asynchronously.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/base/common/buffer.ts",
+            "Operation": "Native or fallback Base64/hex encoding and UTF-8 byte-length computation",
+            "Cardinality": "One full linear transform per payload; no extra per-item fan-out beyond the message count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The fallback Base64 path performed four JavaScript string appends per three bytes, and byte-length measurement allocated an encoded buffer. The diff uses native typed-array codecs when available and scans byte length without materializing bytes.",
+            "CriticalPathEffect": "Base64 and transport serialization remain on the response critical path; byte-length measurement is synchronous when protocol logging is active."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/common/ahpJsonlLogger.ts",
+            "Operation": "Append bounded JSONL protocol log batches and rotate log files",
+            "Cardinality": "At most one bounded log entry per accepted protocol message, with pending-byte and retention budgets; writes are batched by the existing queue.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The logger already wrote and rotated JSONL entries; oversized entries first materialized a full JSON string before truncating. The diff can choose truncation from the supplied frame length and avoids the first huge stringify.",
+            "CriticalPathEffect": "Stringification/enqueue is synchronous, but filesystem writes are off the message-delivery critical path."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:resourceRead",
+            "Operation": "Send the JSON-RPC resource response",
+            "Cardinality": "One response per resource request; transport chunking may split bytes into frames but does not add logical resource requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC response existed with substantially more temporary encoding allocation.",
+            "CriticalPathEffect": "The response must serialize and cross the transport before the renderer read resolves."
+          }
+        ],
+        "ScalingInput": "Payload byte length, especially tens-of-megabyte binary files and Base64 strings; work remains O(bytes), but native codecs remove O(bytes) JavaScript concatenation operations and oversized logging avoids a duplicate full serialization.",
+        "EffectiveConcurrency": "Individual protocol transforms are synchronous per message; client file reads are now capped at 10 aggregate operations. Logger filesystem drains remain sequenced by its existing promise queue.",
+        "CacheBehavior": "No payload cache is involved. Native codec availability selects the fast path; unsupported runtimes retain the old fallback. Logger budgets and pending-byte caps bound warm, sustained traffic.",
+        "MechanismConfidence": "High: the old concatenation loop, resource-provider call path, native early return, logger truncation gate, and bounded queues are explicit.",
+        "MagnitudeUncertainty": "Runtime support for typed-array codecs controls how often the native path is available, but the large-payload mechanism and improvement are direct. The supplied profile gives concrete magnitude for a 45 MiB payload.",
+        "Verdict": "No new regression found. The diff fixes a concrete serialization/allocation regression, which was recorded with introducing-commit blame."
+      },
+      {
+        "Scenario": "Large strings and single-chunk streams are converted to `VSBuffer` for files, requests, backups, notebooks, and IPC",
+        "CriticalPath": "Consumers await stream completion and buffer reduction; large browser strings synchronously compute UTF-8 length and encode into the destination before downstream serialization or file/request handling can proceed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/base/common/buffer.ts:VSBuffer.fromString/readableToBuffer/streamToBuffer",
+            "Operation": "UTF-8 encode strings and combine stream chunks",
+            "Cardinality": "One length scan plus chunked `encodeInto` over strings above 64 KiB; zero copies for exactly one stream chunk and one concatenation for multiple chunks.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Large strings used `TextEncoder.encode`, which created an intermediate encoded backing store in the target browser path; even one stream chunk was copied by `VSBuffer.concat`.",
+            "CriticalPathEffect": "Conversion must finish before the caller receives a contiguous buffer."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/files/common/fileService.ts",
+            "Operation": "Upstream file streams consumed by file service, working-copy, and notebook callers",
+            "Cardinality": "One source stream per requested file; chunk count is determined by the provider.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same stream/file boundary existed; the reducer copied the sole chunk.",
+            "CriticalPathEffect": "Stream completion remains required before `streamToBuffer` resolves."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/request/common/request.ts",
+            "Operation": "Upstream request response streams consumed into a buffer",
+            "Cardinality": "One response stream per request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same response boundary existed with a redundant copy for a single chunk.",
+            "CriticalPathEffect": "The response must end before the contiguous buffer is returned."
+          }
+        ],
+        "ScalingInput": "UTF-16 source length and stream chunk count/total bytes. The new string path uses bounded 64 KiB slices; the single-chunk path retains that chunk's backing store.",
+        "EffectiveConcurrency": "No concurrency change in these helpers; each call performs synchronous conversion when its stream reducer runs.",
+        "CacheBehavior": "No cache or coalescing. `TextEncoder` is reused globally; codec capability is checked per call.",
+        "MechanismConfidence": "High for copy/allocation changes; insufficient evidence for a reportable retention regression.",
+        "MagnitudeUncertainty": "Some single chunks can be views into larger buffers, but inspected production callers did not establish a realistic unbounded retained-backing-store case; pooled/slab overhead is bounded in common sources.",
+        "Verdict": "No finding. The added fast paths reduce copies, and no concrete caller proved materially larger retained memory from returning a sole chunk."
+      },
+      {
+        "Scenario": "Chat image data URLs and image strings are decoded before Blob/canvas resizing or attachment creation",
+        "CriticalPath": "A string is classified/decoded synchronously into bytes, then browser Blob/Image/canvas decoding and resizing must complete before the attachment is available.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatImageUtils.ts and src/vs/platform/imageResize/browser/imageResizeService.ts",
+            "Operation": "Validate/decode Base64 image text into a `Uint8Array`",
+            "Cardinality": "One decode attempt per image string; valid chat data URLs no longer run `atob` and then a second decoder.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The chat helper validated with `atob` before decoding again, and the image service validated by calling `decodeBase64` before calling it a second time for valid data.",
+            "CriticalPathEffect": "Byte decoding is synchronous and precedes image load/resize."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatImageUtils.ts:resizeImage",
+            "Operation": "Browser Blob creation, image decode, canvas draw, and `toBlob` resize",
+            "Cardinality": "One browser image pipeline per attached image.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same browser image pipeline followed conversion.",
+            "CriticalPathEffect": "This dominates completion for resized images and remains unchanged."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatImageUtils.ts:createFileForMedia",
+            "Operation": "Persist an attachment image when `createFileForMedia` is used",
+            "Cardinality": "One create-folder check and one write per attachment.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same file-service operations occurred.",
+            "CriticalPathEffect": "Persistence must finish before the URI is returned, but this path is unchanged and separate from decode optimization."
+          }
+        ],
+        "ScalingInput": "Base64 character count and number of images attached; effective cardinality is one conversion per image.",
+        "EffectiveConcurrency": "Conversion is synchronous per image. Browser image promises can overlap only as initiated by callers; the diff adds no fan-out or limiter.",
+        "CacheBehavior": "No image decode cache; repeated strings are decoded again both before and after the diff.",
+        "MechanismConfidence": "High: both old validation paths and new direct decode paths are visible in the diff and callers use image data URLs.",
+        "MagnitudeUncertainty": "Malformed large plain strings can still scan before fallback, but the image service already performed that decode attempt through `isValidBase64`; no changed multiplicity was established.",
+        "Verdict": "No finding. The diff removes duplicate full-payload decode/allocation work for valid images without adding a new expensive boundary."
+      }
+    ],
+    "Summary": "Completed the performance pass over all seven changed files and all diff pages. Reported one introduced cross-authority head-of-line latency issue in the provider-wide limiter, recorded the native Base64 path as a concrete regression fix, and rejected speculative retention or image-decoding concerns after caller and boundary tracing."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-03T16:41:59.782840467Z",
+    "CompletedAt": "2026-11-03T16:44:44.881898676Z",
+    "WallClockMilliseconds": 165099,
+    "ModelCalls": 10,
+    "InputTokens": 453832,
+    "OutputTokens": 10193,
+    "TotalTokens": 464025,
+    "ReasoningTokens": 3978,
+    "CacheReadTokens": 374661,
+    "CacheWriteTokens": 79141,
+    "APIDurationMilliseconds": 131223,
+    "ToolCalls": 68,
+    "NanoAIUnits": 74954940000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 374661,
+      "cache_write": 79141,
+      "input": 30,
+      "output": 10193
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
