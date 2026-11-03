@@ -1,0 +1,185 @@
+{
+  "PullRequest": {
+    "Number": 345850,
+    "Title": "agentHost: fix DeepSeek reasoning_content 400 in BYOK tool loops",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #344748\n\n## Problem\n\nWith an Agent Host BYOK custom endpoint (DeepSeek `deepseek-v4-pro`, thinking enabled, Chat Completions), a multi-step tool loop fails partway through with `400 The reasoning_text/reasoning_content in the thinking mode must be passed back to the API`. The runtime then retries 5 times (~15s) before surfacing the error.\n\n**Root cause:** DeepSeek requires `reasoning_content` on every assistant message with `tool_calls` after the latest user message. When a step makes tool calls without streaming any reasoning text, no thinking part is produced. On replay, `rawMessageToCAPI` only calls `OpenAIEndpoint.getCompletionsCallback` for Opaque thinking parts, so that message is sent without `reasoning_content`. Typing \"continue\" works around it because DeepSeek only validates messages after the latest user message.\n\n**Retries:** `ByokLmProxyService` mapped every renderer/provider error to HTTP 502, so the runtime retried deterministic 4xx errors.\n\n## Changes\n\n- **`OpenAIEndpoint` (BYOK Chat Completions only):** for models with `supports.thinking`, assistant messages with `tool_calls` and no `reasoning_content` get `reasoning_content: ''`. They also get `reasoning: ''`, matching the existing callback, which always sets both fields. Messages with real reasoning, non-thinking models, and the Responses/Messages API paths are unchanged. The Vercel AI SDK's DeepSeek provider ships the same empty-string backfill for V4 (vercel/ai#14739).\n- **`IByokLmChatResult.errorStatus` (optional, so the bridge contract stays compatible):** the renderer handler reads the provider status from the `Request Failed: \u003cstatus\u003e` message that the Copilot extension produces. The language model API only carries the error message across the extension host boundary.\n- **`ByokLmProxyService`:** forwards that status for 4xx errors with type `invalid_request_error`. It still returns 502 for 401 (used for the proxy's own authentication), for transient 408/429, and for all other failures.\n\n## Testing\n\n- `npx vitest run src/extension/byok/node/test/openAIEndpoint.spec.ts` (in `extensions/copilot`): passed, 39 tests. New snapshot test over a tool loop with and without reasoning; non-thinking model is unchanged.\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/byokLmProxyService.test.ts --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts`: passed, 45 tests. New proxy status mapping table and handler status parsing.\n- `npm run eslint -- \u003cchanged files\u003e`: passed.\n- `npx tsc --noEmit -p tsconfig.json` (in `extensions/copilot`): passed.\n- `npm run typecheck-client`: no errors in changed files. One unrelated local error in `terminalProcess.ts` (`IPty.setParentWindow`) comes from the locally installed node-pty types.\n\n**Not verified live** against the DeepSeek API.\n\n## Reviewer notes\n\n- The backfill applies to all assistant tool-call messages, not only those after the latest user message. This is simpler, and DeepSeek ignores reasoning on earlier turns.\n- Provider 4xx errors that `chatMLFetcher` rewrites with a dedicated reason (402/404/422, etc.) carry no status prefix and still map to 502.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/345850",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "vritant24",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "80b58799654016b1c83e1eb2c14b517a3932b7fb",
+    "HeadRef": "agents/fix-deepseek-reasoning-content-400-error",
+    "HeadSHA": "d36a51f7adae908652d69e4450f9a86381c582b3",
+    "CreatedAt": "2026-11-03T16:47:02Z",
+    "UpdatedAt": "2026-11-03T19:41:27Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 319,
+      "BasePath": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts",
+      "BaseLine": 305,
+      "IntroducingPath": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts",
+      "IntroducingCommit": "f7c07eeb5cc1305c877f5f2a09799d99687d05d6",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "latency",
+      "Mechanism": "A deterministic provider client error was rewritten as retryable HTTP 502, causing the runtime to repeat the same loopback HTTP request, renderer IPC call, LM API request, and upstream provider request before surfacing the failure.",
+      "Symptom": "Deterministic BYOK provider errors incurred repeated remote attempts and roughly 15 seconds of avoidable failure latency before being surfaced.",
+      "FixedBehavior": "The handler extracts the provider's 4xx status, the bridge result carries it, and the proxy now returns deterministic 4xx statuses directly while retaining 502 for transient or server failures, preventing runtime retries of deterministic failures.",
+      "Evidence": "In the base revision, ByokLmProxyService converted every renderer/provider failure into HTTP 502 at line 305. The proxy documents that the SDK runtime retries 5xx responses, and the changed end-to-end path now transports the provider status from AgentHostByokLmHandler over the existing IPC result and maps deterministic 4xx responses to invalid_request_error. Thus one provider-side 400 previously became repeated loopback IPC/LM/provider requests before the turn failed; the PR tests the resulting 400 versus 502 classification.",
+      "Confidence": 0.98
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Thinking-enabled BYOK Chat Completions tool loop, including an assistant tool-call step that emitted no reasoning text",
+        "CriticalPath": "The agent runtime POSTs to the local BYOK Responses proxy, which translates and sends one renderer IPC chat call; the renderer invokes the LM API, the Copilot extension converts the complete Chat Completions history, applies the new reasoning-field pass, serializes it, and performs the upstream provider network request. The new pass is synchronous on this critical path but only walks message references already traversed and serialized by createCapiRequestBody.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts:_handleResponses and src/vs/platform/agentHost/common/agentHostClientByokLmChannel.ts:createAgentHostClientByokLmConnection",
+            "Operation": "Loopback proxy forwards the translated chat request to the serving renderer and the renderer LM service crosses to the extension-provided model implementation.",
+            "Cardinality": "One bridge chat RPC per tool-loop model request; no per-message or per-tool-call RPC is added.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single bridge/LM request occurred per tool-loop step.",
+            "CriticalPathEffect": "The RPC and buffered LM completion must finish before the loop can execute the next tool step."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/byok/node/openAIEndpoint.ts:OpenAIEndpoint.createRequestBody, consumed by the existing ChatML fetch path",
+            "Operation": "Copilot BYOK endpoint sends the serialized Chat Completions request to the configured model provider.",
+            "Cardinality": "One upstream request per tool-loop model step in the successful case.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same upstream request occurred, but DeepSeek could reject later rounds when a replayed tool-call assistant message lacked reasoning_content.",
+            "CriticalPathEffect": "Provider completion is the dominant critical-path wait for each sequential tool round."
+          }
+        ],
+        "ScalingInput": "Conversation message count, with the forward mutation limited to assistant tool-call messages after the latest user message; the backward search can inspect the whole history. Each tool round submits one progressively larger history, as before.",
+        "EffectiveConcurrency": "Tool rounds are causally sequential because each provider response supplies calls whose results feed the next request. Independent sessions may run concurrently; this diff adds no fan-out, queue, limiter, or new parallel work.",
+        "CacheBehavior": "Chat Completions has no response-history cache on this path and serializes the full supplied history on every round both before and after the diff. The change neither adds nor defeats a cache; Responses and Messages API paths bypass the new pass.",
+        "MechanismConfidence": "High confidence in the synchronous O(n) pass and boundary cardinality from the changed createRequestBody branch and existing conversion path.",
+        "MagnitudeUncertainty": "Exact conversation lengths and per-provider latency vary, but the added CPU/allocation is one reference-array slice plus linear scans over data already linearly converted and network-serialized; no evidence supports a user-visible regression.",
+        "Verdict": "No reportable regression. The added linear pass is proportional to an already mandatory full-history conversion/serialization and prevents a failed remote round rather than increasing boundary work."
+      },
+      {
+        "Scenario": "Deterministic BYOK provider client error returned through the renderer bridge and local proxy",
+        "CriticalPath": "A runtime request reaches the loopback proxy, performs one renderer IPC chat call, invokes the extension-host LM provider, and performs an upstream network request. On failure, the renderer now extracts the numeric status from the existing error string and returns it over the same IPC response; the proxy maps deterministic 4xx to a non-retryable response.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts:_handleResponses and src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts:chat",
+            "Operation": "Proxy calls the serving renderer, which invokes the renderer LM service and extension-provided BYOK model.",
+            "Cardinality": "After the diff, one IPC chain for a deterministic 4xx; before, the proxy's 502 classification allowed the runtime to repeat the same chain for each retry.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The boundary existed, but its deterministic-failure result was always converted to retryable 502, multiplying calls.",
+            "CriticalPathEffect": "Each repeated IPC/LM attempt blocked failure completion; forwarding 4xx removes those sequential waits."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/prompt/node/chatMLFetcher.ts and the configured OpenAIEndpoint",
+            "Operation": "The BYOK extension sends the model request to the configured provider and receives the deterministic 4xx.",
+            "Cardinality": "One provider call after the diff versus the initial call plus runtime retries when the old proxy returned 502.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same deterministic request could be repeated despite receiving a client error.",
+            "CriticalPathEffect": "The remote request dominates each retry delay and directly extends time until the user sees the error."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/common/agentHostByokLm.ts:IByokLmChatResult and src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts:_handleResponses",
+            "Operation": "The optional numeric errorStatus is serialized in the existing renderer-to-agent-host bridge result and used to construct the proxy JSON error.",
+            "Cardinality": "One small optional numeric field per failed bridge response.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the error string crossed the bridge and the proxy emitted 502 unconditionally.",
+            "CriticalPathEffect": "Constant-size serialization is negligible and enables removal of repeated boundary calls."
+          }
+        ],
+        "ScalingInput": "One logical model request that receives a deterministic 4xx. Before the PR, retry count rather than collection size controlled cost: rewriting the error to 502 caused up to an initial attempt plus five retries; after the PR, the runtime receives the deterministic 4xx after one attempt.",
+        "EffectiveConcurrency": "Retries are sequential on the same turn. Independent sessions remain independently concurrent; the diff adds no burst or shared-state contention.",
+        "CacheBehavior": "No cache or coalescing participates in failures. Every retry repeats the bridge and provider boundaries; the change avoids those repeats for recognized deterministic 4xx statuses. Negative caching is unnecessary because the first response now terminates the turn.",
+        "MechanismConfidence": "Very high confidence: the base proxy unconditionally wrote 502, the proxy documents 5xx retry behavior, and changed tests establish deterministic 4xx forwarding. This concrete regression fix was recorded separately with its blamed introducing commit.",
+        "MagnitudeUncertainty": "The exact backoff and provider latency depend on the runtime and endpoint, but repeated remote attempts and their removal are directly established; the PR description reports about 15 seconds for the affected loop.",
+        "Verdict": "Performance improvement, not a regression. The change eliminates repeated IPC and network work for deterministic provider failures."
+      },
+      {
+        "Scenario": "Transient or server-side BYOK provider failure (401, 408, 429, 5xx, or unknown status)",
+        "CriticalPath": "The same loopback HTTP, renderer IPC, LM API, and upstream provider boundaries execute. clientErrorStatus rejects these statuses, so the proxy continues returning 502 and the runtime retains its existing retry policy.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts:_handleResponses",
+            "Operation": "Proxy-to-renderer BYOK chat RPC for each runtime attempt.",
+            "Cardinality": "Unchanged: one per runtime attempt, including existing retries for transient classifications.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical retryable 502 behavior and boundary count.",
+            "CriticalPathEffect": "Must complete for each attempt before retry or failure handling proceeds."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/extension/prompt/node/chatMLFetcher.ts",
+            "Operation": "Upstream BYOK provider request for each attempt.",
+            "Cardinality": "Unchanged for 401, 408, 429, 5xx, and unrecognized failures because they still map to 502.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical transient/server retry behavior.",
+            "CriticalPathEffect": "Remote latency remains on the retry critical path by design."
+          }
+        ],
+        "ScalingInput": "Retry policy and provider response count, unchanged by the diff for excluded or unknown statuses.",
+        "EffectiveConcurrency": "Retries remain sequential per turn; independent turns can overlap exactly as before. No new limiter or concurrency burst is introduced.",
+        "CacheBehavior": "Failures are not cached or coalesced before or after the diff. The new status parser and classifier perform constant work per failed attempt.",
+        "MechanismConfidence": "High confidence from the explicit clientErrorStatus exclusions and fallback to 502.",
+        "MagnitudeUncertainty": "Runtime retry delays and endpoint latency vary, but there is no changed multiplicity for these statuses.",
+        "Verdict": "No reportable regression; the existing transient retry behavior is intentionally preserved with only constant-time parsing/classification added."
+      }
+    ],
+    "Summary": "Reviewed all eight changed files and all diff pages for the performance focus. Traced successful thinking-mode tool loops and deterministic/transient failure paths through loopback HTTP, renderer IPC, extension-host LM handling, serialization, and provider network calls. No diff-introduced performance issue met the reporting threshold. The PR fixes a concrete repeated-work regression by preserving deterministic 4xx status across the bridge; that fix was recorded with blame to f7c07eeb5cc1305c877f5f2a09799d99687d05d6."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-03T22:08:12.652415595Z",
+    "CompletedAt": "2026-11-03T22:10:27.224193568Z",
+    "WallClockMilliseconds": 134571,
+    "ModelCalls": 8,
+    "InputTokens": 249507,
+    "OutputTokens": 5919,
+    "TotalTokens": 255426,
+    "ReasoningTokens": 1833,
+    "CacheReadTokens": 198929,
+    "CacheWriteTokens": 50554,
+    "APIDurationMilliseconds": 74974,
+    "ToolCalls": 38,
+    "NanoAIUnits": 45081760000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 198929,
+      "cache_write": 50554,
+      "input": 24,
+      "output": 5919
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

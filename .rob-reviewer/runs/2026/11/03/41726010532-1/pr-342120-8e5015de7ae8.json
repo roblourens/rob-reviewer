@@ -1,0 +1,316 @@
+{
+  "PullRequest": {
+    "Number": 342120,
+    "Title": "chat: open Copilot CLI sessions from product protocol links",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nPart of microsoft/vscode-internalbacklog#10107 (related: #310621). Companion to github/copilot-agent-runtime#25941 (merged).\r\n\r\n## What\r\n\r\nThe Copilot CLI has `/code` and `/code-insiders` (github/copilot-agent-runtime#25941, merged and experimental). They hand the current CLI session to VS Code, so the session opens in the editor window's Chat view with its history. The CLI saves the session, releases its in-use lock, and opens a link of this form:\r\n\r\n```\r\nvscode://file/\u003cabsolute-folder\u003e?windowId=_blank\u0026copilotCliSession=\u003ccli-session-id\u003e\r\nvscode-insiders://file/\u003cabsolute-folder\u003e?windowId=_blank\u0026copilotCliSession=\u003ccli-session-id\u003e\r\n```\r\n\r\n`/code-insiders` needs nothing extra on the VS Code side, because Insiders registers its own `vscode-insiders` protocol.\r\n\r\n**Versions.** This PR doesn't need a newer `@github/copilot-sdk`: `/code` runs in the user's CLI, and the agent host uses SDK calls the pinned version already has (`sessions.checkInUse`, `model.getCurrent`, `agent.getCurrent`). `/code` itself first ships in the CLI prerelease after `1.0.106-6`; no published CLI has it yet. Until then, testing needs a CLI built from the runtime's `main`.\r\n\r\n### Link handling (commits 1 and 5)\r\n\r\n- **New `copilotCliSession=\u003cid\u003e` link parameter**, accepted on `file` and `vscode-remote` links. It carries only the CLI session id, so the CLI doesn't depend on a provider-specific URI. The id is checked against the CLI runtime's rule (ASCII letters, digits, `_`, `-`) and capped at 256 characters. The main process sends the id to the target window (`vscode:openCopilotCliSession`).\r\n- **Cold start.** When the link is what starts VS Code, the chat session parameter (`session` and the new `copilotCliSession`) was dropped: `resolveInitialProtocolUrls`/`openFirstWindow` opened the folder but never sent the session to the window. It is now carried in `IInitialProtocolUrls.chatSessionToOpen`. This also fixes the existing `session=` parameter on cold start.\r\n- **The window that opened the link's path gets the session.** The chat session goes into `IOpenConfiguration.chatSessionToOpen`, and `WindowsMainService.open` sends it to the window that opened the requested path, for links on startup and while VS Code runs. It matches on the resolved (normalized) path, or on the window the files opened in for a file link. Windows restored next to it (`window.restoreWindows: preserve`) never get the session, and nothing is sent when the path doesn't exist.\r\n- **Unchanged.** The \"An external application wants to open…\" prompt, workspace trust, and window selection all stay as they are. With `windowId=_blank`, a window that already has the folder open is focused, and other windows are never retargeted.\r\n\r\n### Opening the session in the Copilot agent host (commits 2–4)\r\n\r\n`CopilotCliSessionLinkOpener` always opens the session in Copilot in the agent host (the Copilot harness), whatever new chats default to. The Copilot extension's Copilot CLI chat session provider isn't used.\r\n\r\n- The window waits for the ambient agent host's handshake (on a cold start, `canResolveChatSession` waits for the agent host to register Copilot), calls `importSession(copilotcli:/\u003cid\u003e)`, and opens the session the import reports in the Chat view. The chat continues in the same runtime, so the runtime restores the session's model, reasoning effort, context tier, custom agent, agent mode and permission mode.\r\n- If another process holds the session, the user is asked whether to open it anyway.\r\n- **An error notification** when AI features are disabled, the agent host isn't available or doesn't offer Copilot, the host can't import sessions, or the import fails. When the host can't find the session (for example, it was deleted, or another app created it), the notification says so in plain terms instead of showing the host's internal reason; the raw error is logged. A new, empty chat is never shown.\r\n\r\nAgent host changes that make the import work for a session handed over by the CLI:\r\n\r\n- **Sessions discovery hasn't registered.** `importSession` used to require a registered session, but discovery hides external sessions when `chat.agentSessions.showExternal` is `none`, and on a cold start it may not have scanned yet. A new optional `IAgent.discoverChat(session)` classifies just that session with the same eligibility rules as discovery (client `github/cli` or `github/autopilot`, recently modified, has a working directory). The Copilot provider runs an explicit single-session scan that skips the startup discovery telemetry.\r\n- **One writer per session.** A new optional `IAgent.importChat(chat, context, options)` runs after restore and before adoption. The Copilot provider calls the SDK's `sessions.checkInUse` and refuses with `Conflict` when another process holds the session, before anything resumes it. A CLI that runs `/code` launches the link first and releases its lock while it exits, after its last write to the session, so before refusing, the provider checks again every 250 ms for up to 5 s. The session then stays external rather than being adopted. The in-use record is best effort, so, like the CLI, the link opener asks whether to take the session over and retries with `takeOver` (a new optional `vscode/importSession` parameter) if the user agrees. Without the check, both processes would append to the same `events.jsonl`.\r\n- **Same permissions and mode.** Before this change, the first turn pushed the host's configured approval level and agent mode into the runtime (`syncPermissionMode('turn-start')`, `applyMode`), replacing what the CLI had (for example `allow-all` and `plan`). `importChat` now resumes the chat right away and `CopilotAgentSession.adoptRuntimeModes()` writes the runtime's restored permission mode and agent mode into the chat's configuration. The Chat input shows them before anything is sent, and the next turn keeps them. A permission mode that managed policy disallows falls back exactly as a configured one would, so policy can lower a level but never raise it. If resuming fails, the import still succeeds and the chat keeps the host's modes, with a warning in the log.\r\n- **Same model, effort, context tier and custom agent.** Each turn carries the model and agent the user picked, seeded from the chat's draft, and the host applies them before the turn. History rebuilt from the CLI's events records the model without its effort or tier, and no custom agent, so the first turn reset the effort and deselected the agent the runtime had restored. `importChat` now returns the selection the runtime continues with (`rpc.model.getCurrent`, plus `rpc.agent.getCurrent` matched by name to an agent this host offers), and the host makes it the chat's draft. Values that equal a managed default are still dropped when the turn applies them, so VS Code's policy decides those. A custom agent VS Code doesn't offer, or a model it doesn't list (for example a BYOK model), falls back to VS Code's default.\r\n\r\n- **The session's own address.** The agent host admits the CLI session's backing (`copilotcli:/\u003cid\u003e`) under its own address, `ahp-session:/\u003cid\u003e` for a session it hasn't seen, and lists it there. `vscode/importSession` now resolves to the session's exact resource (`{ session }`, as `vscode/moveSession` does), and the opener opens that resource instead of deriving one from the backing, which would conflict with the listed session. A host that doesn't report it keeps the session at the address it was imported from.\r\n\r\nThese also apply to the Agents window's existing Import action, which goes through the same `importSession`.\r\n\r\n**Not covered:** a session the Copilot extension's Copilot CLI provider created. The agent host imports those only when `chat.agentSessions.migrateLegacyCopilotCli` is on (read at startup); otherwise opening one reports that it couldn't be found.\r\n\r\n## Related\r\n\r\n- #342230 (closed): the Copilot extension's Copilot CLI provider restoring a session's model and refusing sessions in use elsewhere. `/code` doesn't depend on it.\r\n- github/copilot-agent-runtime#27356 (merged): the runtime records the client that last ran a session (`lastClientName` on the SDK's `SessionMetadata`). The persisted `clientName` is only the client that created it. With that, the agent host can adopt the runtime's modes whenever another client ran a session last, not only on an explicit import. That's a follow-up: no published `@github/copilot-sdk` includes it yet (the newest, `1.0.29-preview.5`, was built before it merged).\r\n- #342466: test plan item.\r\n\r\n## How to test\r\n\r\n1. Run `copilot` in a folder in an external terminal, using a CLI that includes github/copilot-agent-runtime#25941, and turn on experimental mode (`/experimental`). Pick a model and a reasoning effort other than the defaults, select a custom agent that VS Code also offers (for example one in `.github/agents`), switch to plan mode (`Shift+Tab`) and allow all tools (`/allow-all`), then send a message.\r\n2. Quit VS Code, then run `/code` in the CLI (or open `vscode://file/\u003cfolder\u003e?windowId=_blank\u0026copilotCliSession=\u003csession-id\u003e` after exiting the CLI session). The folder opens and the session appears in Chat with its history, in Plan mode with **Allow all** approvals, with the CLI's model, effort and agent selected. Send a message: the CLI's model, effort and agent are still in effect.\r\n3. Repeat with VS Code already running, both with that folder open (the window is focused) and without it (a new window opens and existing windows are untouched). The result doesn't depend on `chat.defaultToCopilotHarness`.\r\n4. Resume the session in another terminal with `copilot --resume \u003csession-id\u003e`, then open the link. VS Code asks whether to open the session anyway. **Cancel** leaves it untouched; **Open Anyway** opens it.\r\n5. Set `\"chat.disableAIFeatures\": true` and open the link. An error notification appears and no chat opens.\r\n6. Set `\"window.restoreWindows\": \"preserve\"`, open another folder, and quit. Open the link: the session opens only in the link's folder window. Then quit and open a link to a folder that doesn't exist: VS Code reports the missing path, and no restored window opens a chat.\r\n\r\nThe full scenarios are in the test plan item, #342466.\r\n\r\n## Validation\r\n\r\nRebased onto `main` at 73db368cb57 (which moved the pinned `@github/copilot-sdk` to `1.0.29-preview.1` and Electron to 43.8.6), and run with Node 24.22.1 after `pnpm run install-fast` and `pnpm run build-fast --client-only`. The rebase conflicts were only imports and a neighbouring method that `main` added next to this PR's changes (`refreshSandboxCertificate`, `isAgentChatDefaultChat`). An earlier rebase picked up a `_resolveAgentSelection` helper that `main` added to `copilotAgent.ts`, which has the same name as this PR's lookup by agent name; this PR's helper is now `_findAgentSelectionByName`.\r\n\r\n- `pnpm run typecheck-client`: **passed**, against `@github/copilot-sdk` `1.0.29-preview.1`.\r\n- `scripts\\test.bat --run src/vs/platform/windows/test/electron-main/windowsFinder.test.ts --run src/vs/platform/window/test/common/window.test.ts --run src/vs/workbench/contrib/chat/test/browser/copilotCliSessionLink.test.ts --run src/vs/platform/agentHost/test/electron-browser/agentHostProtocolClient.test.ts`: **passed** (421 passing).\r\n- `scripts\\test.bat --run src/vs/platform/agentHost/test/node/agentService.test.ts --run src/vs/platform/agentHost/test/node/copilotAgent.test.ts --run src/vs/platform/agentHost/test/node/copilotAgentSession.test.ts --run src/vs/platform/agentHost/test/node/copilotChatDiscovery.test.ts --run src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts --run src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts`: **passed** (4598 passing, 17 pending).\r\n- `pnpm run eslint -- \u003cchanged files\u003e` (26 files): **passed** (no problems).\r\n- `pnpm run valid-layers-check`: **passed**.\r\n- **Manual, dev build (earlier rebase):** a session created by a Copilot CLI built from github/copilot-agent-runtime#25941, opened through `vscode://file/\u003cfolder\u003e?windowId=_blank\u0026copilotCliSession=\u003cid\u003e` (the OS protocol handler pointed at the dev build), imports and opens in the Chat view with its history.\r\n- **End to end, recorded (earlier rebase):** Copilot CLI built from github/copilot-agent-runtime#25941 in Windows Terminal: `/model`, Plan mode, a planning turn, then `/code`. The dev build opened the same session in the Chat view with the conversation, model, and Interactive mode with manual permissions.\r\n- **Not run:** the manual and recorded end-to-end steps on this rebase, with the merged #25941, or with the wait for the CLI's lock (that run didn't hit the race: VS Code checked about 2.4 s after the CLI began exiting).\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342120",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ae11fb02d19d819abdbaf4551aa5c41a18334d43",
+    "HeadRef": "karthiknadig/copilot-cli-code-deeplink",
+    "HeadSHA": "8e5015de7ae8a4094984020b5df04123b1f6b262",
+    "CreatedAt": "2026-10-16T17:26:21Z",
+    "UpdatedAt": "2026-11-03T18:51:50Z",
+    "MergedAt": null,
+    "Labels": [
+      "on-testplan"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-521D67E8409E",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentService.ts",
+      "Side": "RIGHT",
+      "Line": 2432,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The shared call path, the existing multi-select sequential caller, the explicit lazy-resume comment, and the runtime initialization implementation are all directly traced. Exact startup duration varies by plugins/workspace, which affects magnitude rather than mechanism.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "Copilot runtime initialization, SDK subprocess/RPC work, filesystem metadata reads, plugin/customization snapshots, shell/session objects, and retained live runtime memory",
+      "PerformanceScaling": "The existing Sessions view accepts multi-selection and imports sessions sequentially; this new hook starts one runtime per selected Copilot session, so command latency and initialization work grow linearly with the number imported, while up to the 10-session residency limit can remain live.",
+      "PerformanceOutcome": "The Import command is blocked on heavyweight runtime starts and incurs unnecessary CPU/I/O and retained memory for sessions the user may never open or message.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff, importSession restored host/catalog state and adopted the external session only. CopilotAgent.materializeChat explicitly records the backing so it \"can be resumed lazily on its first send,\" avoiding a live runtime during a list-only import.",
+      "ChangedBehavior": "Importing an external Copilot session now resumes and initializes its runtime immediately to read modes/model/agent, even for the pre-existing Sessions-view Import action.",
+      "CausalDiffEvidence": "The added call at agentService.ts:2432 invokes provider.importChat for every import. CopilotAgent.importChat then calls _ensureResolvedChatSession, which reaches _resumeSession/_resumeSessionOnce and initializes/registers a live CopilotAgentSession before importSession returns.",
+      "Title": "Keep ordinary session imports lazy",
+      "Impact": "Selecting one or several external Copilot sessions and choosing Import now makes the UI command wait for one full runtime resume per session and can leave several heavyweight runtimes resident, even though Import only changes list ownership and does not open a chat.",
+      "Evidence": "SessionsView Import accepts ISession[] and loops over each selected session, awaiting SessionsManagementService.importSession and BaseAgentHostSessionsProvider.importSession. The changed AgentService path invokes CopilotAgent.importChat; its _ensureResolvedChatSession resumes the SDK session, and _resumeSessionOnce performs client acquisition, metadata/filesystem reads, customization/plugin snapshot creation, ShellManager creation, and _initializeAndRegisterSession. AgentSessionResidency retains up to 10 resident sessions, so this is not just transient metadata work.",
+      "Recommendation": "Keep the generic Sessions-view import metadata-only. Gate provider.importChat/runtime-state adoption behind an explicit option used by the CLI deeplink, or defer runtime mode/selection adoption until the chat is actually opened/first used so bulk imports remain lazy."
+    },
+    {
+      "ID": "PERF-2A01A9B283DA",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts",
+      "Side": "RIGHT",
+      "Line": 5171,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The one-ID input, full-list boundary, post-RPC filter, exact alternative API, critical-path caller, and large catalog cardinality are directly visible. Actual milliseconds depend on SDK storage and machine speed.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "SDK subprocess IPC response bytes, serialized/deserialized session metadata objects, and catalog filtering/allocation",
+      "PerformanceScaling": "Each explicit import of an unregistered session transfers and filters O(N) metadata for every saved SDK session to locate one ID; repository tests explicitly exercise catalogs of 5,000 sessions, while the effective requested cardinality is one.",
+      "PerformanceOutcome": "Opening a Copilot CLI deeplink can suffer avoidable latency and CPU/GC pressure proportional to total session history, and on cold start this full listing can overlap the normal startup discovery listing.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Existing imports operate on sessions already present in the registry/list and did not add this catalog scan. The provider already uses client.getSessionMetadata(sessionId) elsewhere for exact per-session reads, including getChatMetadata and resume.",
+      "ChangedBehavior": "An import that names one unseen CLI session now performs a full SDK catalog RPC and materializes all session metadata before selecting the requested session.",
+      "CausalDiffEvidence": "The new discoverChat path sets a one-element sessionIds set but calls _discoverCopilotChats, whose added explicit-import branch still executes client.rpc.sessions.list({ source: 'local' }) at copilotAgent.ts:5171 and only filters the returned catalog afterward.",
+      "Title": "Look up the named CLI session without listing the full catalog",
+      "Impact": "Users with long Copilot histories pay a full-catalog IPC/serialization cost on the critical path from a `/code` link to the Chat view, even though the link already supplies the exact session ID.",
+      "Evidence": "_registerSessionForImport invokes discoverChat only on a registry miss. discoverChat passes exactly one session ID, but _discoverCopilotChats lists the complete local catalog and applies catalog.filter afterward. Tests in this file model 5,000 saved sessions, establishing realistic large-history scaling. The same implementation already uses client.getSessionMetadata(sessionId), proving a bounded SDK API exists.",
+      "Recommendation": "Implement explicit discovery with client.getSessionMetadata(sessionId) and classify that single result, or coalesce with an already-running startup discovery scan; preserve the same eligibility checks without transferring the full catalog."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "missing-coalescing",
+      "concurrency-burst",
+      "cache-lifecycle",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold-start `/code` product link for a newly created Copilot CLI session",
+        "CriticalPath": "Main-process protocol parsing and window selection send `vscode:openCopilotCliSession` when the target renderer is ready; the BlockRestore chat contribution checks provider availability, waits for the agent-host handshake, sends `vscode/importSession`, discovers/registers and restores the session, checks its lock, resumes the Copilot runtime, reads modes/model/agent, persists the draft selection, adopts the session, then opens Chat. All of this import work is on the path to showing the session.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/windows/electron-main/windowsMainService.ts:557",
+            "Operation": "Main process sends `vscode:openCopilotCliSession` to the target renderer.",
+            "Cardinality": "One send per accepted link.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Copilot CLI session IPC existed; ordinary `session=` links used the existing open-chat-session IPC.",
+            "CriticalPathEffect": "Starts the renderer-side opening path once the window is ready."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:2215",
+            "Operation": "Renderer sends `vscode/importSession` JSON-RPC to the ambient agent host and receives the exact session resource.",
+            "Cardinality": "One request normally; two when lock conflict is confirmed and the user chooses takeover.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The import request existed for listed external sessions, but the deeplink now invokes it and adds takeover/result data.",
+            "CriticalPathEffect": "Import must complete before Chat opens."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5171",
+            "Operation": "SDK `sessions.list({source:'local'})` returns the complete local session catalog before filtering to the one requested ID.",
+            "Cardinality": "One full-catalog response per registry-miss import; can duplicate the startup discovery listing.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Known/listed imports did not perform this explicit full-catalog lookup.",
+            "CriticalPathEffect": "Blocks registration and all later restore/open work; response bytes and parsing scale with total saved sessions."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5193 and src/vs/platform/agentHost/node/agentService.ts:2426",
+            "Operation": "Classifies the selected session via marker/metadata and project/workspace resolution, then restores host session state/history from databases and persisted events.",
+            "Cardinality": "One candidate after catalog filtering; history/database work scales with the selected session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The unseen-session explicit discovery path did not exist; restore itself already existed for imports.",
+            "CriticalPathEffect": "Must complete before import hook/adoption."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5024",
+            "Operation": "SDK `sessions.checkInUse` polling.",
+            "Cardinality": "One when free; up to 21 checks over 5 seconds when held; takeover retry adds one.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Imports did not check another process's lock.",
+            "CriticalPathEffect": "Intentionally delays resume to allow CLI handoff and prevents dual writers."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5044 and src/vs/platform/agentHost/node/copilot/copilotAgent.ts:9801",
+            "Operation": "Resume and initialize the Copilot runtime, including exact metadata, customization/plugin snapshot, shell/session construction, permissions/mode, model and agent RPCs.",
+            "Cardinality": "One runtime resume for the imported chat unless already live/coalesced by session lifetime.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Import only restored/materialized host state; the Copilot backing was resumed lazily on first send.",
+            "CriticalPathEffect": "Blocks import and Chat opening so restored runtime selections are available."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:2479",
+            "Operation": "Read and write the imported chat draft selection.",
+            "Cardinality": "At most one read and one write per successful import.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Import did not rewrite the draft from runtime selection.",
+            "CriticalPathEffect": "Awaited before adoption and Chat opening."
+          }
+        ],
+        "ScalingInput": "One requested session ID, but explicit discovery transfers O(N) saved SDK session metadata; restored transcript/session data scales with that session's history. Repository tests exercise N=5,000. Lock polling is up to 21 serial checks. Runtime startup work scales with workspace/customization/plugin inventory.",
+        "EffectiveConcurrency": "The import chain is serial. Discovery limits per-candidate metadata/project work to 4, but explicit discovery has one effective candidate after receiving the full catalog. Lock checks are serial every 250 ms. There is no coalescing with a potentially concurrent startup discovery scan or duplicate link import; runtime operations are sequenced per chat.",
+        "CacheBehavior": "A registry hit skips explicit discovery; a miss always calls the full SDK list. The runtime/session restore has in-flight and live-state reuse, while exact persisted history is cached per chat after first read. A just-created or hidden external session commonly misses the registry. No negative or full-catalog cache serves the explicit lookup.",
+        "MechanismConfidence": "High: every boundary and ordering step is directly traced from added calls through existing implementations.",
+        "MagnitudeUncertainty": "Catalog serialization and runtime resume duration vary with session count, workspace, plugins and machine speed; the O(N) catalog transfer and eager runtime startup are certain. Lock polling's five-second delay is intentional and only applies while held.",
+        "Verdict": "Reportable: the full-catalog exact-ID lookup and eager runtime startup introduce avoidable scaling and latency on this path."
+      },
+      {
+        "Scenario": "Warm `/code` link when the session is already registered or live",
+        "CriticalPath": "Window routing and renderer checks lead to import. Registry hit skips explicit discovery; restore is a no-op if host state is resident. Lock check, provider import, runtime-state reads, draft persistence, adoption and Chat opening remain on path. If the runtime is live, per-chat sequencing reuses it.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:2215",
+            "Operation": "Workbench-to-agent-host import JSON-RPC.",
+            "Cardinality": "One, or two after confirmed takeover.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Existing external-session imports used this boundary.",
+            "CriticalPathEffect": "Blocks open."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5024 and src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:5804",
+            "Operation": "One SDK in-use check plus mode/model/agent reads.",
+            "Cardinality": "Normally one lock check and four control-plane reads grouped into two Promise.all pairs.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These reads were absent from import; mode/model application happened around later turns.",
+            "CriticalPathEffect": "Blocks adoption/open even with warm state."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:2499",
+            "Operation": "Persist imported selection to the draft.",
+            "Cardinality": "One write.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No draft rewrite during import.",
+            "CriticalPathEffect": "Awaited before import returns."
+          }
+        ],
+        "ScalingInput": "One session; no full catalog on a registry hit. Cost scales with whether host/runtime state is cold and with selected session history if restore is needed.",
+        "EffectiveConcurrency": "Per-chat sequencer serializes import/runtime operations. Separate link events are not explicitly coalesced, though restore in-flight and runtime lifetime helpers share some work.",
+        "CacheBehavior": "Warm registry and state remove catalog and restore work; a live runtime avoids resume initialization. Draft persistence still occurs on successful provider import.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Warm runtime RPCs may be fast; exact latency is unmeasured, but multiplicity is bounded to one session.",
+        "Verdict": "No additional finding beyond the shared eager-runtime issue; warm cache bounds most work."
+      },
+      {
+        "Scenario": "Existing Sessions/Agents window Import action, including multi-selection",
+        "CriticalPath": "The action resolves selected external sessions, then sequentially awaits SessionsManagementService and BaseAgentHostSessionsProvider imports. Each reaches the changed shared AgentService import, restores host state, calls the provider import hook, resumes the Copilot runtime, reads runtime state, writes draft selection, and adopts before advancing to the next selected row.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:7637",
+            "Operation": "One agent-host import request per selected session.",
+            "Cardinality": "M serial requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same request count, but each request performed metadata adoption without runtime resume.",
+            "CriticalPathEffect": "The action waits for all before showing imported status."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5044",
+            "Operation": "Resume and initialize one Copilot runtime per imported session, including SDK/session/plugin/shell setup.",
+            "Cardinality": "Up to M cold runtime starts, sequentially.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "CopilotAgent materialized the backing and explicitly left SDK resume lazy until first send.",
+            "CriticalPathEffect": "Materially increases Import command latency and resource use."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:9818",
+            "Operation": "Per-runtime metadata, workspace, customization and session initialization reads.",
+            "Cardinality": "At least one set per cold imported session, with plugin/workspace-dependent fanout.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Not performed merely to import a row.",
+            "CriticalPathEffect": "Part of each awaited runtime start."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:2479",
+            "Operation": "Per-session draft read/write.",
+            "Cardinality": "Up to one read and write for each of M imports.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No runtime-selection draft update during import.",
+            "CriticalPathEffect": "Serially awaited."
+          }
+        ],
+        "ScalingInput": "M selected external sessions. The action loop is sequential, so elapsed latency is approximately the sum of M restores/runtime starts. Up to the default 10 resident sessions can retain live runtime resources before residency eviction.",
+        "EffectiveConcurrency": "Strictly serial across selected sessions. Within each resume, some metadata and mode RPCs use Promise.all, but runtime initialization remains on each import's critical path.",
+        "CacheBehavior": "Rows shown by the provider are already cached/registered, so explicit catalog discovery is normally skipped. Restored/live sessions reduce work, but cold external sessions each start a runtime. Residency is bounded at 10 rather than unbounded; eviction releases chats/runtimes after the limit is exceeded.",
+        "MechanismConfidence": "Very high.",
+        "MagnitudeUncertainty": "Runtime startup cost depends on workspace and plugins; multi-select prevalence is uncertain. The sequential M-start mechanism and retained-live-session bound are explicit.",
+        "Verdict": "Reportable eager-work regression because a list-management action now starts runtimes for chats that may never be opened or used."
+      },
+      {
+        "Scenario": "Import while the Copilot CLI still holds the session",
+        "CriticalPath": "After restore, import checks lock state immediately and every 250 ms for up to five seconds. If still held it returns Conflict; the renderer prompts, and confirmed takeover retries import with one lock check before runtime resume/open.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5024",
+            "Operation": "Repeated SDK `sessions.checkInUse` calls.",
+            "Cardinality": "Up to 21 over five seconds, plus one if takeover is confirmed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No lock safety check or wait existed.",
+            "CriticalPathEffect": "Adds a bounded intentional handoff wait before prompting/opening."
+          }
+        ],
+        "ScalingInput": "One held session, fixed maximum 21 serial checks on first attempt and one on takeover retry.",
+        "EffectiveConcurrency": "Deliberately serial polling with no burst; takeover retry repeats restore/import entry but warm state makes restore mostly a no-op.",
+        "CacheBehavior": "No lock-result cache, appropriately, because lock state must become current. Session registration/restore are warm on retry.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "How often CLI teardown takes long enough to poll is unknown; maximum delay and call count are fixed and tested.",
+        "Verdict": "No separate finding: the bounded delay is an explicit one-writer correctness tradeoff and avoids immediately prompting during normal CLI exit."
+      },
+      {
+        "Scenario": "Normal product protocol links and window startup without a chat-session parameter",
+        "CriticalPath": "URL handling calls extractChatSessionToOpen, which constructs URLSearchParams only for each protocol URL, returns the original URI when no parameter is present, and window opening proceeds normally. WindowsMainService snapshots requested path descriptors and only runs session routing when chatSessionToOpen exists.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of startup protocol URLs and requested open paths, normally one or a few.",
+        "EffectiveConcurrency": "Existing serial URL/window processing; no new asynchronous boundary when no session is requested.",
+        "CacheBehavior": "Not cache-sensitive; parsing and shallow path-array copy are bounded by small request counts.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "None material.",
+        "Verdict": "No reportable regression; added CPU/allocation is small and bounded, with no new I/O/IPC on ordinary links."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 26 changed files and all diff pages. Reported two medium-confidence-high regressions: shared imports eagerly initialize Copilot runtimes, and explicit one-session discovery transfers the full SDK catalog. Traced startup/warm links, bulk import, lock handoff, ordinary links, caches, concurrency, lifecycle eviction, and all changed/transitive IPC, subprocess, filesystem, and database boundaries."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-03T22:02:45.989813663Z",
+    "CompletedAt": "2026-11-03T22:05:53.66437843Z",
+    "WallClockMilliseconds": 187674,
+    "ModelCalls": 11,
+    "InputTokens": 817786,
+    "OutputTokens": 10610,
+    "TotalTokens": 828396,
+    "ReasoningTokens": 3044,
+    "CacheReadTokens": 704979,
+    "CacheWriteTokens": 112774,
+    "APIDurationMilliseconds": 134889,
+    "ToolCalls": 82,
+    "NanoAIUnits": 105819360000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 704979,
+      "cache_write": 112774,
+      "input": 33,
+      "output": 10610
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
