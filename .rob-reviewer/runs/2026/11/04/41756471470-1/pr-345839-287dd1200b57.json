@@ -1,0 +1,187 @@
+{
+  "PullRequest": {
+    "Number": 345839,
+    "Title": "build: move the native build targets from .npmrc to package.json",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFollow-up to the pnpm 12 migration (#344791), from its review feedback: drop the `.npmrc` files that only held native-build settings.\n\n## What changed\n\nAfter the migration, the `.npmrc` files of the root, `build` and `remote` only held node-gyp and prebuild-install settings (`target`, `runtime`, `disturl`, `ms_build_id`, `build_from_source`, `force_process_config`). pnpm ignores them there, and npm 11 warns that they will stop working. This PR moves them to a typed `nativeBuild` field in each install root's `package.json` and deletes the three `.npmrc` files. `pnpm-workspace.yaml` can't hold them, because pnpm 12 fails on unknown settings.\n\n```jsonc\n// package.json\n\"nativeBuild\": { \"runtime\": \"electron\", \"target\": \"43.8.6\", \"disturl\": \"https://electronjs.org/headers\", \"msBuildId\": \"15893748\", \"buildFromSource\": true }\n// remote/package.json\n\"nativeBuild\": { \"runtime\": \"node\", \"target\": \"24.22.1\", \"disturl\": \"https://nodejs.org/dist\", \"msBuildId\": \"488038\", \"buildFromSource\": true, \"forceProcessConfig\": true }\n// build/package.json (no target: it builds for the running Node.js, as before)\n\"nativeBuild\": { \"runtime\": \"node\", \"disturl\": \"https://nodejs.org/dist\", \"buildFromSource\": true, \"forceProcessConfig\": true }\n```\n\n- **One definition:** the field is described once, as `NativeBuildConfig` in `build/npm/pnpm/nativeBuildEnv.ts`. `readNativeBuildConfig` checks it and fails on an unknown property, a wrong type or a missing `runtime`/`disturl`. The `.pnpmfile.mjs` hooks still turn it into the same `npm_config_*` variables.\n- **Typed readers:** `getElectronVersion()` (`build/lib/electronVersion.ts`, same return shape as before, so the distro mixins keep working) and the new `getServerNodeVersion()`/`getServerNodePath()` (`build/lib/node.ts`; running it as a script still prints the path).\n- **Readers switched:**\n  - install: preinstall header downloads, postinstall (distro remote root), `installStateHash.ts`, `cloudSandboxSetup.ts`;\n  - build: `gulpfile.reh.ts`, `darwin/sign.ts`, `useRunnerNodeForServer.ts`;\n  - CI: the Alpine pipelines read the field with `node -p` inside the existing step, with no new steps;\n  - tests: `scripts/test.sh`, `scripts/test.bat`, `test/unit/node/index.js`.\n- **`force_process_config`:** in `build/.npmrc` it had no effect, because a pnpmfile option always overrode it. The field now controls it (still macOS only), and that option is removed. `remote/package.json` sets it too, so its builds stay the same.\n- **Caches:**\n  - The `node_modules` cache key hashes only selected sections of each `package.json`, so it now also hashes `nativeBuild`.\n  - The base key that pull requests start from when their own `node_modules` cache is missing (`computeNodeModulesBaseCacheKey`, #345840) used to hash the `.npmrc` files; it now hashes the `nativeBuild` fields instead, so a runtime bump doesn't reuse modules built for the old runtime.\n  - The GitHub Electron download cache is keyed on `build/checksums/electron.txt` alone. Every Electron bump changes that file, and `msBuildId` doesn't affect those downloads.\n- **Install-state hash:** the local install-state hash (`build/npm/installStateHash.ts`) also keeps only selected `package.json` keys, so `nativeBuild` is added there too: changing the field makes the next install run again.\n- **Change detection:** `detect-changes`, `detect-agent-host-e2e-changes` and ripple no longer list the `.npmrc` files.\n- **Packaging:** the shipped desktop and server `package.json` files don't include `nativeBuild`.\n- **Lockfiles:** the three `.pnpmfile.mjs` files changed (comments, and the removed option), so each lockfile's `pnpmfileChecksum` changes. That is the only lockfile change.\n\n## Notes for reviewers\n\n- **Electron and Node.js bumps** now edit `nativeBuild.target`/`msBuildId` in `package.json` (Electron) or `remote/package.json` (Node.js), together with `build/checksums/*.txt` and `cgmanifest.json` as before. Tooling outside this repo that opens bump PRs needs updating.\n- **ripple:** it can't single out the `nativeBuild` field, so it relies on the checksum files.\n  - Electron and Node.js bumps still run every unit test, through `build/checksums/electron.txt`, and now also `build/checksums/nodejs.txt`.\n  - An `msBuildId`-only change selects the tests that read `package.json` instead of all tests. A `remote` target change without a `nodejs.txt` update selects none.\n- **Out of scope:** release branches (they stay on npm), the distro's npm folders (they still get `remote`'s values from the environment through `postinstall.ts`), and `build/agent-sdk/agents/*`.\n\n## How to test\n\nAll validation was on macOS arm64 with Node.js 24.22.1 and pnpm 12.16.0.\n\n- After `git clean -fdX`, `PNPM_CONFIG_FROZEN_LOCKFILE=true pnpm install` succeeds, with the same install-script results as `main`.\n- **Native build environment:** the `.pnpmfile.mjs` hooks produce the same environment as `main` in all 18 cases tried (darwin/linux/win32 × root/build/remote, with and without an inherited Electron environment), checked again after rebasing on `main` with Electron 43.8.6. The distro's `remote` environment from `postinstall.ts` is the same as on `main` too.\n- **Native module parity:**\n  - Rebuilding a module without any change already gives a different `.node` file here, so the binaries can't be compared byte for byte.\n  - Instead, all 32 `build/config.gypi` files are byte-identical to a fresh `main` install. They show Electron (ABI 148) for the root and Copilot, Node.js 24.22.1 (ABI 137) for `remote` and `build`, and the `process.config` settings only for `remote` and `build`.\n- **Version readers:** `getElectronVersion()` and `getServerNodeVersion()` return the same values as before. `pnpm run gulp node` downloads Node.js 24.22.1 and checks it against `build/checksums/nodejs.txt`.\n- **Checks:**\n  - `npm run typecheck` in `build` passes.\n  - The `build/npm/**` tests pass, and so do the `build/lib` tests for electronVersion, cloudSandbox, detectChanges, detectMissingCaches, agentHostTestSelection, useRunnerNodeForServer, darwinSign and nodeGypHeaders.\n  - ESLint reports no problems in the changed files.\n  - In the full `build` suite, `build/next/test/resources.test.ts` fails the same way on `main` (macOS `/private/var` vs `/var` temporary paths).\n- **Pipelines:** the Azure template preview of the product build succeeds with default parameters and with `VSCODE_PUBLISH=false`. It has the same number of steps as `main`, and no builds were queued.\n- **Not verified:** Windows (including the `test.bat` change), Linux and the Alpine container installs, and a full product build.\n\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/345839",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "088a7d744624589d429dbdb1456b116e4becc3f4",
+    "HeadRef": "lszomoru/native-build-targets-in-package-json",
+    "HeadSHA": "287dd1200b573e24573debc2713fe165d093dbed",
+    "CreatedAt": "2026-11-03T15:53:20Z",
+    "UpdatedAt": "2026-11-03T22:25:11Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cache-lifecycle",
+      "boundary-fanout",
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Root dependency install and native-module configuration",
+        "CriticalPath": "On a warm unchanged tree, install-state hashing completes and preinstall exits before header setup. On a cold or invalidated install, the preinstall's gyp install and two runtime-header installs must finish before dependency installation can proceed; later separate native roots are installed sequentially as before.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "build/npm/pnpm/nativeBuildEnv.ts:readNativeBuildConfig; build/npm/preinstall.ts:getHeaderInfo",
+            "Operation": "Read and JSON-parse package.json/remote/package.json for nativeBuild settings instead of reading and regex-parsing .npmrc files.",
+            "Cardinality": "Two manifest reads in cold preinstall plus one read per pnpm install-root hook process; independent of dependency count because updateConfig computes extraEnv once.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same paths synchronously read small .npmrc files; the diff changes the source and parsing format, not boundary cardinality.",
+            "CriticalPathEffect": "Synchronous reads are on cold-install setup, but replace equivalent synchronous configuration-file reads and are negligible beside package installation and native compilation."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/preinstall.ts:installHeaders; build/npm/nodeGypHeaders.ts:installNodeGypHeaders",
+            "Operation": "Install the pinned node-gyp package, then run node-gyp to install Electron and server Node.js headers.",
+            "Cardinality": "One pnpm subprocess and two sequential node-gyp subprocesses on a cold/invalidated install; cached headers may avoid network transfer inside node-gyp.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical subprocess count and ordering; only dist URL and target lookup moved from .npmrc to package.json.",
+            "CriticalPathEffect": "These operations block cold install before dependency installation."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/npm/nodeGypHeaders.ts:installNodeGypHeaders",
+            "Operation": "Download Electron and Node.js headers through node-gyp on cache misses.",
+            "Cardinality": "At most two logical header installs per cold preinstall, each with the existing retry policy; effective target count remains two.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two targets and URLs were read from .npmrc and downloaded on the same path.",
+            "CriticalPathEffect": "Cold cache misses block install; warm node-gyp caches avoid the downloads."
+          }
+        ],
+        "ScalingInput": "Number of install roots is fixed and small; dependency count does not multiply manifest parsing or header downloads.",
+        "EffectiveConcurrency": "The Electron and server Node.js header subprocesses remain sequential. Postinstall native roots remain sequential to avoid node-gyp conflicts, while JS-only roots retain the existing CPU-count limiter capped at 8. The pnpm updateConfig hook reads one manifest once per install-root pnpm process, not once per dependency script.",
+        "CacheBehavior": "The warm install-state fast path remains before header setup. Adding nativeBuild to the normalized install-state input intentionally invalidates after runtime configuration changes; unrelated package.json fields remain excluded. Header caches continue to key internally by target.",
+        "MechanismConfidence": "High: call sites, ordering, hook lifetime, and unchanged two-target header boundary are explicit in the code.",
+        "MagnitudeUncertainty": "Exact JSON parse cost varies with manifest size, but call count is fixed and the work replaces configuration parsing on an already expensive cold path.",
+        "Verdict": "No reportable regression: expensive subprocess/network work and concurrency are unchanged, while added manifest parsing is bounded and one-time per root."
+      },
+      {
+        "Scenario": "CI node_modules and Electron cache-key computation/restoration",
+        "CriticalPath": "Local synchronous file hashing must finish before cache restore keys are available; subsequent cache restore/download behavior depends on the resulting keys.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "build/azure-pipelines/common/cacheKeys.ts:computeNodeModulesCacheKey/computeNodeModulesBaseCacheKey",
+            "Operation": "Read package manifests and native-build hook files to compute node_modules keys.",
+            "Cardinality": "The main key already reads each of roughly 60 workspace/install-root package.json files once. The base-key helper now reads the same fixed directory list to extract nativeBuild, but repository search finds no production caller in this revision beyond tests.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The main key read the same manifests but omitted nativeBuild from the selected object. The base helper read three .npmrc files rather than the fixed manifest list.",
+            "CriticalPathEffect": "Main key hashing is required before restore; base-key work is not currently on a production workflow path in this revision."
+          },
+          {
+            "Kind": "network",
+            "Location": ".github/actions/setup-electron/action.yml",
+            "Operation": "Restore an Electron download cache and download Electron archives on a cold cache miss.",
+            "Cardinality": "One cache restore and one logical Electron download setup per job, unchanged; the key now hashes one checksum file instead of the checksum plus .npmrc.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cache action and download ran; .npmrc contributed to the key. The checksum file changes with every Electron target bump, preserving target invalidation.",
+            "CriticalPathEffect": "Cache misses can block setup, while warm hits avoid archive downloads."
+          }
+        ],
+        "ScalingInput": "Fixed repository package count for filesystem hashing and one cache operation per job; no per-dependency network fan-out.",
+        "EffectiveConcurrency": "Cache-key file reads and hashing are sequential in one Node.js process. Cache actions remain one logical restore per cache; no loop adds parallel network requests.",
+        "CacheBehavior": "Electron cache remains keyed by OS, architecture, and Electron checksum inventory, so target changes still miss and ordinary manifest changes no longer cause false misses. node_modules keys now include nativeBuild, preventing reuse of binaries built for a different runtime. No negative cache is introduced.",
+        "MechanismConfidence": "High for key composition and file-read cardinality; high that the base helper has no non-test caller in this revision.",
+        "MagnitudeUncertainty": "Future use of the base-key helper could add roughly one manifest read per listed directory, but current production reachability is absent and the bounded local work is small compared with cache restore/install.",
+        "Verdict": "No reportable regression: cache invalidation becomes more precise, network cardinality is unchanged, and the only added filesystem scan is bounded and not currently on a production path."
+      },
+      {
+        "Scenario": "Build, package, sign, and test launch runtime-version resolution",
+        "CriticalPath": "Runtime version lookup occurs once during each affected script's startup before signing, packaging, downloading runtimes, or launching tests can proceed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "scripts/test.sh; scripts/test.bat; build/azure-pipelines/alpine/product-build-alpine*.yml",
+            "Operation": "Resolve Electron or server Node.js version from package.json in shell/CI scripts.",
+            "Cardinality": "One version-resolution command per script invocation. Alpine reduces two pipeline processes to one Node process; test launch remains one external command.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Unix tests used one sed command, Windows used findstr, and Alpine used grep piped to cut. The diff substitutes a single Node process.",
+            "CriticalPathEffect": "The command is on script startup, but fixed-cardinality and followed by much larger test/build work."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/common/useRunnerNodeForServer.ts:main",
+            "Operation": "Locate the server Node.js binary for CI reuse.",
+            "Cardinality": "Zero nested subprocesses after the diff; direct helper calls replace one execFileSync Node process.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Spawned one Node subprocess to execute build/lib/node.ts, then separately read remote/.npmrc.",
+            "CriticalPathEffect": "Removes process startup from the CI setup critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/lib/electron.ts; build/gulpfile.reh.ts",
+            "Operation": "Fetch Electron/server Node.js archives during build tasks when absent.",
+            "Cardinality": "One runtime artifact per requested platform/architecture task, unchanged by the version reader refactor.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same target and internal build IDs selected the same artifact fetches; only their checked-in source moved.",
+            "CriticalPathEffect": "Cold artifact fetches block their build tasks; existing caches serve warm runs."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/lib/electronVersion.ts; build/lib/node.ts; build/gulpfile.vscode.ts; build/gulpfile.reh.ts",
+            "Operation": "Read package.json to obtain nativeBuild and remove nativeBuild while generating shipped manifests.",
+            "Cardinality": "One or a few fixed reads/JSON edits per build-script invocation or packaged product, not per source file.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Version readers synchronously read tiny .npmrc files, and package editors did not need to remove nativeBuild because the field did not exist.",
+            "CriticalPathEffect": "Bounded setup work before substantially heavier packaging/signing operations."
+          }
+        ],
+        "ScalingInput": "Number of script invocations and build platform/architecture tasks; version parsing is constant per invocation and does not scale with source-tree size.",
+        "EffectiveConcurrency": "Each script resolves versions synchronously once. Alpine commands run one node process instead of a grep/cut pipeline; Unix and Windows test launchers run one node process where they previously invoked sed or findstr. useRunnerNodeForServer removes a nested Node subprocess and performs direct reads.",
+        "CacheBehavior": "Runtime artifact cache targets remain the same. Generated desktop/server manifests explicitly omit nativeBuild, avoiding shipped metadata growth. Warm installed-Electron checks still compare the same target value.",
+        "MechanismConfidence": "High: all command substitutions and direct-helper call paths are visible in changed lines.",
+        "MagnitudeUncertainty": "Node startup is heavier than sed/findstr on test launch, but it occurs once before a full suite and is partly offset in Alpine and CI helper paths; no realistic user-visible regression is evidenced.",
+        "Verdict": "No reportable regression: all added work is constant startup overhead on heavyweight build/test workflows, while one existing subprocess is removed and artifact boundary cardinality is unchanged."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 46 changed files and all diff pages. Traced install, native-header, cache-key, runtime-fetch, packaging, signing, and test-launch paths. No high-confidence diff-introduced performance regression met the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-04T01:59:20.267105086Z",
+    "CompletedAt": "2026-11-04T02:00:43.353106617Z",
+    "WallClockMilliseconds": 83086,
+    "ModelCalls": 6,
+    "InputTokens": 216626,
+    "OutputTokens": 5788,
+    "TotalTokens": 222414,
+    "ReasoningTokens": 1411,
+    "CacheReadTokens": 160832,
+    "CacheWriteTokens": 55776,
+    "APIDurationMilliseconds": 61433,
+    "ToolCalls": 70,
+    "NanoAIUnits": 45904480000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 160832,
+      "cache_write": 55776,
+      "input": 18,
+      "output": 5788
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

@@ -1,0 +1,225 @@
+{
+  "PullRequest": {
+    "Number": 342906,
+    "Title": "editTelemetry: preserve precise edit survival attribution",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\n## What changes\r\n\r\nEdit-survival attribution should count changed characters, not unchanged text between distant edits. Agent Host disk writes currently reach the workbench as one replacement from the first changed line to the last. Attributing that replacement inflates inserted characters, claims intervening user text, and makes later disjoint edits appear to destroy earlier agent work.\r\n\r\nThis fixes character attribution for:\r\n- **`editTelemetry.editSources.details`**: `deltaModifiedCount` (inserted) and `modifiedCount` (retained), particularly `10minFocusWindow` and `20minFocusWindow`.\r\n- **`editTelemetry.editSources.stats`**: retained-character totals and ownership, including `agentHostModifiedCount`.\r\n- **`longterm`**: whitespace-sensitive Agent Host attribution and preservation of intervening user ownership in the workbench.\r\n\r\nThese are character-retention events, not the separate `agentHost.trackEditSurvival` similarity scorer or `editTelemetry.reportEditArc` reporter.\r\n\r\nBoth `editSources` events now include an optional numeric measurement, **`coarseDiffCount`**, to identify reporting scopes affected by coarse diffing:\r\n- **0:** no coarse diff application was observed.\r\n- **Greater than 0:** a worker timeout/error fallback or Agent Host coarse attribution fallback occurred, including external/user reconciliation.\r\n- **Missing:** metadata is unavailable, including from older hosts; do not interpret it as zero.\r\n\r\nThis is a scope-wide count repeated on source-detail rows, not a per-source count or a count of unique tool writes. Do not sum it across source rows. The affected-event rate can be computed as events with `coarseDiffCount \u003e 0` divided by events where the field is present. Core and GitHub telemetry carry the measurement; optional host responses are validated and preserve older-host compatibility.\r\n\r\n## How\r\n\r\n- Compute a precise editor-worker diff for each external disk reload before composing attribution. Keep reloads separate so before/after correlation boundaries and edit ordering are preserved. Editor reload and undo behavior are not changed.\r\n- Preserve whitespace-insensitive displayed line counts, but make the Agent Host character changes whitespace-sensitive. Reuse the initial changes when they reconstruct the new content exactly; only run a second diff when necessary, using the remaining computation budget.\r\n- Log when attribution must use the existing coarse fallback because supplied changes do not reconstruct the updated content.\r\n- Drain pre-boundary edits before retiring a tracker and attach replacement trackers after that boundary, preserving queued edits across hide/close, branch/hash changes, and timer resets. This shared boundary fix also applies to Extension Host edits; their normal edit application and diff algorithms are not changed.\r\n- Propagate worker precision metadata through the attribution pipeline, reset coarse counters with the reporting scope, and retain them through Agent Host flush cancellation/recovery. The stopwatch remains production timeout-budget logic, not benchmark instrumentation.\r\n\r\n## Manual smoke results\r\n\r\nTested on **Windows x64, VS Code 1.143.0 Dev**. Baseline and fixed processors observed the same real editor model, filesystem-triggered `reloadFromDisk` events, and keyboard edits. Agent Host correlation was synthetic for repeatability; telemetry transmission was disabled.\r\n\r\n| Behavior | Before | After |\r\n|---|---:|---:|\r\n| One write changes lines 10 and 100 | 2,268 inserted | **200 inserted** |\r\n| User restores the first changed line | 95.5% survival | **50% survival** |\r\n| Second write changes different lines, with no user activity | 66.0% survival | **100% survival** |\r\n| Untouched user note between edits | 0 user characters retained | **13 retained** |\r\n| Single pure insertion | 200 inserted | **200 inserted** |\r\n\r\nAdditional live-editor checks passed: typing, undo/redo, CRLF and non-BMP Unicode coordinates, and protection of unsaved user edits after an observed external filesystem change. Genuine replacement of earlier agent text still reduces retention; the fix does not force agent-only activity to 100% survival.\r\n\r\nLongterm payloads were captured locally from the real `AgentEditAttributionService` with an in-memory filesystem and telemetry sink, asserting both details and stats events:\r\n\r\n| Behavior | Before: inserted / retained | After: inserted / retained |\r\n|---|---:|---:|\r\n| Ordinary separated edits | 206 / 206 | 206 / 206 |\r\n| Indentation plus separated edits | 2,286 / 2,286 | **207 / 207** |\r\n| User then restores the first changed line | 2,286 / 2,168 (94.84%) | **207 / 103 (49.76%)** |\r\n| External indentation around unchanged agent text | 206 / 103 (50%) | **206 / 206 (100%)** |\r\n| Two whitespace-only tab insertions | 2,072 / 2,072 | **2 / 2** |\r\n\r\nLongterm and editor-worker diff boundaries still differ slightly (206 versus 200 in this fixture); this removes the broad-span error, not every cross-algorithm boundary difference.\r\n\r\n## Performance measurements\r\n\r\nTesting caught an unnecessary unconditional second Agent Host diff, initially costing about 1.4-2x for ordinary edits. The conditional reconstruction check above removes that penalty from ordinary edits and no-ops.\r\n\r\n| Ordinary Agent Host diff | Before median | Fixed median |\r\n|---|---:|---:|\r\n| 1,000 lines | 2.27 ms | 2.27 ms |\r\n| 10,000 lines | 10.36 ms | 10.54 ms |\r\n| 50,000 lines | 66.43 ms | 64.21 ms |\r\n\r\nPrecision is not free: workbench reload-to-tracked median latency increased from **2.6 to 5.1 ms** at 1,000 lines and **88.9 to 140.1 ms** at 50,000 lines (~2.93 MB). Synchronous model-update medians were **2.5 to 2.2 ms** and **88.7 to 88.7 ms**, respectively. The additional diff runs in the editor worker; renderer heartbeat measurements did not show additional stalls in these samples. Whitespace cases still need extra worker work: at 50,000 lines, the Agent Host median was **40.29 to 55.95 ms**.\r\n\r\nMeasurements used eight warmup iterations, 30 workbench samples per case (20 at 50,000 lines), and 40 Node samples (20 at 50,000 lines). Node variants alternated order; workbench variants ran sequentially in the same instance. These are local measurements, not a universal no-regression guarantee.\r\n\r\n## Regression coverage / how to test\r\n\r\nThe initial validation below had **277 reported checks passing** across the workbench edit telemetry suite, ModelService, Agent Host attribution/file edits/reverts/aggregation, edit survival and ARC. After the queue-boundary and coarse-diff metadata follow-ups, the targeted rerun passed **114 edit-telemetry browser checks, 19 editor-worker checks, and 93 Agent Host checks**. Client type checking, changed-file ESLint, formatting, and extracted GDPR measurement classifications passed. Existing successful validation was reused for publication.\r\n\r\n\u003cdetails\u003e\r\n\u003csummary\u003eInitial regression commands and results\u003c/summary\u003e\r\n\r\n```powershell\r\nnpm run build-fast -- --client-only\r\n# Passed\r\n\r\n.\\scripts\\test.bat --runGlob \"**/workbench/contrib/editTelemetry/test/browser/*.test.js\"\r\n# 92 passing\r\n\r\n.\\scripts\\test.bat --run src\\vs\\editor\\test\\common\\services\\modelService.test.ts\r\n# 21 passing\r\n\r\nnpm run test-node -- --run src/vs/platform/agentHost/test/node/diffWorkerMain.test.ts --run src/vs/platform/agentHost/test/node/agentEditAttributionService.test.ts --run src/vs/platform/agentHost/test/node/fileEditTracker.test.ts --run src/vs/platform/agentHost/test/node/fileEditDiscard.test.ts --run src/vs/platform/agentHost/test/node/sessionDiffAggregator.test.ts --run src/vs/platform/agentHost/test/node/agentHostFileEditRevert.test.ts --run src/vs/platform/agentHost/test/node/agentHostMultiRootDiff.test.ts --run src/vs/platform/agentHost/test/node/claudeFileEditObserver.test.ts --run src/vs/platform/agentHost/test/node/shared/arcToolEdit.test.ts --run src/vs/platform/agentHost/test/node/shared/editArcReporter.test.ts --run src/vs/platform/agentHost/test/node/shared/editSurvivalReporter.test.ts --run src/vs/workbench/contrib/editTelemetry/test/node/arcTracker.test.ts\r\n# 164 passing\r\n\r\nnpm run typecheck-client\r\n# Passed, no diagnostics\r\n```\r\n\r\nThe new tests cover real ModelService reload replacement shapes through both focus windows, user reverts, subsequent disjoint edits, suppressed longterm reloads, whitespace-only and mixed changes, and LF/CRLF with UTF-16 offsets.\r\n\r\n\u003c/details\u003e\r\n\r\n\u003cdetails\u003e\r\n\u003csummary\u003eLatest targeted regression commands and results\u003c/summary\u003e\r\n\r\n```powershell\r\nnpm run build-fast -- --client-only\r\n# Passed\r\n\r\n.\\scripts\\test.bat --runGlob \"**/workbench/contrib/editTelemetry/test/browser/*.test.js\"\r\n# 114 passing\r\n\r\n.\\scripts\\test.bat --run src\\vs\\editor\\test\\common\\services\\editorWebWorker.test.ts\r\n# 19 passing\r\n\r\nnpm run test-node -- --run src\\vs\\platform\\agentHost\\test\\node\\diffWorkerMain.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\agentEditAttributionService.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\fileEditTracker.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\shared\\editArcReporter.test.ts --run src\\vs\\platform\\agentHost\\test\\node\\shared\\editSurvivalReporter.test.ts\r\n# 93 passing\r\n\r\nnpm run typecheck-client\r\n# Passed, no diagnostics\r\n```\r\n\r\n\u003c/details\u003e\r\n\r\n**Limits:** no live Copilot/Claude/Codex provider session, remote filesystem, backend telemetry ingestion, sustained backlog stress, or memory-leak profiling. The existing coarse fallback remains for unrepresentable changes and now logs a warning. Local screenshots, traces, raw videos and detailed JSON measurements were retained; they are not attached here. Videos lack captions because ffmpeg/ffprobe were unavailable.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/342906",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "amunger",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "109b9b8bc132809d5141e23a5894ab82aecd40d1",
+    "HeadRef": "agents/edit-survival-tracking-review-c9099af0",
+    "HeadSHA": "05503f91cc0d2cddeea474f727170540bc5e57a5",
+    "CreatedAt": "2026-10-20T15:26:10Z",
+    "UpdatedAt": "2026-10-20T22:19:29Z",
+    "MergedAt": "2026-10-20T22:18:41Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-6540B9B96A6F",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/editTelemetry/browser/helpers/documentWithAnnotatedEdits.ts",
+      "Side": "RIGHT",
+      "Line": 281,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The added boundary call, one-call-per-reload cardinality, full-snapshot payloads, 500 ms budget, and singleton shared worker are all directly traced in repository code. Exact delay depends on file sizes and how many open files an external operation changes, which affects severity rather than the mechanism.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Full before/after document strings sent over worker IPC plus whole-document line/character diff CPU on the singleton editor worker",
+      "PerformanceScaling": "Cost grows with the number of externally reloaded, previously visible open models and with each model's byte/line count; every reload is deliberately kept separate and can consume up to 500 ms, while all documents converge on the same editor worker event loop.",
+      "PerformanceOutcome": "Queued reload-attribution jobs can delay interactive editor-worker operations such as word-based completions, diff computation, link detection, and edit minimization; in the synchronous fallback they can block the renderer directly.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "External reload events used the StringEdit already supplied by the text-model change and published it without invoking the editor worker; only streamed chat edits used DiffService.",
+      "ChangedBehavior": "The added external-edit branch now awaits DiffService.computeDiff for every reload. DiffService forwards both complete snapshots to IEditorWorkerService with a 500 ms budget, and WorkerManager serves this and all core editor-worker features through one EditorWorkerClient.",
+      "CausalDiffEvidence": "RIGHT line 281 is inside the newly added all-external branch and adds `await this._diffService.computeDiff(peeked.prevValue.value, peeked.value.value)` where the pre-diff code directly published the composed external edit.",
+      "Title": "Isolate reload attribution diffs from the shared editor worker",
+      "Impact": "A source-control checkout, external formatter, or generator that updates several open files now fans out into one full-document worker diff per reload. Those CPU-bound calls share and serialize on the editor worker, so background telemetry attribution can noticeably postpone completion lists or diff/formatting results after the reload burst.",
+      "Evidence": "VSCodeWorkspace tracks every syncable model and snapshots textModel.getValue() on content changes; TextFileEditorModel marks disk updates as reloadFromDisk; this changed branch passes each reload's full prevValue/value to DiffService. DiffService calls computeStringEditFromDiffWithMetadata(..., maxComputationTimeMs: 500), while EditorWorkerService's WorkerManager owns a single EditorWorkerClient also used by computeDiff, textualSuggest, computeLinks, and computeMoreMinimalEdits. WebWorkerServer executes the CPU-bound DefaultLinesDiffComputer on that single worker event loop.",
+      "Recommendation": "Keep the per-reload attribution boundaries, but run these background telemetry diffs in a telemetry-owned worker or another low-priority/preemptible execution path rather than the singleton editor worker; also apply a global queue/budget so a multi-file reload burst cannot monopolize worker CPU."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "serialization-allocation",
+      "repeated-work",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "External disk reload attribution for open/previously visible editors, including source-control checkout or external formatter bursts",
+        "CriticalPath": "The filesystem-triggered text-file resolve updates the model immediately; attribution then asynchronously processes each reload, but its full-document diff occupies the shared editor worker that interactive completion/diff/formatting requests need. Tracker shutdown and telemetry publication also wait for the captured attribution queue to drain.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/textfile/common/textFileEditorModel.ts:resolveFromContent",
+            "Operation": "Read/resolve changed disk content and replace the existing text model",
+            "Cardinality": "One existing filesystem resolve per externally changed open model; a checkout can affect multiple open models",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same disk resolve updated the model before this PR.",
+            "CriticalPathEffect": "Precedes the model reload and is already on the reload path"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/editTelemetry/browser/helpers/documentWithAnnotatedEdits.ts:CombineStreamedChanges._run / DiffService.computeDiff",
+            "Operation": "Send complete before/after strings to the singleton editor web worker and compute an advanced character diff with a 500 ms budget",
+            "Cardinality": "New one call per external reload, kept separate across every changed open/ever-visible model; no cache or coalescing",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "External reload attribution directly published the composed model edit and made no worker call.",
+            "CriticalPathEffect": "Off the immediate model-update path, but blocks the shared worker's interactive operations and must finish before attribution queue drains"
+          }
+        ],
+        "ScalingInput": "Effective cardinality is the number of reload events across syncable models that have been visible, multiplied by full document size. Each document queue serializes reloads; requests from documents converge on one editor worker whose CPU execution is effectively serial.",
+        "EffectiveConcurrency": "Per-document CombineStreamedChanges queues are serial. Different documents can submit concurrently, but CPU-bound calls execute on one EditorWorkerClient/web-worker event loop, with no global burst limiter or interactive priority.",
+        "CacheBehavior": "No positive/negative cache exists; every reload sends both snapshots and recomputes the diff. Separate reloads intentionally cannot be merged for attribution ordering.",
+        "MechanismConfidence": "High: the new per-reload call, full snapshots, timeout, single shared worker, and competing editor-worker consumers are directly traced.",
+        "MagnitudeUncertainty": "The exact delay depends on open-file count, file size, and external-change frequency; multi-file source-control operations are realistic, but prevalence and milliseconds vary.",
+        "Verdict": "Reportable medium regression: background telemetry now fans out full-document CPU jobs onto the shared editor worker and can delay interactive editor features."
+      },
+      {
+        "Scenario": "Agent Host tool edit completion and character attribution",
+        "CriticalPath": "For Copilot, Promise.all of takeCompletedEdit calls must finish before complete(authoritativeOutput); Claude awaits takeCompletedEdit before mapping the user/tool-result message. Pre/post file reads, diff worker work, database persistence, and attribution therefore precede tool completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/shared/fileEditTracker.ts:trackEditStart/completeEdit",
+            "Operation": "Read before and after file contents",
+            "Cardinality": "Two reads per tracked edited file",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same reads occurred before the PR.",
+            "CriticalPathEffect": "Before/after snapshots are required before the completed tool result can be emitted"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/diffComputeService.ts:NodeWorkerDiffComputeService.computeDiffCounts",
+            "Operation": "Post full before/after strings to one worker thread for diff computation",
+            "Cardinality": "One worker message per edited file; multiple files are submitted with Promise.all but one worker thread executes CPU work",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one worker call per file already occurred.",
+            "CriticalPathEffect": "Awaited by takeCompletedEdit and thus tool completion"
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/diffWorkerMain.ts:computeDiffCounts",
+            "Operation": "Split both texts, convert mappings, reconstruct the candidate output, and conditionally run a whitespace-sensitive second diff",
+            "Cardinality": "One reconstruction scan per diff; a second diff only when the whitespace-insensitive result cannot reconstruct modified text",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only the whitespace-insensitive diff and mapping conversion ran.",
+            "CriticalPathEffect": "Runs inside the existing worker request and shares the original timeout budget"
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/fileEditTracker.ts:_processCompletedEdit",
+            "Operation": "Persist before/after file edit snapshots",
+            "Cardinality": "One storeFileEdit transaction per edited file",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same persistence occurred before the PR.",
+            "CriticalPathEffect": "Awaited before the returned tool-result file edit"
+          }
+        ],
+        "ScalingInput": "Edited file count and full before/after text sizes; whitespace-sensitive edits trigger the conditional second computation.",
+        "EffectiveConcurrency": "SequencerByKey preserves per-file order. Multi-file Copilot completion submits files concurrently, but all diff calls share one worker thread; the changed second pass remains within each call's remaining 5-second budget.",
+        "CacheBehavior": "No diff cache; each edit snapshot pair is unique. The first diff result is reused when it reconstructs the target, avoiding the second pass for ordinary edits.",
+        "MechanismConfidence": "High for the extra scan/conditional pass and critical-path reachability; lower magnitude concern because work is bounded and avoided for reconstructing results.",
+        "MagnitudeUncertainty": "Whitespace-heavy large edits incur extra CPU and allocation, but the second pass uses only the remaining timeout and repository code does not establish a severe common-case delay.",
+        "Verdict": "No additional finding: the precision work is conditional, reuses the initial result in the common case, and shares the existing bounded computation budget."
+      },
+      {
+        "Scenario": "Streamed chat edits in the workbench attribution pipeline",
+        "CriticalPath": "Chat edit events are buffered for up to one second and then diffed in the editor worker before attribution consumers receive the composed edit; this behavior already existed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/editTelemetry/browser/helpers/documentWithAnnotatedEdits.ts:CombineStreamedChanges._run",
+            "Operation": "Compute one full-string editor-worker diff for a contiguous stream of chat edits",
+            "Cardinality": "One call per coalesced chat-edit stream, not per streamed token/change",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same coalesced worker diff was already performed; the PR only propagates timeout metadata.",
+            "CriticalPathEffect": "Required before attribution state advances, but not before the editor model itself updates"
+          }
+        ],
+        "ScalingInput": "Number and size of coalesced chat streams after the existing one-second grouping window.",
+        "EffectiveConcurrency": "Serial per-document queue; shared editor worker across documents.",
+        "CacheBehavior": "No cache; grouping coalesces adjacent chat changes into one diff.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "No meaningful changed cost beyond a boolean in the worker response.",
+        "Verdict": "No regression: metadata propagation does not add another diff or increase call cardinality."
+      },
+      {
+        "Scenario": "Tracker rotation, document close, and telemetry/Agent Host flush",
+        "CriticalPath": "Changed queue barriers drain edits observed at the boundary before disposing listeners and sending telemetry. Long-term Agent Host prepare/commit remains asynchronous IPC; telemetry sends occur after local queue drain and correlation handling.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/editTelemetry/browser/telemetry/agentHostEditMarkerService.ts:prepareFlush/commitFlush/cancelFlush",
+            "Operation": "Prepare, commit, or recover Agent Host attribution flush state",
+            "Cardinality": "Existing prepare plus commit/cancel flow per long-term reporting scope; added coarseDiffCount is one scalar",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same flush calls occurred without coarseDiffCount metadata.",
+            "CriticalPathEffect": "Awaited for long-term telemetry consistency, as before"
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/telemetry/common/editTelemetry.ts:sendEditSourcesDetailsTelemetry/sendEditSourcesStatsTelemetry",
+            "Operation": "Emit edit-source telemetry records",
+            "Cardinality": "One stats event and one details event per reported source; coarseDiffCount is repeated as a scalar",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same event cardinality; payload gains one optional number.",
+            "CriticalPathEffect": "Off editor interaction critical paths"
+          }
+        ],
+        "ScalingInput": "Number of queued document changes at a rotation/close boundary and number of reported edit sources.",
+        "EffectiveConcurrency": "Boundary callbacks are chained after the prior per-document run queue. Later events are captured by a replacement source, preserving ordering; there is no new telemetry request concurrency.",
+        "CacheBehavior": "No cache is relevant. Prepared Agent Host flush state is reused through cancel/recovery, including the new scalar count.",
+        "MechanismConfidence": "High.",
+        "MagnitudeUncertainty": "Drain latency inherits any pending diff duration, chiefly the newly reported external-reload worker work; scalar telemetry metadata is negligible.",
+        "Verdict": "No separate finding: lifecycle changes preserve queued work and add negligible metadata; their latency consequence is covered by the external-reload worker finding."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 25 changed files and paginated diffs. One diff-caused boundary-fanout regression was reported: per-reload full-document attribution diffs now contend with interactive features on the singleton editor worker. Agent Host conditional re-diffing, chat metadata propagation, queue draining, flush handling, and scalar telemetry changes were traced but did not independently meet the reporting threshold."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-04T02:02:11.859434333Z",
+    "CompletedAt": "2026-11-04T02:04:35.646656418Z",
+    "WallClockMilliseconds": 143787,
+    "ModelCalls": 12,
+    "InputTokens": 870875,
+    "OutputTokens": 10872,
+    "TotalTokens": 881747,
+    "ReasoningTokens": 4470,
+    "CacheReadTokens": 759614,
+    "CacheWriteTokens": 111225,
+    "APIDurationMilliseconds": 120504,
+    "ToolCalls": 95,
+    "NanoAIUnits": 107755460000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 759614,
+      "cache_write": 111225,
+      "input": 36,
+      "output": 10872
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
