@@ -1,0 +1,178 @@
+{
+  "PullRequest": {
+    "Number": 345960,
+    "Title": "tasks: resolve process variables before Windows executable lookup",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFollow-up to #316369; related to #160891.\n\n### Confirmed feedback and fixes\n\nThe interaction step has already populated the variable map when Windows executable lookup runs. Passing unresolved commands through avoids corrupting absolute paths, but skips the task-specific cwd and PATH lookup for relative paths and bare executable names.\n\n- Reuse `VariableResolver` with the acquired values before looking up the executable. Resolve cwd and PATH too, splitting PATH after substitution and retaining case-insensitive environment-key handling.\n- Reject empty process commands with a localized error before terminal creation, and emit the task-end event so extension task executions also finish instead of remaining pending.\n- Revert the extension-host pass-through from #316369: its returned `process` is not used to construct the launched executable. The actual fix belongs in `TerminalTaskSystem`.\n- Add 11 regression tests exercising the final launch configuration, both command/input variables, executable lookup, previously acquired values, missing task-system info, and empty-command lifecycle completion.\n\n### Code OSS reproduction and verification\n\nExecuted real process tasks in an isolated Code OSS Dev 1.146.0 window on Windows, driven through the Command Palette with a temporary test extension. Successful tasks wrote their actual `process.execPath` and cwd; the harness also observed process start, exit and task-end events.\n\n| Scenario | Before | After |\n| --- | --- | --- |\n| Command variable returning an absolute executable | Passed | Passed |\n| Input variable returning an absolute executable | Passed | Passed |\n| Input returning `tools\\\\run.exe` with nonempty cwd | Failed to launch | Passed |\n| Bare input executable found through `options.env.Path` | Failed to launch | Passed |\n| Bare input executable falling back to task cwd | Failed to launch | Passed |\n| Fully resolved bare command using PATH lookup | Passed | Passed |\n| Empty input executable | Started a default shell and timed out | Explicit error, no process started, task ended |\n\nAll seven scenarios passed after the fix. To reproduce manually, use a Windows process task with nonempty `options.cwd`, substitute these command/input values, and verify the actual executable and cwd. For an empty value, expect “The process task command resolved to an empty string.” and no new terminal.\n\n### Validation\n\n- `pnpm run build-fast --client-only` — passed.\n- `.\\scripts\\test.bat --runGlob '**/contrib/tasks/test/**/*.test.js' --reporter dot` — 106 passed, 5 existing pending. Before production changes, the new suite had 9 failures and 2 passes.\n- `corepack pnpm run typecheck-client` — passed.\n- `corepack pnpm run eslint src\\vs\\workbench\\api\\node\\extHostTask.ts src\\vs\\workbench\\contrib\\tasks\\browser\\terminalTaskSystem.ts src\\vs\\workbench\\contrib\\tasks\\test\\browser\\terminalTaskSystem.test.ts` — passed without warnings.\n- `git diff --cached --check` — passed.\n\nValidation limits: the full `pnpm run build-fast` command failed in the unrelated Copilot extension bundle due to incompatible OpenTelemetry dependency exports (`defaultResource`/`getEnv`). Client and other built-in extension outputs compiled, and the Code OSS task scenarios above ran successfully with AI disabled. Remote hosts, macOS and Linux were not exercised live.",
+    "URL": "https://github.com/microsoft/vscode/pull/345960",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dmitrivMS",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "495549391a1d264377ea1ab88be83c7da2d6a4b7",
+    "HeadRef": "agents/feedback-review-and-fix-pr316369",
+    "HeadSHA": "4c1905effa7dd8e9ea22ef79ea9e80900c0ae4a7",
+    "CreatedAt": "2026-11-04T01:21:53Z",
+    "UpdatedAt": "2026-11-04T02:08:08Z",
+    "MergedAt": null,
+    "Labels": [
+      "tasks"
+    ]
+  },
+  "Findings": [
+    {
+      "ID": "PERF-71E8DA33EE6F",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/api/node/extHostTask.ts",
+      "Side": "LEFT",
+      "Line": 185,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The call path is explicit: TerminalTaskSystem supplies `resolveSet.process`, MainThreadTask forwards it to `$resolveVariables`, and this changed code awaits `findExecutable` on the unresolved text. `findExecutable` checks each PATH entry and Windows PATHEXT candidate through filesystem `exists`/`stat`; the new task-system code and its tests establish a second lookup after variables are resolved. Only exact prevalence and filesystem latency vary.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "filesystem existence/stat operations across PATH and PATHEXT candidates",
+      "PerformanceScaling": "Per affected launch, the wasted work grows with PATH-entry count times PATHEXT count (plus bare-path checks); it repeats for every variable-driven task and can overlap across parallel dependency tasks.",
+      "PerformanceOutcome": "increased task-launch latency and excessive filesystem I/O",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "When the extension-host resolver could not expand a process command, the deleted guard returned the placeholder without probing the filesystem; only the later task-system stage needed to look up the acquired command value.",
+      "ChangedBehavior": "Windows task variable resolution now performs an extension-host executable search before command/input variables have been acquired, then the changed TerminalTaskSystem path performs the authoritative executable search again after substituting those values.",
+      "CausalDiffEvidence": "The deleted `if (/\\$\\{.+?\\}/.test(processName))` branch at LEFT line 185 was the only guard preventing unresolved `${command:...}`/`${input:...}` text from reaching `findExecutable`; the replacement now calls `findExecutable(processName, cwd, paths)` unconditionally.",
+      "Title": "Keep unresolved commands out of the first PATH scan",
+      "Impact": "Launching a variable-driven Windows process task incurs a guaranteed useless PATH scan before the real lookup, increasing launch latency and filesystem I/O; parallel task dependencies can multiply the probes, and remote or slow filesystems make the delay more visible.",
+      "Evidence": "For a Windows process task whose command is `${input:tool}` or `${command:tool}`, the extension-host resolver leaves that token unresolved. With the guard removed, `src/vs/base/node/processes.ts:86-133` walks PATH and checks each PATHEXT candidate for that literal, even though no such executable can be selected. After interaction, `_resolveAndFindExecutable` at `terminalTaskSystem.ts:694-707` calls `taskSystemInfo.findExecutable` again with the real value. Both awaits are on the task-launch critical path.",
+      "Recommendation": "Restore the unresolved-placeholder guard in `$resolveVariables` (or otherwise skip this first executable lookup when variables remain) and leave executable discovery to the post-acquisition `_resolveAndFindExecutable` call."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Launch a Windows process task whose executable is supplied by `${input:...}` or `${command:...}`.",
+        "CriticalPath": "Task launch awaits variable acquisition over main-thread/extension-host IPC; the newly unguarded extension-host PATH scan completes before command/input interaction and before the authoritative resolved lookup, so both filesystem walks block terminal creation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/filesystem",
+            "Location": "src/vs/workbench/api/node/extHostTask.ts:185 and src/vs/base/node/processes.ts:86",
+            "Operation": "The main thread calls extension-host `$resolveVariables`, which searches PATH for the still-literal `${command:...}` or `${input:...}` name.",
+            "Cardinality": "One IPC request and one useless executable search per affected launch; the search performs roughly PATH-entry count × PATHEXT count absent-file checks, plus bare-name checks.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The deleted placeholder guard returned the unresolved name without calling `findExecutable`, so this first filesystem walk did not occur.",
+            "CriticalPathEffect": "The main thread awaits `$resolveVariables`, so all filesystem probes must finish before variable acquisition and task launch can progress."
+          },
+          {
+            "Kind": "IPC/filesystem",
+            "Location": "src/vs/workbench/contrib/tasks/browser/terminalTaskSystem.ts:694-707",
+            "Operation": "After acquired values are merged, `taskSystemInfo.findExecutable` resolves the real command against task cwd and PATH.",
+            "Cardinality": "One IPC call and one executable search per affected launch after substitution; absolute/relative commands require one probe while bare names can scan all configured PATH entries and PATHEXT candidates.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The task-system guard returned unresolved variable text without lookup, and nested launch-time substitution supplied the value without task-specific executable discovery.",
+            "CriticalPathEffect": "This lookup is awaited before constructing the terminal launch configuration and is necessary for the new relative-name/PATH behavior."
+          }
+        ],
+        "ScalingInput": "Number of variable-driven Windows process-task launches, parallel dependency count, PATH entries, and PATHEXT entries.",
+        "EffectiveConcurrency": "Each individual launch performs the two lookups serially. Compound task dependencies run concurrently unless `dependsOrder` is sequence, so multiple affected tasks can produce concurrent PATH-scan bursts without a shared limiter.",
+        "CacheBehavior": "No executable-lookup cache or coalescing exists. Both the pre-interaction extension-host lookup and the post-interaction lookup run on every affected task execution, including reruns that reacquire variables.",
+        "MechanismConfidence": "High: changed-line guards, IPC forwarding, filesystem implementation, and the second lookup are all directly traced.",
+        "MagnitudeUncertainty": "Actual delay depends on PATH length, local versus remote storage, and concurrent task count; the redundant absent-file fan-out and its critical-path placement are deterministic.",
+        "Verdict": "Reportable: removing the extension-host unresolved-variable guard adds a guaranteed useless filesystem fan-out before the required resolved lookup."
+      },
+      {
+        "Scenario": "Launch a Windows process task with an already concrete executable command.",
+        "CriticalPath": "Variable acquisition and both executable lookups are awaited before terminal creation in both revisions.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/filesystem",
+            "Location": "src/vs/workbench/api/node/extHostTask.ts:176 and src/vs/workbench/contrib/tasks/browser/terminalTaskSystem.ts:704",
+            "Operation": "Resolve an already concrete executable name on the extension host, then resolve it through task-system info.",
+            "Cardinality": "Two executable-lookup IPC/filesystem operations per launch, with filesystem cardinality determined by whether the command is absolute, relative, or bare.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Already-resolved process tasks followed the same two-lookup pattern before the diff.",
+            "CriticalPathEffect": "Both are awaited before launch."
+          }
+        ],
+        "ScalingInput": "Task launch count and PATH size.",
+        "EffectiveConcurrency": "One serial pair of lookups per task; parallel compound tasks can run separate pairs concurrently, unchanged by this diff.",
+        "CacheBehavior": "There is no executable cache, but both before and after the PR each execution performs the extension-host lookup and task-system lookup for a command that is already fully resolved.",
+        "MechanismConfidence": "High: neither old placeholder guard applied to concrete commands, and both pre/post code call executable discovery.",
+        "MagnitudeUncertainty": "Lookup duration varies by filesystem and PATH, but call count is unchanged.",
+        "Verdict": "No diff-introduced regression: boundary count and critical-path placement are unchanged; the new resolver only changes how existing values are substituted."
+      },
+      {
+        "Scenario": "Launch a local Windows process task without registered task-system info, including use of previously acquired values.",
+        "CriticalPath": "Interaction resolution and string/path substitution are awaited before creating the terminal; no subprocess, network, database, or filesystem executable-discovery boundary is reached without task-system info.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of placeholders in command, cwd, and PATH strings.",
+        "EffectiveConcurrency": "Resolution is per task. Variable replacers within each string use `Promise.all`; task dependency parallelism is unchanged.",
+        "CacheBehavior": "Previously acquired values are held only in the execution's variable map; there is no filesystem lookup when task-system info is unavailable.",
+        "MechanismConfidence": "High: optional chaining prevents `findExecutable` when `systemInfo` is undefined.",
+        "MagnitudeUncertainty": "String count and value lengths are small task-configuration inputs; no realistic scaling concern was found.",
+        "Verdict": "No reportable performance regression: added work is bounded string substitution and path manipulation, with no added expensive boundary."
+      },
+      {
+        "Scenario": "Run a process task whose command/input variable resolves to an empty string.",
+        "CriticalPath": "After resolution to an empty command, the new check returns before shell-launch configuration and terminal creation; task-end notification is synchronous and off any expensive boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/contrib/tasks/browser/terminalTaskSystem.ts:1560-1564",
+            "Operation": "Terminal creation and default-shell/process startup are avoided when the resolved process command is empty.",
+            "Cardinality": "Zero terminal/process creations after the change for an empty resolved process command, versus one attempted terminal launch before.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The empty command continued into shell launch configuration and terminal creation.",
+            "CriticalPathEffect": "The change short-circuits the invalid launch rather than waiting on terminal/process lifecycle."
+          }
+        ],
+        "ScalingInput": "Number of executions whose command/input resolves to an empty string.",
+        "EffectiveConcurrency": "One validation per launch; it prevents each empty-command launch from allocating its own terminal/process resources.",
+        "CacheBehavior": "No lookup cache applies. The unresolved-command pre-scan still occurs for command/input variables and is covered by the reported finding.",
+        "MechanismConfidence": "High that the new branch avoids terminal creation; insufficient introducing-commit evidence to record it as a shipped regression fix.",
+        "MagnitudeUncertainty": "The exact lifetime and resource cost of the old invalid terminal depended on terminal backend behavior.",
+        "Verdict": "No new regression from the validation branch; it removes eager terminal/process work. The separate pre-interaction PATH scan remains covered by the submitted finding."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files. One medium-confidence-impact, high-mechanism-confidence boundary-fanout regression was submitted: variable-driven Windows tasks now scan PATH for unresolved placeholder text before scanning again for the acquired executable. Other changed paths either preserve prior boundary counts, add bounded substitution, or avoid invalid terminal creation."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-04T08:12:20.757883026Z",
+    "CompletedAt": "2026-11-04T08:14:25.193180876Z",
+    "WallClockMilliseconds": 124435,
+    "ModelCalls": 8,
+    "InputTokens": 176544,
+    "OutputTokens": 6143,
+    "TotalTokens": 182687,
+    "ReasoningTokens": 2837,
+    "CacheReadTokens": 142379,
+    "CacheWriteTokens": 34141,
+    "APIDurationMilliseconds": 83557,
+    "ToolCalls": 28,
+    "NanoAIUnits": 35061260000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 142379,
+      "cache_write": 34141,
+      "input": 24,
+      "output": 6143
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
