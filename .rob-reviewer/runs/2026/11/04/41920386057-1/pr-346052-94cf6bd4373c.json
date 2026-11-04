@@ -1,0 +1,163 @@
+{
+  "PullRequest": {
+    "Number": 346052,
+    "Title": "chat: match pins across a model's copies in editor and Agents windows",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFollow-up to #346046, which shared pin storage between the Editor and Agents windows but merged before this fix. Fixes the remaining case of #345882.\n\n## Problem\n\nThe same model has a different identifier in each window, so even with shared storage, pins didn't carry over in either direction:\n\n- The Editor window's Copilot picker stores a pin as `copilot/\u003cid\u003e`, but the Agents window offers the same model as `agent-host-copilotcli:\u003cid\u003e`.\n- Codex and Claude qualify ids with the provider they reach a model through, such as `codex:@provider=vscode-proxy:gpt-5.6-sol` and `claude:@provider=copilot:claude-opus-4.6`.\n- Agent host copies of models users bring from extensions also get new identifiers.\n\n## Change\n\n`LanguageModelsService` now stores and matches pins by an identity:\n\n- Built-in models (`BUILT_IN_GROUP_IDS`: the extension, the CLI harness, and agent host copies in the `copilot` group) share the extension's identifier, `copilot/\u003cid\u003e`. Provider-qualified ids are decoded first, so Codex's and Claude's Copilot copies match too. Their ChatGPT and Anthropic copies group under `chatgpt` and `anthropic`, so they stay separate.\n- Agent host copies of extension-provided models share the original identifier from `byokModelIdentifier`, which the picker already uses to match hidden models.\n- Auto, which routes differently per harness, and all other models keep their own identifiers.\n\n`getPinnedModelIds()` returns every available copy of a pinned model, `isModelPinned()` matches any copy, pinning stores the identity, and unpinning removes every entry for it. Existing Editor pins already use these identities, so nothing is migrated.\n\nThe `@provider=\u003cprovider\u003e:\u003cmodelId\u003e` format was implemented separately for Codex (`codexModelSelection.ts`) and Claude (`claudeModelSelection.ts`). It now lives in `platform/agentHost/common/providerQualifiedModelId.ts`, which both parsers and the pin identity use. The parsers' behavior is unchanged.\n\n## Notes for reviewers\n\n- Hidden models still match by plain identifier, because whether hiding a model in one window should hide its copy in the other needs a product decision. Recently used models are being removed in #346053.\n\n## How to test\n\n1. In an Editor window on the default profile, pin a Copilot model and a model from an extension provider in the chat model picker.\n2. Open the Agents window and its model picker, including a Codex or Claude session: the Copilot copies of those models are pinned, and the ChatGPT or Anthropic copies are not.\n3. Unpin one in the Agents window: it's unpinned in the Editor window too.\n\n## Validation\n\n- `./scripts/test.sh --reporter dot --run \u003cfile\u003e` for `languageModels.test.ts`, `sessionModelSelection.test.ts`, `agentHostLanguageModelProvider.test.ts`, `chatModelsViewModel.test.ts`, `modelPickerTelemetry.test.ts`, `claudeModelSelection.test.ts`, `claudeAgent.test.ts`, `codexModelSelection.test.ts`, `codexCreateChat.test.ts`, `codexModelRefresh.test.ts` and `codexPrewarmEviction.test.ts`: 967 passing\n- The new regression test fails without pin identities, and fails without decoding provider-qualified ids.\n- `pnpm run typecheck-client`: passed\n- `pnpm run eslint` on the changed files: passed\n- End to end in Code OSS with both windows: not run.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346052",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "881999100739fef36236fe0b93fedc9b730f94a9",
+    "HeadRef": "agents/chat-pinning-cross-window-state",
+    "HeadSHA": "94cf6bd4373c5bd2099305f493354f052690944c",
+    "CreatedAt": "2026-11-04T15:40:55Z",
+    "UpdatedAt": "2026-11-04T17:11:10Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "missing-coalescing",
+      "synchronous-ui-work",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open the chat model picker or cycle to the next pinned model",
+        "CriticalPath": "After model discovery, getPinnedModelIds synchronously walks the in-memory model cache, groups identifiers by pin identity, and returns matching available copies before the picker can render or the cycle command can choose a model. Model discovery itself is unchanged and is not initiated by the new identity helper.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Total resolved models M, stored pin identities P, and the number of available vendor/harness copies per identity C. The pass is O(M + P*C); although the implementation copies each per-identity array while grouping, effective C is bounded by the small set of extension/CLI/Codex/Claude copies rather than M, so realistic cost remains near-linear.",
+        "EffectiveConcurrency": "Entire pin-query computation is synchronous with no queue or parallel work. Existing vendor model resolution is independently sequenced/coalesced per vendor and is not changed by this diff.",
+        "CacheBehavior": "The model cache is the authoritative warm cache. On a cold/unresolved cache, no available copies are returned, as before unavailable stored pins were filtered out; subsequent model resolution populates the cache. The diff adds no retained identity cache, miss retry, or negative-cache state.",
+        "MechanismConfidence": "High confidence that the diff adds an in-memory model-cache scan and small allocations on each query; callers and cache ownership are directly traced. It does not add an external boundary or hot per-frame invocation.",
+        "MagnitudeUncertainty": "Installations can have varying numbers of extension/BYOK models, but picker opening and pinned cycling are user-triggered, and duplicate copies per identity remain small. No evidence supports user-visible latency at realistic cardinality.",
+        "Verdict": "No reportable regression. The query is more expensive than the prior O(P) filter, but remains bounded, user-triggered, in-memory work at realistic model counts and copy multiplicity."
+      },
+      {
+        "Scenario": "Render or interact with rows in the Manage Language Models table",
+        "CriticalPath": "Visible model rows synchronously call isModelPinned while rendering pin actions; context-menu creation may call it for each selected row. The new implementation resolves the candidate identity and scans stored pins, all in memory, before actions are shown.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Visible/selected model rows R and stored pins P. Both before and after the diff the membership check scales O(R*P); the diff adds cache lookups and provider-ID decoding for built-in entries but does not increase asymptotic cardinality. Table virtualization bounds normal row rendering.",
+        "EffectiveConcurrency": "Synchronous UI work only; no async fan-out is started by isModelPinned.",
+        "CacheBehavior": "Metadata is read from the existing model cache. Unknown/stale stored identifiers fall back to their literal identifier without creating or retaining cache entries.",
+        "MechanismConfidence": "High confidence from the row renderer and context-menu call sites that checks occur per rendered/selected row and remain in-memory.",
+        "MagnitudeUncertainty": "P is user-controlled and not explicitly capped, but it was already scanned by Array.includes for each row and ordinarily tracks a small curated list. The added constant-factor identity work is insufficient for a concrete regression finding.",
+        "Verdict": "No reportable regression. There is no new scaling class, boundary, retained state, or realistic dropped-frame mechanism."
+      },
+      {
+        "Scenario": "Pin or unpin a model, including cross-window copies and multi-selection in Manage Models",
+        "CriticalPath": "A pin checks identity membership, stores one normalized identity, writes preferences, logs telemetry, and emits the existing change event. Unpin filters equivalent stored identities, then performs the same existing write/log/event sequence. In the Manage Models view, that event still invokes the pre-existing refresh path that resolves vendors before rebuilding rows.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/common/languageModels.ts:_savePinnedModels",
+            "Operation": "Persist the pinned-model identifier array through IStorageService.store",
+            "Cardinality": "One write per successful pin or unpin action; equivalent-copy operations can now be coalesced into no-ops.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Successful pin/unpin already performed one storage write; the diff changes stored identifiers but does not add writes and can reduce them for duplicate copies.",
+            "CriticalPathEffect": "The existing storage call occurs before the action emits its change event and completes."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/contrib/chat/common/languageModels.ts:_logPinChange",
+            "Operation": "Emit chat.modelPinChange telemetry",
+            "Cardinality": "One telemetry event per successful pin/unpin, unchanged; equivalent-copy no-ops can reduce events.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same telemetry call occurred once after every successful mutation.",
+            "CriticalPathEffect": "Telemetry API invocation remains on the action path, while transport batching/network behavior is owned downstream and unchanged."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatManagement/chatModelsViewModel.ts:refresh and src/vs/workbench/contrib/chat/common/languageModels.ts:selectLanguageModels",
+            "Operation": "Resolve language-model information from registered providers via provideLanguageModelChatInfo during the Manage Models refresh triggered by the existing pin-change listener",
+            "Cardinality": "At most one joined/queued resolution per vendor per refresh request under the existing per-vendor sequencer; successful mutations emit the same event as before, while equivalent duplicates can emit fewer.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every successful pin/unpin already fired onDidChangePinnedModels, whose listener called the same refresh and provider-resolution path.",
+            "CriticalPathEffect": "Manage Models waits for provider resolution before rebuilding all vendor rows; this pre-existing refresh is not added or moved by the diff."
+          }
+        ],
+        "ScalingInput": "Stored pins P per action; multi-selection count S. Identity matching adds O(P) in-memory work per action. Equivalent copies are now coalesced, so later pin/unpin calls for the same identity can return without duplicate writes, telemetry, events, or refreshes.",
+        "EffectiveConcurrency": "Pin identity work is synchronous. Existing model refresh uses per-vendor SequencerByKey queues and joins queued resolutions; the diff does not alter this scheduling. Multi-selection still invokes actions serially in its loop, as before.",
+        "CacheBehavior": "Pin identity is derived from the current authoritative model cache; stored identities persist through the existing storage service. No new cache or retained map survives a call. Cross-window storage listeners reload the same bounded persisted array.",
+        "MechanismConfidence": "High confidence in the storage, telemetry, event, and provider-refresh call flow and in the diff's unchanged or reduced boundary cardinality.",
+        "MagnitudeUncertainty": "Provider resolution duration varies by installed provider, but the diff neither introduces that boundary nor increases successful mutation events for a given action sequence.",
+        "Verdict": "No regression. Added O(P) identity work is small relative to existing explicit-action boundaries, and coalescing equivalent copies can reduce duplicate boundary work."
+      },
+      {
+        "Scenario": "Encode, restore, switch, or dispatch a Codex/Claude provider-qualified model selection",
+        "CriticalPath": "The extracted helper performs the same prefix check, separator search, URL decoding, and fallback behavior synchronously before existing model lookup, transport selection, subprocess switching, or request dispatch proceeds.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/claude/claudeAgentSession.ts:setModel",
+            "Operation": "Use the parsed Claude provider/model to select or rebuild the existing Claude subprocess transport on a later send",
+            "Cardinality": "At most the same transport decision/rebuild per actual cross-transport model switch as before.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The module-local parser returned the same provider/model/explicit-provider result and drove the same rebuild decision.",
+            "CriticalPathEffect": "A cross-transport switch may require the existing subprocess rebuild on the next send; helper extraction does not add, duplicate, or move this boundary."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/common/codexModelSelection.ts:parseCodexModelSelection and src/vs/platform/agentHost/node/claude/claudeModelSelection.ts:parseClaudeModelSelection transitive dispatch paths",
+            "Operation": "Dispatch an existing Codex or Claude model request through the selected provider/transport",
+            "Cardinality": "One existing request per user send; parser extraction does not alter request count or fan-out.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Equivalent module-local encode/decode logic selected the provider before the same request dispatch.",
+            "CriticalPathEffect": "Provider parsing precedes dispatch but adds no extra network operation and preserves the same decoding algorithm."
+          }
+        ],
+        "ScalingInput": "One model identifier per selection operation, plus existing catalog scans where callers already parse each candidate. Identifier length and catalog size are unchanged by the extraction.",
+        "EffectiveConcurrency": "Parsing is synchronous and constant per identifier. Existing model-refresh sequencing, Claude subprocess lifecycle, and request concurrency are unchanged.",
+        "CacheBehavior": "No cache is involved or added; encoding/decoding remains stateless. Warm and cold behavior are identical.",
+        "MechanismConfidence": "High confidence because the deleted and added parser bodies are mechanically equivalent and all call sites continue through the wrapper functions.",
+        "MagnitudeUncertainty": "Downstream subprocess and network latencies vary, but their occurrence, scheduling, and cardinality are unchanged.",
+        "Verdict": "No reportable performance change; this is a shared-helper refactor with unchanged per-identifier CPU and unchanged external boundaries."
+      }
+    ],
+    "Summary": "Reviewed all five changed files and complete diff pages under the performance focus. Traced pin queries through picker commands and virtualized Manage Models rendering, pin mutations through storage/telemetry/provider refresh, and shared provider-ID parsing through Codex/Claude dispatch and subprocess paths. The PR adds bounded in-memory identity matching and allocations but no realistic hot-path or boundary amplification; equivalent-copy coalescing can reduce duplicate mutation work. No performance findings or regression-fix learning record are warranted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-04T21:58:37.747598371Z",
+    "CompletedAt": "2026-11-04T22:00:07.355735845Z",
+    "WallClockMilliseconds": 89608,
+    "ModelCalls": 10,
+    "InputTokens": 325604,
+    "OutputTokens": 5637,
+    "TotalTokens": 331241,
+    "ReasoningTokens": 1592,
+    "CacheReadTokens": 273285,
+    "CacheWriteTokens": 52289,
+    "APIDurationMilliseconds": 63137,
+    "ToolCalls": 43,
+    "NanoAIUnits": 48361900000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 273285,
+      "cache_write": 52289,
+      "input": 30,
+      "output": 5637
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
