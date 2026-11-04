@@ -1,0 +1,202 @@
+{
+  "PullRequest": {
+    "Number": 346026,
+    "Title": "Webview: check resolved paths against local resource roots",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nWebview local resource loading checked the requested path against `localResourceRoots` lexically, while the read follows symbolic links and junctions. This change additionally resolves the real path when the file system supports it (local and remote) and only serves the resource if the resolved file is inside an allowed root, or inside the resolved location of a root (roots may be links themselves). Unresolvable links are denied, including links whose resolution silently falls back to the unresolved path. File systems without real path support keep the lexical check.\n\nResources inside a root, including links that stay inside a root, keep loading.\n\n## How to test\n\n1. In a folder, create a symbolic link or junction to a folder outside of it, plus an image inside the folder.\n2. Reference both images from a Markdown file and open the Markdown preview.\n3. The image inside the folder loads; the image reached through the link to the outside folder does not. A link that points to another location inside the folder still works.\n\n## Validation\n\n- `scripts\\test.bat --run src/vs/workbench/contrib/webview/test/browser/resourceLoading.test.ts --run src/vs/platform/files/test/node/diskFileSystemProvider.test.ts --run src/vs/workbench/api/test/browser/mainThreadWebviewPanels.test.ts --run src/vs/workbench/contrib/webview/test/browser/webviewElement.test.ts`: passed on Windows (101 tests, including new tests for resolved links; the Linux-only disk provider test is skipped there)\n- `pnpm run typecheck-client`: passed\n- `pnpm run valid-layers-check`: passed\n- `pnpm run eslint` on the changed files: passed\n- Manually verified in Code OSS on Windows with junctions (Markdown preview).",
+    "URL": "https://github.com/microsoft/vscode/pull/346026",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "hediet",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "f92b8f3adcd9bc034e6b9ade05c093dd59b99c5f",
+    "HeadRef": "hediet/webview-resolved-resource-roots",
+    "HeadSHA": "144aaa7de45c9c2e12f5a19d2101ffb12b884dbc",
+    "CreatedAt": "2026-11-04T11:11:48Z",
+    "UpdatedAt": "2026-11-04T12:41:45Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-8506052C7654",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/webview/browser/resourceLoading.ts",
+      "Side": "RIGHT",
+      "Line": 194,
+      "Severity": "high",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The common non-link branch, per-component call count, desktop/remote IPC implementations, per-resource caller, cache revalidation behavior, and before/after placement are all directly traced in repository code. Exact milliseconds and typical asset counts vary, but the introduced boundary fan-out and critical-path delay do not.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Filesystem metadata operations and IPC/remote-channel calls: one realpath plus one stat per path component below the closest root for each requested asset.",
+      "PerformanceScaling": "For N requested assets at average depth D below their effective closest root, authorization grows from no boundary calls to N realpath calls plus N*D stat calls. Requests execute independently, with up to 32 host resource requests admitted concurrently on Electron, so the metadata operations can also arrive as a burst.",
+      "PerformanceOutcome": "Blocked resource-load critical path, increased IPC/filesystem throughput demand, and higher remote webview load latency.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The same webview resource request performed an in-memory lexical containment check and proceeded directly to readFileStream; it did not issue realpath or per-component stat calls.",
+      "ChangedBehavior": "After resolving an allowed resource, the common case where realpath equals the requested path now builds every path component below the closest localResourceRoot and issues provider.stat for all of them before the file read can start.",
+      "CausalDiffEvidence": "The added line `const stats = await Promise.all(candidates.map(candidate =\u003e provider.stat(candidate)));` directly introduces the per-component provider calls; the newly added await at line 78 places them before every allowed resource read.",
+      "Title": "Avoid statting every ancestor on every resource request",
+      "Impact": "Opening or refreshing a webview such as Markdown preview now delays each local asset by a realpath boundary round followed by a stat boundary round before reading. A page with many images, scripts, or styles can generate a burst of filesystem IPC (or remote-channel calls), increasing preview load latency and filesystem/IPC load; remote workspaces additionally pay network round trips.",
+      "Evidence": "loadLocalResource now awaits isResolvedResourceInAnyRoot before readFileStream (resourceLoading.ts:78). For an ordinary non-link resource, resolveRealpath returns the same URI, which enters hasLinkBelowRoot (lines 183-184); line 194 invokes provider.stat once for the file and once for every ancestor below the closest root. The desktop file provider delegates both realpath and stat through DiskFileSystemProviderClient.channel.call, and RemoteFileSystemProviderClient uses the remote filesystem channel. webviewElement starts loadResource independently for every service-worker load-resource message, while the service worker revalidates cached responses through the host with an ETag, so this work also occurs on warm-cache requests.",
+      "Recommendation": "Keep strict link authorization without walking every component on the normal path: have the disk/remote realpath operation expose whether it used the unresolved fallback (or add a strict variant), and perform the component checks only for that rare fallback. Coalesce any unavoidable checks per request/root and preserve provider-change invalidation rather than issuing D metadata calls per asset."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "concurrency-burst",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open or refresh a desktop webview/Markdown preview containing ordinary local images, scripts, and styles under localResourceRoots",
+        "CriticalPath": "Each service-worker load-resource message awaits loadLocalResource; the new realpath check and the full ancestor stat Promise.all must both finish before the pre-existing readFileStream can begin and before the asset response is returned.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/webview/browser/resourceLoading.ts:241 resolveRealpath",
+            "Operation": "Resolve the requested asset's real path via the local filesystem provider/main-process channel and filesystem realpath.",
+            "Cardinality": "One call per allowed asset on FileRealpath-capable providers, including warm-cache revalidations.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The lexical root check was in-memory and proceeded directly to the asset read; no realpath call occurred.",
+            "CriticalPathEffect": "A serialized metadata round must complete before ancestor checks and before file streaming."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/webview/browser/resourceLoading.ts:194 hasLinkBelowRoot",
+            "Operation": "Stat the asset and every ancestor below the closest allowed root through the local filesystem provider/main-process channel.",
+            "Cardinality": "D calls per ordinary asset, or N*D for a page; calls are parallel within one asset but can burst across up to 32 concurrent assets.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No per-component stat calls occurred during authorization.",
+            "CriticalPathEffect": "The entire stat batch must complete after realpath and before file streaming, adding a second boundary round and metadata load."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/webview/browser/resourceLoading.ts:96 loadLocalResource",
+            "Operation": "Read the authorized resource as a file stream through the filesystem provider.",
+            "Cardinality": "One read per cold/changed asset; ETag matches may terminate as NotModified.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The read began immediately after lexical authorization.",
+            "CriticalPathEffect": "This is the pre-existing resource delivery boundary, but it now starts only after the new metadata rounds."
+          }
+        ],
+        "ScalingInput": "N requested assets and average path depth D below each asset's closest effective root; Markdown previews include extension styles/scripts plus document images, and arbitrary extension webviews can contain many assets.",
+        "EffectiveConcurrency": "The webview launches each loadResource without awaiting other resource messages. Electron's service worker admits up to 32 active host resource responses, so up to 32 resource checks can overlap; stats within each request fan out concurrently across D candidates, with no shared metadata limiter or coalescing.",
+        "CacheBehavior": "There is no cache or coalescing for realpath/stat authorization. The service-worker cache is no-cache/ETag based and still sends a host request with ifNoneMatch, so warm 304 revalidations repeat the same authorization operations before the read detects NotModified.",
+        "MechanismConfidence": "Very high: the unchanged-realpath branch, IPC provider implementation, service-worker revalidation, and per-resource caller are directly visible.",
+        "MagnitudeUncertainty": "Asset count, path depth, IPC latency, and filesystem cache warmth vary by webview, but ordinary non-link assets deterministically take the new one-plus-D metadata calls.",
+        "Verdict": "Reportable high-severity boundary fan-out: the common success path now performs O(N*D) metadata IPC/filesystem operations and two prerequisite boundary rounds before asset reads."
+      },
+      {
+        "Scenario": "Load webview resources from a remote workspace",
+        "CriticalPath": "For vscode-remote assets, the host awaits remote realpath and then remote stats before issuing the existing remote read, so metadata channel responses gate every resource response.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/remote/common/remoteFileSystemProviderClient.ts:18 and src/vs/workbench/contrib/webview/browser/resourceLoading.ts:241",
+            "Operation": "Call realpath over RemoteFileSystemProviderClient's remoteFilesystem channel.",
+            "Cardinality": "One remote call per asset before any stat or read.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Remote resources used only lexical authorization before the existing read.",
+            "CriticalPathEffect": "Adds a full prerequisite remote-channel round trip before the next authorization stage."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/webview/browser/resourceLoading.ts:194",
+            "Operation": "Call stat for every candidate path component over the remoteFilesystem channel.",
+            "Cardinality": "D remote calls per ordinary asset, grouped concurrently per asset but unbounded across independently admitted resource loads up to the service-worker limit.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No remote metadata fan-out occurred for authorization.",
+            "CriticalPathEffect": "All D responses gate the subsequent read, adding another remote-channel round trip and server filesystem work."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/webview/browser/resourceLoading.ts:96",
+            "Operation": "Read the remote resource stream.",
+            "Cardinality": "One pre-existing read per cold/changed resource.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "It followed the in-memory containment check directly.",
+            "CriticalPathEffect": "The read remains critical but is now postponed by the two metadata phases."
+          }
+        ],
+        "ScalingInput": "N remote assets at average depth D below the closest remote localResourceRoot; workspace-folder roots can be shallow, making D several components for nested media.",
+        "EffectiveConcurrency": "Resource requests are independent; Electron permits up to 32 active host resource responses and each one concurrently sends D stat calls after its realpath response. DiskFileSystemProviderClient has no shared limiter for these channel.call operations.",
+        "CacheBehavior": "Remote authorization results and root/component resolutions are not cached or coalesced. ETag-backed service-worker cache revalidation still reaches the host and repeats realpath/stat work.",
+        "MechanismConfidence": "Very high: vscode-remote uses RemoteFileSystemProviderClient, which subclasses the channel-backed DiskFileSystemProviderClient implementing realpath/stat as channel.call.",
+        "MagnitudeUncertainty": "Network RTT and asset count depend on the remote setup, but placement of two metadata phases before every read is certain and latency sensitivity is greater than local IPC.",
+        "Verdict": "Covered by the submitted finding; remote workspaces amplify the same introduced fan-out into network latency and server metadata load."
+      },
+      {
+        "Scenario": "Load a resource through a symlink/junction or from a root that is itself linked",
+        "CriticalPath": "The resource realpath must complete before containment. If the resolved target is outside lexical roots, all same-scheme roots are realpathed in parallel before access can be allowed or denied; allowed resources then proceed to the existing read.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/webview/browser/resourceLoading.ts:187-190",
+            "Operation": "Resolve the requested linked resource and, when needed, resolve every same-scheme root.",
+            "Cardinality": "One resource realpath plus up to R root realpaths per linked asset.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The resource was checked lexically and read without realpath authorization.",
+            "CriticalPathEffect": "These calls intentionally gate authorization; root calls are concurrent but add a prerequisite boundary round."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/webview/browser/resourceLoading.ts:96",
+            "Operation": "Read an allowed linked resource stream.",
+            "Cardinality": "One pre-existing read for each allowed asset; denied links skip it.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Read followed lexical containment.",
+            "CriticalPathEffect": "Begins only after resolution-based authorization."
+          }
+        ],
+        "ScalingInput": "One request plus R same-scheme localResourceRoots. Markdown can include extension contribution roots and all workspace-folder roots, so R can exceed one in multi-root workspaces.",
+        "EffectiveConcurrency": "Root realpaths are Promise.all within a request, and separate asset requests are independent. There is no root-resolution cache, though this branch occurs only when the resource path resolves to a different location outside lexical roots.",
+        "CacheBehavior": "Neither resolved resources nor resolved roots are cached. Every request through such a link repeats root resolution, including ETag revalidation.",
+        "MechanismConfidence": "High: branch conditions and Promise.all over filtered roots are explicit.",
+        "MagnitudeUncertainty": "Linked roots/resources are less common than ordinary assets, and R is usually small; exact impact is therefore lower-confidence in prevalence, not in mechanism.",
+        "Verdict": "No separate finding: this work supports the intended security behavior and is less common, while the submitted finding targets the avoidable common-path ancestor fan-out."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and traced desktop, cached, remote, and linked-resource paths. One high-confidence regression was submitted: every ordinary webview asset now incurs a realpath boundary plus per-path-component stat fan-out before reading, repeated on cache revalidation and burst across concurrent resources. No concrete shipped-regression fix was present, so no regression-fix record was filed."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-04T16:21:38.350551588Z",
+    "CompletedAt": "2026-11-04T16:23:35.38259369Z",
+    "WallClockMilliseconds": 117032,
+    "ModelCalls": 11,
+    "InputTokens": 383042,
+    "OutputTokens": 6877,
+    "TotalTokens": 389919,
+    "ReasoningTokens": 2335,
+    "CacheReadTokens": 328860,
+    "CacheWriteTokens": 54149,
+    "APIDurationMilliseconds": 80364,
+    "ToolCalls": 53,
+    "NanoAIUnits": 53996100000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 328860,
+      "cache_write": 54149,
+      "input": 33,
+      "output": 6877
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

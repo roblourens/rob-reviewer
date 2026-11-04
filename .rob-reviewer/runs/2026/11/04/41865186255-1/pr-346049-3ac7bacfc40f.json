@@ -1,0 +1,249 @@
+{
+  "PullRequest": {
+    "Number": 346049,
+    "Title": "build: remove the install-state fast path and `install-fast`",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n`pnpm install` becomes the one command to install dependencies, and it does the same work on every run. This removes `pnpm run install-fast` and the install-state file in `node_modules` (`.postinstall-state` and `.postinstall-state-contents`) with everything that used it. A follow-up to the pnpm migration (#344791).\n\n## What changes\n\n**`build/npm/preinstall.ts`** no longer exits early when the state hash matches. It always:\n- runs the Visual Studio check (Windows);\n- installs `build/npm/gyp`;\n- installs the Electron and Node.js headers;\n- overlays the custom headers.\n\n**`build/npm/nodeGypHeaders.ts`** passes `--ensure` to `node-gyp install` (first commit). Without it, node-gyp 11.2.0 downloads the headers on every run. With it, node-gyp skips versions whose headers are already cached (it compares `installVersion`) and still downloads a new version. This makes the preinstall about 0.4 s instead of about 2.3 s.\n\n**`build/npm/postinstall.ts`** always installs the separate install roots (`build`, `remote`, `remote/web`, `extensions/copilot`, the distro roots). Each takes pnpm's own repeat-install check (\"Already up to date\", 0.01–0.2 s each). It also:\n- no longer writes the state files;\n- deletes leftover ones on every run. Release branches still have the fast path and use the same path (`node_modules/.postinstall-state` on `release/1.145`), so a stale file could make them skip an install after switching back from `main`.\n\n**Removed:**\n- `build/npm/installStateHash.ts` and its test;\n- `build/npm/fast-install.ts` and the `install-fast` script;\n- the `VSCODE_FORCE_INSTALL` variable.\n\n**`electronTypes.ts`, `postinstall.ts` and `cloudSandboxSetup.ts`** compute the repository root themselves. The distro's `electronTypes.ts` mixins already do (microsoft/vscode-distro#1483, picked up in #346037).\n\n**`build/lib/test/cloudSandbox.test.ts`:**\n- The fake `isUpToDate() → true` module and the `install-fast` cases are gone.\n- Every install now expects `headers`.\n- The \"cold install\" check now asserts what pnpm does: it runs the root `preinstall`, which installs `build/npm/gyp`, before the install scripts of dependencies, so the cold install succeeds. The old assertion that it fails held under npm, which ran the root `preinstall` after dependencies (#339983), and later only because the fake fast path made the preinstall exit early.\n- The Windows part sets `vs2026_install` to an existing folder, because the preinstall now reaches the Visual Studio check.\n\n**Docs and comments:**\n- `.github/copilot-instructions.md` now tells agents to run `pnpm install`;\n- the smoke-test notes, `workspaceConfig.ts`, and the comments that pointed at `installStateHash.ts`.\n\n## Why\n\n- **The cost is small.** An up-to-date install now runs everything in about 0.7 s more than with the fast path (numbers below).\n- **The hash missed inputs:**\n  - `build/npm/gyp`'s manifest and lockfile;\n  - the custom header overlays;\n  - the install scripts themselves.\n- **A repeat install could undo the postinstall's fix-ups.** pnpm relinks packages while the postinstall skipped its work; that is how the `@parcel/watcher` prebuild came back (fixed differently in #345583).\n- **A native-target change alone never rebuilt anything.** pnpm reports \"Already up to date\" either way. With `--ensure`, the preinstall still installs the headers for a new target version.\n- **CI doesn't use the fast path.** No job runs `install-fast` or relies on the state file. Every install runs on a clean checkout or a cache miss, and the cache keys don't hash the install scripts, so no cache rotates.\n\n## How to test\n\nmacOS (Apple M4 Pro), Node.js 24.22.1, pnpm 12.16.0.\n\n- `cd build \u0026\u0026 node --test lib/test/cloudSandbox.test.ts lib/test/nodeGypHeaders.test.ts lib/test/nodeModulesCacheKeys.test.ts`: 38 passed, 1 skipped (Linux only).\n- `cd build \u0026\u0026 pnpm test`: 1358 passed, 1 failed, 1 skipped. The failure is `next/test/resources.test.ts` (\"preserves ESM exports…\", a `/var` vs `/private/var` path on macOS) and fails the same way on `main`.\n- `cd build \u0026\u0026 pnpm run typecheck`: passes.\n- `pnpm run eslint` on the 11 changed TypeScript files: clean. Hygiene ran in the pre-commit hook.\n- **Timing of an up-to-date `pnpm install`** (6 rounds, alternating between a `main` worktree and this branch; the machine was under load):\n\n  | | Wall time (median) | CPU time (median) |\n  |---|---|---|\n  | `main` (fast path) | 1.75 s | 2.73 s |\n  | This branch | 2.46 s | 3.04 s |\n\n  On a quieter machine, 5 runs on this branch alone gave a median of 2.46 s (`pnpm install`) and 2.39 s (`--frozen-lockfile`).\n- **Scenarios on this branch:**\n  - The first install deletes the old `.postinstall-state*` files.\n  - Deleting `build/npm/gyp/node_modules`: the next install restores it.\n  - Deleting the Electron 43.8.6 header cache: the next install downloads it and overlays the custom headers again.\n  - `pnpm install` in `extensions/git` runs the root preinstall and postinstall.\n  - `pnpm install --offline` works.\n  - After repeated installs, `@parcel/watcher` loads `build/Release/watcher.node` from the root and from `remote`, and no `@parcel/watcher-*` prebuild exists.\n- **Not measured:** Windows, where every extra `pnpm`/`node` spawn goes through a `cmd` shim; my estimate is +1 to 3 s per install. Also not tested: Linux, and a checkout with distro roots.\n\nNo pipelines were queued. No pipeline YAML changes.\n\n## For review\n\n- **vscode-extras** (`.vscode/extensions/vscode-extras/src/npmUpToDateFeature.ts`) is left untouched, as agreed (out of scope). Its \"node_modules is stale\" status bar item runs `build/npm/installStateHash.ts` and reads the state contents file, and its button runs `node build/npm/fast-install.ts --force`. After this PR it logs an error on activation and stays hidden; nothing else breaks. It should be re-based on pnpm's own record (`node_modules/.pnpm/lock.yaml` vs `pnpm-lock.yaml` in each install root) or removed later.\n- **Rebased onto #345839** (native-build targets in `package.json`). `installStateHash.ts` and its test are deleted, so its `nativeBuild` additions go with them. `preinstall.ts` keeps #345839's `readNativeBuildConfig`-based `getHeaderInfo`, and `cloudSandboxSetup.ts` keeps its fingerprint. The Cloud Sandbox test uses #345839's `remote/package.json` fixture.\n  - On the new base, the first `pnpm install` re-linked `build` and `remote` against their updated lockfiles; the unchanged roots reported \"Already up to date\". No state file was involved.\n- **Cloud Sandboxes** re-run their one-time setup after this lands, because the setup fingerprint includes `preinstall.ts`.\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346049",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6e35f5ceffa04ac728a0fb3a0dd6fb9cdb4ff100",
+    "HeadRef": "lszomoru/deprecate-install-fast",
+    "HeadSHA": "3ac7bacfc40fe82f775701782e27b8d2e3d59eb5",
+    "CreatedAt": "2026-11-04T15:27:39Z",
+    "UpdatedAt": "2026-11-04T16:21:11Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-35F850D968CB",
+      "Focus": "performance-review",
+      "Path": "build/npm/postinstall.ts",
+      "Side": "LEFT",
+      "Line": 210,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The removed return and the unchanged loop/call path directly establish the frequency change. `dirs.ts` fixes the effective cardinality at four normal roots plus three optional distro roots, and `postinstall.ts` shows that build, remote, Copilot, and distro remote installs are serialized before the remaining roots run with bounded concurrency. The exact duration varies by platform and pnpm cache state, but the PR's own alternating warm-run timing corroborates a median increase from 1.75 s to 2.46 s.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceResource": "Four to seven pnpm subprocesses plus their lockfile and node_modules filesystem work.",
+      "PerformanceScaling": "Cost grows linearly with the number of separate/distro install roots and repeats on every warm root install: four child calls in a normal checkout and seven with distro roots; three or four of them execute serially.",
+      "PerformanceOutcome": "Increased warm-install latency from extra subprocess startup and per-root dependency-state scans on the command's critical path.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "When the complete saved state matched, postinstall performed the already-required Electron typings check and git configuration, then returned without spawning any child pnpm installs.",
+      "ChangedBehavior": "An unchanged root install now launches one child pnpm install for every separate install root instead of returning before those calls. The default checkout launches four child installs; a distro checkout launches seven.",
+      "CausalDiffEvidence": "Deleting the `if (!process.env['VSCODE_FORCE_INSTALL'] \u0026\u0026 isUpToDate())` return at base line 210 makes every invocation fall through to the loop over `separateRoots`/`distroRoots` and call `pnpmInstallAsync` even when the saved install state previously matched.",
+      "Title": "Skip unchanged install roots before spawning pnpm",
+      "Impact": "Every no-op `pnpm install` now blocks on at least four extra pnpm subprocesses and their filesystem scans, increasing repeat-install latency in the common developer workflow; platform process-launch overhead amplifies the delay on Windows.",
+      "Evidence": "`pnpm-workspace.yaml` disables optimistic repeat install for the repository root, so this postinstall runs on every root `pnpm install`. Before the diff, a matching state returned at line 210; after its deletion, lines 220-254 enqueue `pnpm install` subprocesses for `build`, `remote`, `remote/web`, and `extensions/copilot` (plus three distro roots when present). Three default tasks are awaited serially, and the remaining task still requires a separate process and lock/module-state scan. Pnpm reporting \"Already up to date\" only avoids relinking inside each child; it does not avoid process startup and per-root checks.",
+      "Recommendation": "Keep required relink fix-ups unconditional, but restore a correctness-complete pre-spawn freshness check per install root (for example, compare that root's lock/install state and all script/native inputs) so only stale roots launch pnpm; alternatively coalesce the checks without starting one process per unchanged root."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Developer runs a no-op `pnpm install`, including from a workspace member.",
+        "CriticalPath": "The root install cannot complete until preinstall runs the gyp pnpm install and up to two sequential node-gyp header checks, then postinstall completes the child-root installs, git configuration, and links. None of the newly unconditional child processes is off the critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/preinstall.ts:114",
+            "Operation": "Run `pnpm install --frozen-lockfile` in build/npm/gyp.",
+            "Cardinality": "One child pnpm process per warm root install.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A matching saved state returned before this subprocess.",
+            "CriticalPathEffect": "Blocks preinstall before the root dependency operation proceeds."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/preinstall.ts:127-133 via build/npm/nodeGypHeaders.ts:59",
+            "Operation": "Run node-gyp header installation/checks.",
+            "Cardinality": "Up to two sequential processes per warm install, one each for the root and remote native targets.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A matching saved state launched neither process; stale installs ran them without `--ensure`.",
+            "CriticalPathEffect": "Each process must inspect the node-gyp cache before preinstall completes; network/download work occurs only on a cache miss because the diff adds `--ensure`."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/postinstall.ts:220-254",
+            "Operation": "Run pnpm in every separate and distro install root.",
+            "Cardinality": "Four child pnpm processes normally and seven when distro roots exist.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A matching saved state returned before all child-root installs.",
+            "CriticalPathEffect": "All must complete before postinstall and the outer install return; three default processes are serialized."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/postinstall.ts:256-257",
+            "Operation": "Set repository git configuration.",
+            "Cardinality": "Two commands per install.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two commands ran on both warm and stale installs.",
+            "CriticalPathEffect": "Synchronous and critical-path, but unchanged by the diff because the old fast path also ran them."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/npm/postinstall.ts:208 via build/npm/electronTypes.ts",
+            "Operation": "Ensure cached Electron typings.",
+            "Cardinality": "At most one Electron types download on a checksum/cache miss.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical cache check and possible download.",
+            "CriticalPathEffect": "Awaited at the start of postinstall; unchanged by the removed gate because it already ran before the old check."
+          }
+        ],
+        "ScalingInput": "Number of repeat install invocations and effective install-root cardinality: four roots normally, seven with distro roots.",
+        "EffectiveConcurrency": "The preinstall boundaries are sequential. In postinstall, build, remote, and extensions/copilot execute serially; remote/web is then the only default parallel task. With distro roots, four native tasks are serial and three JS-only roots run with a limiter of at most 8.",
+        "CacheBehavior": "Previously a matching `.postinstall-state` skipped preinstall and the child-root portion of postinstall. The diff removes that warm fast path. Child pnpm invocations retain their own warm checks, and node-gyp `--ensure` avoids downloading cached header versions, but those checks happen only after the subprocesses start.",
+        "MechanismConfidence": "High: the deleted returns, fixed root lists, subprocess implementations, and scheduler directly prove the warm-path fan-out.",
+        "MagnitudeUncertainty": "The exact delay varies by OS and pnpm/filesystem cache warmth. The fixed subprocess cardinality and serialization are certain; the PR's reported warm benchmark indicates about 0.7 seconds median on macOS, while Windows magnitude is not independently measured.",
+        "Verdict": "Reportable regression: unchanged installs now synchronously fan out to multiple child package-manager processes instead of returning before them."
+      },
+      {
+        "Scenario": "Cold checkout or dependency/native-target change requires a real install.",
+        "CriticalPath": "Header preparation, root dependency installation, all separate-root installs, and any required downloads/rebuilds are on the install critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/preinstall.ts:114-133",
+            "Operation": "Install node-gyp and prepare runtime headers.",
+            "Cardinality": "One gyp pnpm process and up to two node-gyp processes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same processes ran when the saved state was absent/stale; node-gyp lacked `--ensure`.",
+            "CriticalPathEffect": "Required before dependency scripts can compile native modules."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/npm/nodeGypHeaders.ts:59",
+            "Operation": "Fetch Electron/Node headers.",
+            "Cardinality": "Zero to two downloads, depending on whether each target version exists in node-gyp's shared cache.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old invocation did not pass `--ensure`; the changed invocation bounds downloads to uncached versions.",
+            "CriticalPathEffect": "A miss blocks preinstall while headers download and unpack."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/postinstall.ts:220-254",
+            "Operation": "Install all separate and distro roots.",
+            "Cardinality": "Four to seven child pnpm installs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The old stale/cold path performed the same fan-out.",
+            "CriticalPathEffect": "Required to materialize each separate root before the outer install succeeds."
+          }
+        ],
+        "ScalingInput": "Number of missing packages, native targets, and separate/distro roots.",
+        "EffectiveConcurrency": "Header operations and native-root installs are sequential; JS-only roots use the existing bounded worker pool. No new aggregate concurrency is introduced.",
+        "CacheBehavior": "On a cold checkout or changed dependency inputs, the old state gate already missed, so the main pre/postinstall work and child-root cardinality are unchanged. The new node-gyp `--ensure` uses cached headers when available; missing target versions still download. Pnpm stores and root-level install state may be cold.",
+        "MechanismConfidence": "High: a cold/stale old state necessarily bypassed the deleted guards and reached the same work.",
+        "MagnitudeUncertainty": "Native rebuild and download duration depends on store/header cache misses, but this uncertainty does not create a diff-caused regression on the cold path.",
+        "Verdict": "No regression on this scenario; `--ensure` improves header-cache behavior, while removed state writes are minor savings."
+      },
+      {
+        "Scenario": "Cloud Sandbox startup prepares prerequisites and then runs pnpm install.",
+        "CriticalPath": "On a setup-fingerprint miss, sandbox preparation and one explicit preinstall must finish before the user install starts; that install then performs its own preinstall. On a fingerprint hit only the user install's preinstall remains.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/cloudSandboxSetup.ts:111-115",
+            "Operation": "Execute build/npm/preinstall.ts with the sandbox Node.",
+            "Cardinality": "One explicit preinstall process per setup-fingerprint miss.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The setup already forced this preinstall on a fingerprint miss.",
+            "CriticalPathEffect": "Blocks sandbox readiness before pnpm can run."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/preinstall.ts:49",
+            "Operation": "Run header preparation without the former saved-state early exit.",
+            "Cardinality": "One additional lifecycle preinstall for the following root install; its internal cardinality is one gyp pnpm plus up to two node-gyp checks.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A matching install-state file could skip this second preparation; a truly cold checkout without state already ran it.",
+            "CriticalPathEffect": "Blocks the install after setup; warm header caches reduce it to process/cache checks."
+          }
+        ],
+        "ScalingInput": "Number of sandbox setup fingerprint changes and install invocations.",
+        "EffectiveConcurrency": "A cross-checkout lock serializes setup; header/gyp operations are sequential. There is no coalescing between setup's explicit preinstall and the install lifecycle.",
+        "CacheBehavior": "Cloud setup is guarded by `.build/cloud-sandbox-setup`, a fingerprint covering Node/pnpm versions, preinstall, gyp inputs, native targets, and custom headers. A warm matching fingerprint skips setup preinstall, but the subsequent root install now always performs its own preinstall because the install-state gate is gone.",
+        "MechanismConfidence": "High for the call path and lack of coalescing; moderate for prevalence of a fingerprint miss combined with a formerly matching install state.",
+        "MagnitudeUncertainty": "How often sandbox setup fingerprints miss while the old install-state still matched is uncertain, and warm header checks are bounded, so this does not justify a separate finding beyond the general warm-install regression.",
+        "Verdict": "The same removed fast path can duplicate bounded warm checks, but this is covered by the reported repeated-install fan-out rather than a separate issue."
+      },
+      {
+        "Scenario": "Alpine/distro product build installs remote dependencies inside a container.",
+        "CriticalPath": "The root install, remote-container Docker work, tool installation, remote pnpm install, and ownership restoration are all critical-path steps.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "build/npm/postinstall.ts:83-99",
+            "Operation": "Start the build container, globally install node-gyp-build/pnpm, install remote dependencies, and restore ownership.",
+            "Cardinality": "For an Alpine build, one Docker run for `remote`; arm64 may add one QEMU Docker run, followed by up to two ownership commands.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Cold/cache-miss CI installs already missed the old state check and executed this branch.",
+            "CriticalPathEffect": "Blocks the serial remote-root install."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/npm/postinstall.ts:94",
+            "Operation": "Fetch global tooling or missing remote packages inside the container.",
+            "Cardinality": "Network access as needed by global npm installation and pnpm store misses.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same network-capable command ran on the old CI cold path.",
+            "CriticalPathEffect": "Downloads block the container command."
+          }
+        ],
+        "ScalingInput": "CI retries/cache state, architecture, and package/store misses.",
+        "EffectiveConcurrency": "The remote container branch is one of the serial native tasks. Other native roots remain serial and JS roots are bounded by the existing pool.",
+        "CacheBehavior": "CI node_modules jobs generally run on clean checkout/cache-miss paths, so the former repository state file did not provide a warm shortcut. Pnpm/store and node-gyp caches may still be warm. Alpine remote installation uses its mounted pnpm store.",
+        "MechanismConfidence": "High for boundary behavior; low prevalence confidence for a matching-state warm Alpine run.",
+        "MagnitudeUncertainty": "A hypothetical cached CI checkout retaining a matching old state would expose the warm regression and make this branch expensive, but repository pipeline evidence shows these jobs as install/cache-build paths rather than established no-op repeats.",
+        "Verdict": "No separate finding: the expensive boundary is real but pre-existing on the demonstrated cold CI path; only a warm matching-state invocation would be newly exposed."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 18 changed files. Submitted one medium-confidence/high-mechanism-confidence finding for the newly unconditional warm-install subprocess fan-out. Cold installs, CI container installs, node-gyp cache behavior, Cloud Sandbox setup, filesystem cleanup, and cache/concurrency semantics were separately traced; no other diff-caused performance issue or qualifying shipped-regression fix was established."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-04T16:27:08.476200895Z",
+    "CompletedAt": "2026-11-04T16:29:26.800158336Z",
+    "WallClockMilliseconds": 138323,
+    "ModelCalls": 7,
+    "InputTokens": 233958,
+    "OutputTokens": 9678,
+    "TotalTokens": 243636,
+    "ReasoningTokens": 5174,
+    "CacheReadTokens": 178824,
+    "CacheWriteTokens": 55113,
+    "APIDurationMilliseconds": 112739,
+    "ToolCalls": 42,
+    "NanoAIUnits": 54073860000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 178824,
+      "cache_write": 55113,
+      "input": 21,
+      "output": 9678
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
