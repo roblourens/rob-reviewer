@@ -1,0 +1,176 @@
+{
+  "PullRequest": {
+    "Number": 346297,
+    "Title": "chatEditing: dispose entries created after the session was disposed",
+    "Body": "Based on #346261 (lint rule `local/code-no-register-after-await`). Review only the top commit.\n\n`ChatEditingSession._getOrCreateModifiedFileEntry` awaits the creation of a new entry. If the session is disposed during that await, `dispose()` never sees the entry, so it leaked. The entry is now disposed and a `CancellationError` is thrown.\n\nThrowing alone would cause a hang. In two queued callers, the throw would skip the promise that waiting code depends on:\n- `startExternalEdits` would never complete `acquiredLock`, so `await Promise.all(acquiredLockPromises)` would never resolve.\n- `startStreamingEdits` would never complete `startPromise`, so the edit sequencer and the baseline lock would wait forever.\n\nBoth now complete their promise in `finally`, and ignore the cancellation only when the session is disposed. The file is removed from the register-after-await baseline.\n\nOriginally by @alexdima; the hang was found by Copilot's review of #346261.\n\n**Validation**\n- `scripts/test.bat --run src/vs/workbench/contrib/chat/test/browser/chatEditing/chatEditingService.test.ts`: 12 passing\n- `pnpm run eslint` on the changed file: clean\n- No new test: the race requires disposal during entry creation.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346297",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "hediet",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "agents/formal-verification-integration",
+    "BaseSHA": "22e6ec1695ef34e664b9ded6f68875b14f0869eb",
+    "HeadRef": "hediet/chat-editing-dispose-during-entry",
+    "HeadSHA": "d0b1b90dcbae2d83fd4b6b9a33d34392b009c8c9",
+    "CreatedAt": "2026-11-05T17:04:53Z",
+    "UpdatedAt": "2026-11-05T18:15:36Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingSession.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 1197,
+      "BasePath": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingSession.ts",
+      "BaseLine": 1175,
+      "IntroducingPath": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingSession.ts",
+      "IntroducingCommit": "15dba1928a0799a0f465415b344931e98550d0eb",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "memory",
+      "Mechanism": "Disposing a chat editing session while asynchronous text/notebook entry creation was in flight lost the only cleanup owner for the completed entry, retaining model references, models, listeners/watchers, autoruns, and notebook snapshot resources beyond the session lifetime.",
+      "Symptom": "Repeatedly closing or replacing editing sessions while file/notebook model resolution is in flight can accumulate orphaned editing entries and their heavyweight model/listener graphs, increasing retained memory and background listener work.",
+      "FixedBehavior": "After asynchronous entry creation returns, the added disposed-store guard immediately disposes the newly created entry and throws cancellation. The changed streaming/external queue handlers complete their deferred start/acquisition promises in finally blocks, so this cleanup cancellation also cannot strand per-resource sequencers or baseline locks.",
+      "Evidence": "In the base revision, _getOrCreateModifiedFileEntry awaited _createModifiedFileEntry at line 1175 and then unconditionally adopted the returned entry. ChatEditingSession.dispose() only disposes entries already present in _entriesObs before disposing its store. If disposal occurs during that await, the newly returned entry was never seen by dispose(). Text entries own a text-model reference, an original model, a file watcher, global file-change listener, autoruns, and diff services; notebook entries own two resolved notebook-model references and registered snapshot resources. The changed post-await guard detects that ownership has already ended and disposes the orphan before it can escape.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "concurrency-burst",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Streaming chat edits begin for a text file or notebook, including disposal while entry creation is in flight.",
+        "CriticalPath": "A chat response change calls startStreamingEdits; the per-resource streaming lock waits for session readiness and _acceptStreamingEditsStart. On a cold resource, model entry creation must finish before startPromise releases the edit sequencer and baseline-creation lock. The added disposed-store check is a constant-time post-await guard; its disposal work runs only after session ownership has already ended. The new finally completion removes an indefinite wait on cancellation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingSession.ts:_createModifiedFileEntry",
+            "Operation": "Resolve the modified text model through ITextModelService.createModelReference on a cold text resource.",
+            "Cardinality": "At most once for the cold entry creation reached by a serialized resource start; zero for an existing entry.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cold model reference was resolved before the diff; if the session was disposed during resolution, the returned entry could outlive its owner.",
+            "CriticalPathEffect": "Cold model resolution blocks startPromise and therefore streamed edit application for that resource."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingModifiedNotebookEntry.ts:ChatEditingModifiedNotebookEntry.create",
+            "Operation": "Resolve notebook models, serialize a notebook snapshot to a buffer, register the snapshot resource, and resolve the original snapshot model.",
+            "Cardinality": "Once per cold notebook entry; zero for a warm entry.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical notebook creation work occurred before the diff, but completed entries could leak if disposal raced creation.",
+            "CriticalPathEffect": "These operations must finish before notebook streaming edits can begin."
+          }
+        ],
+        "ScalingInput": "One start path per streamed edit group/resource. Existing entries collapse repeated work to an in-memory lookup; cold work scales with the number of distinct resources. Same-resource work is serialized, while distinct resources may create entries concurrently.",
+        "EffectiveConcurrency": "SequencerByKey serializes starts for each URI but has no cross-resource limiter, so distinct resources can resolve concurrently. Each IStreamingEdits instance serializes edit chunks through ThrottledSequencer. The diff does not increase concurrency; on disposal it lets canceled queues terminate instead of remaining pending.",
+        "CacheBehavior": "_entriesObs is the positive cache for created entries, and _initialFileContents preserves baselines. Warm resources perform no model creation. Cold missing resources may be created when NotExistBehavior.Create is used; abort misses are not negatively cached, unchanged by the diff. Per-resource sequencing coalesces overlapping starts operationally.",
+        "MechanismConfidence": "High: the per-key queue, deferred promises, post-await ownership check, and entry-owned model resources are explicit in the traced code.",
+        "MagnitudeUncertainty": "The frequency of users closing a session during model resolution and model sizes are workload-dependent; the cancellation and ownership race itself is directly established.",
+        "Verdict": "No performance regression. The diff bounds retained resources after disposal and ensures cancellation cannot leave the streaming and baseline queues pending."
+      },
+      {
+        "Scenario": "An extension-host external-edit operation acquires snapshots and locks for a batch of resources.",
+        "CriticalPath": "The main-thread progress handler awaits startExternalEdits. That method queues one task per resource, then waits for all acquiredLock promises before creating the operation snapshot. For each resource, optional content reads, cold entry resolution, streaming-start setup, save/snapshot work, and tracker reset are on this acquisition path. The changed finally guarantees each acquisition promise completes on success, failure, or disposal cancellation; it does not add boundary work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadChatAgents2.ts:$handleProgressChunk",
+            "Operation": "Receive and handle an externalEdits progress chunk from the extension-host-facing main-thread agent bridge.",
+            "Cardinality": "One startExternalEdits call per externalEdits start progress item, carrying the whole resource batch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same progress IPC and await existed before the diff.",
+            "CriticalPathEffect": "The IPC handler awaits all resource acquisitions before acknowledging the progress chunk."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingSession.ts:startExternalEdits",
+            "Operation": "Read each supplied contentFor URI as the before-content snapshot.",
+            "Cardinality": "One read for each resource with a contentFor URI; zero otherwise.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same per-resource read occurred before the diff; the code is only wrapped in cancellation-safe try/finally.",
+            "CriticalPathEffect": "Each read blocks that resource's lock acquisition, and the batch waits for all acquisitions."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingSession.ts:startExternalEdits/_createModifiedFileEntry",
+            "Operation": "Resolve a cold file/notebook entry and save an existing entry when no contentFor snapshot is supplied.",
+            "Cardinality": "Cold model resolution is at most once per effective resource; save is once per successfully resolved resource lacking contentFor.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Boundary count and placement are unchanged. Previously a disposal race could strand ownership or deferred completion; the diff only guarantees cleanup and completion.",
+            "CriticalPathEffect": "These operations are part of lock acquisition and delay completion of startExternalEdits."
+          }
+        ],
+        "ScalingInput": "Work scales with the effective resource count in the externalEdits progress item. Each resource has one queued acquisition; optional contentFor adds one read per corresponding resource. Existing entries avoid cold model creation. Duplicate URIs serialize under one key rather than increasing parallelism.",
+        "EffectiveConcurrency": "Different resource keys execute concurrently through SequencerByKey; duplicate/same-resource operations serialize. Promise.all waits for the slowest resource acquisition. There is no global limiter, but the diff neither adds resources nor changes this cross-resource concurrency.",
+        "CacheBehavior": "Existing _entriesObs entries are reused. Cold resources resolve once in their per-key queue. contentFor reads and entry saves are not cached, matching pre-diff behavior. Cancellation after session disposal now terminates acquisition rather than retaining the newly created entry.",
+        "MechanismConfidence": "High: caller awaiting, loop cardinality, per-key sequencing, file reads/saves, and finally completion are directly visible.",
+        "MagnitudeUncertainty": "Batch sizes and provider latency vary, but the exact per-resource cardinality and all-resources acquisition barrier are explicit.",
+        "Verdict": "No diff-caused fan-out or concurrency regression. Boundary cardinality is unchanged, and the new finally prevents a disposed resource from indefinitely blocking the batch acquisition barrier."
+      },
+      {
+        "Scenario": "A chat editing session is disposed while asynchronous text or notebook entry creation is unresolved.",
+        "CriticalPath": "Session disposal synchronously disposes entries already published in _entriesObs and its DisposableStore. In-flight creation still finishes its existing model-resolution/serialization work; the new post-await guard then disposes that orphan and throws cancellation. Queue handlers swallow only this disposal cancellation and release their deferred gates. Cleanup is on the shutdown path, not a normal edit-start critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingSession.ts:_getOrCreateModifiedFileEntry",
+            "Operation": "Complete the already-started text/notebook model resolution after session disposal.",
+            "Cardinality": "One completion per resource whose entry creation was already in flight at disposal.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The asynchronous creation also completed after disposal, but the returned entry was not owned by dispose() and retained model references, listeners/watchers, and notebook snapshot resources.",
+            "CriticalPathEffect": "The boundary was initiated before disposal and is not introduced or repeated by the guard; cleanup occurs when it returns."
+          }
+        ],
+        "ScalingInput": "Potential work and retained state scale with the number of distinct entry creations simultaneously in flight when the session is disposed. Each completed orphan is now disposed exactly once.",
+        "EffectiveConcurrency": "Different resource keys can have creations in flight concurrently. Added checks do not launch more work; each continuation independently observes the disposed store and tears down its own entry.",
+        "CacheBehavior": "Published entries are disposed by the normal _entriesObs ownership path. In-flight entries have not reached that cache, so the new guard supplies the missing ownership handoff. No new cache or retained key is introduced.",
+        "MechanismConfidence": "Very high: disposal order, await boundary, disposed-store guard, explicit entry disposal, and owned resource graphs are directly traced. Base blame identified the introducing commit for the old mechanism.",
+        "MagnitudeUncertainty": "Race frequency and retained model size vary; repeated session replacement during slow model resolution is the realistic worst case.",
+        "Verdict": "This is a concrete cleanup-lifecycle regression fix, recorded through report_regression_fix. It reduces retained memory/background listener work and removes cancellation-induced queue hangs; it introduces no actionable performance regression."
+      }
+    ],
+    "Summary": "Completed the performance pass over the full two-file diff. Traced streaming edits, batched external edits, entry creation, session disposal, per-key sequencing, caches, IPC, filesystem/model resolution, and notebook serialization. No reportable performance regression was introduced. The PR fixes a verified cleanup-lifecycle leak from an asynchronous ownership race, and that regression fix was recorded with base blame."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-05T22:46:46.914600097Z",
+    "CompletedAt": "2026-11-05T22:49:28.809936305Z",
+    "WallClockMilliseconds": 161895,
+    "ModelCalls": 11,
+    "InputTokens": 331230,
+    "OutputTokens": 6779,
+    "TotalTokens": 338009,
+    "ReasoningTokens": 2645,
+    "CacheReadTokens": 282692,
+    "CacheWriteTokens": 48505,
+    "APIDurationMilliseconds": 87999,
+    "ToolCalls": 42,
+    "NanoAIUnits": 49131380000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 282692,
+      "cache_write": 48505,
+      "input": 33,
+      "output": 6779
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

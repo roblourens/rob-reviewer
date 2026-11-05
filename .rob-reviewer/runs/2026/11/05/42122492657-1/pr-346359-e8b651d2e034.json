@@ -1,0 +1,119 @@
+{
+  "PullRequest": {
+    "Number": 346359,
+    "Title": "Sessions: dispose the Inbox's new-session composer before its scoped services",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n## Symptom\n\nClosing the Agents window's Inbox logged `Error: InstantiationService has been disposed`, thrown from `ChatWidget.parseInputForEditor` as the Inbox's new-session composer went away. It happened when the composer's input was empty or held a generated prompt option.\n\n## Root cause\n\nAs the composer is disposed, its prompt options clear its input (`NewSessionPromptOptionsPresenter.dispose` → `model.setValue('')`), and its chat widget then parses the input with the instantiation service it was created with. That service was already disposed, because two scopes above the composer registered their services before what they created with them, and disposing an instantiation service also disposes its children:\n\n1. `WindowCanvasService.getPresentation` added the canvas's scoped context key service and child instantiation service to the canvas entry's store before the canvas content (the Inbox view). Closing the Inbox disposed that child, and with it every service below it, before the Inbox view was disposed.\n2. `InboxNotificationsView.createNewSessionComposer` did the same inside the Inbox: the composer's scope was registered before the composer.\n\n## Fix\n\nBoth now keep the services of the scope in their own store, disposed after what they created: the canvas content's store is added before its scope's, and the Inbox's composer scope lives in `newSessionScopedServices`, registered after `newSessionDisposables`. This is the same pattern #346217 used for `SessionView`.\n\nOther places register a scope before what it creates, but nothing there is known to use the scope while it is disposed, so they are left as they are: the Inbox's question carousel and chat exchange list, `SharedChatInputComposer`'s chat widget, and `ChatView`'s chat widget.\n\n## Triage\n\nThe same error was reported from a session pane leaving the grid while it showed a composer, and from the main window's draft composer as its session was created. Both are already fixed on `main` by #346217. A throwaway test whose composer used its scope while it was being disposed reported no error for either path.\n\n## Tests\n\n- `windowCanvasService.test.ts`: \"closing a canvas disposes its content, which may still create with the services of its scope as it goes away, before those services\".\n- `inboxNotificationsView.test.ts`: \"disposes its new-session composer, whose input may clear as it goes away, while the services of the composer's scope are still there: they dispose after it\".\n\n## Validation\n\n| Check | Result |\n| --- | --- |\n| `./scripts/test.sh --runGlob \"vs/sessions/services/canvas/test/**/*.test.js\"` | Passed: 27 passing, 0 failing |\n| `./scripts/test.sh --run src/vs/sessions/contrib/inboxOne/test/browser/inboxNotificationsView.test.ts --run src/vs/sessions/test/browser/sessionView.test.ts` | Passed: 214 passing, 0 failing |\n| Negative check: the canvas test with the canvas fix reverted | Failed as expected: `[\"dispose services\", \"dispose canvas\"]` |\n| Negative check: the Inbox test with the Inbox fix reverted | Failed as expected: `[\"dispose services\", \"dispose composer\"]` |\n| `pnpm run typecheck-client` | Passed |\n| `pnpm run eslint` on the changed files | Passed |\n\nLive verification: passed. Before the fix, closing the Inbox with an empty composer logged the error twice per close. With only the first fix (the Inbox order), it still did, which led to the canvas-level fix. With both fixes (e8b651d2e03), two closes with an empty composer logged no errors, and a control close with typed text logged none either.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346359",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "586f7692634573f535b8654369a248a4d54b137c",
+    "HeadRef": "agents/triage-fix-instantiation-error-composer",
+    "HeadSHA": "e8b651d2e0342dbe7947f033660e51c11d694078",
+    "CreatedAt": "2026-11-05T20:09:23Z",
+    "UpdatedAt": "2026-11-05T22:18:52Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First opening the Inbox new-session composer, followed by subsequent warm opens",
+        "CriticalPath": "On the cold path, ensureNewSessionComposer coalesces callers through composerInitialization, creates one scoped context and child instantiation service, then synchronously creates and attaches one chat view. Warm calls stop at the existing newSessionView check and only update composer mode. The diff only changes which already-owned disposable store receives the two scope objects; it does not add chat-view construction or move it onto a hotter path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One composer and one service scope per InboxNotificationsView lifetime, independent of notification count and repeated openNewSession calls.",
+        "EffectiveConcurrency": "Cold initialization is coalesced by the shared composerInitialization promise; the synchronous newSessionView guard prevents duplicate construction. Warm opens reuse the singleton view.",
+        "CacheBehavior": "newSessionView is the positive singleton state. Cold creation occurs once; warm accesses reuse it. Failures clear composerInitialization for an explicit retry, unchanged by the diff.",
+        "MechanismConfidence": "High: changed lines only redirect two add calls to a second store registered immediately after the composer store, and all usages show no path that clears or recreates the composer during the view lifetime.",
+        "MagnitudeUncertainty": "The chat view may be heavyweight, but its construction frequency and timing are unchanged; the only additional steady allocation is one DisposableStore per Inbox view.",
+        "Verdict": "No reportable regression. The added store is constant-size lifecycle bookkeeping and neither repeats expensive work nor retains the scope beyond the owning view."
+      },
+      {
+        "Scenario": "Creating and opening a window canvas presentation",
+        "CriticalPath": "getPresentation synchronously creates the DOM element, scope, child instantiation service, canvas content, and renders it only when entry.presentation is absent. The diff splits content and scoped services into adjacent stores solely to control later disposal order; all pre-existing UI construction remains on the same cold path.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One presentation and one pair of stores per opened canvas entry, rather than work scaling with rows, messages, or frames.",
+        "EffectiveConcurrency": "Presentation construction is synchronous and guarded by entry.presentation; each canvas entry receives at most one successful presentation. Failed construction synchronously deletes and disposes both new stores before rethrowing.",
+        "CacheBehavior": "entry.presentation is the positive singleton cache. Warm getPresentation calls return it directly. Failed construction leaves no presentation and disposes both temporary stores, allowing a later explicit retry without retained scope state.",
+        "MechanismConfidence": "High: the guard, synchronous construction, and catch cleanup are visible in the changed method, and the entry store owns both stores until closure.",
+        "MagnitudeUncertainty": "Canvas constructors can vary in cost, but the diff neither invokes them more often nor changes their render inputs.",
+        "Verdict": "No reportable regression. One extra constant-sized DisposableStore does not establish meaningful startup, CPU, or memory degradation."
+      },
+      {
+        "Scenario": "Closing an Inbox-backed window canvas with a live new-session composer",
+        "CriticalPath": "Canvas forget removes the element and synchronously disposes entry.store. In insertion order this now disposes canvas content first; Inbox disposal hides the view and disposes its composer before the composer's scoped services, then the canvas-level scoped services dispose. Only after teardown does forget persist the open-canvas set. The reordered service cleanup remains within the same synchronous close operation and is not deferred or leaked.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/sessions/contrib/inboxOne/browser/inboxNotificationsView.ts:655 logViewState",
+            "Operation": "Emit the existing agents/inboxViewState close telemetry event with fixed-size scalar fields while InboxNotificationsView.setVisible(false) runs.",
+            "Cardinality": "One close event per visible Inbox close, plus an existing blur event only when focus timing requires it; independent of notification collection size.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same close/blur telemetry was emitted before the disposal-store reordering.",
+            "CriticalPathEffect": "Called synchronously before super.dispose, but the diff does not add, duplicate, or move this telemetry call."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/sessions/services/canvas/browser/windowCanvasService.ts:433 saveOpenCanvases",
+            "Operation": "Persist the remaining restored canvas ID array through IStorageService.store.",
+            "Cardinality": "One storage call per forgotten canvas, serializing the current set of restored canvas IDs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same storage write occurred once after every canvas forget before this PR.",
+            "CriticalPathEffect": "Runs synchronously after entry.store disposal on the close path; its placement and cardinality are unchanged."
+          }
+        ],
+        "ScalingInput": "Teardown work remains proportional to the pre-existing disposables owned by one composer/canvas. The diff adds two constant-size nested stores and does not multiply work by notification count, repeated closes, or session history.",
+        "EffectiveConcurrency": "Disposal is synchronous and serial in DisposableStore insertion order. Closing one canvas does not launch concurrent service cleanup, subprocesses, IPC bursts, or network work.",
+        "CacheBehavior": "No cache lookup occurs during teardown. The composer and canvas presentation singletons are released once with their owning view/entry; no negative-cache or retry behavior changes.",
+        "MechanismConfidence": "High: DisposableStore uses insertion-ordered Set disposal; both new scope stores are registered immediately after their content stores, catch paths dispose both, and owner teardown disposes the parent store once.",
+        "MagnitudeUncertainty": "Individual chat-view disposables may have varying cost, but they were already disposed on this path. The changed order adds no duplicate disposal and scoped services remain retained only until the immediately following store entry.",
+        "Verdict": "No reportable performance regression. The PR fixes cleanup ordering without increasing lifecycle cardinality, crossing a new expensive boundary, or extending resource lifetime beyond the same synchronous close."
+      }
+    ],
+    "Summary": "Reviewed all four changed files and both lifecycle-order changes. The diff adds constant-size disposable-store separation so content tears down before its scoped services. Cold/warm creation guards, failure cleanup, boundary cardinality, and synchronous close behavior remain unchanged; no actionable diff-introduced performance issue or qualifying performance-regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-05T22:49:32.658116721Z",
+    "CompletedAt": "2026-11-05T22:50:38.928695308Z",
+    "WallClockMilliseconds": 66270,
+    "ModelCalls": 8,
+    "InputTokens": 143766,
+    "OutputTokens": 3863,
+    "TotalTokens": 147629,
+    "ReasoningTokens": 1354,
+    "CacheReadTokens": 117145,
+    "CacheWriteTokens": 26597,
+    "APIDurationMilliseconds": 43677,
+    "ToolCalls": 28,
+    "NanoAIUnits": 25719900000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 117145,
+      "cache_write": 26597,
+      "input": 24,
+      "output": 3863
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
