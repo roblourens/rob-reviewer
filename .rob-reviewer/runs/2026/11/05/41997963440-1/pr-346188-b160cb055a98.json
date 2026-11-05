@@ -1,0 +1,183 @@
+{
+  "PullRequest": {
+    "Number": 346188,
+    "Title": "agentHost: find the Codex platform package next to the real folder of @openai/codex",
+    "Body": "FYI @Giuspepe \n\nThe Codex agent (`codexAgent.ts`) and the saved-chat reader (`codexSavedChatReader.ts`) run the native binary of the platform package `@openai/codex-\u003cplatform\u003e`. They looked for it at `\u003csdkRoot\u003e/node_modules/@openai/codex-\u003cplatform\u003e`. That's where the downloaded SDK and a flat `node_modules` (npm, pnpm's hoisted layout) put it. But it is an optional dependency of `@openai/codex`, so pnpm's isolated layout (a symlinked `node_modules`) only has it next to the real folder of `@openai/codex`, inside `node_modules/.pnpm/@openai+codex@\u003cversion\u003e/node_modules/@openai`. With an SDK root override that points at a source checkout (the `chat.agentHost.codexAgent.sdkRoot` setting / `VSCODE_AGENT_HOST_CODEX_SDK_ROOT`, which the provider integration tests use), the binary was \"not executable\" (ENOENT).\n\nThis is the same fix as #345734 made for the Copilot SDK's platform packages; that PR missed the Codex lookup.\n\n**Changes**\n- **`codexSdk.ts`:** new `resolveCodexBinaryPath(sdkRoot, target, triple)`.\n  - It looks in `\u003csdkRoot\u003e/node_modules/@openai` first, then in the folder that holds the real path of `\u003csdkRoot\u003e/node_modules/@openai/codex`.\n  - It returns the **real path** of the first binary that exists. In pnpm's isolated layout the platform package folder is itself a link to its own folder in the virtual store. Codex's macOS sandbox can't read that link (`file-read-metadata` denied), so its sandboxed file helper, which starts the binary again through the same path, failed with \"sandbox-exec: execvp() … Operation not permitted\" while loading `AGENTS.md`.\n  - If neither folder has the binary, it returns the first path, so error messages stay the same.\n- **`codexAgent.ts` and `codexSavedChatReader.ts`:** use the helper instead of building the path themselves.\n- **Tests (`codexPackagePaths.test.ts`):** three layouts on disk: a flat `node_modules`, pnpm's isolated layout (`@openai/codex` and its platform package both linked into `.pnpm`, as pnpm does), and a missing package.\n\n**No change where the binary already was:** the downloaded SDK and hoisted installs keep resolving to the same path. It is checked first, and it contains no links, so its real path is the same path.\n\n**How to test**\n- `./scripts/test.sh --run src/vs/platform/agentHost/test/node/codex/codexPackagePaths.test.ts --run src/vs/platform/agentHost/test/node/codex/codexSavedChatReader.test.ts --run src/vs/platform/agentHost/test/node/codex/codexAgent.test.ts`: 41 passing. Without the fallback, the new test fails.\n- **Codex provider integration tests** (`./scripts/test-integration.sh --run …/providerIntegration/codex{TurnDiff,Permissions,Sandbox,Customizations}.integrationTest.ts`):\n  - **Hoisted layout (as on `main`):** 40 passing.\n  - **Isolated layout** (the root `pnpm-workspace.yaml` set to `nodeLinker: isolated`, not part of this PR): before this PR all 37 tests that start Codex failed with \"Codex binary not executable … ENOENT\". With it: **40 passing, in two runs**. With the first commit only (no real path), 19–20 tests still failed with the sandbox error.\n- `pnpm run typecheck-client`: passes. ESLint on the changed files: passes.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346188",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d563e1b9809946e8885226ccb0ad841358b002a7",
+    "HeadRef": "lszomoru/codex-platform-package-by-real-path",
+    "HeadSHA": "b160cb055a98c675ce6e25db00412ed6c08269d9",
+    "CreatedAt": "2026-11-05T06:23:59Z",
+    "UpdatedAt": "2026-11-05T08:17:59Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Starting a retained or one-off Codex app-server connection after explicit Codex use",
+        "CriticalPath": "SDK root resolution (including a cold download when necessary) completes first; the new binary resolver then performs filesystem realpath lookups, followed by executable access, proxy startup, temporary-directory creation, process spawn, and the app-server initialization handshake. The added realpath work is on the startup critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentSdkDownloader.ts:_download",
+            "Operation": "Fetch a configured Codex SDK tarball on a cold SDK-cache miss.",
+            "Cardinality": "At most one coalesced download per package/version/target and downloader process; zero with a warm cache or development override.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cold SDK resolution/download occurred before direct binary-path construction.",
+            "CriticalPathEffect": "Blocks a cold connection start, but is unchanged by this diff."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexSdk.ts:resolveCodexBinaryPath",
+            "Operation": "Resolve the real directory of `@openai/codex` and the real native-binary path.",
+            "Cardinality": "Two successful/attempted realpath calls in a flat or missing layout, and three in the isolated pnpm fallback layout where the first binary candidate misses.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The caller constructed the flat binary path without these realpath operations.",
+            "CriticalPathEffect": "Adds two to three local metadata operations before executable validation and process spawn."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_startRawConnection",
+            "Operation": "Validate executable access, create a sandbox temporary directory, and on Linux resolve the launch path.",
+            "Cardinality": "One access and one temporary-directory creation per actual connection start; Linux also performs one realpath. These operations pre-existed.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same access, temporary-directory creation, and Linux realpath occurred against the directly constructed path.",
+            "CriticalPathEffect": "Blocks process launch but is unchanged except that the supplied path is now already canonical."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_startRawConnection",
+            "Operation": "Spawn the Codex app-server.",
+            "Cardinality": "One process per actual retained or transient connection start.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same binary was spawned when present at the flat path.",
+            "CriticalPathEffect": "Process startup is required before Codex actions can proceed and dominates the bounded metadata lookup added here."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexAgent.ts:_startRawConnection",
+            "Operation": "Initialize the spawned app-server over its child-process transport.",
+            "Cardinality": "One initialization handshake per spawned connection, followed by operation-specific requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same initialization handshake followed process spawn.",
+            "CriticalPathEffect": "The handshake remains on the connection-start critical path."
+          }
+        ],
+        "ScalingInput": "Cost scales with actual Codex process starts (initial explicit activation, process-loss restart, or serialized one-off actions), not with messages or concurrent callers. The diff adds a constant two to three filesystem metadata calls per start.",
+        "EffectiveConcurrency": "Concurrent retained-connection callers share `_ensureConnection`'s single starting promise and then reuse the ready process. One-off actions are serialized by `_onDemandConnectionSequencer`. Cold SDK downloads are coalesced by cache-directory key, so the changed lookup is executed once per actual connection start, not once per concurrent caller or chat message.",
+        "CacheBehavior": "The SDK downloader uses a persistent sentinel cache, coalesces cold downloads, and negatively caches failures. The binary path itself is not memoized, but a retained ready connection avoids subsequent resolution; only a genuine restart or serialized one-off connection repeats it. Flat, isolated, and missing layouts are resolved independently on each actual start.",
+        "MechanismConfidence": "High: changed lines directly add the awaited realpath calls, and connection lifecycle code proves coalescing and reuse.",
+        "MagnitudeUncertainty": "Exact realpath latency depends on the local filesystem and development layout, but the added count is fixed and is adjacent to an existing SDK check, process spawn, and IPC handshake.",
+        "Verdict": "No reportable regression. The diff adds bounded metadata work to startup, but it does not fan out with messages or callers and is minor relative to the unchanged subprocess startup; canonicalization is required for the supported isolated layout."
+      },
+      {
+        "Scenario": "Opening or validating a saved Codex chat from native history",
+        "CriticalPath": "Saved-chat metadata/database resolution precedes the provider reader. The reader resolves the installed SDK root, executes the new binary-path realpath lookups, snapshots native history into scratch storage, spawns a one-shot Codex process, reads the thread over IPC, optionally reads rollout metadata, and replays turns. The new realpath calls are on this read critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/codex/codexSavedChatReader.ts:read",
+            "Operation": "Read saved-session metadata and resolve the native thread identifier.",
+            "Cardinality": "One metadata read per requested saved chat, plus host-level saved-chat resolution around the provider read.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same metadata reads selected the native thread before binary-path construction.",
+            "CriticalPathEffect": "Must complete before native history decoding and is unchanged."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexSdk.ts:resolveCodexBinaryPath",
+            "Operation": "Resolve the real `@openai/codex` scope and native executable path.",
+            "Cardinality": "Two realpath attempts in flat/missing layouts or three in isolated pnpm layout per sequenced saved-chat read.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The saved-chat reader directly constructed the flat executable path with no realpath lookup.",
+            "CriticalPathEffect": "Adds a constant local metadata delay before the one-shot native reader starts."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/codex/codexSavedThreadReader.ts:readCodexSavedThreadFromDisk",
+            "Operation": "Validate the executable, discover and snapshot native history, create/remove scratch storage, validate history, and canonicalize the returned transcript path.",
+            "Cardinality": "One snapshot lifecycle per saved-chat read; copied history volume depends on the native history store.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same access, snapshot, validation, and cleanup ran using the directly constructed binary path.",
+            "CriticalPathEffect": "This existing snapshot work must complete around the one-shot decode and is substantially broader than the added fixed metadata lookups."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/codex/codexSavedThreadReader.ts:readCodexSavedThreadFromDisk",
+            "Operation": "Spawn a sandboxed one-shot Codex app-server to decode native history.",
+            "Cardinality": "One process per saved-chat read, globally serialized by the reader.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one-shot process was spawned when the flat executable path existed.",
+            "CriticalPathEffect": "Required for the read and unchanged by the diff."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/codex/codexSavedThreadReader.ts:readCodexSavedThread",
+            "Operation": "Initialize the child, read thread metadata, and fetch full turn pages.",
+            "Cardinality": "One initialize and one initial thread read, then either one legacy full read or approximately one page request per 100 turns.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same child-process requests and pagination were performed.",
+            "CriticalPathEffect": "Controls native decoding latency and remains unchanged."
+          }
+        ],
+        "ScalingInput": "Overall work scales with requested saved chats and transcript turn count. The diff's incremental work is fixed at two to three metadata calls per chat; IPC pagination remains approximately one request per 100 turns and is unchanged.",
+        "EffectiveConcurrency": "`CodexSavedChatReader._reads` is a single Sequencer, so heavy native reads—including the changed lookup—run one at a time even when callers request multiple chats concurrently. Each completed saved-chat read starts one one-shot process; there is no parallel process burst.",
+        "CacheBehavior": "Installed SDK discovery checks the persistent cache sentinel; this path does not trigger a network download. The binary path has no explicit memoization, so each requested chat repeats the fixed lookup, while the sequencer prevents overlap. The native history itself is snapshotted per read rather than cached, as before.",
+        "MechanismConfidence": "High: the changed awaited helper is directly reached once per sequenced provider read, and the reader and tests establish serialization.",
+        "MagnitudeUncertainty": "A bulk continuation/archive workflow can request several chats, but the reads are serialized and each already performs a filesystem snapshot plus process startup. Exact filesystem latency is environment-dependent.",
+        "Verdict": "No reportable regression. Repeated reads do repeat the new lookup, but only at constant cardinality per already-heavy, serialized process-based read; the diff does not introduce meaningful fan-out, concurrency, or retained state."
+      }
+    ],
+    "Summary": "Reviewed all four changed files and traced both production call paths. The only new performance cost is two to three awaited filesystem realpath operations per actual Codex process start or sequenced saved-chat read. Existing connection coalescing, SDK caching/download deduplication, and saved-reader sequencing keep the work bounded; no actionable performance regression was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-05T09:00:58.795807789Z",
+    "CompletedAt": "2026-11-05T09:02:41.877428818Z",
+    "WallClockMilliseconds": 103081,
+    "ModelCalls": 8,
+    "InputTokens": 204092,
+    "OutputTokens": 5377,
+    "TotalTokens": 209469,
+    "ReasoningTokens": 1852,
+    "CacheReadTokens": 161884,
+    "CacheWriteTokens": 42184,
+    "APIDurationMilliseconds": 78843,
+    "ToolCalls": 33,
+    "NanoAIUnits": 38330960000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 161884,
+      "cache_write": 42184,
+      "input": 24,
+      "output": 5377
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
