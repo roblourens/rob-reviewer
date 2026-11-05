@@ -1,0 +1,150 @@
+{
+  "PullRequest": {
+    "Number": 346146,
+    "Title": "agentHost: preserve canonical BYOK model identity",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nPass canonical BYOK model IDs separately from provider-group routing IDs so the runtime can select the correct model-specific tool and prompt policy. Together with github/copilot-agent-runtime#32967, this fixes GPT-6+ BYOK models receiving `edit`/`create` instead of `apply_patch`, while preserving provider selection and inference routing.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346146",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "dileepyavan",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e5b6876dcb95750b5329172cb4d0c48b39dbb64d",
+    "HeadRef": "agents/openai-byok-edit-tool-usage",
+    "HeadSHA": "d0bd81e37d4676803e9184aa3873443bb36aa8b4",
+    "CreatedAt": "2026-11-04T23:27:09Z",
+    "UpdatedAt": "2026-11-05T00:32:02Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "boundary-fanout",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create or resume a Copilot session with renderer-provided BYOK models",
+        "CriticalPath": "The launcher reads the registry's in-memory snapshot, deduplicates and maps the models, lazily obtains the existing shared loopback proxy handle, then includes the provider/model config in the SDK create/resume call before the session is usable. The changed modelId field adds only one existing string reference per deduplicated model and its serialization in the already-required session-config boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:synthesizeByokSessionConfig/resolveByokSessionConfig",
+            "Operation": "Bind or reuse the local BYOK loopback proxy listener",
+            "Cardinality": "At most one cold start per launcher; all later sessions reuse the memoized handle.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same lazy proxy startup and reuse occurred before the diff.",
+            "CriticalPathEffect": "A cold BYOK launch awaits listener startup; warm launches reuse the settled handle."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_buildSessionConfig and session create/resume path",
+            "Operation": "Create or resume the SDK/runtime session with serialized provider and model configuration",
+            "Cardinality": "One existing session-config transfer per launched or resumed session, containing M models after selection-id deduplication.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same providers/models array crossed the boundary once per session without the modelId property.",
+            "CriticalPathEffect": "The transfer is on session launch's critical path; the diff increases payload by the canonical model-id bytes for each model but adds no call or round trip."
+          }
+        ],
+        "ScalingInput": "M renderer-advertised BYOK models after deduplication; realistic catalogs are bounded by configured model providers. Mapping and payload size remain O(M), with only one additional short scalar per model.",
+        "EffectiveConcurrency": "BYOK synthesis runs concurrently with shell-tool, custom-agent, and computer-use setup via Promise.all. Proxy startup is memoized across sessions; this diff changes neither parallelism nor call count.",
+        "CacheBehavior": "Model enumeration is a synchronous cached registry read. The proxy handle is lazily memoized and reused; no cache key, miss behavior, coalescing, or invalidation changes.",
+        "MechanismConfidence": "High confidence from the launch call path: the changed line only adds a field while preserving iteration count, proxy startup, and SDK boundary cardinality.",
+        "MagnitudeUncertainty": "Exact SDK serialization overhead depends on catalog size, but the added bytes are bounded by existing model identifiers and do not create a distinct expensive operation.",
+        "Verdict": "No reportable regression. The linear payload increase is necessary metadata and is too small and bounded to establish meaningful latency, CPU, GC, or memory impact."
+      },
+      {
+        "Scenario": "Refresh BYOK models on renderer changes and switch a live session to a BYOK model",
+        "CriticalPath": "A bridge model-change event refreshes the catalog and asks live sessions to sync. Each session serializes sync work, reads the cached model snapshot, merges it, skips unchanged configurations, and performs provider.sync only when the effective config changed. setModel awaits this same sync before model selection.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:syncByokModels",
+            "Operation": "Synchronize provider/model configuration with the runtime through provider.sync",
+            "Cardinality": "At most one effective sync per changed snapshot per live session; concurrent requests for one session are serialized, and objectsEqual suppresses unchanged configurations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Live sessions already performed the same merge, equality check, and provider.sync round trip. Adding a stable modelId value does not create additional changes after the initial applied config.",
+            "CriticalPathEffect": "Event-driven refresh is off the active turn path; an explicit model switch awaits any necessary sync before setModel."
+          }
+        ],
+        "ScalingInput": "S live sessions times genuinely changed model snapshots; each sync serializes M registered models. The diff does not increase S, event frequency, or M.",
+        "EffectiveConcurrency": "A per-session queue serializes syncs; separate live sessions may sync concurrently as before. No new burst or missing coalescing is introduced by the field.",
+        "CacheBehavior": "Each sync reads the bridge registry's cached snapshot and reuses the memoized proxy. Stable modelId values participate in existing deep equality and therefore do not defeat no-op suppression.",
+        "MechanismConfidence": "High confidence from the event listener, per-session queue, merge, equality check, and provider.sync call path.",
+        "MagnitudeUncertainty": "The number of simultaneous sessions varies, but boundary cardinality and scheduling are unchanged by this PR.",
+        "Verdict": "No reportable regression. The PR neither fans out more RPCs nor repeats synthesis more often; it only enriches existing model entries."
+      },
+      {
+        "Scenario": "Send an inference turn through a selected BYOK model",
+        "CriticalPath": "The runtime uses the new canonical modelId to choose model-specific prompt/tool policy, then follows the existing BYOK proxy and renderer inference route. The metadata is resolved at configuration time and does not add a per-turn host operation or boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts and IByokLmBridgeConnection.chat",
+            "Operation": "Route the existing BYOK inference request through the local proxy to the serving renderer bridge",
+            "Cardinality": "One existing bridge request per model inference attempt; tool calls depend on the model response and existing runtime policy.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same inference route and request cardinality existed, but policy lookup used the grouped routing ID rather than the canonical model ID.",
+            "CriticalPathEffect": "Inference already depends on the bridge/provider response. The canonical ID changes policy selection but does not add another request or await."
+          },
+          {
+            "Kind": "network",
+            "Location": "Renderer BYOK language-model provider reached through IByokLmBridgeConnection.chat",
+            "Operation": "Provider-specific model inference performed behind the renderer language-model bridge",
+            "Cardinality": "Provider-dependent and unchanged: the diff adds no retry, fan-out, or parallel request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "BYOK inference already reached the selected provider once per runtime inference attempt.",
+            "CriticalPathEffect": "The provider response remains the turn's dominant boundary; no new network dependency is introduced."
+          }
+        ],
+        "ScalingInput": "Number of inference attempts and model-generated tool calls; the changed session metadata does not alter host-side request multiplicity.",
+        "EffectiveConcurrency": "Existing runtime and provider scheduling governs inference. This change introduces no Promise fan-out, limiter bypass, or new concurrent work.",
+        "CacheBehavior": "No new inference cache or cache key is introduced. The canonical ID is retained in the already-existing session model configuration.",
+        "MechanismConfidence": "High confidence that no host-side boundary is added; exact downstream model behavior remains provider-dependent.",
+        "MagnitudeUncertainty": "Different model policies can produce different tool choices, but the diff provides no evidence of systematically greater work; that functional policy correction is not itself a performance mechanism.",
+        "Verdict": "No performance finding. The change corrects policy identity without proving increased inference calls, tool executions, latency, or retained state."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and traced launch/resume, live provider synchronization, and BYOK inference. The sole production change adds bounded metadata to existing per-model configuration; it adds no boundary call, fan-out, cache-lifecycle change, repeated work, or concurrency burst. The integration test adds two bounded sequential local runtime turns, but that is test-only coverage with an immediate mocked bridge response and does not establish a product performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-05T02:00:57.098597678Z",
+    "CompletedAt": "2026-11-05T02:02:14.088253897Z",
+    "WallClockMilliseconds": 76989,
+    "ModelCalls": 8,
+    "InputTokens": 179698,
+    "OutputTokens": 4400,
+    "TotalTokens": 184098,
+    "ReasoningTokens": 1591,
+    "CacheReadTokens": 141132,
+    "CacheWriteTokens": 38542,
+    "APIDurationMilliseconds": 54811,
+    "ToolCalls": 28,
+    "NanoAIUnits": 33725880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 141132,
+      "cache_write": 38542,
+      "input": 24,
+      "output": 4400
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
