@@ -1,0 +1,174 @@
+{
+  "PullRequest": {
+    "Number": 346337,
+    "Title": "build: stop processes that hold Windows test log files before publishing them",
+    "Body": "`🔒 Publish Log Files` in the Windows `Browser \u0026 Remote Tests` job failed in main CI twice, in [492717](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=492717) and [493303](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=493303). Every test passed. Files under `.build\\logs\\integration-tests-remote` (`window1\\exthost\\exthost.log`, `server\\agenthost.log`, `remoteagent.log`, …) were still \"being used by another process\".\n\n## Why the existing kill step doesn't cover it\n\n`Kill lingering test processes` stops processes whose **executable** is under `$(agent.builddirectory)\\test`.\n- In 493303 it stopped the 3 server `node.exe` processes, but the files were still locked 35 s later.\n- In 492717 it found nothing to stop.\n\nSo whatever held them runs from somewhere else. The process list from `Diagnostics after smoke test run` shows a lingering **`git.exe`** owned by the build user in **both** failing runs, and in none of the 8 green main runs before 493303. A process started from the server or an extension host (git is started by the Git extension) inherits that process's inheritable file handles, and it can outlive it. I haven't proven that git is the holder, which is why this logs what it finds.\n\n## Fix\n\n- The new `build/azure-pipelines/win32/stop-log-file-holders.ps1` asks the Windows Restart Manager (`RmGetList`) which processes hold any file under `.build\\logs`. It logs each one's pid, name, parent, owner, path and command line, and stops it if it belongs to the build user and isn't an `Agent.*` process. It then checks again and logs anything still holding a file.\n- The existing kill step calls it after its executable-path loop. The step stays `continueOnError: true`.\n\n## Validation\n\nLocally, with Windows PowerShell 5.1, which the step uses:\n- **Nothing holding:** logs `No process holds files`, exit 0.\n- **A process holding `exthost.log` exclusively:** `Get-FileHash` failed with \"used by another process\". The script named the holder with its command line and stopped it, and then the hash succeeded.\n- **The CI shape:** a parent opened `server\\remoteagent.log` with an inheritable handle, started `ping.exe`, and exited. The orphaned `ping.exe` held the file. The script found it by file, logged `parent=\u003cdead pid\u003e`, and stopped it, and then the file opened exclusively.\n- **Missing folder:** exit 0.\n\nProof: def 111 CI build, Windows x64 only, Publish off: [493385](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=493385). It checks that the step runs on the agent and logs its result there.\n\n\u003e Authored with Copilot\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346337",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "9b428f8bb663faeabf2ae60f12bbfddb99f95a83",
+    "HeadRef": "copilot/vscode/publish-log-lock",
+    "HeadSHA": "3c7c67a2d3c5680b3e8d1a2953e1bf4aa2f14ac5",
+    "CreatedAt": "2026-11-05T19:02:24Z",
+    "UpdatedAt": "2026-11-06T02:25:46Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Normal Windows product-test job finalization with no process holding a log file",
+        "CriticalPath": "After tests and result publication, the existing broad process cleanup runs, then the new script synchronously compiles its Restart Manager interop helper, recursively enumerates `.build/logs`, and—when files exist—completes one Restart Manager session before the always-on pipeline artifact upload can begin. All added work is on job-finalization's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other expensive boundary",
+            "Location": "build/azure-pipelines/win32/stop-log-file-holders.ps1:18",
+            "Operation": "Dynamically compile and load the C# Restart Manager interop type with `Add-Type`.",
+            "Cardinality": "Once per Windows product-test job because the script runs in its own PowerShell task.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The previous cleanup was inline PowerShell and performed no dynamic compilation.",
+            "CriticalPathEffect": "Must complete before holder detection and therefore before job-finalization artifact publication."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/azure-pipelines/win32/stop-log-file-holders.ps1:91",
+            "Operation": "Recursively enumerate every file under `.build/logs` and materialize each full path.",
+            "Cardinality": "One directory traversal and F path objects when no holder is found.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The previous cleanup did not traverse the log tree; the later artifact publisher still performed its own unchanged traversal/upload.",
+            "CriticalPathEffect": "Synchronous prerequisite to the Restart Manager query and subsequent artifact publication."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "build/azure-pipelines/win32/stop-log-file-holders.ps1:57-85",
+            "Operation": "Start a Restart Manager session, bulk-register F files, query affected processes, and end the session.",
+            "Cardinality": "One session with one bulk registration and one `RmGetList` probe in the no-holder case, independent of F call count.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Restart Manager boundary existed; cleanup only queried the process list and killed executables rooted under the test directory.",
+            "CriticalPathEffect": "The native OS query completes synchronously before publication can proceed."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/win32/product-build-win32-test.yml:47-50",
+            "Operation": "Publish `.build/logs` as the pipeline log artifact.",
+            "Cardinality": "One artifact publication per job, with uploaded bytes/files determined by the existing log tree.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same artifact was always published immediately after the prior cleanup and remaining job steps.",
+            "CriticalPathEffect": "This unchanged post-job output now starts after the new cleanup script; the diff does not increase upload cardinality or bytes."
+          }
+        ],
+        "ScalingInput": "The number F of files recursively present under `.build/logs`; the helper materializes F full paths and registers all F in one bulk Restart Manager call. Effective holder cardinality is zero in this scenario.",
+        "EffectiveConcurrency": "Fully serialized in one PowerShell task. File enumeration is sequential from the caller's perspective, and all F paths are grouped into one Restart Manager registration rather than F calls. No limiter is needed because there is one session and no per-file concurrency.",
+        "CacheBehavior": "There is no cross-job cache: this task starts a fresh Windows PowerShell process, so `Add-Type` runs once per job. File paths and the negative no-holder result are not cached, but in the no-holder branch they are computed only once. The existing artifact publisher later traverses the directory independently.",
+        "MechanismConfidence": "High: the changed YAML unconditionally invokes the script under `condition: always()`, and the script's compile, recursive enumeration, and bulk native call are explicit. There is no per-file boundary fan-out.",
+        "MagnitudeUncertainty": "Repository evidence does not establish typical F or measured `Add-Type`/Restart Manager duration. The work runs once at job teardown, is bulked, and does not execute in an interactive or repeated test path.",
+        "Verdict": "No reportable regression. The diff adds bounded, synchronous teardown overhead, but groups all files into one Restart Manager registration and performs only one scan/query on the dominant no-holder path; there is no high-confidence hot-path, fan-out, or unbounded mechanism."
+      },
+      {
+        "Scenario": "Windows product-test job finalization when one or more out-of-tree processes hold log files",
+        "CriticalPath": "The same compile, recursive scan, and Restart Manager query run first. For each of H unique holders, the task synchronously queries WMI metadata/ownership, may force-stop the process, waits up to 10 seconds for that process, then performs one second full log-tree scan and Restart Manager session. Artifact publication waits for all of this.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "build/azure-pipelines/win32/stop-log-file-holders.ps1:91,129",
+            "Operation": "Recursively enumerate all log files before and after holder cleanup.",
+            "Cardinality": "Two traversals, materializing F paths each time, regardless of how many files each holder has open.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The prior cleanup did not inspect log files or re-scan them after process termination.",
+            "CriticalPathEffect": "Both synchronous traversals precede artifact publication; the second verifies cleanup."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "build/azure-pipelines/win32/stop-log-file-holders.ps1:57-85",
+            "Operation": "Run two bulk Restart Manager sessions to discover holders before cleanup and verify remaining holders afterward.",
+            "Cardinality": "Two sessions, each with one bulk F-file registration; holder results are deduplicated before per-process handling.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No file-holder query existed, so out-of-tree holders survived and could cause the later publication to fail.",
+            "CriticalPathEffect": "Both OS queries block cleanup completion and artifact publication."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "build/azure-pipelines/win32/stop-log-file-holders.ps1:108-112",
+            "Operation": "Query `Win32_Process` and invoke `GetOwner` for each unique holder through CIM/WMI.",
+            "Cardinality": "Up to two serialized WMI operations per unique holder PID H.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The existing cleanup made one broad `Win32_Process` query and filtered by executable path; it did not perform per-holder lookup/owner calls for out-of-tree processes.",
+            "CriticalPathEffect": "Ownership and agent-process checks must finish before each stop decision."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/win32/stop-log-file-holders.ps1:120-121",
+            "Operation": "Force-stop each eligible holder and wait up to 10 seconds for termination.",
+            "Cardinality": "At most one stop and one serialized wait per eligible unique holder; ineligible/current/agent holders are skipped.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only processes whose executable path was under the test root were stopped, without an explicit wait; out-of-tree holders such as inherited `git.exe` processes were not touched.",
+            "CriticalPathEffect": "Termination and any wait directly delay the artifact upload, but remove the file lock that previously caused publication failure."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/win32/product-build-win32-test.yml:47-50",
+            "Operation": "Publish `.build/logs` as a pipeline artifact after cleanup.",
+            "Cardinality": "One unchanged artifact upload per job.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Publication could begin sooner but fail when an out-of-tree process retained a log handle.",
+            "CriticalPathEffect": "The upload is delayed by holder cleanup but is expected to succeed after locks are released instead of failing on locked files."
+          }
+        ],
+        "ScalingInput": "F log files and H unique holder PIDs returned after `Sort-Object -Unique`; WMI and stop/wait work scales with H, while filesystem/native registration work is exactly two bulk passes when any holder is detected.",
+        "EffectiveConcurrency": "Holder processing is deliberately serial. There is no concurrent process-stop burst; each eligible holder is stopped and awaited before the next. Restart Manager still receives files in one bulk call per pass.",
+        "CacheBehavior": "No positive or negative holder cache is retained. The second enumeration/query intentionally refreshes state after stopping processes. PID deduplication prevents repeated per-holder WMI/stop work when one process holds multiple files.",
+        "MechanismConfidence": "High: F- and H-scaling, PID deduplication, serial waits, and the second verification pass are explicit in changed code. The task is directly before post-job artifact publication.",
+        "MagnitudeUncertainty": "The repository and PR metadata establish rare observed holder incidents and examples with a small number of processes, but do not establish large H, large F, or force-killed processes routinely consuming the full wait timeout. Thus the theoretical O(F + H) teardown delay lacks a realistic high-impact trigger.",
+        "Verdict": "No reportable regression. The extra work is intentional, holder-triggered teardown on the publication critical path; file operations are bulked, holder PIDs are deduplicated, and process handling is serialized. There is insufficient evidence of realistically large H/F or repeated 10-second waits to establish an actionable performance bug."
+      }
+    ],
+    "Summary": "Reviewed the complete two-file diff and traced normal and holder-present Windows CI teardown paths through dynamic compilation, filesystem traversal, Restart Manager, WMI, process termination, and artifact publication. The PR adds bounded one-time cleanup latency but avoids per-file boundary fan-out and concurrency bursts; no high-confidence performance regression or qualifying regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-06T02:53:09.291683094Z",
+    "CompletedAt": "2026-11-06T02:54:30.272301568Z",
+    "WallClockMilliseconds": 80980,
+    "ModelCalls": 6,
+    "InputTokens": 87001,
+    "OutputTokens": 5267,
+    "TotalTokens": 92268,
+    "ReasoningTokens": 2539,
+    "CacheReadTokens": 63261,
+    "CacheWriteTokens": 23722,
+    "APIDurationMilliseconds": 58395,
+    "ToolCalls": 20,
+    "NanoAIUnits": 24932640000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 63261,
+      "cache_write": 23722,
+      "input": 18,
+      "output": 5267
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
