@@ -1,0 +1,145 @@
+{
+  "PullRequest": {
+    "Number": 346434,
+    "Title": "Show Copilot Fusion reasoning in the agent host chat",
+    "Body": "Copilot Fusion phases stream no reasoning deltas: the runtime keeps phase output private while it runs, so a phase's reasoning arrives only as the `reasoningText` of each complete `assistant.message`. The live path only rendered reasoning from deltas, so Fusion turns showed no reasoning until the session was reloaded, when history restore renders `reasoningText`.\n\nRender `reasoningText` as a reasoning part when a Fusion message is shown, and show it for inline-phase model calls whose answer waits for the commit, so the main pass shows progress. A message's committed copy does not repeat reasoning its provisional copy already showed.\n\n\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n\n## Before: no reasoning output is shown in Fusion:\n\n\u003cimg width=\"624\" height=\"426\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/760fc4a0-81e2-4f54-b9c3-3cd4419d4cf0\" /\u003e\n\n## After: reasoning output appears in Fusion:\n\n\u003cimg width=\"1006\" height=\"868\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/cdc5c18e-0abd-4240-a464-6ee0a5a04ac9\" /\u003e",
+    "URL": "https://github.com/microsoft/vscode/pull/346434",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "andysalerno",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "a0bf224dbe585c8c3ee8d109e5e146c3c1587720",
+    "HeadRef": "andysalerno/fusion-reasoning",
+    "HeadSHA": "39ea613d494df1d2852f1e32fa7001960ba6276b",
+    "CreatedAt": "2026-11-06T01:22:39Z",
+    "UpdatedAt": "2026-11-06T03:16:56Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-F1E9E41DCAEA",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts",
+      "Side": "RIGHT",
+      "Line": 10072,
+      "Severity": "low",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed helper, provisional/committed call paths, and turn cleanup are explicit: both live and committed Fusion messages call the helper, the key includes the complete text, and the Set is cleared only with provisional turn state. Exact model output lengths vary, which affects severity but not the mechanism.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "full-length serialized reasoning strings and retained heap bytes",
+      "PerformanceScaling": "O(total reasoning characters across provisional and committed Fusion messages); unique reasoning keys retain approximately another encoded copy of each reasoning text until turn completion, while committed replays add another O(text length) temporary allocation.",
+      "PerformanceOutcome": "increased synchronous publication latency plus CPU/GC pressure",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this PR, live Fusion assistant messages did not construct or retain any deduplication key from `reasoningText`, so this full-payload serialization and turn-long duplicate storage did not occur.",
+      "ChangedBehavior": "Each provisional Fusion reasoning message and its committed replay now synchronously JSON-serializes the complete reasoning text to perform deduplication, and each unique serialized copy is retained until the turn is cleared.",
+      "CausalDiffEvidence": "Added RIGHT line 10072 constructs `JSON.stringify([e.data.messageId, reasoning])` for every Fusion assistant message before the duplicate check; RIGHT line 10076 stores that serialized key in the turn-scoped Set.",
+      "Title": "Avoid serializing full reasoning text for deduplication",
+      "Impact": "On Fusion turns with long chain-of-thought output across several phase model calls, completion of each message performs an extra full-string allocation on the synchronous publication path, delaying reasoning display and adding retained heap/GC pressure for the lifetime of the turn; committed replays repeat the CPU/allocation even when no UI action is emitted.",
+      "Evidence": "`renderFusionReasoning` builds the key from the full `reasoningText` before `_emitAction`; provisional inline messages call it at 10889 and committed messages reach it through `renderMessage`. Tests at 23651-23656 show the same message/reasoning is replayed at commit, so even suppressed copies pay the full serialization cost. The serialized unique keys remain in `_shownFusionReasoning` until `_clearProvisionalFusionState` at 12730.",
+      "Recommendation": "Deduplicate without encoding the payload, for example use a map keyed by `messageId` whose value is the original reasoning string (or a small per-message identity/version if SDK IDs are sufficient), and test emptiness before creating any key. This preserves provisional/commit suppression while avoiding a copied JSON string."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "repeated-work",
+      "boundary-fanout",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Live reasoning for provisional Fusion phases and accepted committed replay",
+        "CriticalPath": "The complete `assistant.message` handler synchronously constructs the dedupe key before it can call `_emitAction`; state dispatch and UI progress therefore wait for the full-string serialization. Model generation has already completed, but this work is on the critical path to showing reasoning.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:10072 `renderFusionReasoning`",
+            "Operation": "JSON-encode `[messageId, reasoningText]` and retain the encoded string for deduplication.",
+            "Cardinality": "One incoming complete SDK assistant event per model-call message, plus a committed replay for accepted Fusion work. One outbound reasoning state update per unique cold key; warm committed duplicates emit none.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Fusion complete messages were handled without serializing or retaining `reasoningText` for live deduplication.",
+            "CriticalPathEffect": "The incoming event already exists; the new full-text serialization runs synchronously before publication. For cold keys, the added action then traverses host state dispatch to the chat client and is rendered as a thinking part."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:10077-10081 via AgentSideEffects.dispatchServerAction",
+            "Operation": "Publish the reasoning response part into agent-host state for the workbench chat UI.",
+            "Cardinality": "At most one host-to-client reasoning update per unique Fusion message/reasoning pair; committed exact duplicates are suppressed.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No live Fusion reasoning update crossed this path; reasoning appeared only when restored from history.",
+            "CriticalPathEffect": "The state update is required for the new live-reasoning feature and drives one UI thinking-part update; no per-token or per-row IPC fan-out was introduced."
+          }
+        ],
+        "ScalingInput": "Total characters in reasoning across model-call messages in all Fusion phases, counting provisional and committed event attempts; effective outbound cardinality is unique message/text pairs after Set deduplication.",
+        "EffectiveConcurrency": "Calls inside a phase are documented as sequential by `CopilotFusionMessageChunks`; event emission and state dispatch are synchronous. Multiple phases increase aggregate calls, but this path does not create an unbounded async concurrency burst.",
+        "CacheBehavior": "The turn-scoped `_shownFusionReasoning` Set is cold for the provisional message, so reasoning is emitted; the committed replay is a warm hit and suppresses the UI action, but both cold and warm paths JSON-serialize the full payload before lookup. The Set is cleared on turn reset/active-turn cleanup; there is no cross-turn cache or negative-cache state.",
+        "MechanismConfidence": "High: the full text is visibly passed to `JSON.stringify`, replayed committed messages invoke the same helper, and unique keys remain in the Set until explicit turn cleanup.",
+        "MagnitudeUncertainty": "Actual reasoning lengths and number of Fusion phase calls vary by model and task. This lowers the finding to low severity, while long multi-phase turns remain a realistic trigger for full-payload allocation and retention.",
+        "Verdict": "Reportable low-severity serialization/allocation regression: required live output is correctly coalesced to one action per unique reasoning item, but deduplication unnecessarily copies the complete payload and repeats that work on warm committed replays."
+      },
+      {
+        "Scenario": "Multi-chunk Fusion model calls with tool work or delayed inline answers",
+        "CriticalPath": "Earlier chunks are buffered off the UI critical path until call completion. At the final chunk, all buffered messages are synchronously iterated and each reasoning-bearing chunk is processed before resulting progress is visible.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:10881-10890",
+            "Operation": "Drain grouped Fusion messages and publish reasoning parts to chat state.",
+            "Cardinality": "One reasoning state update per reasoning-bearing unique chunk after call grouping; no update for duplicate committed chunks. The supplied chunk tests use distinct message IDs and demonstrate one drain per completed call.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Grouped Fusion content was already drained for markdown/tool work, but reasoning parts were not published live.",
+            "CriticalPathEffect": "Updates are emitted synchronously during the final-chunk handler, so work scales with the number and size of buffered reasoning-bearing chunks, but grouping prevents repeated whole-call drains."
+          }
+        ],
+        "ScalingInput": "Number of message chunks in a completed model call after grouping, and reasoning bytes carried by those chunks.",
+        "EffectiveConcurrency": "Per-phase model calls are sequential and each completed buffered call is drained once. There is no Promise-based fan-out or new parallel external work.",
+        "CacheBehavior": "`CopilotFusionMessageChunks` buffers chunks by phase and call ID until the last chunk, then deletes the entry. Reasoning deduplication is per message ID/text and remains warm through the committed replay, then is cleared at turn end.",
+        "MechanismConfidence": "High for one-time grouped draining and synchronous publication; low evidence for reasoning being repeated across multiple chunks, so no duplicate-rendering issue was reported.",
+        "MagnitudeUncertainty": "The SDK's frequency of reasoning on multiple chunks is not established by repository tests; the established implementation drains each call once, so no additional chunk-scaling finding is warranted.",
+        "Verdict": "No separate regression: call grouping drains once and exact provisional/commit copies are suppressed. The avoidable full-text dedupe serialization is already covered by the submitted finding."
+      }
+    ],
+    "Summary": "Reviewed both changed files and all diff pages. Traced provisional, inline, committed, multi-chunk, turn-cleanup, state-dispatch, and UI thinking-part paths. Submitted one low-severity serialization/allocation finding; found no boundary fan-out, concurrency burst, unbounded lifecycle retention, or performance regression fix to record."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-06T10:02:01.727271861Z",
+    "CompletedAt": "2026-11-06T10:03:48.177484768Z",
+    "WallClockMilliseconds": 106450,
+    "ModelCalls": 11,
+    "InputTokens": 435830,
+    "OutputTokens": 6591,
+    "TotalTokens": 442421,
+    "ReasoningTokens": 2457,
+    "CacheReadTokens": 369328,
+    "CacheWriteTokens": 66469,
+    "APIDurationMilliseconds": 84181,
+    "ToolCalls": 52,
+    "NanoAIUnits": 61202820000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 369328,
+      "cache_write": 66469,
+      "input": 33,
+      "output": 6591
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
