@@ -1,0 +1,231 @@
+{
+  "PullRequest": {
+    "Number": 346076,
+    "Title": "agentHost: reload a loaded session on import when another client ran it",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nPart of microsoft/vscode-internalbacklog#10136.\r\n\r\nWhen `/code` opens a Copilot CLI session that the agent host already has loaded, VS Code shows its earlier copy, without the turns the CLI ran since.\r\n\r\nOn import of a session that's already loaded:\r\n\r\n- `CopilotAgent.importChat` drops its loaded copy and resumes the session from storage, unless the runtime reports that VS Code ran it last (`lastClientName`). It keeps the loaded copy while a turn, a subagent or a detached shell is running.\r\n- `AgentService.importSession` then replaces the chat's turns with the rebuilt ones. It doesn't merge them, because turns that ran live and turns rebuilt from storage have different ids. If a turn is running, the replacement waits for it to end, then reads the turns again so they include it.\r\n\r\n## How to test\r\n\r\n1. In an external terminal, run `copilot`, send a message, then `/code`.\r\n2. Keep VS Code running. Resume the session with `copilot --resume=\u003cid\u003e`, send another message, then run `/code` again.\r\n3. The chat shows both messages.\r\n\r\n## Validation\r\n\r\n- `scripts\\test.bat` for `copilotAgent`, `agentService`, `protocolServerHandler`, `copilotAgentSession`, `agentSessionResidency`, `agentHostProtocolClient` and `copilotCliSessionLink`: **passed** (5000 passing, 17 pending).\r\n- `pnpm run typecheck-client` and `pnpm run eslint` on the changed files: **passed**.\r\n- End to end with a CLI built from the runtime's `main`: after the CLI added a turn, opening the link again reloaded the session, and the window received both turns (`chat/truncated`, then `chat/turnsLoaded`, in the AHP log). This was before the review fixes and the rebase onto SDK 1.0.29-preview.10, and wasn't repeated.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346076",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "bd2ba5565df633340643555d27cc0e5f4ef6a6fc",
+    "HeadRef": "karthiknadig/code-round-trip-reload",
+    "HeadSHA": "04127e3425af668b8f8fc2657e5c78d92f48e865",
+    "CreatedAt": "2026-11-04T17:34:05Z",
+    "UpdatedAt": "2026-11-06T16:37:04Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-C56C0EEF255C",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts",
+      "Side": "RIGHT",
+      "Line": 5252,
+      "Severity": "low",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed critical path and the two sequential IPC operations are directly traced in repository code, and the PR test establishes the realistic no-reload case. Only the exact duration of the local SDK RPCs is uncertain, which is reflected in low severity.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "Two SDK task-control IPC calls (`tasks.refresh` and `tasks.list`) per loaded-chat import",
+      "PerformanceScaling": "The two sequential calls repeat on every re-import of an idle loaded session, including the common no-reload case where VS Code was the last client.",
+      "PerformanceOutcome": "Increased latency on the session-link opening critical path",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Importing an already loaded chat did not inspect detached shell tasks, so opening the link did not pay these two task RPC round trips.",
+      "ChangedBehavior": "Before reading `lastClientName`, the new stale-reload check always awaits `target.hasRunningDetachedShells()` for an idle target; that method synchronously performs `rpc.tasks.refresh()` followed by `rpc.tasks.list()`. Even when metadata then proves `lastClientName === vscode-agent-host` and no reload is possible, both calls have already completed.",
+      "CausalDiffEvidence": "The added condition at line 5252 introduces `await target.hasRunningDetachedShells()` into every idle loaded-session import before the newly added metadata guard; no detached-task query existed on the import path before this diff.",
+      "Title": "Check session metadata before refreshing detached-shell tasks",
+      "Impact": "Reopening a loaded Copilot CLI session link while VS Code was the last client now waits for two unnecessary sequential SDK IPC operations before the chat can open. The cost recurs for each explicit re-import and is visible under the window-level “Opening Copilot CLI session” progress UI.",
+      "Evidence": "`importSession` marks every already-loaded session with `reloadIfStale`; `importChat` awaits `_releaseChatRunElsewhere` on its critical path. At the changed line, the helper calls `hasRunningDetachedShells()` before `client.getSessionMetadata()`. `CopilotAgentSession.hasRunningDetachedShells` performs `session.rpc.tasks.refresh()` and then `session.rpc.tasks.list()`, while line 5266 returns without reloading when metadata says the agent host ran the session last. The added test includes exactly this `lastClientName: 'vscode-agent-host'` no-reload scenario.",
+      "Recommendation": "Keep the in-memory active-turn/subagent checks first, then read `lastClientName` and return immediately when it is the agent host; query detached-shell state only when metadata indicates the session would otherwise be reloaded."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "repeated-work",
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "serialization-allocation",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open a Copilot CLI deep link for a session already loaded by VS Code after the CLI ran it again",
+        "CriticalPath": "The window-level open progress awaits protocol `importSession`, provider import/reload, SDK session resume, full provider-history reconstruction, host hydration, and turn replacement before opening the chat.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5194 importChat",
+            "Operation": "SDK `sessions.checkInUse` request, with polling only while another process still holds the session",
+            "Cardinality": "One request normally; up to 21 over five seconds when held",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same check and polling already occurred for every import.",
+            "CriticalPathEffect": "Blocks import and may display takeover handling"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5252 _releaseChatRunElsewhere",
+            "Operation": "Refresh and list SDK tasks to detect detached shells",
+            "Cardinality": "Two sequential RPCs for one idle loaded live chat",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Loaded imports did not query task state.",
+            "CriticalPathEffect": "Blocks stale determination and reload"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5258 _releaseChatRunElsewhere",
+            "Operation": "Read SDK session metadata and `lastClientName`",
+            "Cardinality": "One RPC per loaded import that reaches the stale check",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Import did not read metadata for this decision.",
+            "CriticalPathEffect": "Blocks the reload decision"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5271 and :10521",
+            "Operation": "Destroy the loaded SDK session and resume it from persisted state, including runtime/MCP initialization",
+            "Cardinality": "One destroy and one resume when another client ran the session",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A loaded import retained its warm live SDK session.",
+            "CriticalPathEffect": "Required before reading the authoritative refreshed transcript and selection"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:7334 _computeMappedEvents",
+            "Operation": "Read persisted SDK event-log pages",
+            "Cardinality": "One or more RPCs, each requesting at most 1000 events, until the session history is consumed",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A loaded import did not rebuild the provider transcript.",
+            "CriticalPathEffect": "Blocks transcript replacement"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:10723 _getChatMessages",
+            "Operation": "Open/read workspace-transition storage and hydrate/interleave reconstructed turns",
+            "Cardinality": "One storage load and one full-history hydration for the reloaded chat",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A loaded import kept existing host turns and did not rebuild them.",
+            "CriticalPathEffect": "Runs in parallel with provider message retrieval where possible, then blocks turn replacement"
+          }
+        ],
+        "ScalingInput": "One session/chat per link; history reconstruction scales with the session event count in pages of up to 1000 events, then with the number and size of reconstructed turns.",
+        "EffectiveConcurrency": "Imports for the same chat are serialized by the Copilot per-chat queue. Provider history and workspace-transition loading run in parallel, while history refreshes are coalesced per chat by `ThrottlerByKey`; distinct chats are independent.",
+        "CacheBehavior": "The loaded live target is warm before import, but a stale reload destroys it, deletes `_persistedChatHistory`, resumes a fresh SDK session, and starts with an empty mapped-event memo. The reconstructed event history is memoized on that new session. There is no cross-import stale-check cache because another client may run the session between imports.",
+        "MechanismConfidence": "High: the loaded check, provider queue, session destruction/resume, paginated event read, hydration, and replacement are directly traced.",
+        "MagnitudeUncertainty": "Resume and event-log duration depends on runtime/MCP configuration and history size, but the full cold reconstruction is intentional for stale external histories. No separate regression was reported for that required work.",
+        "Verdict": "The cold reload cost is intentional and bounded to a single explicitly imported chat. No additional issue beyond the separately reported eager detached-task RPCs was found."
+      },
+      {
+        "Scenario": "Reopen a loaded session link when VS Code was the last client and the live session is idle",
+        "CriticalPath": "The open progress awaits import, stale determination, existing runtime-mode adoption, and selection read; no transcript replacement or resume is needed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5194 importChat",
+            "Operation": "SDK in-use check",
+            "Cardinality": "One normally",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Already performed.",
+            "CriticalPathEffect": "Blocks import"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5252 _releaseChatRunElsewhere",
+            "Operation": "SDK task refresh followed by task list",
+            "Cardinality": "Two sequential calls per reopen",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No task calls on loaded import.",
+            "CriticalPathEffect": "Blocks the no-reload result despite not affecting it when metadata identifies VS Code as last client"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5258 _releaseChatRunElsewhere",
+            "Operation": "Read last-client metadata",
+            "Cardinality": "One call per reopen",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No stale-client determination was needed.",
+            "CriticalPathEffect": "Determines that the warm session should be retained"
+          }
+        ],
+        "ScalingInput": "One loaded chat per explicit link open; the added cost repeats with each re-import.",
+        "EffectiveConcurrency": "Same-chat imports serialize in the per-chat queue, so duplicate opens queue rather than burst; distinct chats can proceed independently.",
+        "CacheBehavior": "The live SDK session and host turns remain warm. Metadata is read afresh and there is no coalescing or cache across explicit imports. Task state is also refreshed and listed afresh even though metadata later rules out reload.",
+        "MechanismConfidence": "High: the no-reload branch and the task RPC implementation are explicit and covered by the added host-last test case.",
+        "MagnitudeUncertainty": "The exact local RPC latency varies, but two strictly sequential calls are guaranteed by the implementation.",
+        "Verdict": "Reportable low-severity latency regression: detached-task RPCs are eagerly executed before metadata can prove that reload is impossible."
+      },
+      {
+        "Scenario": "Import while a turn, subagent, or detached shell is running, including a turn starting during history replacement",
+        "CriticalPath": "An already active turn or subagent suppresses reload immediately. Detached-shell detection awaits task refresh/list. If a turn races with replacement after the provider reload, replacement is deferred until the turn ends, then the provider history is read again and applied.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:5252 _releaseChatRunElsewhere",
+            "Operation": "Refresh/list SDK tasks when only detached-shell state remains unknown",
+            "Cardinality": "Two sequential calls for the imported chat",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Import never inspected detached work.",
+            "CriticalPathEffect": "Blocks deciding whether import may reload"
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:2516 _replaceReloadedChatTurns",
+            "Operation": "Read provider messages again after a racing turn completes",
+            "Cardinality": "One full-history retrieval for the pending chat after coalescing",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no reloaded transcript to reconcile after a race.",
+            "CriticalPathEffect": "Off the running turn's critical path but required before refreshed turns are shown"
+          }
+        ],
+        "ScalingInput": "One pending entry per affected imported chat; post-turn scanning scales with the number of pending reloaded chats, while the eventual read scales with that chat's full event history.",
+        "EffectiveConcurrency": "The provider import is serialized per chat. `_pendingChatReloads` keeps one latest provider per chat, and `_chatHistoryRefreshes` coalesces same-chat queued work; different chats remain independent.",
+        "CacheBehavior": "When active/background work is detected before release, the warm live copy remains and no history cache is invalidated. In the race case, the provider has already reloaded, so the eventual replacement reads from the fresh session's memoized event reconstruction; session removal clears pending reload entries.",
+        "MechanismConfidence": "High for ordering, map ownership, and coalescing; lower prevalence does not alter the mechanism.",
+        "MagnitudeUncertainty": "Races between import and turn start should be uncommon; histories and concurrent pending chats vary. Coalescing and cleanup bound normal behavior.",
+        "Verdict": "The deferral and re-read preserve an authoritative transcript and are coalesced per chat; no additional performance finding is warranted."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and their import, SDK-session, history-hydration, queue, and lifecycle paths. Submitted one low-severity eager-IPC finding for querying detached tasks before the no-reload metadata guard; the required stale-session resume and full transcript rebuild are intentional, serialized, and bounded to explicit imports."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-06T17:13:06.49342678Z",
+    "CompletedAt": "2026-11-06T17:15:04.087263901Z",
+    "WallClockMilliseconds": 117593,
+    "ModelCalls": 12,
+    "InputTokens": 491092,
+    "OutputTokens": 7755,
+    "TotalTokens": 498847,
+    "ReasoningTokens": 3139,
+    "CacheReadTokens": 429614,
+    "CacheWriteTokens": 61442,
+    "APIDurationMilliseconds": 89081,
+    "ToolCalls": 51,
+    "NanoAIUnits": 63429960000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 429614,
+      "cache_write": 61442,
+      "input": 36,
+      "output": 7755
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
