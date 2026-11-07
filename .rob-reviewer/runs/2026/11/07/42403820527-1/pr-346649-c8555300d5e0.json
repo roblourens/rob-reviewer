@@ -1,0 +1,174 @@
+{
+  "PullRequest": {
+    "Number": 346649,
+    "Title": "Repaint only the changed rows of the minimap decorations layer",
+    "Body": "Fixes #193422\n\n## Problem\nEvery decorations render, for example on each keystroke or selection change, cleared and redrew the whole minimap decorations canvas. That makes Chromium repaint and recomposite the full minimap layer, even when only one row changed.\n\n## Change\n- The decoration helpers now draw into a `RecordedFrame` (`minimapDirtyRows.ts`) instead of a canvas.\n  - It keeps one closure per drawing, plus a signature string per pixel row: what is drawn there and with which style.\n  - For section header labels, the signature also holds the row's offset within the label.\n- `RowSignatures.diff` compares the signatures with the previous frame's and trims the equal rows from the top and the bottom, which gives the dirty band.\n- On the visible canvas, the band is redrawn in place: `save` → clip to the band → `clearRect` the band → replay the drawings that intersect it → `restore`. Chromium then invalidates only that band.\n- There is no pixel readback and no second canvas. An earlier revision of this PR drew offscreen, then used `getImageData`/`putImageData`; the readback made it slower than main.\n- `MinimapOptions.equals` now also compares `sectionHeaderFontColor`. Without that, a theme change that only changes the editor foreground left the section header labels in the old theme's color. This is an existing bug on main; it showed up in the correctness check below.\n\n## Measurements\nLocal dev build on macOS arm64. Typing in a 2000-line file with a selection and section headers in view; per key, over 3 runs each.\n\n| Build | Renderer task ms | Script ms | Minimap rows repainted |\n|---|---|---|---|\n| main | 13.1–14.5 | 7.3–7.7 | 747 px (whole layer) |\n| previous revision (offscreen + readback) | 17.4–23.1 | 9.9–11.2 | 4 px |\n| this revision | 13.3–15.7 | 7.5–8.4 | 4 px |\n\n## Testing\n- Unit test: `./scripts/test.sh --grep \"Minimap\"` passes. The new suite is `Minimap RowSignatures`.\n- `pnpm run eslint` on the changed files passes, and `pnpm run typecheck-client` passes.\n- Correctness scenario, run against a dev build:\n  - It updates the layer incrementally, then toggles the minimap to force a full redraw, and compares the two pixel by pixel. Rounding differences of 1–4 levels are tolerated, because main shows those between two full redraws as well.\n  - The cases are: initial render, selecting and then collapsing 30 lines, find matches, typing with multiple cursors and scrolling, and switching to a light theme.\n  - All five cases pass on this branch. On main, the theme case fails: the labels keep the dark theme's text color (left: incremental, right: full redraw).\n\n![i193422-main-theme-stale-labels.png](https://github.com/user-attachments/assets/eac04d3f-918b-47db-939f-6783c031a92e)\n\nRecording of the passing check:\n\nhttps://github.com/user-attachments/assets/c88a4d7a-00c9-4a01-a3f3-5013c2ec67b3\n\n🤖 Authored with GitHub Copilot on behalf of @alexdima.",
+    "URL": "https://github.com/microsoft/vscode/pull/346649",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "fbc2e922990dfa481866a4162571bf90565392f6",
+    "HeadRef": "agents/minimap-193422-decorations-dirty-rows",
+    "HeadSHA": "c8555300d5e04ca1350ffdda6e1379085e6f1e55",
+    "CreatedAt": "2026-11-06T20:58:42Z",
+    "UpdatedAt": "2026-11-07T18:32:59Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-962EF2E27491",
+      "Focus": "performance-review",
+      "Path": "src/vs/editor/browser/viewParts/minimap/minimap.ts",
+      "Side": "RIGHT",
+      "Line": 1572,
+      "Severity": "medium",
+      "Confidence": 0.92,
+      "ConfidenceRationale": "The default minimap size is proportional; onScrollChanged unconditionally schedules a decorations render; a viewport shift changes decoration row signatures; and RecordedFrame.add plus replay visibly add allocation, string construction, scanning, and a second traversal before the canvas calls. Magnitude depends on decoration density and scroll duration, so severity is medium rather than high.",
+      "PerformanceCategory": "rendering",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceResource": "Main-thread CPU work and short-lived strings, closures, and drawing-record objects, plus a second traversal of all visible drawings.",
+      "PerformanceScaling": "Cost grows with the number of visible decoration-line drawings and their covered pixel rows on every scroll render; aggregate cost grows further with the number of frames in a continuous scroll gesture.",
+      "PerformanceOutcome": "Increased synchronous scroll latency, CPU/GC pressure, and potential dropped frames.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before the PR, a scroll render cleared the canvas and issued each visible decoration draw once, with no row-signature array, per-row string concatenation, deferred closure/object allocation, diff scan, or replay traversal.",
+      "ChangedBehavior": "Scrolling now synchronously materializes row signatures and deferred drawing closures for the entire visible decoration set before issuing the same canvas drawing calls during replay. On a moving proportional minimap with dense decorations, the dirty band spans most or all of the canvas, so this extra recording pass cannot reduce repaint work.",
+      "CausalDiffEvidence": "RIGHT line 1572 constructs a RecordedFrame for every decorations render; every scroll event sets _renderDecorations at minimap.ts:1488. When the proportional minimap viewport moves, the changed code first records every visible drawing (including per-row signature strings and one closure/object per drawing) and then replays those same drawings after the diff identifies the broad changed band.",
+      "Title": "Bypass frame recording when scrolling moves the minimap viewport",
+      "Impact": "Continuous scrolling through a file with dense minimap decorations can incur thousands of short-lived strings, closures, and drawing records per animation frame before a full-band redraw, adding main-thread CPU/GC pressure and risking dropped scroll frames.",
+      "Evidence": "RecordedFrame.fillRect/add calls RowSignatures.add, which loops over covered pixel rows and concatenates strings, then allocates an IRecordedDrawing object and closure. renderDecorations subsequently scans all canvas rows in RowSignatures.diff and all recorded drawings in replay. During continuous scrolling of the default proportional minimap, layout.startLineNumber changes and dense find/diagnostic/selection decorations move to different pixel rows, making the dirty range effectively the full decorated band; replay therefore performs all prior canvas calls in addition to the newly introduced recording work.",
+      "Recommendation": "Detect when scrolling changes the proportional minimap viewport and use an immediate full-redraw mode that skips signatures and deferred closures (resetting the cached signatures so the next incremental frame rebuilds them). Keep RecordedFrame only for stable-layout renders where a narrow dirty band can avoid repaint work."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/editor/browser/viewParts/minimap/minimap.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 1596,
+      "BasePath": "src/vs/editor/browser/viewParts/minimap/minimap.ts",
+      "BaseLine": 1562,
+      "IntroducingPath": "src/vs/editor/browser/viewParts/minimap/minimap.ts",
+      "IntroducingCommit": "f7930a5bbda44408ed8395eb4291125dcd224100",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceCategory": "rendering",
+      "Mechanism": "Every decorations render synchronously cleared and redrew the full visible canvas, causing Chromium to repaint and recomposite the complete minimap decorations layer even for a one-row selection or decoration change.",
+      "Symptom": "Typing and selection changes repaint the entire minimap decorations layer, increasing renderer-task latency on an input-critical path.",
+      "FixedBehavior": "The renderer now clips to the differing row band and clears/replays only drawings intersecting it, avoiding complete decorations-layer invalidation for localized selection or decoration changes.",
+      "Evidence": "In the base revision, cursor, decoration, theme, and scroll events set _renderDecorations, after which base line 1562 clears the complete decorations canvas and the renderer redraws all visible decorations. The changed code computes RowSignatures.diff and changed line 1596 clears only that differing row band. The supplied measurements corroborate the mechanism by showing repainting fall from the full layer to a four-pixel band for a small edit.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "repeated-work",
+      "serialization-allocation",
+      "cache-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Typing, cursor movement, and localized decoration updates with the minimap visible",
+        "CriticalPath": "Selection, typing-triggered decoration changes, and theme changes synchronously rebuild signatures during the editor view render. Row diffing and any canvas replay must finish before that frame completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/editor/browser/viewParts/minimap/minimap.ts:1589-1597",
+            "Operation": "Diff row signatures, clip/clear the changed canvas band, and replay intersecting Canvas 2D drawings.",
+            "Cardinality": "One canvas clear for the dirty band plus one Canvas 2D draw for each recorded drawing intersecting that band; section-header text measurement remains one per uncached header text through the existing LRU.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every decorations render cleared the full canvas and immediately issued every visible decoration drawing, causing full-layer invalidation.",
+            "CriticalPathEffect": "Canvas operations and signature generation are synchronous in the editor render frame. Narrow dirty bands reduce browser repaint/recomposition compared with the base behavior."
+          }
+        ],
+        "ScalingInput": "Canvas backing-store height (typically viewport height times pixel ratio), visible decoration-line intersections, selections, and section headers after viewport filtering and event coalescing.",
+        "EffectiveConcurrency": "Single-threaded and serialized on the editor render path. Multiple pre-render events are coalesced by _renderDecorations, but each resulting render processes the complete visible selection/decoration set.",
+        "CacheBehavior": "The previous frame retains one RowSignatures array bounded by canvas backing-store height. The first render or a resize/options change is cold and redraws the full canvas; stable-layout selection/decoration updates compare against the warm previous frame and can replay only a narrow band. There is no negative-cache state or asynchronous coalescing; the existing _renderDecorations boolean coalesces view events before a render.",
+        "MechanismConfidence": "High: event handlers, render flow, retained signature state, and Canvas 2D calls are directly visible in the changed and surrounding code.",
+        "MagnitudeUncertainty": "Exact renderer savings vary by display scale, canvas height, decoration density, and Chromium compositor behavior, but the localized-update mechanism and critical-path placement are explicit and supported by the supplied measurements.",
+        "Verdict": "The PR intentionally trades bounded per-frame signature/allocation work for substantially narrower canvas invalidation. For stable layouts and localized changes this is a real performance fix, not a reportable regression."
+      },
+      {
+        "Scenario": "Continuous scrolling in the default proportional minimap with dense decorations",
+        "CriticalPath": "onScrollChanged unconditionally marks decorations dirty; rebuilding signatures, diffing rows, and replaying drawings all run synchronously before each scroll frame can present.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/editor/browser/viewParts/minimap/minimap.ts:1572-1597",
+            "Operation": "Record visible minimap decorations and replay them to the Canvas 2D context after row diffing.",
+            "Cardinality": "For D visible decoration-line drawings, the moved-viewport case performs D canvas drawing calls as before, plus D drawing-record/closure allocations, per-covered-row string construction, an H-row diff, and a D-record replay scan per scroll frame.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A scroll render cleared once and drew each visible decoration directly, without signature strings, deferred closures/records, row scanning, or replay traversal.",
+            "CriticalPathEffect": "The new recording work precedes the same broad canvas redraw on the scroll critical path, adding CPU and GC without reducing repaint when the dirty band is broad."
+          }
+        ],
+        "ScalingInput": "Visible decoration-line count and covered pixel rows after viewport filtering, multiplied by continuous-scroll frame count; dense find/diagnostic decorations are the realistic high-cardinality trigger.",
+        "EffectiveConcurrency": "One serialized main-thread render per scheduled editor frame. _renderDecorations coalesces multiple events before a frame, but continuous scrolling repeatedly schedules frames and has no limiter or deferred worker.",
+        "CacheBehavior": "The row-signature cache is warm but becomes ineffective when the proportional minimap viewport shifts and dense decorations move to different rows; the dirty band then covers most or all decorated rows. The cache remains bounded to one prior frame, so there is no unbounded retention.",
+        "MechanismConfidence": "High: proportional is the default size, onScrollChanged always enables decoration rendering, viewport movement changes row signatures, and the added allocations plus second traversal are explicit.",
+        "MagnitudeUncertainty": "The exact dropped-frame threshold depends on hardware, scroll duration, and decoration density. Sparse decorations or fill/fit minimaps can still benefit; the regression is concentrated in the default proportional mode when the viewport moves through dense minimap decorations.",
+        "Verdict": "Reportable medium regression: moved layouts often force a broad redraw, so the new recording/replay machinery adds synchronous CPU and GC work without avoiding the prior Canvas draw cardinality."
+      },
+      {
+        "Scenario": "Resize, minimap configuration, and theme changes including section headers",
+        "CriticalPath": "The first render after resize, minimap option change, or theme change rebuilds the frame and redraws the required affected band; this is synchronous but occurs once per change rather than continuously.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/editor/browser/viewParts/minimap/minimap.ts:1420-1427, 1881-1935",
+            "Operation": "Resize the Canvas backing store and measure/draw visible section-header labels.",
+            "Cardinality": "One canvas resize/reset followed by one cold full decorations redraw; section headers issue one measureText per uncached label and one label draw per visible header.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Canvas resizing and section-header measurement/drawing already occurred; the PR adds signature invalidation and records label drawing for band replay.",
+            "CriticalPathEffect": "Required before the newly sized or themed minimap is presented, but not repeated after the cache warms unless another configuration/theme/layout change occurs."
+          }
+        ],
+        "ScalingInput": "Canvas height, visible section-header count, and uncached unique header strings after viewport filtering.",
+        "EffectiveConcurrency": "Serialized on the editor view render path with event coalescing through _renderDecorations; no parallel work or external queue is introduced.",
+        "CacheBehavior": "_applyLayout resets the retained signatures after canvas dimensions change, guaranteeing a cold full redraw. Theme-only color changes alter signatures and similarly produce the necessary redraw. The retained cache remains one frame and section-header fitting continues to use the pre-existing LRU cache.",
+        "MechanismConfidence": "High: layout reset, option equality, and section-header cache/drawing paths were inspected directly.",
+        "MagnitudeUncertainty": "Very large display pixel ratios increase canvas height and cold-frame signature work, but these events are infrequent and the canvas dimensions are viewport-derived or sampling-bounded.",
+        "Verdict": "No additional reportable regression: cache invalidation is bounded and necessary, and the changed font-color equality prevents stale cached rendering while causing only the expected one-time redraw."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and surrounding minimap layout/event/cache paths. Submitted one medium synchronous scroll-path regression caused by recording and replaying dense decorations when viewport movement already requires a broad redraw. Also recorded the PR's verified fix for the pre-existing full-layer repaint regression and its introducing commit."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-07T19:01:00.751864935Z",
+    "CompletedAt": "2026-11-07T19:04:45.916056934Z",
+    "WallClockMilliseconds": 225164,
+    "ModelCalls": 11,
+    "InputTokens": 416197,
+    "OutputTokens": 9930,
+    "TotalTokens": 426127,
+    "ReasoningTokens": 5195,
+    "CacheReadTokens": 359106,
+    "CacheWriteTokens": 57058,
+    "APIDurationMilliseconds": 139673,
+    "ToolCalls": 45,
+    "NanoAIUnits": 62766440000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 359106,
+      "cache_write": 57058,
+      "input": 33,
+      "output": 9930
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
