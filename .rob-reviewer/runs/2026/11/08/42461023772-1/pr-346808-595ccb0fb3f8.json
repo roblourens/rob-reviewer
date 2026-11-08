@@ -1,0 +1,149 @@
+{
+  "PullRequest": {
+    "Number": 346808,
+    "Title": "Model router: judge a follow-up's effort by the work it hands over",
+    "Body": "On follow-ups, the model router's effort question now tells the decision model to judge a message together with the recent turns.\n\nA short follow-up such as \"fix it\", \"do that\" or \"open a PR with the fix\" reads as easy work on its own, so its reasoning effort was often rated too low. The note says that such a message hands over the work the earlier turns discussed, and to judge the effort that work needs rather than the length of the message. First turns and the model question are unchanged.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346808",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bhavyaus",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ed8e3879fa0a93fe756fa8141e43d3570161269f",
+    "HeadRef": "bhavyaus/model-router-followup-effort",
+    "HeadSHA": "595ccb0fb3f88f5dfc131bc3ff58b9fa31aec8d2",
+    "CreatedAt": "2026-11-08T06:46:32Z",
+    "UpdatedAt": "2026-11-08T07:46:32Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "An eligible non-continuation follow-up in a multi-route chat configured with `switching: auto`, where effort is `auto` and at least one route has no fixed effort",
+        "CriticalPath": "`agentSideEffects` awaits `resolveTurnModel`; that awaits catalog/model availability, `CopilotModelRouter._routeFollowUp`, request construction, and the Decisions API result before the agent turn can proceed. The new note is serialized into the existing effort question on this blocking path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:resolveTurnModel",
+            "Operation": "Settle the model-router catalog and obtain available models for the chat credential before routing",
+            "Cardinality": "At most one catalog settlement and one model-list lookup per turn; warm catalog/model state is reused by existing caches.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same catalog settlement and model lookup occurred for the same follow-up.",
+            "CriticalPathEffect": "These operations precede the decision request and may block model resolution when cold, but the changed instruction does not alter them."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:askDecisions",
+            "Operation": "Invoke the Copilot SDK `decisions.ask` RPC, which sends the bounded request to the decision model",
+            "Cardinality": "One call for each eligible follow-up when the failure gate is open; zero when the follow-up is skipped or a cooldown gate is active.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same scenario made one blocking `decisions.ask` call with the same context and questions except for the fixed follow-up-effort note.",
+            "CriticalPathEffect": "The result is awaited before the turn model and effort are selected. The diff increases only this existing request by a fixed instruction; it adds no round trip."
+          }
+        ],
+        "ScalingInput": "One decision request per eligible follow-up. Context is bounded to four recent turns, 8 KiB per turn, a 32 KiB latest prompt, and a 200 KiB whole request. The diff adds one fixed roughly 350-byte instruction, independent of chat length, route count, or recent-turn size.",
+        "EffectiveConcurrency": "Each turn awaits its one decision request. `DecisionsGate` neither coalesces nor serializes successful calls; the runtime is documented as bounding aggregate concurrency. The diff does not change call count, scheduling, or concurrency.",
+        "CacheBehavior": "Decision answers are never cached. A per-client/per-token gate retains only failure cooldown state; warm calls still invoke the service once, while active failure cooldowns reject without a boundary call. Client, router catalog, and credential-scoped model catalogs can be reused, all unchanged by the diff.",
+        "MechanismConfidence": "High confidence in the path and one-call cardinality from `_routeFollowUp` through `DecisionsModelRouterPicker.pick`, `askDecisions`, and `DecisionsGate`.",
+        "MagnitudeUncertainty": "Exact tokenization and service-side latency for the added fixed text are not measured, but payload growth is constant and small relative to bounded context; no multiplicative or unbounded mechanism exists.",
+        "Verdict": "No reportable regression. The change intentionally adds a small constant amount of serialization and model input to an already-required call, without increasing boundary count, frequency, concurrency, or retained state."
+      },
+      {
+        "Scenario": "A first turn, a follow-up with fixed/off effort, or a follow-up skipped as a simple continuation",
+        "CriticalPath": "First turns can still await one Decisions API call; fixed/off-effort requests omit the effort question, and continuation follow-ups return before constructing a decision request. The new conditional note is absent on all these paths.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:askDecisions",
+            "Operation": "Invoke `decisions.ask` only on paths that already required routing",
+            "Cardinality": "One for an eligible first turn or fixed/off-effort auto-switch follow-up; zero for continuation follow-ups.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical call count, request content, and critical-path placement.",
+            "CriticalPathEffect": "Existing awaited routing boundary; the diff does not alter its payload on these paths."
+          }
+        ],
+        "ScalingInput": "First-turn prompt remains capped at 32 KiB. Skipped follow-ups make zero decision calls. Fixed/off-effort follow-ups preserve their prior bounded request shape.",
+        "EffectiveConcurrency": "Unchanged: at most the pre-existing single awaited call for a routed turn, with no call on continuation shortcuts.",
+        "CacheBehavior": "Unchanged client/catalog reuse and failure cooldown behavior; successful decisions remain uncached.",
+        "MechanismConfidence": "High confidence from the `followUp` and `askEffort` guards and the continuation early return.",
+        "MagnitudeUncertainty": "None material for diff causality because the new conditional evaluates false.",
+        "Verdict": "No performance change on these scenarios."
+      },
+      {
+        "Scenario": "A follow-up request whose serialized size is within the fixed note's size of the 200 KiB cap",
+        "CriticalPath": "Request construction repeatedly measures serialized size before making the same Decisions API call. The added text can make a previously just-under-cap request enter the existing trimming loop once, dropping an oldest recent turn and rebuilding.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotModelRouterPicker.ts:buildModelRouterDecisionsRequest",
+            "Operation": "JSON stringify the built Decisions request to enforce the whole-request byte cap",
+            "Cardinality": "Normally unchanged; at this narrow cap boundary the note can cause one additional bounded rebuild/size check before the outbound call.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A request just below the cap skipped the trim-loop rebuild.",
+            "CriticalPathEffect": "Adds at most bounded synchronous serialization/allocation for an approximately 200 KiB object, then generally sends a smaller payload after removing a recent turn."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:askDecisions",
+            "Operation": "Send the final bounded request through `decisions.ask`",
+            "Cardinality": "Still exactly one call.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One call with the just-under-cap payload.",
+            "CriticalPathEffect": "No extra round trip; after trimming, transferred bytes can be lower than before."
+          }
+        ],
+        "ScalingInput": "Bounded by a 200 KiB request and at most four recent turns. The narrow trigger is a payload within roughly the note's fixed byte size of the cap; trimming reduces subsequent request size.",
+        "EffectiveConcurrency": "Synchronous request construction for one turn; no parallel work or burst is introduced.",
+        "CacheBehavior": "No cache participates in serialization. Existing bounded recent-turn and prompt truncation remains unchanged.",
+        "MechanismConfidence": "High confidence that the existing cap loop can gain an iteration at the threshold; high confidence that it cannot scale beyond existing bounded context and does not add a boundary call.",
+        "MagnitudeUncertainty": "The prevalence of payloads in this few-hundred-byte threshold is unknown, but the work is tightly bounded and offset by a smaller outbound payload.",
+        "Verdict": "Not reportable: the edge-case extra serialization is bounded, narrowly triggered, and does not establish meaningful user-visible latency or throughput degradation."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files and all diff pages. Traced follow-up routing from turn submission through request construction, cache/gate behavior, and the SDK Decisions boundary. The PR adds only constant-size prompt text to an existing bounded call; no actionable performance regression or qualifying regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-08T08:03:37.24129089Z",
+    "CompletedAt": "2026-11-08T08:04:51.960791079Z",
+    "WallClockMilliseconds": 74719,
+    "ModelCalls": 7,
+    "InputTokens": 145940,
+    "OutputTokens": 4324,
+    "TotalTokens": 150264,
+    "ReasoningTokens": 1686,
+    "CacheReadTokens": 109817,
+    "CacheWriteTokens": 36102,
+    "APIDurationMilliseconds": 51143,
+    "ToolCalls": 24,
+    "NanoAIUnits": 31100080000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 109817,
+      "cache_write": 36102,
+      "input": 21,
+      "output": 4324
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
