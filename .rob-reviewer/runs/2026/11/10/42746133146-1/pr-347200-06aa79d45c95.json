@@ -1,0 +1,243 @@
+{
+  "PullRequest": {
+    "Number": 347200,
+    "Title": "Engineering - install every pnpm root with the isolated linker",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nThis is part of the pnpm migration. It switches every pnpm install root from `nodeLinker: hoisted` to `isolated`, with one commit per root: the main workspace, `remote`, `extensions`, `extensions/copilot`, `build` and `test/sanity`. No lockfile changes. It builds on #346923 (packaging that works with either linker), #346940, #346907, #346965 and #347205 (Azure Pipelines and GitHub Actions cache the pnpm store instead of `node_modules`, so the layout of `node_modules` no longer matters for the caches).\n\nIt's a draft, to run the CI and product builds in Azure Pipelines before review. It has only been validated locally on macOS arm64 so far (see below).\n\n## Changes\n\n- **Main workspace:** the linker switch. The pre-check of the Codex smoke test looked for `@openai/codex-\u003cplatform\u003e` only in the root `node_modules`. It now also looks next to the real folder of `@openai/codex`.\n- **`remote`:** the linker switch, and the comments about `remote/web` in `build/npm/dirs.ts` and `build/gulpfile.vscode.web.ts`.\n- **`extensions`:** the linker switch, and the comment on `hoistWorkspacePackages`.\n- **`extensions/copilot`:**\n  - `vsce package` lists the production dependencies with `npm list`, which can't read the symlinked `node_modules` of the isolated layout. The `package` script now runs `script/build/packageVsix.ts`, which runs `vsce package` in a staging folder that `pnpm deploy --prod` creates. The Copilot pipeline calls the script.\n  - `debug` tries to load `supports-color`, an optional peer that isn't installed. esbuild bundled whichever copy it could reach, which depends on the layout, so it's now external in the extension host bundle.\n  - When chat-lib is extracted, TypeScript can't name TypeBox's types in the declarations of the schemas through the symlinks (TS2883). The files that define the schemas now export those types.\n- **`build`** and **`test/sanity`:** the linker switch only. The sanity jobs cache the pnpm store, and the containers that bind-mount `test/sanity` can use the layout, because pnpm's links are relative.\n- **Copilot CI jobs:** Copilot's lint uses the root ESLint configuration, which loads the local rules in `.eslint-plugin-local`. The Copilot jobs installed only the root project (`--filter .`), and the lint found the rules' dependencies, such as `@typescript-eslint/utils`, through the root's hoisting. The Azure Pipelines Copilot setup and the GitHub Copilot jobs, which share their pnpm store caches, now also install `.eslint-plugin-local` (`--filter vscode-eslint-plugin-local`).\n- **Windows test jobs on GitHub Actions:** esbuild follows pnpm's junctions with Go's `os.Readlink`, which by default for esbuild turns the volume behind a mount point into a drive letter path. These jobs mount their Dev Drive or workspace image at the parent of the workspace without a drive letter, so esbuild couldn't resolve the dependencies of packages (\"Could not resolve `@hpke/common`\"). `pr-win32-test.yml` now sets `GODEBUG=winreadlinkvolume=1`, so that `Readlink` keeps the volume path. Some paths in esbuild's source maps may then be absolute in these jobs.\n\nExisting checkouts switch layout on the next `pnpm install`, with no manual step.\n\n## What changes in the output\n\nThe packages contain the same files as with the hoisted linker, apart from renamed webview chunks. Besides rebuilt native modules, these files differ:\n- The Copilot `extension.js` no longer bundles `supports-color`, or the second copies of `semver` and `content-type` that the hoisted layout installed in two folders. It also no longer bundles the optional `bufferutil`, `utf-8-validate` and `node-gyp-build` of `ws`, which it reached through the root's hoisting; `ws` falls back to JavaScript either way.\n- The HTML language server and the TypeScript web server no longer bundle a second copy of `vscode-languageserver-textdocument` and `vscode-uri`.\n- The chunk names of the Markdown and Mermaid webviews change, because their content includes the module paths.\n- Some source maps list different `sources` paths.\n\nThe esbuild inputs of all 82 built-in extension builds have the same packages and versions, and the Copilot builds differ only as described above. The Copilot VSIX has the same 82 files as `vsce package` run directly on the same build.\n\n## Known issues\n\n- **OSS license scan:** `build/azure-pipelines/oss/scan-licenses.ts` keys packages by name, so for a package installed in several versions it reports a different version than with the hoisted layout (same package names). It should key by name and version.\n- **Not yet validated:** Windows (long `.pnpm` paths, native builds, `zx.cmd` in signing), Linux and Alpine containers, and the product pipeline.\n\n## Validation\n\nAll on macOS arm64, with offline installs from the local pnpm store:\n\n- `pnpm install --frozen-lockfile --offline`: passed for every root, lockfiles unchanged. Switching an existing install in place works in both directions.\n- `pnpm exec npm-run-all2 -lp --continue-on-error eslint stylelint hygiene core-ci-pr valid-layers-check 'gulp compile-extensions'`: passed.\n- `cd build \u0026\u0026 pnpm run typecheck \u0026\u0026 pnpm run test`: 1493 passed, 1 failed (`next/test/resources.test.ts`: `/var` vs `/private/var` on macOS, which also fails with hoisted).\n- `cd extensions/copilot \u0026\u0026 pnpm run typecheck \u0026\u0026 pnpm run compile \u0026\u0026 pnpm run package`: passed.\n- The Copilot jobs' installs in a clean checkout: `pnpm install --frozen-lockfile --ignore-scripts --filter .`, then `pnpm install --frozen-lockfile` in `extensions/copilot`, then `pnpm run lint` there failed with the CI's `ERR_MODULE_NOT_FOUND` for `@typescript-eslint/utils`. With `--filter . --filter vscode-eslint-plugin-local`, the lint passed (2285 files).\n- `test/sanity`: `pnpm run compile`, loading every test module (`node out/index.js` with a `--grep` that matches no test), `pnpm run test-copilot-shim-helper` and `pnpm run test-copilot-shim-rendering`: passed, also from a copy in another folder. The local store doesn't have `yargs@17.7.3`, so this used 17.7.2 (not committed).\n\nBefore rebasing onto `main` (the same commits; `main` didn't change the packaging code since), with the same results as the hoisted linker, apart from local environment failures that also occur with it:\n- `pnpm run gulp --series --continue vscode-darwin-arm64-min vscode-reh-darwin-arm64-min vscode-reh-web-darwin-arm64-min vscode-web-min`, compared with hoisted after each root's switch: the differences listed above. Locally the `-min` builds of desktop and server stop at `prepareBuiltInCopilotRipgrepShim` with either linker.\n- Unit tests in Node.js, Electron and WebKit.\n- Integration tests: Electron (`./scripts/test-integration.sh`, also `--suite copilot`), web and remote.\n- Smoke tests: `pnpm run smoketest-no-compile`, also with `--web` and `--remote`.\n- Copilot: `pnpm run lint`, the unit, prompt and simulation tests, and the chat-lib job.\n- The OSS license scan: the differences described above.\n\n\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/347200",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d558ad2fed0328920d65ae879f736fb6a518bc96",
+    "HeadRef": "lszomoru/pnpm-isolated-main",
+    "HeadSHA": "06aa79d45c95e01b59d438bbcf0500a350ad5010",
+    "CreatedAt": "2026-11-09T22:23:39Z",
+    "UpdatedAt": "2026-11-10T00:32:19Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-DF2D04C73B01",
+      "Focus": "performance-review",
+      "Path": "extensions/copilot/script/build/packageVsix.ts",
+      "Side": "RIGHT",
+      "Line": 30,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The before/after subprocess sequence, manifest dependency closure, lack of a `files` bound, ignore-file allowlist, and synchronous cleanup are all directly visible. Exact elapsed time depends on filesystem/link behavior and cache warmth, which affects severity but not the I/O amplification mechanism.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "filesystem operations and bytes for a full temporary project plus hoisted production dependency tree",
+      "PerformanceScaling": "Each packaging invocation copies work proportional to the entire extensions/copilot source tree and all transitive production dependencies, then recursively deletes that staging tree; the final VSIX remains constrained by .vscodeignore to a small allowlist.",
+      "PerformanceOutcome": "increased Copilot VSIX packaging latency and temporary disk usage on local and product-build critical paths",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "`vsce package` ran directly in extensions/copilot and traversed the installed dependency graph without first creating and deleting another complete deployment.",
+      "ChangedBehavior": "The added synchronous `pnpm deploy --prod` creates a hoisted portable copy of the project and every production dependency before `vsce` packages it, after which the entire staging directory is synchronously removed.",
+      "CausalDiffEvidence": "RIGHT line 30 adds the full `pnpm deploy --prod --config.node-linker=hoisted` subprocess before the existing packager; this deployment and its later recursive deletion did not exist in the previous direct `vsce package` path.",
+      "Title": "Limit staging to files that can enter the VSIX",
+      "Impact": "Every `pnpm run package`, including the Product Copilot pipeline, now waits for an additional full-tree deployment and cleanup. This scales with the large Copilot source tree and its 40+ direct production dependencies even though `.vscodeignore` starts with `**` and admits only the built artifacts and selected dependency files.",
+      "Evidence": "Added line 30 invokes `pnpm deploy --prod` into a fresh temp directory; lines 44-45 then run the pre-existing `vsce package`, and line 42 recursively removes the deployment. `extensions/copilot/package.json` has no `files` allowlist and declares 40+ production dependencies, while `.vscodeignore` excludes everything by default and selectively includes only build outputs, the server plugin, and selected `@github/copilot` files. The changed product pipeline calls this script on its packaging critical path.",
+      "Recommendation": "Keep the flat dependency layout needed by `vsce`, but construct the staging deployment from a package/files allowlist matching the VSIX inputs (or otherwise stage only the built artifacts and explicitly included dependency/plugin files) so source, tests, and excluded production packages are never copied and deleted."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Install dependencies in the main, remote, extensions, Copilot, build, and sanity pnpm roots",
+        "CriticalPath": "`pnpm install` must finish before compilation, lint, tests, and product builds. The linker change affects filesystem layout during that existing critical-path install but does not add a package set or a new install invocation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "pnpm-workspace.yaml and the five nested pnpm-workspace.yaml files, `nodeLinker`",
+            "Operation": "Import/link dependency files from the pnpm store and create the isolated node_modules symlink graph",
+            "Cardinality": "One install layout operation per package graph entry in each invoked root, with the same package graph as before",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same installs imported the same locked packages into a hoisted node_modules layout.",
+            "CriticalPathEffect": "Required before dependent build/test commands can start"
+          },
+          {
+            "Kind": "network",
+            "Location": "Existing `pnpm install` invocations across setup workflows/scripts",
+            "Operation": "Fetch package tarballs on pnpm-store misses",
+            "Cardinality": "Only missing packages in the unchanged lockfile graph; zero on a fully warm store",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Cold installs fetched the same locked packages; warm installs used the same pnpm-store cache.",
+            "CriticalPathEffect": "Cold-cache misses block install completion; warm-cache builds avoid them"
+          }
+        ],
+        "ScalingInput": "The existing lockfile package graph in each of six install roots; the PR states no lockfile changes, so effective package cardinality is unchanged.",
+        "EffectiveConcurrency": "pnpm performs its normal internal fetch/import/link concurrency within each root; separate CI jobs can install independently. The diff adds no shared burst, limiter change, or serialization.",
+        "CacheBehavior": "Warm pnpm-store installs reuse package contents but relink node_modules; cold installs fetch the same locked package graph as before. Existing workflow store caches remain the cache boundary and are not invalidated by node_modules layout.",
+        "MechanismConfidence": "High confidence that only dependency layout changes here; no concrete performance regression is established from the configuration switch alone.",
+        "MagnitudeUncertainty": "Exact link/import operation counts and filesystem performance vary by platform, especially Windows junction handling, but there is no evidence that the isolated layout adds package downloads or unbounded work.",
+        "Verdict": "No finding: the diff changes layout without changing package cardinality, network fan-out, cache keys, or install concurrency, and no measured or code-proven slowdown is present."
+      },
+      {
+        "Scenario": "Prepare dependencies for Copilot lint jobs",
+        "CriticalPath": "The root install must complete before Copilot lint loads the repository ESLint configuration and local rules.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": ".github/workflows/pr.yml, .github/workflows/pr-pnpm-store.yml, and build/azure-pipelines/copilot/setup-steps.yml",
+            "Operation": "Run pnpm install with the added `vscode-eslint-plugin-local` filter",
+            "Cardinality": "One install invocation per affected Copilot CI job; the diff expands the selected graph rather than adding another subprocess",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same install selected only the root project and omitted the local ESLint rule workspace.",
+            "CriticalPathEffect": "Blocks lint/test setup, as did the prior root install"
+          },
+          {
+            "Kind": "network",
+            "Location": ".eslint-plugin-local/package.json dependency graph reached by the changed filters",
+            "Operation": "Fetch dependencies unique to the local ESLint workspace on store misses",
+            "Cardinality": "At most the plugin's bounded dependency closure per cold shared store, reduced by overlap with root dependencies",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Those packages were not selected solely for this workspace, although overlapping root packages could already be present.",
+            "CriticalPathEffect": "Only cold-store misses extend setup; warm shared stores avoid fetches"
+          }
+        ],
+        "ScalingInput": "One additional local workspace package with nine declared dev dependencies per affected install definition; effective fetched cardinality is only dependencies absent from the root graph/store.",
+        "EffectiveConcurrency": "One pnpm install subprocess per CI job; six changed job/setup definitions may execute in separate CI jobs, while each invocation is handled by pnpm's existing internal concurrency.",
+        "CacheBehavior": "The pnpm-store workflows skip installs on a matching saved store, and other jobs reuse the store. On cold misses, only previously absent plugin dependencies require network fetch; workspace linking still occurs when install runs.",
+        "MechanismConfidence": "High confidence in the bounded graph expansion, but low confidence in meaningful performance impact because the dependencies are required for lint correctness, heavily overlap tooling already installed, and are cached.",
+        "MagnitudeUncertainty": "The exact incremental package count depends on graph overlap and store warmth.",
+        "Verdict": "No finding: this is bounded, necessary setup work within an existing install and no actionable avoidable fan-out or concurrency amplification is shown."
+      },
+      {
+        "Scenario": "Package the Copilot extension locally or in the Product Copilot pipeline",
+        "CriticalPath": "The new `pnpm deploy` completes synchronously before `vsce package`; packaging then completes before artifact publication. Temporary-tree deletion also runs synchronously before the script exits.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/copilot/script/build/packageVsix.ts:30",
+            "Operation": "Create a hoisted production deployment in a fresh temporary directory",
+            "Cardinality": "One full deployment per package invocation",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No deployment subprocess or temporary production tree was created; vsce packaged directly from extensions/copilot.",
+            "CriticalPathEffect": "New blocking stage before the existing packager"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/script/build/packageVsix.ts:30-42",
+            "Operation": "Copy/materialize the project and production dependency closure, copy the server plugin, then recursively delete the staging tree",
+            "Cardinality": "Filesystem work proportional to the complete staged project and transitive production graph per invocation",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "vsce read package inputs in place and did not create/delete a second complete deployment.",
+            "CriticalPathEffect": "All materialization and cleanup block script completion and product artifact publication"
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/copilot/script/build/packageVsix.ts:41",
+            "Operation": "Run `vsce package` against the staging folder",
+            "Cardinality": "One invocation per package operation",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The product pipeline invoked the same packager directly in the Copilot source directory.",
+            "CriticalPathEffect": "Existing packaging critical path, now sequenced after deploy"
+          }
+        ],
+        "ScalingInput": "The complete Copilot project file tree plus its 40+ direct and transitive production dependencies, despite the final VSIX being restricted by `.vscodeignore` to built artifacts and selected dependency/plugin files.",
+        "EffectiveConcurrency": "The deploy, manifest/plugin copies, vsce subprocess, and recursive cleanup are strictly serialized through `spawnSync` and synchronous filesystem APIs; there is no coalescing across invocations.",
+        "CacheBehavior": "A warm pnpm store can avoid downloads, but every invocation creates a fresh temp directory and still materializes and deletes the deployment. There is no reusable staging cache.",
+        "MechanismConfidence": "Very high: the new deploy, strict sequencing, broad dependency manifest, restrictive VSIX ignore file, and recursive cleanup are directly visible.",
+        "MagnitudeUncertainty": "Elapsed time depends on filesystem/link strategy, platform, and dependency sizes; the extra full-tree materialization remains certain even on a warm store.",
+        "Verdict": "Reported: avoidable eager filesystem work now scales with the whole project/dependency closure rather than the small final VSIX input set."
+      },
+      {
+        "Scenario": "Build and activate the Copilot Node extension bundle",
+        "CriticalPath": "esbuild treats `supports-color` as external during compilation. At extension activation, `debug` performs its normal optional module resolution once when its module initializes; activation does not wait on a new network or subprocess boundary.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/.esbuild.mts nodeExtHostBuildOptions.external",
+            "Operation": "Resolve the external optional `supports-color` module at runtime",
+            "Cardinality": "One cached optional resolution per module instance/process",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The reachable `supports-color` copy was bundled, so its code loaded from the extension bundle rather than external module resolution.",
+            "CriticalPathEffect": "A small fixed module-initialization lookup during extension loading"
+          }
+        ],
+        "ScalingInput": "One optional module resolution per loaded `debug` module instance, not per log event, request, editor, or message.",
+        "EffectiveConcurrency": "Synchronous Node module resolution during module initialization; fixed cardinality with no burst.",
+        "CacheBehavior": "Node's module cache coalesces subsequent requires within the extension host process. The optional module is absent in this install layout, so the first lookup falls back to `debug` basic colors.",
+        "MechanismConfidence": "High confidence in the one-time changed resolution behavior and high confidence that it lacks realistic scaling.",
+        "MagnitudeUncertainty": "Exact filesystem stat count depends on Node resolution paths, but cardinality is fixed and tiny.",
+        "Verdict": "No finding: this replaces bundled optional code with one cached lookup and does not create a meaningful hot/scaling performance mechanism."
+      },
+      {
+        "Scenario": "Run the Agents Window Codex smoke-test precheck and Windows esbuild jobs",
+        "CriticalPath": "The development smoke test performs its synchronous binary precheck once before spawning Codex tests. Windows builds use the changed Go readlink behavior while esbuild resolves package junctions; those resolutions remain part of the existing build path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "test/smoke/src/areas/agentsWindow/agentsWindow.test.ts:687-703",
+            "Operation": "Resolve the real path of `@openai/codex`, inspect one or two vendor directories, and test candidate binaries",
+            "Cardinality": "One precheck over one deduplicated location in flat installs or two locations in isolated development installs",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Inspected one flat platform-package vendor directory.",
+            "CriticalPathEffect": "Blocks only this smoke-test setup and remains fixed/small"
+          },
+          {
+            "Kind": "filesystem",
+            "Location": ".github/workflows/pr-win32-test.yml GODEBUG setting",
+            "Operation": "Resolve pnpm junction targets through Go `os.Readlink` during esbuild jobs",
+            "Cardinality": "The existing set of package junction resolutions performed by esbuild",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same readlink calls occurred but could return drive-letter paths for mounted volumes.",
+            "CriticalPathEffect": "Remains on the existing Windows build/test path; the setting preserves volume paths so resolution succeeds"
+          }
+        ],
+        "ScalingInput": "At most two Codex scope locations and the small set of vendor triples for the smoke precheck; existing module/junction count for each esbuild job.",
+        "EffectiveConcurrency": "The smoke checks are sequential synchronous filesystem calls once per test setup. Esbuild retains its existing build concurrency; the environment variable changes path representation, not concurrency.",
+        "CacheBehavior": "No explicit application cache for the smoke precheck, but it runs once. OS filesystem caches may warm repeated esbuild path resolution; no cache key or lifecycle changes are introduced.",
+        "MechanismConfidence": "High confidence that the extra smoke-test filesystem work is bounded and test-only and that GODEBUG changes semantics rather than call count.",
+        "MagnitudeUncertainty": "Vendor triple count and esbuild module graph vary, but neither changed path creates unbounded or collection-wide duplicate work.",
+        "Verdict": "No finding: added smoke-test I/O is one bounded preflight check, while the Windows setting does not increase boundary cardinality."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 20 changed files and their relevant callers. Submitted one medium-confidence/high-mechanism-confidence finding for full-tree Copilot VSIX staging I/O; no other changed path established an actionable scaling or critical-path performance regression."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-10T03:06:41.148113803Z",
+    "CompletedAt": "2026-11-10T03:08:39.734453867Z",
+    "WallClockMilliseconds": 118586,
+    "ModelCalls": 7,
+    "InputTokens": 165823,
+    "OutputTokens": 8496,
+    "TotalTokens": 174319,
+    "ReasoningTokens": 3703,
+    "CacheReadTokens": 129234,
+    "CacheWriteTokens": 36568,
+    "APIDurationMilliseconds": 91445,
+    "ToolCalls": 49,
+    "NanoAIUnits": 40453760000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 129234,
+      "cache_write": 36568,
+      "input": 21,
+      "output": 8496
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

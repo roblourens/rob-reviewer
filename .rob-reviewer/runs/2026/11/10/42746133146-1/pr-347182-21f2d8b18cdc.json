@@ -1,0 +1,164 @@
+{
+  "PullRequest": {
+    "Number": 347182,
+    "Title": "sessions: wait for startup providers before resolving a handed-off folder",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #346833\n\n## What changed\n\nWhen the Agents window opens from an editor window with a local folder, `AgentsWindowWorkspaceHandoff` polls `ISessionsManagementService.resolveWorkspace` and accepts the first provider that resolves the folder. The Cloud provider (`default-copilot`) accepts local `file:` folders and registers shortly before the local agent-host provider (both are `AfterRestored` contributions, Cloud first in import order). If the handoff resolves inside that gap, `selectWorkspace` → `_reconcileWorkspaceEnvironment` pins the composer to **Cloud**, overriding the default that would pick **This Computer** for a local folder, and the handoff never revisits it.\n\nThe handoff now waits, before resolving a folder, until the contributions instantiated after restore have been created (`IWorkbenchContributionsRegistry.whenRestored`), which is when the startup session providers have registered. This applies to every folder handoff path (Open Agents Window, the title-bar button, and draft handoffs).\n\n## Why this is safe\n\n- No change to provider logic, environment defaults, or the composer.\n- `whenRestored` always settles; the existing cancellation and 15 second timeout still apply, and the wait is skipped once it has settled.\n- The added delay is short: in local testing the folder applied ~130 ms after the local provider registered.\n\n## How to test\n\n1. Open a local git folder in an editor window and make sure no Agents window is open.\n2. Run **Chat: Open Agents Window**.\n3. The new-session composer should show **This Computer** with the folder selected.\n\nThe race is easier to hit with `--skip-sessions-welcome`, which removes the account wait before the handoff resolves. Before this change that setup selected Cloud every time in Code OSS; with it, This Computer.\n\n## Validation\n\n- `./scripts/test.sh --reporter dot --run src/vs/sessions/contrib/chat/test/browser/agentsWindowWorkspaceHandoff.test.ts --run src/vs/sessions/contrib/chat/test/electron-browser/agentsWindowWorkspaceHandoff.test.ts`: passed (73 tests). The new regression test fails without the fix (selects `cloud`) and passes with it.\n- `pnpm run eslint` on the changed files: passed.\n- `pnpm run typecheck-client`: passed.\n- Manual Code OSS runs with logpoints on provider registration and handoff resolution, on a persistent signed-in profile and a fresh profile: composer shows This Computer.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/347182",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "a247f16f7b7f6e4d56ecf883b442763e19eec096",
+    "HeadRef": "agents/cloud-agent-default-issue-investigation",
+    "HeadSHA": "21f2d8b18cdcca4bfb2f3a7efc4c1058b60c81a1",
+    "CreatedAt": "2026-11-09T21:24:27Z",
+    "UpdatedAt": "2026-11-09T23:17:32Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-AB67A64AE0D7",
+      "Focus": "performance-review",
+      "Path": "src/vs/sessions/contrib/chat/browser/agentsWindowWorkspaceHandoff.ts",
+      "Side": "RIGHT",
+      "Line": 197,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The changed critical-path await, the exact global-promise completion condition, idle batching, 500 ms timeout, and cold-start call path are all explicit in repository code. Exact device-specific delay is uncertain, which is reflected in medium severity rather than mechanism confidence.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "synchronous-ui-work",
+      "PerformanceResource": "main-thread idle scheduling and synchronous construction of all AfterRestored workbench contributions",
+      "PerformanceScaling": "The cold-open delay grows with the number and constructor cost of every AfterRestored contribution; when an idle slice is exhausted, the registry schedules another slice with a 500 ms forced timeout before the global promise can settle.",
+      "PerformanceOutcome": "increased cold Agents-window folder-handoff latency before the composer can apply the requested workspace",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "After setup/view restoration, a folder handoff immediately queried the providers currently registered and applied the workspace; unrelated AfterRestored contributions were not on this critical path.",
+      "ChangedBehavior": "Every cold-start handoff with a folder now awaits the global workbench `whenRestored` promise before resolving the workspace.",
+      "CausalDiffEvidence": "The added `await raceCancellationError(this.whenStartupProvidersRegistered...)` at line 197 is passed `IWorkbenchContributionsRegistry.whenRestored`, changing the folder path from immediate provider resolution to a global restored-contribution barrier.",
+      "Title": "Wait only for startup session providers",
+      "Impact": "Opening a cold Agents window from a local-folder editor, including draft handoffs, can leave the new-session composer waiting for all unrelated restored contributions even after the required provider has registered. The PR description already observes about 130 ms on this path, and busy startup or additional contributions can push it toward one or more idle timeouts.",
+      "Evidence": "`IWorkbenchContributionsRegistry.whenRestored` is documented as completing only after all contributions through Restored are instantiated. Its implementation constructs the full Restored list via `runWhenGlobalIdle`; each exhausted slice is rescheduled and Restored uses a 500 ms forced timeout. The list includes unrelated work such as terminal setup and GitHub PR polling, while the actual default and local session providers are only two AfterRestored contributions. `SelectAgentsFolderContribution` is a BlockStartup contribution, so an initial folder IPC can reach this await before those idle batches complete.",
+      "Recommendation": "Use a dedicated startup-session-provider registration barrier (completed once the relevant provider contributions have synchronously registered), or another provider-scoped readiness signal, and await that instead of global `whenRestored`; preserve the existing cancellation behavior."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold Agents-window open from an editor with a local folder, including a folder-bearing draft handoff",
+        "CriticalPath": "The existing Electron folder-selection IPC reaches `selectWorkspace`, waits for setup and view restoration, and now additionally waits for the global restored-contribution promise before synchronously resolving the folder and applying it to the composer. The new global wait is directly on the user-visible workspace-selection critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/chat/electron-browser/chat.contribution.ts:126",
+            "Operation": "Receive the editor's `vscode:selectAgentsFolder` handoff in the Agents renderer",
+            "Cardinality": "One IPC event per open/handoff; rapid replacement cancels the previous in-process handoff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC initiated the handoff, which proceeded after setup/restoration without waiting for all Restored contributions.",
+            "CriticalPathEffect": "Starts the scenario; it was already on the critical path and is not made more frequent by this diff."
+          }
+        ],
+        "ScalingInput": "One active handoff per window/open intent; newer intents cancel the previous one. Delay scales with the count and synchronous constructor cost of all `AfterRestored` contributions and the number of exhausted idle slices, not with folder count.",
+        "EffectiveConcurrency": "Only one handoff remains active because `selectWorkspace` cancels its predecessor. All waiters share the same global promise, so work is coalesced, but the registry constructs Restored contributions serially on the renderer idle callback; exhausted slices are rescheduled with a 500 ms forced timeout.",
+        "CacheBehavior": "On a cold window the global promise is pending and the new barrier applies. Once it settles, `_startupProvidersRegistered` is set and all later/warm handoffs skip the wait. Provider lookup is synchronous and the local provider's `resolveWorkspace` does not cross an external boundary.",
+        "MechanismConfidence": "High: the added await, the global promise's completion condition, serial idle construction, and cold-start call path are explicit.",
+        "MagnitudeUncertainty": "The exact delay depends on available idle time and contribution constructor costs; the PR reports about 130 ms locally, while the implementation permits one or more idle-slice waits. Prevalence is limited to cold startup with a folder.",
+        "Verdict": "Reportable latency regression: the correctness fix gates folder application on unrelated global startup work rather than only startup provider registration."
+      },
+      {
+        "Scenario": "Cold handoff of a folder from an SSH, WSL, or tunnel editor",
+        "CriticalPath": "Remote host/folder resolution starts concurrently with setup and view readiness. After that existing remote resolution completes, the diff waits for global Restored contributions whenever it produced a folder, before provider resolution and composer selection.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/chat/electron-browser/chat.contribution.ts:126",
+            "Operation": "Receive the remote-folder handoff from the editor window",
+            "Cardinality": "One per handoff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical IPC delivery before the diff.",
+            "CriticalPathEffect": "Initiates the handoff and remains unchanged."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/sessions/contrib/providers/remoteAgentHost/browser/remoteWorkspaceHandoffService.ts:196",
+            "Operation": "Resolve or add the matching remote agent host and establish the user-initiated remote connection as needed",
+            "Cardinality": "At most one host resolution for the single remote folder intent, with behavior depending on whether the host is already configured/connected.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Remote resolution was already started and awaited before selecting the resolved folder, without the global contribution barrier.",
+            "CriticalPathEffect": "Existing critical-path work, started early to overlap setup; the diff does not add or multiply it, but adds the global barrier after its result."
+          }
+        ],
+        "ScalingInput": "One remote machine/folder per handoff. The added delay scales with pending Restored-contribution work; it may overlap remote resolution, so it is most visible when remote resolution is fast or cached.",
+        "EffectiveConcurrency": "Remote resolution is launched before setup and runs concurrently with setup/restoration. The global contribution barrier progresses independently, but the code awaits remote resolution and then the barrier; only one current handoff survives cancellation.",
+        "CacheBehavior": "Known/configured remote hosts can resolve faster than cold hosts; unknown hosts may require setup/connection. The global restored barrier is cold-only and skipped after settlement. No new cache or external call is introduced.",
+        "MechanismConfidence": "High for barrier reachability and concurrency; only the observed added duration varies.",
+        "MagnitudeUncertainty": "A slow remote connection can hide the added startup wait through overlap; a warm/configured host exposes more of it. Exact remote-service transport differs by SSH, WSL, and tunnel.",
+        "Verdict": "The same reported global-barrier regression reaches this path, but it does not warrant a duplicate finding and introduces no new boundary fan-out."
+      },
+      {
+        "Scenario": "Warm Agents-window folder handoff and existing-session/no-folder opens",
+        "CriticalPath": "After startup, folder handoffs pass the `_startupProvidersRegistered` check and continue directly to provider resolution. Existing-session and no-folder paths do not enter the added folder barrier.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/chat/electron-browser/chat.contribution.ts:126",
+            "Operation": "Receive a later folder/session handoff",
+            "Cardinality": "One per user handoff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same IPC and downstream session/folder handling.",
+            "CriticalPathEffect": "Existing event only; the diff adds no warm-path boundary or delay."
+          }
+        ],
+        "ScalingInput": "One active handoff; no collection scaling.",
+        "EffectiveConcurrency": "Replacement intents cancel prior work. There is no added wait after the shared startup promise has settled.",
+        "CacheBehavior": "The settled startup promise is represented by `_startupProvidersRegistered`, so warm calls skip it. Provider registration and workspace resolution remain unchanged.",
+        "MechanismConfidence": "High: the boolean is set from the shared promise and guards the changed block.",
+        "MagnitudeUncertainty": "A microtask race immediately after promise settlement could briefly take the already-resolved await, but that is negligible and bounded.",
+        "Verdict": "No reportable warm-path regression."
+      }
+    ],
+    "Summary": "Reviewed all three changed files and traced local, draft, remote, warm, and existing-session handoffs. Submitted one medium-severity cold-start latency finding: folder selection now waits for every idle-scheduled Restored contribution instead of only startup session-provider registration. No new boundary fan-out, repeated work, retention, or concurrency burst was introduced, and the PR is not itself a performance-regression fix."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-10T03:03:10.054098324Z",
+    "CompletedAt": "2026-11-10T03:05:04.781165281Z",
+    "WallClockMilliseconds": 114727,
+    "ModelCalls": 14,
+    "InputTokens": 653508,
+    "OutputTokens": 7819,
+    "TotalTokens": 661327,
+    "ReasoningTokens": 3293,
+    "CacheReadTokens": 576920,
+    "CacheWriteTokens": 76546,
+    "APIDurationMilliseconds": 87095,
+    "ToolCalls": 60,
+    "NanoAIUnits": 77004600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 576920,
+      "cache_write": 76546,
+      "input": 42,
+      "output": 7819
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
