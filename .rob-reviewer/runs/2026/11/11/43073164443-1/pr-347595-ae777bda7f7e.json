@@ -1,0 +1,216 @@
+{
+  "PullRequest": {
+    "Number": 347595,
+    "Title": "build: start the Windows CI test jobs from workspace images",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nAdopts the workspace images of the Linux and macOS CI test jobs (#347398, #347618) in the **Windows stage of CI builds only**.\n\nIn a Windows CI test job, \"Install dependencies\" takes about 4 minutes, plus the pnpm store restore, against about 1.6 minutes on Linux, where the image brings it down to 0.2 minutes.\n\n### What changes\n\n- **Image job** (`Windows (X64) - Image`, new in the Windows stage of CI builds): like the Linux one. It looks up the current key, and when the cache doesn't have it, it creates a volume at its sources directory, runs the setup steps of the test jobs in it without the distro and the pnpm store cache, and packs it. It continues on error.\n- **Test jobs:** every Windows CI test job except **Smoke Tests (Electron)** passes `VSCODE_WORKSPACE_IMAGE: use`. The smoke job runs the WSL smoke tests, and WSL cannot open folders on a volume that is mounted in a folder. The WSL smoke test job of pull requests doesn't use the images either.\n\n### How it differs from Linux and from the GitHub images\n\n- **NTFS instead of a Dev Drive:** the agents run Windows Server 2022 (`1es-windows-2022-x64`), which has no Dev Drives. `vhd.ps1 -Create` gets a `-FileSystem NTFS` option (`DevDrive` stays the default). The image is otherwise a GitHub Windows image: a dynamic VHDX with blocks of 1 MB, restored into a temporary file and attached through the file system cache, without `-Trust`.\n- **The checkout moves aside:** Windows can only mount a volume at an empty folder, so a job moves the entries of its checkout into `$(Agent.TempDirectory)`, on the same disk, mounts the volume at the sources directory, and fetches the job's commit from the moved `.git`, like Linux fetches from its linked `.git`. It moves the checkout back when it unmounts the volume: the test jobs after any error, and the image job after it detached the volume to pack it, for the rest of the job. vhd.ps1 runs from the moved checkout.\n- **Like the Windows jobs of pull requests**, the jobs that start from an image set `GODEBUG=winreadlinkvolume=1`, so that esbuild resolves pnpm's links on a volume without a drive letter, and trust the files of the image in git (`safe.directory`).\n- **System Volume Information:** the volume is mounted at the sources directory, like on Linux, not at its parent folder like the GitHub images, as the 1ES steps keep files there before the image steps (the Guardian MSBuild hooks, the binary analysis cache). Windows creates `System Volume Information` at the root of the volume when `vhd.ps1 -Create` gives it a drive letter, and the scripts that walk the repository can't read it (build 495261 failed in Setup NPM Registry with `EPERM`). So the jobs take over and delete it, and `$RECYCLE.BIN`: the image job after creating the volume and before packing it, the test jobs after mounting the image, which they attach without a drive letter.\n- **Junctions instead of pnpm's relative links to the root:** pnpm creates relative symbolic links on the agents, such as `extensions\\npm\\node_modules\\which` → `..\\..\\..\\node_modules\\.pnpm\\which@4.0.0\\node_modules\\which`. esbuild resolves their `..` itself, and when that reaches the root of a volume without a drive letter, it drops the separator after the volume name (`\\\\?\\Volume{...}node_modules\\...`), with any `GODEBUG`, so it can't resolve the dependencies of the packages of the workspace members (build 495277 failed in Compile with `Could not resolve \"isexe\"`). The links of the GitHub images go up to the workspace folder at most, as they're mounted at its parent. So after the install steps, the test jobs that mounted an image replace the links that go up to the root (about 500 of them) with junctions, which hold absolute paths (`workspaceImage.ts junctions`).\n\n### Changes\n\n- `image.ts`: exports the Windows mount (`mountWindowsImage`), moved out of `mount()`. The GitHub jobs call it with the same arguments as before.\n- `vhd.ps1`: `-FileSystem DevDrive|NTFS` for `-Create`.\n- `workspaceImage.ts`: `restore`, `create` and `pack` on Windows, and `junctions`, which replaces pnpm's relative links to the root of the sources directory with junctions.\n- `product-build-win32-setup.yml`: the `VSCODE_WORKSPACE_IMAGE` modes of the Linux setup, and, in `use` mode, the junctions step after the install steps. `none` by default, which keeps every other job as it is.\n- `product-build-win32-compile.yml` and `product-build-win32-ci.yml`: pass the mode on.\n- `product-build-win32-workspace-image.yml` (new): the image job.\n- `product-build.yml`: the image job and `use` for the Windows CI test jobs, except Smoke.\n- `README.md` of the workspace images: Windows in the Azure Pipelines section.\n\n### What ran on agents\n\nWindows-only CI builds of this branch, before it was rebased onto `main`:\n- **495265:** the image job created, installed into and packed the image, and the cache saved it. The test jobs found no image, installed everything as before, and passed.\n- **495277:** the test jobs mounted the image, and Compile failed on pnpm's relative links (see above).\n- **495343:** every Windows job passed. In the six test jobs that use the image, \"Mount workspace image\" took 0.2–0.3 minutes, the junctions step under a second, and \"Install dependencies\" 1.0–1.3 minutes, against 4.4 minutes in Smoke, which installs everything. The published test results are identical to 495265: 5,099 tests in 36 result files, all passed. The unit test and Copilot jobs passed in both.\n\nThe rebase onto `main` merged the Windows code into the macOS structure of `workspaceImage.ts` from #347618 (`checkPlatform`, and a pack function per platform: `packWindowsVolume`), so no build has run on the rebased commits yet.\n\nStill to watch:\n- **A new image a day:** the key includes the day, and the image job has created an image once. It continues on error, so a failure only makes the test jobs install everything.\n- **Restore time:** a VHDX can't be sparse, so the restore writes the whole image. The step gives up after 4 minutes, like on Linux.\n- **System Volume Information** hasn't come back in the test jobs, which attach the image without a drive letter.\n- **The junctions** work around esbuild dropping the separator after a volume name. If esbuild fixes it, the step can go.\n\n### How to test\n\n- `cd build \u0026\u0026 node --test lib/test/workspaceImage.test.ts lib/test/testCheckpointTemplates.test.ts lib/test/detectChanges.test.ts lib/test/detectMissingCaches.test.ts lib/test/sanityTestSelection.test.ts lib/test/nodeModulesCacheKeys.test.ts lib/test/agentHostTestSelection.test.ts lib/test/publishGate.test.ts`: passed (65 tests). One new test checks that only the CI test jobs of `product-build.yml` use images, on Linux, macOS and Windows, that the image jobs only run in CI builds, and that Windows Smoke doesn't use one. It fails when Windows Smoke gets the image, or a macOS job loses it. Another checks which of pnpm's relative links `findLinksToRoot` picks, and fails when a link that goes up to the root is missed.\n- `pnpm run eslint` on the changed TypeScript files: passed. `cd build \u0026\u0026 pnpm run typecheck`: passed.\n- `vhd.ps1` parses with the PowerShell parser, and `-FileSystem` only accepts `DevDrive` and `NTFS`.\n- Azure DevOps pipeline preview of this branch against `main` (2d5ba815e49):\n  - Product, Flaky Tests and SDK Validation: identical.\n  - CI: the new `Windows (X64) - Image` job, and in the six Windows test jobs other than Smoke the four image steps (key, cache restore, mount, junctions), Node.js set up before them, and the pnpm store steps skipped when an image is used. The other 22 jobs, Linux, macOS and Windows Smoke, are identical.\n- **To validate on agents:**\n  - Queue two CI builds of this branch (`VSCODE_BUILD_TYPE=CI`), the second after the first's `Windows (X64) - Image` job finishes. One is enough when the cache already has an image of the day with the same lockfiles.\n  - In the first, the image job creates, installs into and packs the volume, and the cache saves it.\n  - In the second, \"Mount workspace image\" mounts it in the six Windows test jobs, \"Install dependencies\" only installs the differences, and the tests pass.\n\n\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/347595",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "2d5ba815e49b3c09de300a83785b06bf38f4d6f1",
+    "HeadRef": "lszomoru/agents/ci-windows-workspace-images",
+    "HeadSHA": "ae777bda7f7e004c99a8274d8838ba9b6ff35270",
+    "CreatedAt": "2026-11-11T10:59:50Z",
+    "UpdatedAt": "2026-11-11T17:29:11Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "concurrency-burst",
+      "serialization-allocation",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Windows CI test jobs with a current or compatible workspace image",
+        "CriticalPath": "Each of the six opted-in Windows test jobs must restore the pipeline-cache entry, recreate and mount the VHDX, update the checkout, run the incremental dependency install, replace affected pnpm links, compile, and test. The separate image-producer job is not a dependency and is off each test job's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/workspace-image.yml Cache@2",
+            "Operation": "Restore the packed workspace image from Azure Pipeline Cache",
+            "Cardinality": "One cache restore per opted-in job, six concurrent restores on a warm CI run; exact/inexact grouping is per platform/architecture key, not shared between agents.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Each Windows job restored its pnpm store cache and then performed a roughly four-minute dependency install; it did not download a workspace image.",
+            "CriticalPathEffect": "On the critical path before install in each job; a hit replaces the prior pnpm-store restore plus most clean-install work."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": ".github/workflows/workspace_image/image.ts mountWindowsImage/unpack",
+            "Operation": "Decompress and write the full raw VHDX into a temporary file",
+            "Cardinality": "Once per warm opted-in job; bytes scale with the packed image and raw VHDX, with a bounded 64-chunk window.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No VHDX recreation occurred in Azure Windows CI jobs.",
+            "CriticalPathEffect": "Required before VHD attachment completes; the temporary-file hint allows Windows file cache to absorb writes and the restore timeout bounds this path."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/common/workspaceImage.ts mountImage and .github/workflows/workspace_image/win32/vhd.ps1",
+            "Operation": "Attach the VHDX with PowerShell and mountvol, then run local git fetch/checkout from the moved checkout",
+            "Cardinality": "One PowerShell attach and one local git update per warm opted-in job.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The checked-out working tree was used directly, with no VHD attach or local fetch.",
+            "CriticalPathEffect": "PowerShell startup overlaps unpack; attachment and local checkout must finish before dependency install."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "build/azure-pipelines/common/workspaceImage.ts findLinksToRoot/junctions",
+            "Operation": "Scan pnpm node_modules/virtual stores and replace root-reaching relative links with junctions",
+            "Cardinality": "One scan per warm opted-in job; each relevant directory/package entry is read once and each matching link is replaced once.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No junction scan or replacement was needed because dependencies lived on the ordinary checkout volume.",
+            "CriticalPathEffect": "Runs after install and before compile; measured PR context says under one second for about 500 links, and traversal is bounded by the installed dependency graph."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/win32/steps/product-build-win32-setup.yml Install dependencies",
+            "Operation": "Run pnpm install for dependency deltas and private distro roots",
+            "Cardinality": "Once per job as before; image hits reuse node_modules and the image-local pnpm store, so network work is limited to changes and private roots.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "A full reconciliation from the checkout plus restored pnpm store ran in every Windows job.",
+            "CriticalPathEffect": "Remains on the critical path but is reduced by the image; the separate pnpm-store restore is skipped on image hits."
+          }
+        ],
+        "ScalingInput": "Six opted-in Windows jobs per CI run; one image restore and mount per job. Image recreation scales with packed-image bytes/raw VHDX bytes, while junction discovery scales with the installed pnpm package/link layout across about 60 declared install/workspace directories. The PR reports roughly 500 replaced links, and the code visits each relevant node_modules/.pnpm entry once.",
+        "EffectiveConcurrency": "The six jobs run in parallel on separate Windows agents. Within each restore, unpack uses os.availableParallelism workers with a 64-chunk readiness window and one ordered writer; PowerShell VHD attachment starts concurrently with unpack but waits for the ready marker. Dependency install and junction replacement are sequential afterward. CI runs use trigger batch:true, limiting normal main-branch producer overlap.",
+        "CacheBehavior": "Cache@2 first requests the exact daily image key and, for use-mode jobs, falls back to the newest image with matching native-build inputs. Exact and inexact hits mount the image; misses install from the pre-existing pnpm-store path. Inexact hits rewrite key files to discarded before job completion so test jobs do not publish an image. There is no negative-cache state beyond the pipeline cache miss, but each job performs only one lookup.",
+        "MechanismConfidence": "High: cache, unpack, subprocess, local checkout, install, and junction ordering are explicit in the templates and implementation; cardinality is explicit in product-build.yml.",
+        "MagnitudeUncertainty": "Exact image sizes, cache-service throughput, and agent memory pressure are not present in repository evidence. The supplied run context reports 0.2-0.3 minute mounts and materially shorter installs, so there is no evidence that the new bounded restore and junction work outweighs the removed install work.",
+        "Verdict": "No reportable regression. The diff adds bounded image I/O and link scanning but replaces larger repeated dependency-install work on the same critical paths, and its per-job concurrency is bounded."
+      },
+      {
+        "Scenario": "First Windows CI run of a day or after dependency/native-input changes",
+        "CriticalPath": "Test jobs do not wait for the image producer. They either use the newest compatible fallback image or, if none exists, follow the prior full-install path. The new producer independently creates an NTFS VHDX, installs dependencies, packs it, and publishes it for later runs.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/common/workspace-image.yml Cache@2",
+            "Operation": "Look up/restore the exact producer cache entry and publish a newly packed image on a miss",
+            "Cardinality": "One producer cache operation per CI run; one upload only on an exact-key miss and successful build.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "There was no Windows workspace-image producer, lookup, or image upload.",
+            "CriticalPathEffect": "Off test-job critical paths, though the job consumes a Windows agent and the stage cannot finish before all jobs complete. Tests are expected to dominate a warm producer lookup."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "build/azure-pipelines/common/workspaceImage.ts create/packWindowsVolume and .github/workflows/workspace_image/win32/vhd.ps1",
+            "Operation": "Create, format, mount, flush, detach, and clean an NTFS VHDX",
+            "Cardinality": "One create/detach lifecycle per exact-key miss; system-folder cleanup runs after creation and before packing.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Windows CI producer volume lifecycle existed.",
+            "CriticalPathEffect": "Only on the producer path and not required for current test jobs to proceed."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/win32/steps/product-build-win32-setup.yml Install dependencies in build mode",
+            "Operation": "Perform a clean pnpm dependency install without the pnpm-store cache",
+            "Cardinality": "Once per exact-key miss; CI trigger batching normally prevents simultaneous main-branch runs from duplicating the daily build.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Each test job installed independently, but there was no additional producer install.",
+            "CriticalPathEffect": "Off current test-job critical paths; creates the reusable image for later runs."
+          },
+          {
+            "Kind": "serialization",
+            "Location": ".github/workflows/workspace_image/image.ts pack via build/azure-pipelines/common/workspaceImage.ts packWindowsVolume",
+            "Operation": "Read, zero-page filter, zstd-compress, and write the VHDX image",
+            "Cardinality": "One whole-image pack per producer miss; CPU, retained compressed buffers, and I/O scale with VHDX allocated/nonzero content.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Windows VHDX was packed in Azure CI.",
+            "CriticalPathEffect": "Producer-only and bounded by a 15-minute pack step plus job timeout; not on test-job progress."
+          }
+        ],
+        "ScalingInput": "One Windows x64 producer job per CI run; a new image is built only when the exact daily/lockfile/native-input key misses. Work scales with checkout size, dependency graph, VHDX allocated bytes, and packed output bytes.",
+        "EffectiveConcurrency": "The producer runs concurrently with the seven Windows test jobs and has no dependency edge to them. Normal CI is batch:true, so producer bursts across overlapping main-branch CI runs are coalesced by pipeline triggering; manual CI overlap remains possible but is not evidenced as a prevalent path. Packing uses os.availableParallelism compression workers and retains compressed frames until output, bounded by image size and job timeout rather than an explicit byte cap.",
+        "CacheBehavior": "The image key includes native inputs, lockfiles/pnpm-store key, and pipeline-start day. An exact cache miss creates one image; exact hits skip creation/install/pack. Cache save occurs only after successful producer completion. Test jobs use compatible older images or fall back cleanly and never wait for the producer.",
+        "MechanismConfidence": "High for the producer work and its off-critical-path placement; medium for cross-run concurrency because normal CI is explicitly batch:true and only manual runs could overlap.",
+        "MagnitudeUncertainty": "The compressed Windows image size and Windows pool capacity are not available. Whole-image packing retains compressed frames, but this implementation is shared with existing platforms and the supplied run context records a successful Windows pack; there is no concrete symptom or evidence of memory exhaustion.",
+        "Verdict": "No reportable regression. The producer adds intentional off-path work to amortize repeated installs, cache misses are daily/input-bound, and normal CI batching rejects the realistic unbounded duplicate-producer candidate."
+      },
+      {
+        "Scenario": "Windows CI cache miss, restore failure, or timeout; Smoke job",
+        "CriticalPath": "On a cache miss the opted-in jobs continue with the existing pnpm-store restore and full dependency install. On mount failure or the 240-second restore timeout, cleanup unmounts/detaches the VHDX, restores the moved checkout, and then follows the same fallback. The Windows Smoke job is not opted in and retains its previous path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "build/azure-pipelines/common/workspaceImage.ts keepCheckout/moveCheckoutBack/restore",
+            "Operation": "Move checkout entries aside and back, delete temporary image/cache files, and restore the original checkout on failure",
+            "Cardinality": "One move-out and one rollback per failed mount; entries are same-volume renames, with at most ten 500ms retries per locked entry.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No checkout relocation or VHD cleanup was needed.",
+            "CriticalPathEffect": "Adds bounded fallback latency before the prior install path; prevents retaining a mounted image or duplicating a checkout after failure."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": ".github/workflows/workspace_image/image.ts mountWindowsImage release",
+            "Operation": "Unmount via mountvol and detach via PowerShell after failed mount",
+            "Cardinality": "At most one release sequence per failed restore attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No VHD process cleanup existed.",
+            "CriticalPathEffect": "On the failure fallback path only; detachment has a 30-second timeout."
+          },
+          {
+            "Kind": "network",
+            "Location": "build/azure-pipelines/win32/steps/product-build-win32-setup.yml",
+            "Operation": "Restore pnpm store and perform the full dependency install after no image is used",
+            "Cardinality": "Once per fallback job, same effective install cardinality as before the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "This was the normal path for every Windows test job.",
+            "CriticalPathEffect": "Returns to the prior critical path after the bounded image attempt."
+          }
+        ],
+        "ScalingInput": "At most one failed restore attempt per opted-in job, with a 240-second internal abort and 10-minute step timeout. Cleanup operates on one VHDX and one moved checkout per job.",
+        "EffectiveConcurrency": "Failures can occur independently in six jobs, each on its own agent. Cleanup subprocesses are sequential per job; no retry loop remounts the image. Smoke remains one ordinary job with no image work.",
+        "CacheBehavior": "A missing image sets WORKSPACE_IMAGE_USED=false; failed restores empty the restored cache folder and fall back. The pnpm store cache is restored only when no workspace image was successfully mounted. Smoke always uses the existing pnpm-store behavior.",
+        "MechanismConfidence": "High: fallback conditions, timeout, cleanup ownership, and Smoke exclusion are explicit in code and templates.",
+        "MagnitudeUncertainty": "Cache task service-side duration is not explicitly bounded in the repository, and failure prevalence is unknown. The mount path itself is bounded and does not retry, so there is no evidenced repeated-I/O amplification.",
+        "Verdict": "No reportable regression. Failure adds one bounded attempt and then preserves the prior install behavior; cleanup retains the handles needed to unmount/detach and restore the checkout, while Smoke is unchanged."
+      }
+    ],
+    "Summary": "Completed the performance pass over all 10 changed files and all diff pages. Traced warm/cold/failure cache behavior, six-job Windows concurrency, the independent image producer, VHDX subprocess/filesystem lifecycle, full-image pack/unpack allocation, pnpm/network work, and junction traversal. No high-confidence actionable performance regression introduced by the diff was established."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-11T18:07:38.916165036Z",
+    "CompletedAt": "2026-11-11T18:10:09.931483631Z",
+    "WallClockMilliseconds": 151015,
+    "ModelCalls": 11,
+    "InputTokens": 441867,
+    "OutputTokens": 9839,
+    "TotalTokens": 451706,
+    "ReasoningTokens": 4991,
+    "CacheReadTokens": 366847,
+    "CacheWriteTokens": 74987,
+    "APIDurationMilliseconds": 128059,
+    "ToolCalls": 47,
+    "NanoAIUnits": 71858580000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 366847,
+      "cache_write": 74987,
+      "input": 33,
+      "output": 9839
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
