@@ -1,0 +1,210 @@
+{
+  "PullRequest": {
+    "Number": 347377,
+    "Title": "agentHost: Move Chats and multi-harness settings are experiment-controlled",
+    "Body": "Makes the Move Chats and multi-harness Agent Host settings experiment-controlled.\n\n- `chat.agentHost.moveChats.enabled` and `chat.agentHost.multipleChatProviders.enabled` declare `experiment: { mode: 'startup' }`, so an assignment can set their defaults; a changed assignment applies on the next start, not mid-session. User-set values still win.\n- Defaults are unchanged: Move Chats stays on outside Stable, multi-harness stays off everywhere. Turning multi-harness on by default in Insiders is a follow-up.\n- No `experimentTrigger` event: both flags change commands, agent tools and protocol capabilities before any single identifiable moment, so a trigger would bias a scorecard.\n\n### How to test\n\nSet `\"experiments.override.config.chat.agentHost.multipleChatProviders.enabled\": true` (or the `moveChats` equivalent) and restart: the setting's default follows the override.\n\n### Validation\n\n- `pnpm run typecheck-client`: passed\n- Earlier on this branch, with the same setting changes: eslint, hygiene and `./scripts/test.sh --runGlob 'vs/platform/agentHost/test/**/*.test.js'` (17675 passing, 75 pending) passed\n",
+    "URL": "https://github.com/microsoft/vscode/pull/347377",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b1988c59b5d2703d15a93fa4960546b73d50c624",
+    "HeadRef": "sandy081/agents/multi-harness-sessions-flag-query",
+    "HeadSHA": "251799b825fa29f9888d3149ab94be1455113128",
+    "CreatedAt": "2026-11-10T16:10:48Z",
+    "UpdatedAt": "2026-11-11T08:49:26Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-20F108B93D90",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts",
+      "Side": "RIGHT",
+      "Line": 232,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The asynchronous treatment path, same-phase ungated prewarm, forced fresh-initialize code, subscription scaling, and one-versus-two-transport behavior are all directly established by repository code and tests. Exact latency varies by transport and subscription count, but the repeated boundary work is deterministic whenever the true assignment lands after connection.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Agent Host transport connections, initialize IPC/RPC calls, and serialized subscription snapshots",
+      "PerformanceScaling": "The diff causes one extra transport teardown and fresh initialize per already-connected Agent Host client on each startup assigned `true`; the initialize payload and snapshot reconstruction grow with the client's active session/chat subscriptions, and omitted snapshots fan out into concurrent per-subscription snapshot requests.",
+      "PerformanceOutcome": "Increased Agent Host startup/session-readiness latency and avoidable IPC/network plus host serialization work",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "The setting had a synchronous fixed default of `false`. Users who explicitly enabled it had that value available before the host starter and first handshake, so the host was seeded enabled and the protocol test asserts only one transport/initialize was needed.",
+      "ChangedBehavior": "Adding startup experiment metadata makes a `true` default arrive asynchronously from `ConfigurationDefaultOverridesContribution` after TAS treatment resolution. `AgentHostPrewarmContribution` independently starts the host in `BlockRestore`, so the first handshake can occur with the old false default; the later default-change is mirrored to the host and deliberately forces a fresh protocol initialization.",
+      "CausalDiffEvidence": "The added `experiment: { mode: 'startup' }` at line 232 is the only change that allows this setting's default to transition asynchronously from false to an assigned true during startup, moving the existing forced-reinitialize path onto every assigned user's cold-start flow.",
+      "Title": "Resolve the rollout before prewarming Agent Host",
+      "Impact": "For users assigned `config.chat.agentHost.multipleChatProviders.enabled=true`, an enabled Agent Host can connect during restore and then immediately disconnect/reconnect when the assignment lands. This repeats authentication/config forwarding and restores every active session/chat subscription, delaying restored Agent Host sessions and doing work proportional to open subscriptions.",
+      "Evidence": "`ConfigurationDefaultOverridesContribution` queues async `updateDefaults()` in its constructor and awaits `getTreatmentWithAssignment` for each experimental setting, while `AgentHostPrewarmContribution` is also registered at `WorkbenchPhase.BlockRestore` and calls `startAgentHost()` without waiting for those defaults. On the late configuration change, `AgentHostProtocolClient` mirrors the flag and `_maybeReinitializeForChatProviders()` clears the transport and requests a fresh initialize. That initialize sends all current subscription URIs; the server loops over them to build snapshots, and missing snapshots are restored per subscription. The existing protocol test `re-initializes once when the host enables chats with their own agents after the handshake` proves the late false-to-true path creates two transports, while `does not re-initialize when the first handshake already advertises...` proves the pre-resolved path uses one.",
+      "Recommendation": "Ensure this startup treatment is resolved before Agent Host prewarm/connection captures the setting and performs its first handshake (or otherwise seed the starter/initial handshake from the resolved treatment). Do not apply the rollout as a post-connect default change that requires reinitializing the transport."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold workbench startup with Agent Host enabled and `config.chat.agentHost.multipleChatProviders.enabled` assigned true",
+        "CriticalPath": "Workbench UI restoration does not await TAS defaults, but Agent Host session readiness and the multi-provider capability do. `AgentHostPrewarmContribution` starts/connects the host in BlockRestore; if the async treatment lands after the first handshake, progress to a stable capable connection requires a second transport connection, initialize, authentication/config forwarding, and subscription restoration.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/assignment/common/assignmentService.ts: setupTASClient/getAssignedTreatment",
+            "Operation": "Fetch TAS assignments for all experiment treatments",
+            "Cardinality": "One coalesced initial TAS fetch per client setup; the two added setting lookups do not create two independent fetches.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The TAS service and shared initial fetch already existed for other experimental settings; this diff adds two consumers of its result.",
+            "CriticalPathEffect": "Not on the workbench UI restore barrier, but treatment completion determines when the default changes and therefore whether it races the Agent Host handshake."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/agentHost/electron-browser/agentHostService.ts: AgentHostPrewarmer",
+            "Operation": "Start the local Agent Host utility process during prewarm",
+            "Cardinality": "One prewarmed process per enabled local workbench host, unchanged by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same process was prewarmed, but the fixed false default could not later force a capability renegotiation.",
+            "CriticalPathEffect": "Its startup races the async experiment default; the process captures the old false value when the treatment is unresolved."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts: configuration change listener",
+            "Operation": "Mirror `multipleChatProviders.enabled=true` as a root-config action after connection",
+            "Cardinality": "One post-connect config action per connected client when the assigned default changes from false to true.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "With the fixed default, no assignment-driven post-connect transition occurred; explicitly enabled users supplied true before startup.",
+            "CriticalPathEffect": "The host echo activates `_maybeReinitializeForChatProviders`, making a fresh connection necessary before the capability is usable."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts: _maybeReinitializeForChatProviders/_reconnectOrInitialize",
+            "Operation": "Tear down the current transport and perform a fresh initialize with all active subscription URIs",
+            "Cardinality": "One additional transport plus initialize request per already-connected assigned client; remote transports cross network, local transports cross IPC.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "A synchronously true user setting seeded the host and advertised the capability in the first initialize; tests establish one transport instead of two.",
+            "CriticalPathEffect": "Temporarily disconnects Agent Host operations and gates readiness on the replacement handshake and restoration."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts: _handleInitialize; src/vs/platform/agentHost/browser/agentHostProtocolClient.ts: _restoreSubscriptionsAwaitingRestore",
+            "Operation": "Build and return snapshots for initial subscriptions, with fallback snapshot requests for omissions",
+            "Cardinality": "Up to one snapshot per effective active subscription in the repeated initialize; omitted snapshots can cause up to one additional request per omitted subscription, grouped as sessions then concurrent chats/others.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These snapshots were produced once during the original startup connection; the diff can make the whole set be produced and transferred again.",
+            "CriticalPathEffect": "The replacement connection is not marked fully restored until required authentication and subscription restoration finish."
+          }
+        ],
+        "ScalingInput": "One extra reconnect per connected Agent Host client per assigned startup; serialization and restoration work scale with the effective number of active session/chat/other subscriptions held by that client.",
+        "EffectiveConcurrency": "Experimental setting treatments are read sequentially against one TAS client and its coalesced initial fetch. Each connected Agent Host client independently performs at most one forced reinitialize. The fresh initialize batches active subscription URIs, while omitted snapshots are restored with sessions first and then chat/other groups concurrently via `Promise.all`, without a shared cross-subscription limiter.",
+        "CacheBehavior": "TAS initializes from persisted assignment storage and uses one shared initial network fetch, not a network request per setting. A warm/cached treatment that resolves before host connection avoids the regression; startup mode latches the first resolved value for the process. A cold or still-initializing client leaves the setting unresolved until the shared fetch completes, creating the late false-to-true path.",
+        "MechanismConfidence": "High: same-phase ungated prewarm, asynchronous treatment resolution, the forced-reinitialize branch, subscription scaling, and one-versus-two-transport behavior are directly shown by code and tests.",
+        "MagnitudeUncertainty": "The exact delay depends on TAS timing, local versus remote transport latency, authentication, and how many subscriptions are live when the assignment lands. The duplicate transport/initialize path itself is deterministic for a late true assignment.",
+        "Verdict": "Reportable medium-severity startup regression: the new async default can move an existing full reconnect-and-restore mechanism onto every assigned user's cold-start path."
+      },
+      {
+        "Scenario": "Startup assignment of `chat.agentHost.moveChats.enabled`, followed by normal Move Chat use",
+        "CriticalPath": "Treatment resolution and any resulting root-config mirror happen during startup but do not reconnect the Agent Host. Actual move work remains off the startup critical path and begins only after an explicit drag/drop or command; the move itself stays serialized by the existing Agent Service move sequencer.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/assignment/common/assignmentService.ts: getTreatmentWithAssignment",
+            "Operation": "Read the Move Chats treatment from the shared TAS assignment set",
+            "Cardinality": "One logical treatment lookup, backed by the same coalesced startup assignment fetch used by all settings.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The shared TAS fetch already occurred; this diff adds a cached treatment read to it.",
+            "CriticalPathEffect": "Can delay only when the default becomes known; it does not block workbench restoration or each later move."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts: configuration change listener",
+            "Operation": "Mirror `chatMoves.enabled` to each connected Agent Host root config",
+            "Cardinality": "At most one small patch per connected host when the startup assignment changes the effective default.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The fixed default was mirrored on initial connection, with no assignment-driven follow-up patch.",
+            "CriticalPathEffect": "No reconnect or subscription restoration is triggered; it only changes command/tool availability."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost common/node move path documented and gated by ChatMoveConfigKey.Enabled",
+            "Operation": "Commit the existing chat move transaction when the user explicitly performs a move",
+            "Cardinality": "One serialized transaction per user move, covering the selected chat and its managed descendants.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same transaction ran for users/builds where Move Chats was already enabled, including the unchanged non-Stable default or explicit user setting.",
+            "CriticalPathEffect": "On the explicit move command's critical path only, not startup; experiment metadata does not add transactions or increase transactions per move."
+          }
+        ],
+        "ScalingInput": "Startup overhead is constant per connected host. A user-initiated move continues to scale with the moved chat and its host-managed descendants, not with the experiment metadata.",
+        "EffectiveConcurrency": "One shared TAS assignment fetch serves the setting. At most one root-config patch is sent per connected host when the resolved default differs. User moves remain serialized one at a time; the diff adds no parallel move/database burst.",
+        "CacheBehavior": "The startup assignment is latched once resolved; warm cache can supply it early, while unresolved cold state retries only on assignment refetch. There is no new per-command cache lookup or repeated experiment resolution.",
+        "MechanismConfidence": "High that the only new boundary work is a bounded treatment lookup/config mirror and that move execution remains user-triggered and serialized.",
+        "MagnitudeUncertainty": "The number of users assigned a different value and connected hosts varies, but the added startup work is bounded to a small config patch and does not amplify move execution.",
+        "Verdict": "No additional performance finding: enabling an existing feature for an experiment cohort does not itself increase the cost or frequency of each move, and the startup mirror is bounded without reconnect fan-out."
+      },
+      {
+        "Scenario": "Startup with experiments disabled, no assignment, or a false multi-provider assignment",
+        "CriticalPath": "Configuration processing examines the two schemas, but no changed default is registered and no Agent Host reconnect is triggered. Agent Host startup follows the prior handshake path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/assignment/common/assignmentService.ts",
+            "Operation": "Potential shared TAS initialization/fetch when experiments are enabled",
+            "Cardinality": "One shared fetch independent of these two specific keys; zero when experiments are disabled.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same shared experimentation service lifecycle for the repository's existing experimental settings.",
+            "CriticalPathEffect": "Off the UI restoration barrier and produces no Agent Host boundary work when values are absent/false."
+          }
+        ],
+        "ScalingInput": "Constant work for two additional schema entries; no growth with sessions, chats, or host lifetime.",
+        "EffectiveConcurrency": "No per-setting network calls occur when experiments are disabled; otherwise both lookups share the assignment client's setup/fetch. Agent Host connection count remains one per existing client.",
+        "CacheBehavior": "Disabled experiments return undefined locally. Missing startup values remain pending for later assignment refetch, but processing is coalesced through the contribution throttler and startup values latch once resolved.",
+        "MechanismConfidence": "High that no reconnect, IPC fan-out, retained state growth, or repeated feature work is introduced for absent/false assignments.",
+        "MagnitudeUncertainty": "Only micro-costs of two additional schema checks/lookups remain; no evidence supports a user-visible regression in this branch.",
+        "Verdict": "No finding for this scenario."
+      }
+    ],
+    "Summary": "Reviewed all three changed files and traced both new startup experiment defaults through TAS assignment resolution, configuration reload, Agent Host prewarm, root-config mirroring, capability negotiation, reconnect, and subscription restoration. Submitted one medium-confidence/high-evidence startup repeated-work finding for the multi-provider flag; the Move Chats rollout adds only a bounded config mirror and does not change move-operation cost or frequency independently of user use."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "/responses",
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-11T10:32:38.473012953Z",
+    "CompletedAt": "2026-11-11T10:35:44.469518589Z",
+    "WallClockMilliseconds": 185996,
+    "ModelCalls": 18,
+    "InputTokens": 999735,
+    "OutputTokens": 11624,
+    "TotalTokens": 1011359,
+    "ReasoningTokens": 4510,
+    "CacheReadTokens": 894061,
+    "CacheWriteTokens": 105620,
+    "APIDurationMilliseconds": 159559,
+    "ToolCalls": 101,
+    "NanoAIUnits": 111842040000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 894061,
+      "cache_write": 105620,
+      "input": 54,
+      "output": 11624
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
