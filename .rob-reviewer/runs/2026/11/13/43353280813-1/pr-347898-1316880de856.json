@@ -1,0 +1,158 @@
+{
+  "PullRequest": {
+    "Number": 347898,
+    "Title": "Avoid quadratic work when many text models are disposed at once",
+    "Body": "Fixes #332670\n\n## What happens\n\nLeaving an Agents session whose Changes view lists thousands of files (for example by clicking **New**) freezes the whole window for tens of seconds. With a 6,601-file change set, the window froze for **35 seconds** on main.\n\n## Why\n\nLeaving the session closes the Changes multi-diff editor. That disposes about 13,000 text models at once: an original and a modified model for each file. For **every** disposed model, two `onModelRemoved` listeners scan **all** the remaining models:\n\n1. The extension-host document sync (`MainThreadDocumentAndEditorStateComputer`) recomputes its entire document and editor state.\n2. The editor worker manager calls `getModels().length` to check whether it can stop the worker.\n\nn removals × O(n) work each makes the burst quadratic.\n\n## Fix\n\n- `mainThreadDocumentsAndEditors.ts`: when a model is removed, drop just that model from the current state and send a one-document delta. The add path already works this way. The full recompute still runs when an editor shows the removed model.\n- `editorWorkerService.ts`: check for an empty worker once per burst of removals, on the next tick, instead of once per model.\n\n## Result\n\nSame repro, longest renderer freeze after clicking **New**: **35,279 ms → 4,448 ms**.\n\nIn the videos, the renderer clock at the top of the window stops while the renderer is blocked.\n\nBefore (main):\n\nhttps://github.com/user-attachments/assets/809dbea6-8f57-4078-b4a9-64a0ca80303e\n\nAfter (this branch):\n\nhttps://github.com/user-attachments/assets/0ac888e3-716b-455e-bd91-0097bccd6b4f\n\n\u003cdetails\u003e\n\u003csummary\u003eFull analysis, logs and validation (click to expand)\u003c/summary\u003e\n\n### Repro\n\n1. Create a git repository with 6,600 tracked files (`gen/d*/f*.ts`) and a `hello.txt`.\n2. Open it in the Agents window and start a Copilot CLI (agent host) session in an isolated worktree that runs `echo hello \u003e hello.txt \u0026\u0026 rm -rf gen`. A scripted mock LLM from `scripts/chat-simulation/common/mock-llm-server.ts` drove the session.\n3. The Changes view shows `6601 Files +1 -19801`. Open the Changes multi-diff and let it resolve.\n4. Click **New** (new session).\n\nOn VS Code Insiders 1.146.0-insider (6bd30dab6e29), Linux x64, the renderer ran a single long task of **30,487 ms**. Playwright's click timed out after 30 s, and the window stayed unresponsive the whole time.\n\n### CPU profile of the freeze\n\nA CPU profile of the renderer was captured while clicking **New**, with a runtime debugger attached (1 ms sampling, 32 s, 29,069 samples).\n\n```\nself time\n  ModelService.getModels                                     19,616 ms\n  MainThreadDocumentAndEditorStateComputer._updateState       2,969 ms\n  diffSets                                                    2,815 ms\n  (program)                                                   1,197 ms\n  WorkerManager._checkStopEmptyWorker                           521 ms\n  postMessage                                                   391 ms\n  (garbage collector)                                           350 ms\n  DocumentAndEditorState.compute                                252 ms\n\ntotal time\n  textModelResolverService.ts:129 (dispose model references) 29,150 ms\n    ModelService._onWillDispose                               27,965 ms\n      mainThreadDocumentsAndEditors.ts:129 -\u003e _updateState    17,290 ms\n        DocumentAndEditorState.compute                         3,072 ms\n      editorWorkerService.ts:367 -\u003e _checkStopEmptyWorker     10,361 ms\n\nAgents-window code (getSession, agent feedback, changes model): \u003c 200 ms in total\n```\n\n### Call path, and why it is quadratic\n\n```\nmulti-diff editor closes -\u003e ~13k model references are disposed\n  ModelService._onWillDispose(model)\n    delete this._models[modelId]\n    this._onModelRemoved.fire(model)               // once per model, ~13k times\n      MainThreadDocumentAndEditorStateComputer\n        _updateState()                             // per removal:\n          modelService.getModels()                 //   O(n) new array from Object.keys\n          new Set(models), diffSets(old, new)      //   O(n)\n          walk all code editors                    //   O(editors)\n      WorkerManager\n        _checkStopEmptyWorker()                    // per removal:\n          modelService.getModels().length          //   O(n)\n```\n\n`ModelService.getModels()` builds a new array of every model on each call, so it dominates self time. 13k removals × 13k models gives roughly 170 million element visits in each listener. The freeze grows with the number of models the multi-diff resolved: after a ~20 s settle, the same steps froze for 2.3 s on main; after 150 s, for 35 s.\n\n### The change, file by file\n\n**`src/vs/workbench/api/browser/mainThreadDocumentsAndEditors.ts`**\n\n- `TextEditorSnapshot` keeps the editor's model (`snapshot.model`), so a removed model can be matched against editors without recomputing the state.\n- `onModelRemoved` now calls a new `_updateStateOnModelRemove(model)`:\n  - no state computed yet → full `_updateState()` (unchanged behavior);\n  - model not in the current state (too large to sync, or only used by a simple widget) → nothing to do;\n  - an editor snapshot shows this model → full `_updateState()`, because editors and the active editor also change;\n  - otherwise → `documents.delete(model)` and emit `DocumentAndEditorStateDelta([model], [], [], [], undefined, undefined)`.\n\n**`src/vs/editor/browser/services/editorWorkerService.ts`**\n\n- `WorkerManager` runs `_checkStopEmptyWorker` through a `RunOnceScheduler` (delay 0). It schedules it on `onModelRemoved` only when a worker exists and a check is not already scheduled. A burst of removals therefore costs one `getModels()` call instead of n.\n\n**`src/vs/workbench/api/test/browser/mainThreadDocumentsAndEditors.test.ts`**\n\n- New `Model#remove` test: with two models, disposing one emits exactly one delta, which contains only `removedDocuments: [uri]`.\n\n### Why this is the right fix and why it is safe\n\n- **It mirrors the existing add path.** `_updateStateOnModelAdd` already adds a model incrementally and emits a one-document delta. Only removal still did a full recompute.\n- **It emits the same delta the full recompute would.** `ModelService._onWillDispose` deletes the model from `_models` before it fires `onModelRemoved` (`modelService.ts`, end of `_onWillDispose`). At that point a full `_updateState()` would find exactly one difference, `removedDocuments: [model]`, unless an editor still shows the model, and that case falls back to the full recompute. Editor and active-editor changes keep their own listeners, which still trigger full updates.\n- **Models that were never synced are still ignored**, the same way the full compute filters them out.\n- **The extension host sees the same deltas.** In a micro-benchmark that disposed 6,000 synchronized models, 6,000 `removedDocuments` deltas were emitted both before and after the change.\n- **The worker check gives the same result.** `_checkStopEmptyWorker` only stops the worker when no models are left, so running it once at the end of the burst is equivalent. At most, the worker stops one tick later. The idle-stop interval is unchanged.\n- **It fixes the cost where the cost is.** The profile shows the Agents-window code at under 200 ms. The time is spent in these generic listeners, so any large multi-diff (SCM, chat editing sessions) that is closed also benefits.\n\n### Measurements\n\nMicro-benchmark (temporary unit test, not committed): `TestModelService` + `MainThreadDocumentsAndEditors`, dispose 6,000 synchronized models.\n\n```\nbefore: 3,483 ms\nafter:    198 ms\ndeltas emitted: 6,000 in both cases\n```\n\nUI scenario: dev builds of main (eadd9f1fd95) and of this branch, Linux x64, the repro above with a 150 s settle after the multi-diff opened. Long tasks were measured with `PerformanceObserver({ type: 'longtask' })`:\n\n```\nmain    {\"tClick\":39193,\"tNew\":39501,\"maxLongTask\":35279,\"longTasksOver200ms\":[[223919,35279]]}\nbranch  {\"tClick\":6792, \"tNew\":7043, \"maxLongTask\":4448, \"longTasksOver200ms\":[[220570,4448]]}\n```\n\n- `tClick`: when the click on **New** returned.\n- `tNew`: when the new-session view appeared.\n- `maxLongTask`: the longest renderer long task after the click.\n\n### How tested\n\n```\npnpm run transpile-client\n./scripts/test.sh --run src/vs/workbench/api/test/browser/mainThreadDocumentsAndEditors.test.ts --run src/vs/workbench/api/test/browser/mainThreadDocuments.test.ts\n  -\u003e 15 passing\npnpm run oxlint src/vs/workbench/api/browser/mainThreadDocumentsAndEditors.ts src/vs/editor/browser/services/editorWorkerService.ts src/vs/workbench/api/test/browser/mainThreadDocumentsAndEditors.test.ts\n  -\u003e no issues\n```\n\nThe UI before/after recordings come from the same scenario, run with `node test/scenario/out/runScenario.js --dev \u003cscenario\u003e` against each build.\n\n### Scope\n\n- The issue also asked to deduplicate session lookups in the per-file agent feedback loops. That is already on main through #332708.\n- Not addressed here, because they are separate design changes: recreating the worktree when a session is unarchived, and the cost of `getSession` lookups in the sessions provider.\n- The remaining 4.4 s freeze after this change was not profiled.\n\n\u003c/details\u003e\n\n🤖 Authored with GitHub Copilot on behalf of @benibenj.",
+    "URL": "https://github.com/microsoft/vscode/pull/347898",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "bc9d2696ff1b9c7bf7405fd7cc068ff71e1a8531",
+    "HeadRef": "agents/agents-large-changeset-dispose-perf",
+    "HeadSHA": "1316880de856fc0b92798d21b655b77c9dd1a8c0",
+    "CreatedAt": "2026-11-12T14:50:43Z",
+    "UpdatedAt": "2026-11-12T19:01:13Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/editor/browser/services/editorWorkerService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 370,
+      "BasePath": "src/vs/editor/browser/services/editorWorkerService.ts",
+      "BaseLine": 367,
+      "IntroducingPath": "src/vs/editor/common/services/editorWorkerServiceImpl.ts",
+      "IntroducingCommit": "18101697a800782d6e5738c3264dd433e5ccb415",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "Every model-removal event synchronously rebuilt/scanned the complete remaining model array merely to determine whether the editor worker could stop, making bulk disposal quadratic.",
+      "Symptom": "Closing a large multi-diff or changes session can block the renderer for seconds while thousands of text models are disposed.",
+      "FixedBehavior": "The changed listener uses a zero-delay RunOnceScheduler and schedules only when a worker exists and no check is pending, so a synchronous removal burst performs one emptiness scan after the burst rather than one scan per removed model.",
+      "Evidence": "In the base revision, WorkerManager's onModelRemoved listener synchronously invoked _checkStopEmptyWorker for every removal. That method calls ModelService.getModels(), which materializes/scans the remaining model collection. A multi-diff teardown can synchronously remove thousands of original/modified models, so the listener performs a decreasing full scan after every removal (quadratic aggregate CPU/allocation) on the renderer teardown path. The PR metadata's profile identifies this call chain during a tens-of-seconds renderer freeze, and the changed listener directly removes the repeated scans.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "missing-coalescing",
+      "cleanup-lifecycle",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Closing a large multi-diff/Changes editor that disposes thousands of original and modified text models in one renderer turn",
+        "CriticalPath": "ModelService removes each model and synchronously fires onModelRemoved. The changed document-state handler now deletes that model from its tracked Set and emits the same one-document delta; the worker emptiness check is deferred until the next timer turn and is therefore off the synchronous disposal critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadDocumentsAndEditors.ts:_onDelta",
+            "Operation": "Send $acceptDocumentsAndEditorsDelta with the removed model URI to the extension host.",
+            "Cardinality": "One small delta per synchronized removed model; for N synchronized models, N IPC messages. Unsynchronized large/simple-widget models emit none.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The previous full recomputation also detected the single removal for each onModelRemoved event and sent one delta per synchronized model.",
+            "CriticalPathEffect": "The proxy call is issued synchronously during each removal, but this cardinality is unchanged by the PR and remains linear."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/editor/browser/services/editorWorkerService.ts:WorkerManager._checkStopEmptyWorker",
+            "Operation": "Dispose the single editor web-worker client once no text models remain.",
+            "Cardinality": "At most one worker disposal after the coalesced burst, and none when no worker exists or models remain.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every removal synchronously scanned all remaining models; only the final removal could dispose the worker.",
+            "CriticalPathEffect": "The PR moves the emptiness scan and possible worker disposal from every synchronous removal to one zero-delay scheduled callback after the burst."
+          }
+        ],
+        "ScalingInput": "N disposed synchronized text models (realistically two per file in a large multi-diff); live code-editor snapshots E are typically limited to instantiated/visible editors. Document-state work changes from repeated collection-wide O(N) recomputation to O(E) membership checking per synchronized removal, while worker scans change from N decreasing full scans to one scan.",
+        "EffectiveConcurrency": "Disposals and listeners run serially on the renderer event loop. The RunOnceScheduler provides one shared pending check for the burst; it does not create parallel worker operations.",
+        "CacheBehavior": "No cache miss path is added. The current synchronized-document Set is updated in place; models excluded from synchronization are rejected by membership without recomputation. Worker scheduling is coalesced only while a check is pending.",
+        "MechanismConfidence": "High: changed handlers, model-removal event order, full-state computation, IPC emission, and scheduler implementation were traced directly.",
+        "MagnitudeUncertainty": "Exact remaining latency depends on the number of synchronized models and extension-host IPC overhead, but the removed quadratic scans and unchanged linear delta fan-out are explicit.",
+        "Verdict": "No regression. The diff removes the dominant repeated scans; the remaining per-model IPC existed before and the new O(E) scan replaces a larger scan."
+      },
+      {
+        "Scenario": "Removing a single model during ordinary editor use, including a model still shown by a code editor",
+        "CriticalPath": "For an unshown synchronized model, the state Set is updated and its removal delta is sent immediately. If a tracked editor snapshot still references the model, the handler falls back to the same full state recomputation used before so editor and active-editor state are reconciled. The worker emptiness check runs on the next timer turn.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadDocumentsAndEditors.ts:_onDelta",
+            "Operation": "Send the document/editor removal delta to the extension host.",
+            "Cardinality": "One message for the single removal; an editor-associated removal combines the document/editor state in the computed delta.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One full recomputation followed by one extension-host delta.",
+            "CriticalPathEffect": "Remains on the synchronous removal path exactly as before."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/editor/browser/services/editorWorkerService.ts:WorkerManager",
+            "Operation": "Potentially dispose the editor web worker when this was the last model.",
+            "Cardinality": "Zero or one scheduled check and zero or one worker disposal.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same check and possible disposal ran synchronously inside onModelRemoved.",
+            "CriticalPathEffect": "Delayed by one timer turn, moving rather than adding the worker check and teardown off the immediate model-disposal path."
+          }
+        ],
+        "ScalingInput": "One removed model and the number of live editor snapshots E; the common unshown case scans only E snapshots, while the shown case retains the prior full recomputation.",
+        "EffectiveConcurrency": "Single-threaded event delivery; one zero-delay scheduled worker check. New worker use before the callback is observed by the callback's current model count.",
+        "CacheBehavior": "The authoritative current-state Set acts as a membership index. Unsynchronized models are negative membership hits and do no further work. No cold/warm cache difference or retry behavior is introduced.",
+        "MechanismConfidence": "High: both branches and event ordering are explicit in the changed code and model service.",
+        "MagnitudeUncertainty": "E varies by UI composition, but it is the instantiated editor count and the fallback preserves the previous path when needed.",
+        "Verdict": "No reportable regression. Single-removal work is reduced or deferred, with no added boundary call or retained resource."
+      },
+      {
+        "Scenario": "Editor model changes and normal state lifetime after storing the model directly in TextEditorSnapshot",
+        "CriticalPath": "Code-editor model-change events trigger a full state rebuild, replacing snapshots; editor removal disposes its listeners and rebuilds state. The added model field is then used only for identity checks on model removal.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Number of live code-editor snapshots and frequency of editor model changes.",
+        "EffectiveConcurrency": "Synchronous renderer event handling with no parallelism.",
+        "CacheBehavior": "Snapshots are replaced on model-change/full-state updates; there is no growing key history or cache.",
+        "MechanismConfidence": "High: snapshot ownership and the editor model-change/removal listeners were traced directly.",
+        "MagnitudeUncertainty": "None material; the snapshot already strongly retained the editor, which itself owns the same current model.",
+        "Verdict": "No retention regression. The explicit model reference has the same snapshot lifetime as the already-retained editor and is released when state is rebuilt or disposed."
+      }
+    ],
+    "Summary": "Completed the performance pass over all three changed files and surrounding model-removal, state-delta, scheduler, worker, IPC, and lifecycle code. No diff-introduced performance finding met the reporting bar. The PR instead removes two quadratic/repeated-work mechanisms; the editor-worker regression fix was recorded against its blamed introducing commit."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-13T02:44:22.85281727Z",
+    "CompletedAt": "2026-11-13T02:47:33.382844395Z",
+    "WallClockMilliseconds": 190530,
+    "ModelCalls": 8,
+    "InputTokens": 186526,
+    "OutputTokens": 5287,
+    "TotalTokens": 191813,
+    "ReasoningTokens": 2306,
+    "CacheReadTokens": 150516,
+    "CacheWriteTokens": 35986,
+    "APIDurationMilliseconds": 73020,
+    "ToolCalls": 31,
+    "NanoAIUnits": 34597240000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 150516,
+      "cache_write": 35986,
+      "input": 24,
+      "output": 5287
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
