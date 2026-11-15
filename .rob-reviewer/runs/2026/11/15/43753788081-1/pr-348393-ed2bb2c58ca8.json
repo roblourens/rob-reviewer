@@ -1,0 +1,166 @@
+{
+  "PullRequest": {
+    "Number": 348393,
+    "Title": "Git - sign merge commits when git.enableCommitSigning is enabled",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #116913\n\n## Repro steps\n\n1. In a repository, configure commit signing (for example SSH signing: `gpg.format=ssh`, `user.signingkey=\u003ctmp\u003e/key.pub`) and make sure git's own `commit.gpgSign` is not enabled.\n2. Set `\"git.enableCommitSigning\": true`.\n3. Have two diverging branches (`main` and `feature`), with `main` checked out.\n4. Run **Git: Merge...** and pick `feature`. Merging a branch from the Repositories view or the Source Control Graph behaves the same way.\n5. Run `git log --format='%h %G? %s' -1`.\n\n**Expected:** the merge commit is signed (`G`). **Actual:** it is unsigned (`N`), even though regular commits made from VS Code with the same setting are signed.\n\n## Root cause\n\n`git.enableCommitSigning` is only applied in the commit flow: `CommandCenter.smartCommit` sets `opts.signCommit = true`, and `Repository.commit()` in `git.ts` passes `-S`. `Repository.merge()` in `git.ts` always ran a plain `git merge \u003cref\u003e`, so a clean merge, which creates its merge commit inside `git merge`, ignored the setting.\n\nA conflicted merge is already signed: after you resolve the conflicts, it's concluded through the regular commit flow, which passes `-S`.\n\n## Fix\n\n- `Repository.merge()` in `repository.ts` reads `git.enableCommitSigning`, scoped to the repository root, and passes `{ signCommit }` down. This mirrors how commit reads the setting.\n- `Repository.merge()` in `git.ts` adds `-S` only when `signCommit` is `true`.\n- When the setting is `false` or unset, the command line is unchanged (`git merge \u003cref\u003e`), so git's own `commit.gpgSign` / `merge.gpgSign` configuration keeps applying. No `--no-gpg-sign` is ever passed.\n- `-S` is harmless for fast-forward merges, since no commit is created.\n\nAll merge entry points (the **Git: Merge...** command, merging from the Repositories view or Graph, and the `Repository.merge` extension API) go through `Repository.merge()`, so all of them pick up the fix.\n\n### Related operations with the same gap (not changed here)\n\nOther commit-creating operations that VS Code runs also don't honour `git.enableCommitSigning`; they rely only on git's own config. Only `merge` is fixed here, to keep this change narrow and matched to the issue:\n\n- `cherryPick` (`git cherry-pick \u003chash\u003e`): commands and Graph cherry-pick.\n- `rebase` (`git rebase`, also via the API) and `rebaseContinue` (`git rebase --continue`, used when committing during a rebase).\n- `pull` when it creates a merge commit (`git pull`).\n\n`cherry-pick` and `rebase` accept `-S`, so they could be follow-ups.\n\n## Validation\n\n| Command | Result |\n| --- | --- |\n| `pnpm run gulp compile-extension:git` | Passed (0 errors) |\n| `node_modules/.bin/tsc -p extensions/git/tsconfig.json --noEmit` | Passed |\n| `pnpm run oxlint extensions/git/src/git.ts extensions/git/src/repository.ts` | Passed (no findings) |\n| `./scripts/test-integration.sh --suite git` | Passed: 91 passing, 2 pending, 0 failing |\n| Pre-commit hygiene hook (oxlint + hygiene on the 2 changed files) | Passed |\n| CLI check in a scratch repo with SSH signing and `commit.gpgsign=false`: `git merge feature` vs `git merge -S feature` | `N Merge branch 'feature'` vs `G Merge branch 'feature'`; fast-forward with `-S` succeeds |\n| UI scenario (`validate-ui-scenario`, Code OSS dev build, throwaway profile) | Before: fails at \"merge commit has a good signature\" (`%G? = N`). After: all 4 steps pass (`%G? = G`) |\n\nNo unit test was added: the change doesn't add or extract a pure function. Existing integration tests cover the `merge` code path when the setting is unset, so the arguments are unchanged.\n\n## Evidence\n\nThe UI scenario ran on a Code OSS dev build (macOS arm64, `Dev` quality) with a throwaway profile. It uses a scratch repository under `\u003ctmp\u003e` with a throwaway, passphrase-less SSH signing key configured only in the repository's local git config (`gpg.format=ssh`, `user.signingkey`, `gpg.ssh.allowedSignersFile`, `commit.gpgsign=false`). The scratch repo's `.vscode/settings.json` seeds `\"git.enableCommitSigning\": true`. The scenario:\n\n1. opens the repository and the `.vscode/settings.json` file;\n2. runs **Git: Merge...** and picks `feature`;\n3. runs `git --no-pager log --format='%h %G? %s' -4; echo; git --no-pager log --show-signature -1` in the integrated terminal;\n4. asserts `git log -1 --format=%G?` is `G`.\n\nThe same scenario was recorded with the fix reverted (before) and with the fix applied (after). A side-by-side video (before on the left, after on the right, aligned by step) and before/after screenshots of the terminal output are available on request. `gh` can't attach them to the PR. They show the same flow; the only difference is the signature status of the merge commit.\n\n**Before (without fix):** terminal output\n\n```\n$ git --no-pager log --format='%h %G? %s' -4; echo; git --no-pager log --show-signature -1\nd2f4cd3 N Merge branch 'feature'\n650708d N Update main\neb0b4bd N Add feature\na5d86e8 N Initial commit\n\ncommit d2f4cd3c5c0b1c9ee1fdbbd28c83906ac321cc50 (HEAD -\u003e main)\nMerge: 650708d eb0b4bd\nAuthor: Demo \u003cdemo@example.com\u003e\n\n    Merge branch 'feature'\n```\n\nScenario result: `FAIL MS-04 Verify the merge commit has a good signature (%G? = G): Merge commit d2f4cd3 is not signed: %G? = N.`\n\n**After (with fix):** terminal output\n\n```\n$ git --no-pager log --format='%h %G? %s' -4; echo; git --no-pager log --show-signature -1\nbdd8a5e G Merge branch 'feature'\n2649b8c N Update main\n3e1904b N Add feature\nb56c91c N Initial commit\n\ncommit bdd8a5e73bae7f0179eb4660dc86bb933d09cee3 (HEAD -\u003e main)\nGood \"git\" signature for demo@example.com with ED25519 key SHA256:...\nMerge: 2649b8c 3e1904b\nAuthor: Demo \u003cdemo@example.com\u003e\n\n    Merge branch 'feature'\n```\n\nScenario result: `PASS MS-04 Verify the merge commit has a good signature (%G? = G): Merge commit bdd8a5e has a good signature: %G? = G (demo@example.com).`\n\nThe setup commits stay `N` in both runs because they were created with `commit.gpgsign=false` outside VS Code. Only the merge commit created by VS Code changes from `N` to `G`.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/348393",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3ea3ca1d231cae6826355b86b03635ebf0d93068",
+    "HeadRef": "lszomoru/agents/fix-git-merge-signing-bug",
+    "HeadSHA": "ed2bb2c58ca89e35e02106651c3ed23cbefd2997",
+    "CreatedAt": "2026-11-15T10:45:35Z",
+    "UpdatedAt": "2026-11-15T19:14:42Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Merge from the command palette, Repositories view, Graph, or extension API with git.enableCommitSigning disabled or unset",
+        "CriticalPath": "A synchronous in-process configuration lookup completes before the existing repository operation starts; then the existing `git merge \u003cref\u003e` subprocess and existing post-operation model refresh must finish before the merge promise resolves.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/git.ts:2283 Repository.merge",
+            "Operation": "Run `git merge \u003cref\u003e`.",
+            "Cardinality": "One per merge invocation, with only the pre-existing sequential repository-lock retry behavior.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same single subprocess ran with the same arguments when signing was disabled or unset.",
+            "CriticalPathEffect": "Creates or advances the merge and must complete before model refresh and command completion."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/git/src/repository.ts:3026 updateModelState",
+            "Operation": "Refresh HEAD, remotes, submodules, worktrees, operation markers, status, and refs after the mutating operation; several reads are parallelized and status/refs may invoke Git.",
+            "Cardinality": "One bounded refresh per merge result, independent of branch or changed-file count except for the data returned by status/refs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The identical post-merge refresh already followed every merge.",
+            "CriticalPathEffect": "The existing refresh is awaited before the public merge promise resolves."
+          }
+        ],
+        "ScalingInput": "One selected ref and one repository per explicit merge invocation; repository size affects Git merge/status/refs costs, but the diff does not increase their cardinality.",
+        "EffectiveConcurrency": "One merge subprocess at a time for this invocation. Repository-lock retries are sequential and pre-existing; post-merge state queries use the existing bounded Promise.all fan-out.",
+        "CacheBehavior": "VS Code configuration is read from the extension-host configuration service on each explicit merge; there is no new external cache or miss path. Git and model-refresh cache behavior is unchanged.",
+        "MechanismConfidence": "High: all callers converge on Repository.merge, the setting defaults false, and the generated arguments remain exactly `git merge \u003cref\u003e` on this path.",
+        "MagnitudeUncertainty": "Repository-dependent merge and refresh durations vary, but the changed disabled-setting path adds only a local configuration lookup and no expensive boundary or extra multiplicity.",
+        "Verdict": "No reportable regression: the common/default path preserves subprocess count, arguments, concurrency, and refresh work."
+      },
+      {
+        "Scenario": "Non-fast-forward merge with git.enableCommitSigning enabled",
+        "CriticalPath": "The local configuration lookup selects `-S`; the existing Git merge subprocess then creates and cryptographically signs one merge commit before the existing model refresh runs. Signing is required behavior for this opt-in setting.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/git.ts:2283 Repository.merge",
+            "Operation": "Run the existing `git merge` process with the added `-S` argument.",
+            "Cardinality": "One Git process per explicit merge invocation, as before.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One `git merge \u003cref\u003e` process ran, but it did not honor the enabled VS Code signing setting.",
+            "CriticalPathEffect": "The process is awaited before refresh and command completion."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/git.ts:2286 conditional `args.push('-S')`",
+            "Operation": "Git invokes the configured GPG, X.509, or SSH signing backend to sign the newly created merge commit.",
+            "Cardinality": "At most one signing operation for the one merge commit; no signing occurs when the merge creates no commit.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "VS Code's merge command omitted `-S`, so this opt-in signing work did not occur unless Git's own configuration independently enabled it.",
+            "CriticalPathEffect": "Cryptographic signing and any signing-agent interaction are necessarily on the merge-commit creation path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/git/src/repository.ts:3026 updateModelState",
+            "Operation": "Run the existing repository model refresh after the merge.",
+            "Cardinality": "One bounded refresh per merge result.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same refresh already occurred after an unsigned merge.",
+            "CriticalPathEffect": "Awaited after signing/merge completes."
+          }
+        ],
+        "ScalingInput": "One signature for the single merge commit produced by one explicit merge invocation; it does not scale with files, commits being merged, refs, or repositories beyond separate user-issued merges.",
+        "EffectiveConcurrency": "The merge and its Git-managed signing helper are serial on the command critical path. No Promise.all or per-item loop creates concurrent signing; repository-lock retries remain sequential.",
+        "CacheBehavior": "The setting is resolved per repository at invocation time. Signing-agent/key caching is owned by the configured Git signing backend and unchanged by this code; no application cache is introduced or defeated.",
+        "MechanismConfidence": "High: the changed argument directly requests one Git signature only when the resource-scoped setting is true, and merge operations are not collection-driven or concurrent.",
+        "MagnitudeUncertainty": "Signing latency depends on backend, agent state, hardware token, and prompts, but cardinality is strictly one and the work is the explicit semantics of the enabled setting.",
+        "Verdict": "No reportable performance regression: the single additional signing boundary is intentional, opt-in, bounded, and inseparable from the requested signed-merge behavior."
+      },
+      {
+        "Scenario": "Fast-forward or conflicting merge with git.enableCommitSigning enabled",
+        "CriticalPath": "The existing `git merge -S \u003cref\u003e` process runs. Fast-forward merges create no commit and therefore do not invoke signing; conflicting merges stop before commit creation and are later concluded through the existing commit flow. The existing model refresh remains awaited.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/git.ts:2283 Repository.merge",
+            "Operation": "Run `git merge -S \u003cref\u003e` without creating a merge commit on fast-forward or conflict.",
+            "Cardinality": "One per explicit merge invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same one Git merge subprocess ran without `-S`; neither form invokes a signing helper when no commit is created.",
+            "CriticalPathEffect": "Must determine fast-forward success or conflicts before refresh/UI progress can complete."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/git/src/repository.ts:3026 updateModelState",
+            "Operation": "Execute the pre-existing post-operation repository refresh, including status/refs and merge-state checks.",
+            "Cardinality": "One bounded refresh for this operation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical refresh cardinality and scheduling.",
+            "CriticalPathEffect": "Awaited before merge promise completion."
+          }
+        ],
+        "ScalingInput": "One selected ref per explicit operation; conflict count and repository size affect pre-existing Git/status work, but the diff adds no per-conflict or per-file work.",
+        "EffectiveConcurrency": "One merge subprocess, followed by the existing bounded refresh. Any later conflict-resolution commit is a separate serialized user action using the pre-existing commit path.",
+        "CacheBehavior": "No new cache is involved. The resource-scoped configuration lookup is local and signing-agent caches are not touched when no merge commit is created.",
+        "MechanismConfidence": "High: `-S` requests signing of a commit only if Git creates one, while the diff contains no loops, retained state, or scheduling changes.",
+        "MagnitudeUncertainty": "Git's merge and refresh durations depend on repository size and conflict volume, but no new signing operation occurs in these no-commit cases.",
+        "Verdict": "No reportable regression: subprocess count and expensive work remain effectively unchanged for merge attempts that create no merge commit."
+      }
+    ],
+    "Summary": "Reviewed all three changed files and all merge entry points. The diff adds one resource-scoped in-process configuration read and conditionally requests a single Git-managed signature for an opted-in merge commit. It introduces no collection fan-out, repeated refresh, concurrency burst, cache-lifecycle issue, or unbounded retention; default, fast-forward, and conflict paths preserve existing expensive-boundary cardinality."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-15T19:51:03.409455473Z",
+    "CompletedAt": "2026-11-15T19:52:27.467561741Z",
+    "WallClockMilliseconds": 84058,
+    "ModelCalls": 11,
+    "InputTokens": 328532,
+    "OutputTokens": 5082,
+    "TotalTokens": 333614,
+    "ReasoningTokens": 1472,
+    "CacheReadTokens": 281088,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 62889,
+    "ToolCalls": 54,
+    "NanoAIUnits": 40385120000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 281088,
+      "cache_write": 0,
+      "input": 47444,
+      "output": 5082
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

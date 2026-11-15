@@ -1,0 +1,154 @@
+{
+  "PullRequest": {
+    "Number": 348388,
+    "Title": "SCM Graph - use the active editor's repository when it opens after the editor",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #229500\n\n## Repro steps\n\n1. Create a multi-root `.code-workspace` with three git repositories `alpha`, `beta`, `gamma` (in that order), each with a few commits.\n2. Open the workspace and open `gamma/gamma.txt`.\n3. Reload the window (`Developer: Reload Window`); `gamma.txt` is restored as the active editor.\n4. Open the Source Control view and look at the Source Control Graph (repository picker in \"Auto\" mode).\n5. 🐛 The Graph (and the active repository in the status bar) shows `alpha`, the first workspace folder, instead of `gamma`.\n\n## Root cause\n\nThe Graph in \"Auto\" mode follows `ISCMViewService.activeRepository`, which is the latest of the active editor's repository and the focused repository. The active editor's repository (`_activeEditorRepositoryObs`) was only re-evaluated when the active editor changed. On startup/reload, editors are restored before the git extension opens the repositories, so the restored editor resolves to no repository and is never revisited when its repository is added later. Meanwhile, the first added repository (`alpha`) gets focused, so it stays the active repository and the Graph shows it.\n\n## Fix\n\nAlso re-evaluate the active editor when the repository that contains the active editor's resource is added. The event is filtered to that repository only, so adding unrelated repositories does not override the user's focused repository. Picker semantics and persistence are unchanged.\n\n## Validation\n\n| Command | Result |\n| --- | --- |\n| `pnpm run typecheck-client` | ✅ Passed |\n| `pnpm run oxlint src/vs/workbench/contrib/scm/browser/scmViewService.ts src/vs/workbench/contrib/scm/test/browser/scmViewService.test.ts` | ✅ Passed (no findings) |\n| `./scripts/test.sh --run src/vs/workbench/contrib/scm/test/browser/scmViewService.test.ts` (with the fix) | ✅ Passed |\n| `./scripts/test.sh --run src/vs/workbench/contrib/scm/test/browser/scmViewService.test.ts` (fix reverted) | ❌ Failed as expected (`repositoryB` never becomes active) |\n| `./scripts/test.sh --runGlob 'vs/workbench/contrib/scm/test/**/*.test.js'` | ✅ 103 passing |\n| UI scenario (`validate-ui-scenario`, Code - OSS dev build, steps above) with the fix reverted | ❌ Graph shows `alpha` (history: `alpha: commit 3..1`) |\n| Same UI scenario with the fix | ✅ Graph shows `gamma` (history: `gamma: commit 3..1`); status bar shows `gamma` |\n\nThe new unit test constructs `SCMViewService` with an active editor in `repositoryB`, then adds `repositoryA` and `repositoryB`, and asserts the active repository sequence is `[undefined, 'repositoryA', 'repositoryB']`.\n\n## Evidence\n\nA step-aligned side-by-side recording (before on the left, after on the right) and before/after screenshots are available on request (`gh` can't attach media). They show:\n\n- **Before:** after the reload, with `gamma.txt` as the active editor, the Graph's repository picker reads `alpha` and lists `alpha: commit 3/2/1`.\n- **After:** same steps, the picker reads `gamma`, the Graph lists `gamma: commit 3/2/1`, and the status bar shows `gamma`.\n\n## Notes for reviewers\n\nThese are related behaviours that this PR does not change:\n\n- If the repositories are already open, opening the Source Control view focuses the first visible repository's commit input. That makes the focused repository (`alpha`) active by design, because the focused repository takes precedence. Behaviour is the same before and after this change.\n- In that same flow, the Graph's picker label can read `alpha` while its contents still show `gamma`. This happens when the active repository changes while the Graph's first render is in flight: the repository-change autorun skips its first run. This is a separate, pre-existing race in `scmHistoryViewPane.ts` and also reproduces without this change.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/348388",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3ea3ca1d231cae6826355b86b03635ebf0d93068",
+    "HeadRef": "lszomoru/agents/fix-scm-graph-repo-selection-bug",
+    "HeadSHA": "5babbad7b15c970a6771202c654db549cc0d444a",
+    "CreatedAt": "2026-11-15T09:47:30Z",
+    "UpdatedAt": "2026-11-15T19:03:47Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-1FA488E16D4A",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/scm/browser/scmViewService.ts",
+      "Side": "RIGHT",
+      "Line": 280,
+      "Severity": "medium",
+      "Confidence": 0.98,
+      "ConfidenceRationale": "The changed callback, synchronous registration call path, and linear getRepository implementation directly prove quadratic main-thread work with repository count. Only the exact user-visible duration varies with repository count and URI implementation cost; that uncertainty is reflected in medium severity.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Main-thread CPU spent normalizing and comparing repository URIs",
+      "PerformanceScaling": "For N repositories registered during restoration, getRepository scans 1, 2, ... N registered providers, yielding Θ(N²) relativePath computations even when only one repository can contain the unchanged active editor.",
+      "PerformanceOutcome": "Increased SCM restoration latency and main-thread CPU/UI stalls in large multi-repository workspaces",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this change, repository registration updated the SCM view but did not re-run the active editor's full repository lookup for every provider; that lookup ran when the active editor observable was read or changed.",
+      "ChangedBehavior": "Every onDidAddRepository event now synchronously invokes getRepository(activeResource), which walks all currently registered repositories; only after completing that walk does the filter suppress unrelated additions.",
+      "CausalDiffEvidence": "The added return expression at line 280 places the collection-wide getRepository(activeResource) scan inside the per-repository onDidAddRepository filter; this event was not part of _activeEditorObs before the PR.",
+      "Title": "Reject unrelated repositories before rescanning them all",
+      "Impact": "On reload with a restored editor and many discovered Git/SCM repositories, provider registrations are handled sequentially on the main thread, so the newly added 1+…+N URI scans delay Source Control readiness and can make the window briefly unresponsive. The cost is paid even when almost every added repository is unrelated to the active file.",
+      "Evidence": "SCMService.registerSCMProvider inserts each provider and synchronously fires onDidAddRepository. The added predicate calls SCMService.getRepository for every such event; getRepository iterates this.repositories and calls uriIdentityService.extUri.relativePath for each visible provider. MainThreadSCM.$registerSourceControl reaches registerSCMProvider from the extension-host registration RPC, so this work runs synchronously in each registration handler. Git repository discovery allows arbitrary workspace-folder counts and repositoryScanMaxDepth=-1, making large N realistic.",
+      "Recommendation": "First test whether the newly added repository's root can contain the active resource using URI-identity-aware containment, immediately reject unrelated roots, and only perform the authoritative getRepository lookup for a containing candidate (preserving nested-repository precedence)."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Window reload restores an active editor before Git/SCM repositories are rediscovered",
+        "CriticalPath": "After the workbench reaches Restored, each extension-host source-control registration synchronously inserts a provider and fires onDidAddRepository on the main thread. The changed filter must finish its active-resource repository lookup before that registration handler returns; a matching event then updates active-repository observers. Repository discovery itself remains asynchronous and outside this callback, but the new URI scans are directly on each registration's main-thread critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadSCM.ts:$registerSourceControl",
+            "Operation": "Receive one source-control registration from the extension host and register its provider in SCMService.",
+            "Cardinality": "One pre-existing IPC handler invocation per discovered repository; the changed synchronous scan inside each handler covers all repositories registered so far.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same per-repository registration IPC occurred, but adding a provider did not re-run the active editor's full repository lookup.",
+            "CriticalPathEffect": "The IPC already existed, but its main-thread handler now waits for the added collection-wide URI lookup before completing."
+          }
+        ],
+        "ScalingInput": "N discovered SCM repositories. The changed lookup examines 1 through N providers across incremental registrations, for N(N+1)/2 URI containment computations; effective matching cardinality is normally one repository, or a small number of increasingly specific nested containing repositories.",
+        "EffectiveConcurrency": "Provider-registration callbacks and their event listeners execute synchronously on the main thread, so the scan cost is serialized and cumulative. No limiter, batching, cache, or negative-cache state coalesces repeated lookups for the unchanged active resource.",
+        "CacheBehavior": "SCMService.getRepository performs a fresh full scan on every event, with no positive or negative lookup cache. Unrelated repository additions are filtered only after that full scan. This is identical on cold and warm lookup state because no state is retained for this query.",
+        "MechanismConfidence": "High: the added per-add event predicate directly invokes a synchronous implementation that loops over every currently registered repository.",
+        "MagnitudeUncertainty": "Typical workspaces have few repositories, so the exact delay is workload-dependent; multi-root workspaces and unbounded Git scan depth make tens or hundreds of providers realistic. This uncertainty affects severity, not the proven quadratic mechanism.",
+        "Verdict": "Reportable medium-severity startup regression because the diff adds quadratic, uncached main-thread CPU work before suppressing unrelated additions."
+      },
+      {
+        "Scenario": "SCM Graph is visible in Auto mode while the repository containing the restored editor is added",
+        "CriticalPath": "A containing repository passes the changed filter, updates activeRepository, and the visible graph's repository autorun refreshes its tree. Fetching the corrected repository's history is on the graph-content critical path; if the Graph is hidden, visibility-scoped subscriptions are absent and this history work is off the path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadSCM.ts:MainThreadSCMHistoryProvider.provideHistoryItems",
+            "Operation": "Request history items from the extension-host SCM history provider for the corrected graph repository.",
+            "Cardinality": "At most one effective request per coalesced visible graph refresh; usually one for the newly authoritative repository.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The repository-add event did not revise the active editor repository, so the graph did not fetch the restored editor's repository and remained on the previously selected/first repository.",
+            "CriticalPathEffect": "Blocks rendering the corrected graph page while history is fetched."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/git/src/historyProvider.ts:GitHistoryProvider.provideHistoryItems",
+            "Operation": "Run repository.log (Git log) to populate the requested graph page; optional history detail providers may also enrich returned items.",
+            "Cardinality": "One Git log for a cold, coalesced graph history request in the ordinary case.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No Git log for the restored editor's repository was triggered by its later registration; only the old/wrong graph repository could have been loaded.",
+            "CriticalPathEffect": "Blocks the corrected graph's content, but is not on window progress when the graph is hidden."
+          }
+        ],
+        "ScalingInput": "Normally one authoritative containing repository after unrelated additions are filtered; nested parent/child repositories can produce a small number of updates as a more specific root becomes authoritative. Graph page size is clamped to 1..1000 history items.",
+        "EffectiveConcurrency": "Graph refresh uses a throttler plus an update-children throttler and tree-operation sequencer, so refreshes are coalesced/serialized rather than launched as an unbounded burst.",
+        "CacheBehavior": "The graph retains per-repository view-model state, but a repository-triggered refresh clears state before fetching; a newly selected repository is cold. Hidden views perform no graph fetch. The SCM active-resource predicate itself has no cache.",
+        "MechanismConfidence": "High for the event-to-refresh-to-IPC/subprocess call path when the graph is visible; low uncertainty only around timing and visibility.",
+        "MagnitudeUncertainty": "The exact Git-log duration and whether the graph is visible during discovery vary. The work is typically a single bounded refresh and is necessary to render the corrected repository.",
+        "Verdict": "No additional finding: the new bounded/coalesced fetch is the required work for the PR's corrected graph and does not create fan-out beyond containing repository changes."
+      },
+      {
+        "Scenario": "User switches the active editor after repositories are already open",
+        "CriticalPath": "The existing editor-change event still reevaluates the active editor and performs one repository lookup before active-repository observers and any visible graph refresh can proceed.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "One lookup across N open repositories per active-editor change, unchanged from the base behavior.",
+        "EffectiveConcurrency": "Editor changes are processed synchronously on the main thread; visible graph refreshes remain throttled and sequenced.",
+        "CacheBehavior": "The lookup is uncached both before and after the diff. The newly added repository event source does not fire in this scenario, so warm/cold behavior is unchanged.",
+        "MechanismConfidence": "High: Event.any forwards the pre-existing editor event once, and the added filter subscribes only to repository-add events.",
+        "MagnitudeUncertainty": "None material for PR causality; editor-change frequency and repository count vary but the diff does not increase this scenario's lookup or boundary cardinality.",
+        "Verdict": "No regression introduced for normal active-editor switching."
+      }
+    ],
+    "Summary": "Completed the performance pass over both changed files. Reported one introduced quadratic main-thread startup scan. Also traced the intended active-repository update into status-bar and visible SCM Graph refresh paths; the latter may issue a coalesced history-provider IPC/Git query for the newly authoritative repository, but that work is required to render the corrected graph and does not independently justify another finding."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-15T19:46:45.552402678Z",
+    "CompletedAt": "2026-11-15T19:49:02.481558645Z",
+    "WallClockMilliseconds": 136929,
+    "ModelCalls": 16,
+    "InputTokens": 544530,
+    "OutputTokens": 8576,
+    "TotalTokens": 553106,
+    "ReasoningTokens": 3643,
+    "CacheReadTokens": 480768,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 115338,
+    "ToolCalls": 67,
+    "NanoAIUnits": 61887520000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 480768,
+      "cache_write": 0,
+      "input": 63762,
+      "output": 8576
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
