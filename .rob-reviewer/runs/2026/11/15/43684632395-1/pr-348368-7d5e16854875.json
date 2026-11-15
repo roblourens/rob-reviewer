@@ -1,0 +1,174 @@
+{
+  "PullRequest": {
+    "Number": 348368,
+    "Title": "agentHost: don't show a turn twice after the host replaces a chat's turns",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\r\n* Read our Pull Request guidelines:\r\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\r\n* Associate an issue with the Pull Request.\r\n* Ensure that the code is up-to-date with the `main` branch.\r\n* Include a description of the proposed changes and how to test them.\r\n--\u003e\r\n\r\nWhen the agent host reloads a chat from storage, the reloaded turns get the IDs the SDK stored, not the request IDs this window sent. The chat restorer keeps requests sent from this window, so a turn sent from VS Code showed twice, even after a window reload.\r\n\r\nWhen the host replaces a chat's turns (a server truncation of all turns followed by the loaded list), the handler now removes the chat's finished requests that the new list doesn't have. Requests that are still running are kept, and paging in older turns removes nothing. Removing a request clears the chat's aggregate billing, so the host's billing for the chat, which the replacement doesn't change, is applied again afterwards.\r\n\r\nThis also applies to Take Over: a send that was cancelled at the \"Session Open in Another Process\" question, which the host never ran, is now removed, so the chat matches the CLI session.\r\n\r\n**Steps**\r\n1. Run a turn in Copilot CLI and `/code` it to VS Code.\r\n2. Send a turn from VS Code.\r\n3. In the CLI, choose \"Resume anyway\" and run a turn.\r\n4. Run `/code` again.\r\n\r\nBefore: the turn sent from VS Code shows twice. After: each turn shows once, also after a window reload.\r\n\r\n**Validation**\r\n- `scripts\\test.bat --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts --run src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts`: 1,345 passing. The new test fails without the fix, and without each of the two review fixes (adjacent stale requests, billing).\r\n- `pnpm run typecheck-client`: passed.\n- `pnpm run oxlint` on the changed files: passed.\r\n- End to end on a Code - OSS dev build with Copilot CLI 1.0.109: the steps above, and Take Over, both match the CLI session, including after a window reload.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/348368",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "karthiknadig",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "9bfb9e7eefb447fcb013761b1b18e861d3d320b2",
+    "HeadRef": "karthiknadig/reload-duplicate-turns",
+    "HeadSHA": "7d5e168548758dfef567ce9a8dcbd8f54526f110",
+    "CreatedAt": "2026-11-14T23:32:06Z",
+    "UpdatedAt": "2026-11-15T01:10:41Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-669F7673A242",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionHandler.ts",
+      "Side": "RIGHT",
+      "Line": 3218,
+      "Severity": "medium",
+      "Confidence": 0.94,
+      "ConfidenceRationale": "The synchronous call path and linear per-removal listeners are explicit, and the replacement scenario is directly documented and exercised by the added test. Exact latency depends on transcript length and how many locally sent IDs are replaced, so severity is medium rather than high.",
+      "PerformanceCategory": "rendering",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "main-thread array scans/splices, view-model reconciliation, response disposal, and model change notifications",
+      "PerformanceScaling": "For k missing requests in a transcript with n request/response rows, this performs k individual removals; each removal linearly searches and splices ChatModel, linearly searches/splices ChatViewModel rows, and causes PersistentBackgroundActivityTracker to rescan all responses, yielding O(k*n) synchronous work (O(n^2) when IDs for many locally sent turns are replaced).",
+      "PerformanceOutcome": "A host history replacement can block the renderer/main thread and make a long chat visibly hang while its transcript is reconciled.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff, a ChatTruncated/ChatTurnsLoaded replacement refreshed host history but did not synchronously remove each unmatched ChatModel request, so it did not trigger a full chain of per-request model/view listeners on this action path.",
+      "ChangedBehavior": "The new replacement handler builds the missing set and invokes ChatService.removeRequest once per missing completed request. Although wrapped in Promise.all, ChatService.removeRequest contains no await and calls ChatModel.removeRequest synchronously, so all removals and their listeners run back-to-back in the action callback.",
+      "CausalDiffEvidence": "Added line 3218 maps every element of `missing` to a separate `_chatService.removeRequest(...)`; this is the line that introduces the repeated synchronous model/view update chain on host history replacement.",
+      "Title": "Batch replacement cleanup instead of removing requests one by one",
+      "Impact": "When an externally restored or taken-over long session gives new stored IDs to many turns sent from this window, applying ChatTurnsLoaded repeatedly scans and mutates the remaining transcript for every missing turn, causing UI jank proportional to the product of missing and total turns.",
+      "Evidence": "ChatService.removeRequest synchronously calls model.removeRequest (chatServiceImpl.ts:2639-2653). ChatModel.removeRequest uses findIndex/splice and fires one removeRequest event (chatModel.ts:3792-3803). ChatViewModel handles every event with up to two additional findIndex/splice passes (chatViewModel.ts:417-443), while PersistentBackgroundActivityTracker directly handles every model removal by rebuilding a Set from all response items and reconciling it (chatListRenderer.ts:858-902). The host's refreshChatHistory emits the truncate/load pair with an unbounded turns array (agentHostStateManager.ts:792-800), including reload and provider-history refresh paths.",
+      "Recommendation": "Add/use a bulk removal operation that identifies all missing IDs once, removes/disposes them in one pass, resets billing once, and emits one batched/initialize-style model change so view-model and renderer reconciliation run once; then restore host usage once after the batch."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "synchronous-ui-work",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Reloading or taking over an already-open agent chat replaces the host transcript after stored turn IDs differ from requests sent by this window.",
+        "CriticalPath": "Provider/session history reads and hydration finish first; the host then emits ChatTruncated followed by ChatTurnsLoaded. On the ChatTurnsLoaded action-processing/UI path, the added handler computes missing requests and synchronously executes every ChatService/ChatModel removal and model/view listener before its first await settles, so this cleanup blocks action progress and rendering.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts `_getChatMessages` (around 10808)",
+            "Operation": "Read the provider's complete chat messages via `provider.chats.getMessages`.",
+            "Cardinality": "One provider read for a reload replacement, returning n turns; host per-chat sequencing prevents duplicate concurrent reads for the same queued refresh.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same provider read and hydration occurred before this diff; the workbench then refreshed history without deleting each unmatched ChatModel request.",
+            "CriticalPathEffect": "Must complete before the replacement actions can be emitted; it precedes the newly added UI cleanup."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts `_loadWorkspaceTransitions` (around 10863)",
+            "Operation": "Open/read session storage for workspace-transition hydration.",
+            "Cardinality": "One storage lookup per host history refresh, independent of k missing workbench requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical storage hydration existed before the diff.",
+            "CriticalPathEffect": "Completes before hydrated turns and replacement actions are available; it is not part of the added removal loop."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/agentHostStateManager.ts `refreshChatHistory` (792-800); src/vs/platform/agentHost/common/state/agentSubscription.ts `receiveEnvelope` (219-243)",
+            "Operation": "Deliver the server-originated ChatTruncated and ChatTurnsLoaded action envelopes from the agent host to the workbench subscription.",
+            "Cardinality": "Two protocol actions per changed authoritative history, regardless of n or k.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same two actions were delivered, but their workbench handler only refreshed history.",
+            "CriticalPathEffect": "The second action now synchronously triggers k removals before its handling completes."
+          }
+        ],
+        "ScalingInput": "n loaded ChatModel requests/response rows and k completed local requests absent from the replacement. Effective cardinality is k removals after Set-based ID deduplication; cost is O(k*n), reaching O(n^2) when many locally sent turn IDs are replaced.",
+        "EffectiveConcurrency": "Host refreshes are serialized per chat by `_chatHistoryRefreshes`. The added Promise.all does not provide useful concurrency because `ChatService.removeRequest` has no await and synchronously mutates the model; all k removals execute back-to-back on the main thread. Separate chats may receive independent action streams, with no shared limiter for their UI reconciliation.",
+        "CacheBehavior": "The host and ChatModel states are already in memory. There is no cleanup cache or coalescing; every authoritative replacement recomputes IDs and repeats listener reconciliation. Cold versus warm state does not change the new O(k*n) path, though the pre-existing provider/storage work may vary.",
+        "MechanismConfidence": "High: the added line invokes one synchronous removal per missing request, and each traced model/view/renderer listener contains full-array scans or splices.",
+        "MagnitudeUncertainty": "The exact number of turns sent in one window and per-listener duration varies; short chats will not show visible delay. Long-running agent sessions can realistically accumulate enough replaced local turns for the quadratic main-thread work to become noticeable, so severity is medium.",
+        "Verdict": "Reportable medium performance regression. Batch model mutation and one reconciliation event can preserve replacement semantics while avoiding O(k*n) UI work."
+      },
+      {
+        "Scenario": "Paging older host turns into an open transcript via ChatTurnsLoaded without a preceding server-originated clear.",
+        "CriticalPath": "A pre-existing fetchTurns protocol roundtrip loads a page, then ChatTurnsLoaded prepends it and refreshHistory updates the visible transcript. The added `replaced` guard remains false, so `_removeRequestsMissingFromHost` is not called.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/common/state/protocol/channels-session/commands.ts `FetchTurnsParams`; src/vs/platform/agentHost/node/protocolServerHandler.ts `fetchTurns` (2625-2640)",
+            "Operation": "Send fetchTurns and receive ChatTurnsLoaded over the existing agent-host protocol.",
+            "Cardinality": "One command/response-action sequence per requested page.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Paging used the same roundtrip and history refresh before the diff.",
+            "CriticalPathEffect": "The roundtrip must finish before older rows appear; the diff adds no boundary and no removal work on this path."
+          }
+        ],
+        "ScalingInput": "One fetched page plus the already loaded turn window; the new code performs only constant flag/action checks.",
+        "EffectiveConcurrency": "Protocol action application is ordered. Paging does not launch the Promise.all removal path, and no new concurrency or fan-out is introduced.",
+        "CacheBehavior": "Already loaded turn IDs are deduplicated by the existing reducer; repeated pages do not activate cleanup. Cold first-page and warm subsequent-page behavior are unchanged by the diff.",
+        "MechanismConfidence": "High: the handler records `replaced` only from the immediately preceding server-originated full ChatTruncated action.",
+        "MagnitudeUncertainty": "Provider-specific page sizes are not established here, but they do not affect the new guarded cleanup because no server clear precedes paging.",
+        "Verdict": "No reportable regression; the added checks are constant-time and the test explicitly covers this no-removal path."
+      },
+      {
+        "Scenario": "Normal live turns and client-originated truncation/undo actions update an open chat.",
+        "CriticalPath": "Existing host protocol actions reduce state and update history/progress. Client-originated ChatTruncated envelopes fail the `!envelope.origin` condition, and ordinary turn actions do not match either new action branch.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/common/state/agentSubscription.ts `receiveEnvelope` (219-243)",
+            "Operation": "Exchange existing live chat action envelopes with the agent host.",
+            "Cardinality": "Existing per-action delivery; no additional messages are emitted by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same actions crossed the boundary and drove the same normal history/progress handling.",
+            "CriticalPathEffect": "Only constant-time branch/state updates are added unless the specific authoritative replacement pair occurs."
+          }
+        ],
+        "ScalingInput": "Action frequency follows live response/progress events, but the changed code performs only a few comparisons per relevant truncate/load action, not per streamed token or response part.",
+        "EffectiveConcurrency": "Existing ordered action processing is unchanged; no removal tasks are started for client-originated truncation or normal turn actions.",
+        "CacheBehavior": "The new host-usage accessor reads the current in-memory session subscription and performs the same `readChatUsage` work previously done by `updateSessionCost`; no cache behavior changes.",
+        "MechanismConfidence": "High: action-type and origin guards exclude these actions from the cleanup helper.",
+        "MagnitudeUncertainty": "Live action rates vary, but the changed comparisons are trivial and do not invoke collection work on this scenario.",
+        "Verdict": "No reportable performance regression."
+      }
+    ],
+    "Summary": "Reviewed both changed files and traced host history replacement through provider refresh, protocol actions, ChatService/ChatModel removal, ChatViewModel, and renderer listeners. Reported one medium-confidence scaling regression: per-request removal creates quadratic synchronous transcript reconciliation. Paging and ordinary action handling do not activate the new cleanup and add no performance regression. The PR fixes duplicate-turn correctness, but available evidence does not establish a shipped performance symptom suitable for regression-fix learning."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-15T06:19:21.418137603Z",
+    "CompletedAt": "2026-11-15T06:21:36.871389492Z",
+    "WallClockMilliseconds": 135453,
+    "ModelCalls": 15,
+    "InputTokens": 592259,
+    "OutputTokens": 8583,
+    "TotalTokens": 600842,
+    "ReasoningTokens": 2727,
+    "CacheReadTokens": 522240,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 113784,
+    "ToolCalls": 85,
+    "NanoAIUnits": 66063200000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 522240,
+      "cache_write": 0,
+      "input": 70019,
+      "output": 8583
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
