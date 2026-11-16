@@ -1,0 +1,176 @@
+{
+  "PullRequest": {
+    "Number": 348516,
+    "Title": "Chat resources: show recorded resources of any provided scheme",
+    "Body": "Fixes #348515\n\nWith `chat.resources.enabled` on, a pinned pill of a file that the chat's agent recorded can show the file above the chat input. That only worked for `file:` URIs: a recorded resource of another scheme, such as a `vscode-app-link:` document that Team Tools renders with the CDP viewer, could be pinned but offered no **Show Above Chat Input**. Resources that extensions contribute with `chatResources` already worked with any scheme, because they skip that filter.\n\n## What changes\n\nWhich resources the chat can show now depends on what provides their scheme, through a small abstraction (`getChatResourceProviderKind` in `chatResourceExistence.ts`):\n\n- **File system provider:** the resource is shown while the file system reports that it exists, and changes are watched (as before for `file:` and extension file systems).\n- **Text content provider:** there is no way to stat the resource, so it is assumed to exist. Extensions register these providers when they activate, without an event, so the check runs again when extensions activate.\n- **Neither:** the chat does not offer to show it.\n\nRecorded artifacts still map the agent host's `file:` URIs into the window, which matters in remote windows; other schemes pass through unchanged, as they already name something in the window. Contributed and recorded resources now use the same rule. Before, a recorded resource without a file system provider counted as existing, and a contributed one did not.\n\nNothing changes while `chat.resources.enabled` is off.\n\n## Validation\n\n- Unit test for the three provider kinds, including a text content provider whose extension activates later.\n- The pills tests pass (151), including the remote-window mapping test, which now registers the window's file system for the remote scheme as a real remote window has.",
+    "URL": "https://github.com/microsoft/vscode/pull/348516",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "hediet",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "b79cd7e11c2708ad3b06d6c6b5b91fb4679a4b85",
+    "HeadRef": "hediet/chat-resources-any-scheme",
+    "HeadSHA": "9f1314b37742b71a31058b0ed92c0fe860f9c28f",
+    "CreatedAt": "2026-11-16T10:47:56Z",
+    "UpdatedAt": "2026-11-16T10:56:08Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-4BD85D08C0CE",
+      "Focus": "performance-review",
+      "Path": "src/vs/workbench/contrib/chat/browser/chatResources/chatResourceExistence.ts",
+      "Side": "RIGHT",
+      "Line": 66,
+      "Severity": "low",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The listener ownership, event frequency sources, synchronous refresh prefix, and per-resource cardinality are directly traced in repository code. Exact milliseconds depend on active widgets and resource counts, so severity is low, but the repeated-work mechanism and before/after increase are certain.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "global event-listener callbacks, async refresh promises, and filesystem-provider activation dispatch CPU work",
+      "PerformanceScaling": "For W live chat widgets, R non-filesystem resources, and S extension-status events, this adds O(W×R×S) refreshes even when those resources share one scheme; text-content resources continue refreshing after their provider has already been found because they never acquire a file-system provider.",
+      "PerformanceOutcome": "increased CPU/GC pressure and UI-thread latency while extensions activate or repeatedly report runtime errors",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Observed resources listened for file changes and provider registrations only. Contributed resources did not react to extension-status changes, and recorded non-file resources were filtered out before existence observers were created.",
+      "ChangedBehavior": "Each observed resource now installs its own global onDidChangeExtensionsStatus listener. Every status event for any extension calls refresh for every resource without a file-system provider; refresh allocates an async continuation and calls fileService.activateProvider, which synchronously dispatches onWillActivateFileSystemProvider into the extension activation service before provider-kind detection.",
+      "CausalDiffEvidence": "RIGHT line 66 adds the per-resource subscription to the global extension-status event; RIGHT lines 67-68 route every unrelated status change for non-filesystem resources into refresh. The same PR also begins feeding recorded resources of arbitrary schemes into these observers, increasing the affected cardinality beyond contributed/file resources.",
+      "Title": "Coalesce extension-status refreshes by scheme",
+      "Impact": "With chat resources enabled, a long agent chat containing many recorded links/custom resources (and especially multiple open chat editors) multiplies every unrelated extension activation or runtime-error status event into one refresh per resource. This can add bursts of UI-thread CPU and promise garbage during extension activation, even after a text-content scheme is already known to be supported.",
+      "Evidence": "The added listener at line 66 is created by observeChatResourceExists once per distinct resource through mapObservableArrayCached in both ChatResourcesControl and ChatResourceContributionEntries. Its guard is only !fileService.hasProvider(resource), so text-content resources always pass it. refresh calls fileService.activateProvider before getChatResourceProviderKind; FileService.activateProvider synchronously fires onWillActivateFileSystemProvider, and AbstractExtensionService handles that by calling activateByEvent(onFileSystem:\u003cscheme\u003e). onDidChangeExtensionsStatus fires after every extension activation and runtime error, not only when a relevant text provider registers.",
+      "Recommendation": "Observe extension-status changes once per control/provider set and coalesce refreshes by unresolved URI scheme. Cache the scheme-level provider kind so one activation probe serves all resources of that scheme, while retaining per-resource file existence/watch logic only after the scheme resolves to a file-system provider."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "cache-lifecycle",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open or switch to an agent chat with chat.resources.enabled and populate recorded/contributed resources",
+        "CriticalPath": "The widget can render before the asynchronous existence probes finish, but each resource must complete provider activation and, for filesystem schemes, exists() before it becomes eligible for Show Above Chat Input. The PR newly places arbitrary recorded URI schemes on this eligibility path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/files/common/fileService.ts:activateProvider -\u003e src/vs/workbench/services/extensions/common/abstractExtensionService.ts:activateByEvent",
+            "Operation": "Dispatch onFileSystem:\u003cscheme\u003e activation to extension hosts when an installed extension declares that event",
+            "Cardinality": "activateProvider is invoked once per distinct observed resource initially, but actual extension-host activation is coalesced/cached per scheme activation event; schemes with no interested extension stop at the registry lookup.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same boundary existed for recorded file URIs and contributed resources. The diff newly reaches it for recorded non-file Resource artifacts.",
+            "CriticalPathEffect": "Eligibility waits for activation so a filesystem provider can register; widget rendering itself does not wait."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatResources/chatResourceExistence.ts:refresh",
+            "Operation": "Check resource existence through the registered filesystem provider",
+            "Cardinality": "One exists call per distinct filesystem resource on initial observation and on matching file/provider changes; no call for text-content or unsupported schemes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Recorded non-file Resource artifacts were excluded, so their custom filesystem providers were not queried; contributed and file resources were already queried.",
+            "CriticalPathEffect": "The resource is not listed as showable until the check resolves. Remote/custom providers may implement this through IPC or network."
+          }
+        ],
+        "ScalingInput": "Distinct recorded resource URIs plus resolved extension contributions in each live chat widget. ChatResourcesControl deduplicates recorded targets by URI string; contribution entries are cached by contribution ID plus URI. Provider activation is effectively grouped by the extension service's per-activation-event cache, while filesystem existence remains one operation per distinct filesystem resource.",
+        "EffectiveConcurrency": "observeChatResourceExists launches every initial refresh with void and no limiter, so distinct resources probe concurrently. Version counters suppress stale results but do not coalesce work. This concurrency pattern existed for file resources/contributions; the diff expands it to arbitrary recorded schemes.",
+        "CacheBehavior": "mapObservableArrayCached retains one observer per distinct target while observed and disposes removed targets. Extension activation is warm-cached per onFileSystem:\u003cscheme\u003e; filesystem exists results are retained only in each observable and refreshed by file/provider events. Text-content provider kind is not cached at the scheme level.",
+        "MechanismConfidence": "High: target deduplication, unbounded per-target refresh scheduling, activation caching, and the newly admitted recorded URI schemes are directly visible in the call path.",
+        "MagnitudeUncertainty": "The feature is experimental and off by default, and typical resource counts/provider latency are not measured. Long agent sessions and multiple chat editors increase cardinality.",
+        "Verdict": "No separate finding for initial boundary fan-out: per-resource filesystem existence is required by the feature, actual extension activation is coalesced per scheme, and no narrower authoritative batch API was established."
+      },
+      {
+        "Scenario": "An extension activates, fails, or reports a runtime error while chat resource observers are alive",
+        "CriticalPath": "onDidChangeExtensionsStatus synchronously visits every registered resource listener. Each qualifying listener enters refresh and synchronously dispatches filesystem-provider activation before its first await; the resulting existence update is asynchronous and off the extension's own completion critical path after listener dispatch.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatResources/chatResourceExistence.ts:66-69 -\u003e IFileService.activateProvider",
+            "Operation": "Potential first activation of an extension that declares onFileSystem:\u003cscheme\u003e",
+            "Cardinality": "At most one effective extension-host activation per unique scheme because ExtensionHostManager caches the event, but O(resources) activation dispatches and promises are created per status event.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No extension-status listener existed, so unrelated activations/errors caused zero resource refreshes.",
+            "CriticalPathEffect": "The synchronous dispatch prefix runs during global status-event delivery; any first matching activation is awaited only by each background refresh."
+          }
+        ],
+        "ScalingInput": "Live chat widgets × resources without a filesystem provider × extension-status events. Text-content resources remain in this set after successful discovery because the guard checks only fileService.hasProvider.",
+        "EffectiveConcurrency": "Every listener starts a separate refresh with no batching or limiter. The extension-host manager caches activation per scheme, so repeated warm events mostly duplicate listener, promise, registry, and dispatch CPU rather than repeated extension-host activation.",
+        "CacheBehavior": "There is no shared provider-kind cache or negative cache by scheme. Warm text-content hits and unsupported schemes are retried on every unrelated status event; map caches only observer identity/lifetime.",
+        "MechanismConfidence": "Very high: the added per-resource global listener, event sources, unconditional text-resource retry, and refresh call path are directly traced.",
+        "MagnitudeUncertainty": "Exact UI delay depends on resource count, live widget count, and extension event rate; a noisy extension or long session makes the burst larger.",
+        "Verdict": "Reportable low-severity repeated-work regression; one finding was submitted recommending scheme-level coalescing/caching."
+      },
+      {
+        "Scenario": "Pin and show a newly supported non-file recorded resource above the chat input",
+        "CriticalPath": "After existence/provider-kind resolution, selecting the resource creates one frame. It may activate the default custom editor and resolve a custom webview, or create one text model reference and editor. This work is on the user-visible show action (or an explicit agent aboveInput request).",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatResources/chatResourceContent.ts:createChatResourceContent",
+            "Operation": "Activate the selected resource's custom editor extension and resolve its webview, when a custom editor is the default",
+            "Cardinality": "At most once for the single selected frame; extension activation is cached by activation event.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Recorded non-file Resource artifacts could not reach this show path; contributed resources and recorded files already could.",
+            "CriticalPathEffect": "The selected resource cannot display until custom-editor activation and input resolution finish."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatResources/chatResourceContent.ts:ChatResourceTextContent.ready",
+            "Operation": "Resolve a text model reference, which may read through a filesystem or extension text-content provider",
+            "Cardinality": "One model reference for the single selected text resource.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Recorded non-file Resource artifacts could not invoke this path; existing supported resources already did.",
+            "CriticalPathEffect": "The resource frame waits for model resolution; this is the intended display operation."
+          }
+        ],
+        "ScalingInput": "At most one shown resource per chat control; switching selection disposes the previous cached frame. Content size scales with the selected document, not the total recorded-resource collection.",
+        "EffectiveConcurrency": "One content load for the selected frame. Selection replacement disposes ownership and ready paths check disposal; no collection-wide concurrent content creation was introduced.",
+        "CacheBehavior": "The shown-list cache retains only the current frame. Text model references and custom editor inputs follow their existing service caches/lifecycles; cold selection loads content, warm service behavior is provider-specific.",
+        "MechanismConfidence": "High: only one resource is selected and frame disposal is explicit.",
+        "MagnitudeUncertainty": "Provider-specific document sizes and custom-editor startup costs vary, and agent-requested automatic showing prevalence is unknown.",
+        "Verdict": "No finding: the newly reachable model/custom-editor load is bounded to one selected resource and is the essential requested behavior, not avoidable eager collection work."
+      }
+    ],
+    "Summary": "Completed the performance pass over all six changed files and traced initial existence probing, global extension-status refreshes, and selected-resource rendering. Submitted one low-severity repeated-work finding for per-resource global status listeners; no concrete regression fix in the PR required blame learning."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-16T11:02:26.643026313Z",
+    "CompletedAt": "2026-11-16T11:04:59.773122228Z",
+    "WallClockMilliseconds": 153130,
+    "ModelCalls": 12,
+    "InputTokens": 425265,
+    "OutputTokens": 9064,
+    "TotalTokens": 434329,
+    "ReasoningTokens": 4104,
+    "CacheReadTokens": 366080,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 132935,
+    "ToolCalls": 61,
+    "NanoAIUnits": 56445200000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 366080,
+      "cache_write": 0,
+      "input": 59185,
+      "output": 9064
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
