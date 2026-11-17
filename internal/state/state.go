@@ -21,6 +21,7 @@ type State struct {
 
 type PullRequestState struct {
 	Reviewed        bool      `json:"reviewed,omitempty"`
+	Skipped         bool      `json:"skipped,omitempty"`
 	ReviewedHeadSHA string    `json:"reviewedHeadSha,omitempty"`
 	PendingHeadSHA  string    `json:"pendingHeadSha,omitempty"`
 	PendingSince    time.Time `json:"pendingSince,omitempty"`

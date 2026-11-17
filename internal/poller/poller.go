@@ -170,7 +170,7 @@ func (poller *Poller) Run(ctx context.Context) (result Result, returnErr error) 
 
 	boundary := now.Add(-poller.options.ScanWindow)
 	for number, tracked := range current.PullRequests {
-		if !tracked.Reviewed && strings.EqualFold(tracked.State, "closed") &&
+		if !tracked.Reviewed && !tracked.Skipped && strings.EqualFold(tracked.State, "closed") &&
 			tracked.UpdatedAt.Before(boundary) && tracked.PendingHeadSHA == "" {
 			delete(current.PullRequests, number)
 		}
@@ -243,7 +243,7 @@ func (poller *Poller) observe(current *state.State, pull review.PullRequest, now
 	tracked.UpdatedAt = pull.UpdatedAt
 
 	switch {
-	case tracked.Reviewed:
+	case tracked.Reviewed || tracked.Skipped:
 		tracked.PendingHeadSHA = ""
 		tracked.PendingSince = time.Time{}
 	case !pull.IsTeamAuthored():
@@ -280,7 +280,7 @@ type candidate struct {
 func (poller *Poller) readyCandidates(current state.State, now time.Time) []candidate {
 	var result []candidate
 	for number, tracked := range current.PullRequests {
-		if tracked.Reviewed || tracked.PendingHeadSHA == "" || tracked.PendingSince.IsZero() ||
+		if tracked.Reviewed || tracked.Skipped || tracked.PendingHeadSHA == "" || tracked.PendingSince.IsZero() ||
 			!strings.EqualFold(tracked.State, "open") {
 			continue
 		}
@@ -297,7 +297,7 @@ func (poller *Poller) readyCandidates(current state.State, now time.Time) []cand
 
 func (poller *Poller) stillReady(current *state.State, pull review.PullRequest, now time.Time, result *Result) bool {
 	tracked := current.PullRequests[pull.Number]
-	if tracked.Reviewed || !pull.IsTeamAuthored() || pull.HasAnyLabel(poller.options.SkipLabels) ||
+	if tracked.Reviewed || tracked.Skipped || !pull.IsTeamAuthored() || pull.HasAnyLabel(poller.options.SkipLabels) ||
 		!strings.EqualFold(pull.State, "open") || pull.HeadSHA != tracked.PendingHeadSHA {
 		poller.observe(current, pull, now, result)
 		return false

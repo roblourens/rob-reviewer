@@ -282,6 +282,36 @@ func TestRunDoesNotReviewNewHeadAfterPullRequestCompleted(t *testing.T) {
 	}
 }
 
+func TestRunDoesNotRequeueExplicitlySkippedPullRequests(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	current := initializedState()
+	current.PullRequests[11] = state.PullRequestState{
+		Skipped: true, PendingHeadSHA: "stale-head", PendingSince: now.Add(-time.Hour), State: "open", Draft: true,
+	}
+	current.PullRequests[12] = state.PullRequestState{
+		Skipped: true, State: "closed", UpdatedAt: now.Add(-8 * 24 * time.Hour),
+	}
+	fresh := pull(13, "fresh-head", now)
+	changed := pull(11, "new-head", now)
+	client := &fakePullClient{
+		updatedPages: map[int][]review.PullRequest{1: {changed, fresh}},
+		pulls:        map[int]review.PullRequest{11: changed, 13: fresh},
+	}
+	store := &fakeStateStore{exists: true, current: current}
+	var reviewed []int
+	poller := New(client, store, testOptions(&now), func(_ context.Context, pull review.PullRequest) (ReviewOutcome, error) {
+		reviewed = append(reviewed, pull.Number)
+		return ReviewOutcome{}, nil
+	})
+	if _, err := poller.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(reviewed, []int{13}) || store.current.PullRequests[11].PendingHeadSHA != "" ||
+		store.current.PullRequests[11].Reviewed || !store.current.PullRequests[12].Skipped {
+		t.Fatalf("reviewed=%v skipped states=%+v %+v", reviewed, store.current.PullRequests[11], store.current.PullRequests[12])
+	}
+}
+
 func TestRunReviewsDraftWhenItBecomesReadyButNotCompletedReopenedPull(t *testing.T) {
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	current := initializedState()
