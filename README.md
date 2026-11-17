@@ -64,7 +64,7 @@ learning:
 publication:
   mode: approval
 review:
-  model: gpt-5.6-sol
+  model: gpt-6.1-sol
   reasoningEffort: high
   minConfidence: 0.85
   maxFindings: 10

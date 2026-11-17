@@ -13,7 +13,7 @@ import (
 
 const (
 	CurrentVersion         = 1
-	DefaultModel           = "gpt-5.6-sol"
+	DefaultModel           = "gpt-6.1-sol"
 	DefaultStateBranch     = "reviewer-state"
 	DefaultStatePath       = ".rob-reviewer/state.json"
 	DefaultMaxPerRun       = 5
