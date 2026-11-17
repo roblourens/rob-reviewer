@@ -1,0 +1,237 @@
+{
+  "PullRequest": {
+    "Number": 348926,
+    "Title": "[Perf] collections: simplify group accumulation (reviewer test)",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n**Draft-only performance-reviewer test. Do not merge.**\n\nSimplifies bucket accumulation in `groupBy` while preserving the grouped values and their order. This standalone test has no associated issue and is independent of the earlier reviewer test.\n\nLocal checks with the checkout-required Node version:\n- `pnpm run build-fast --client-only` — passed.\n- `pnpm run oxlint src/vs/base/common/collections.ts` — passed.\n- `./scripts/test.sh --run src/vs/base/test/common/collections.test.ts --reporter dot` — passed, 13 tests.\n\n(Written by Copilot)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/348926",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "53fa24195c2b28c69f847216c3699dc1798f63d3",
+    "HeadRef": "roblou/agents/perf-regression-grouping-test",
+    "HeadSHA": "867800d27f1b734c551ab5e88a4e622d23ed5692",
+    "CreatedAt": "2026-11-17T20:28:33Z",
+    "UpdatedAt": "2026-11-17T22:11:54Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-A3D06A78144C",
+      "Focus": "performance-review",
+      "Path": "src/vs/base/common/collections.ts",
+      "Side": "RIGHT",
+      "Line": 26,
+      "Severity": "medium",
+      "Confidence": 1,
+      "ConfidenceRationale": "The quadratic prefix copying follows directly from the changed loop. A concrete scaling caller is traced from SearchView's changed-file URI list through QueryBuilder.commonQueryFromFileList and TextSearchManager.getSearchOptionsForFolder to ripgrep argument construction. These deduplicate paths but retain one include per distinct changed file; ordinary relative paths all enter the same bucket. Duration is not measured.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Copied array references and short-lived bucket arrays.",
+      "PerformanceScaling": "For a bucket of k distinct input items, k insertions now copy k(k-1)/2 prior references instead of k amortized-constant-time appends. Across groups the cost is proportional to sum(k_g^2), not the number of groups or subprocesses. In changed-file search the effective k is the unique changed-file include count within each workspace root.",
+      "PerformanceOutcome": "Increased search startup latency and CPU/GC pressure; renderer callers can also block UI rendering for large buckets.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "A result bucket was created only for a new key and then mutated with push, yielding amortized linear grouping work and one growing bucket array per key.",
+      "ChangedBehavior": "Each insertion allocates a replacement bucket and copies every previously grouped value, changing total grouping work from amortized O(N) to O(N + sum(k_g^2)) for bucket sizes k_g.",
+      "CausalDiffEvidence": "The deleted code allocated a bucket once and used target.push(element). Added collections.ts:26 instead spreads the entire existing result[key] into a fresh array on every element, introducing repeated prefix copies.",
+      "Title": "Restore in-place bucket accumulation to keep grouping linear",
+      "Impact": "Searching only changed files in a large change set now performs quadratic CPU work and generates transient arrays before ripgrep starts, delaying the first search result and increasing GC pressure. Warm model/module caches do not avoid this grouping.",
+      "Evidence": "SearchView (searchView.ts:1654-1675) supplies SCM changed-file URIs. QueryBuilder.commonQueryFromFileList (queryBuilder.ts:280-304) produces one unique include pattern per file within a workspace root. TextSearchManager (textSearchManager.ts:205-226) passes those patterns to the provider. pushIncludeAndExcludeGlobs (ripgrepTextSearchEngine.ts:612-615) groups them into just two categories before getRgArgs returns and cp.spawn runs (:122-135). Thousands of distinct relative file paths therefore produce a thousands-element otherIncludes bucket and quadratic synchronous copying before the existing one-process-per-folder search can start. The same helper also runs synchronously in SCM badge rendering (scmHistoryViewPane.ts:532,545).",
+      "Recommendation": "Restore one-time bucket initialization followed by in-place push, preserving both group membership and order without repeatedly cloning prefixes."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Build and execute text searches, particularly Search Only in Changed Files with thousands of distinct files in one workspace root.",
+        "CriticalPath": "SearchView builds the query synchronously, validates folder existence, and starts the provider. Ripgrep getRgArgs synchronously groups include patterns before cp.spawn, so this work delays process launch and first results. User-entered include/exclude segments also pass through groupBy during query parsing.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/search/browser/searchView.ts:validateQuery",
+            "Operation": "fileService.exists(fq.folder)",
+            "Cardinality": "One existence check per effective folder query, not per changed file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same folder checks in parallel before search.",
+            "CriticalPathEffect": "Query validation must finish before the search is triggered."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/base/node/ripgrep.ts:rgDiskPath",
+            "Operation": "Resolve @vscode/ripgrep-universal through a Lazy async import.",
+            "Cardinality": "One lazy package import per process, with its promise shared across calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same cold import and warm cached promise.",
+            "CriticalPathEffect": "Must resolve before argument construction and process launch."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:searchWithRipgrep, getRgArgs, pushIncludeAndExcludeGlobs",
+            "Operation": "cp.spawn(resolvedRgDiskPath, rgArgs, { cwd }) and receive search results.",
+            "Cardinality": "Normally one process per folder query; additional existing exception pass or symlink retry when applicable. Includes remain grouped into arguments for the same process.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same process cardinality, but include grouping used amortized linear append work before spawning.",
+            "CriticalPathEffect": "New quadratic grouping must complete before each ordinary process starts."
+          }
+        ],
+        "ScalingInput": "Unique changed-file includes per workspace root after dictionary deduplication. Ordinary relative file paths all enter otherIncludes; at most two buckets do not bound bucket size. User-supplied pattern segment count controls the query-parsing call separately.",
+        "EffectiveConcurrency": "Folder validation uses Promise.all; RipgrepSearchProvider also schedules folders with Promise.all. JavaScript grouping remains synchronous on its event loop. There is normally one ripgrep process per effective folder query, not one per include; existing exception passes and symlink retries can add runs.",
+        "CacheBehavior": "QueryBuilder and resolvePatternsForProvider deduplicate include keys, leaving one pattern per distinct changed file per workspace root. Neither grouping stage caches results. Warm ripgrep module state does not avoid grouping on each search; successful warm searches still incur the new cost.",
+        "MechanismConfidence": "Certain: traced SearchView changed-file URIs through QueryBuilder.commonQueryFromFileList, TextSearchManager.getSearchOptionsForFolder, provider scheduling, getRgArgs, and cp.spawn.",
+        "MagnitudeUncertainty": "No timings were measured. Large change sets are a concrete supported input; delay depends on file count and runtime GC.",
+        "Verdict": "Reportable quadratic CPU/allocation regression; submitted once at the shared helper. No subprocess fan-out regression."
+      },
+      {
+        "Scenario": "Render Source Control Graph badges for a commit with many branch/tag references.",
+        "CriticalPath": "HistoryItemRenderer.renderElement invokes _renderBadges. Its autorun synchronously groups references by color, then eligible groups by icon, before appending badges.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "References per visible history item, then references per color/icon bucket, not total repository commits. Numerous refs sharing a color produce a large bucket.",
+        "EffectiveConcurrency": "Renderer event-loop work is synchronous. Tree rendering limits rendered rows, but does not limit references attached to an individual visible history item.",
+        "CacheBehavior": "References are already present on the history item; grouping is recomputed for the render/autorun. Default badge filtering occurs after the first color grouping, so hidden uncolored references still participate. No filesystem, network, or IPC calls occur in the inspected badge-grouping path.",
+        "MechanismConfidence": "High: both groupBy2 calls resolve to the changed collections helper and execute inside the synchronous renderer.",
+        "MagnitudeUncertainty": "Large ref concentrations are repository-dependent, and frame time is unmeasured.",
+        "Verdict": "Same reported prefix-copying mechanism can cause render jank; not a separate finding."
+      },
+      {
+        "Scenario": "Consume streamed or completed chat notebook cell-text edit batches.",
+        "CriticalPath": "observerEditsInResponse handles new edit batches synchronously, groups a cell-text batch by cell URI, and only then enqueues pushNotebookCellText for each cell. Initial notebook entry/model setup must complete before queued edits apply.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingServiceImpl.ts:ensureEditorOpen",
+            "Operation": "fileService.exists before optionally opening an edited file.",
+            "Cardinality": "When configured, one editor-opening promise per notebook/resource in a response; notebook models already present bypass the existence check.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same per-resource promise deduplication and off-path editor-opening scheduling.",
+            "CriticalPathEffect": "Editor opening is initiated without awaiting it in the batch grouping loop."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingModifiedNotebookEntry.ts:create; src/vs/workbench/contrib/chat/browser/chatEditing/chatEditingSession.ts:_getOrCreateModifiedFileEntry",
+            "Operation": "Resolve notebook models, createNotebookTextDocumentSnapshot, streamToBuffer, and register/resolve the original snapshot.",
+            "Cardinality": "Initial modified-entry creation per notebook resource; existing entries return from _getOrCreateModifiedFileEntry. Notebook creation resolves the current and original snapshot models and serializes a snapshot.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same entry reuse, initial model setup, and snapshot work.",
+            "CriticalPathEffect": "Queued edits wait for initial entry/model creation; new grouping delays enqueueing but does not increase resolution count."
+          }
+        ],
+        "ScalingInput": "Edits per cell URI within each newly received batch; cost sums bucket-size squares over batches, not square of all edits across the response.",
+        "EffectiveConcurrency": "Response handling groups on the renderer event loop. ChatEditingSession uses a ThrottledSequencer(15,1000) per streaming instance plus resource-keyed locks. These serialize edit application for a notebook but do not defer or coalesce the preceding groupBy work.",
+        "CacheBehavior": "editsSeen and entry.seen ensure only new batches are grouped; this is not repeated grouping of the entire response history. Grouping has no cache. Existing notebook entries and initial contents are reused independently.",
+        "MechanismConfidence": "High: imports and enqueue/lock paths inspected directly.",
+        "MagnitudeUncertainty": "Typical batch sizes may be small; large same-cell batches cost more. No streaming latency was measured.",
+        "Verdict": "Same shared quadratic-copy regression; no new filesystem fan-out or concurrency burst and no separate finding."
+      },
+      {
+        "Scenario": "Refresh or remove notebook cell status-bar items.",
+        "CriticalPath": "Contributed items are awaited, then deltaCellStatusBarItems groups old item IDs by cell handle synchronously before replacing cell items. Built-in controllers also call this helper.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "ipc",
+            "Location": "src/vs/workbench/api/browser/mainThreadNotebook.ts:$registerNotebookCellStatusBarItemProvider; src/vs/workbench/contrib/notebook/browser/services/notebookCellStatusBarServiceImpl.ts:getStatusBarItemsForCell",
+            "Operation": "$provideNotebookCellStatusBarItems and $releaseNotebookCellStatusBarItems.",
+            "Cardinality": "One provide request per matching extension provider per executed cell refresh; old result lists are released when replaced/disposed. Not one IPC per item.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same provider Promise.all, per-cell throttling/cancellation, and release calls.",
+            "CriticalPathEffect": "Provider results precede grouping; release follows replacement."
+          }
+        ],
+        "ScalingInput": "Old status-bar item IDs per cell-handle bucket. Common callers update a single cell, so many notebook cells do not automatically form one quadratic bucket.",
+        "EffectiveConcurrency": "Each CellStatusBarHelper uses a Throttler and cancellation. Matching status-bar providers run concurrently with Promise.all. Grouping executes serially after provider results; helpers for distinct visible cells are independent.",
+        "CacheBehavior": "Current item IDs and lists are retained only until refresh/disposal. Each executed refresh regroups its old IDs; no helper-level grouping cache. Cancellation and throttling remain unchanged.",
+        "MechanismConfidence": "High for changed copying and call path; normal cardinality is bounded by contributed item counts.",
+        "MagnitudeUncertainty": "Ordinary cells have few status-bar items; large extension-contributed item lists would amplify the mechanism.",
+        "Verdict": "Same shared mechanism, usually low cardinality; no independent IPC or retention regression."
+      },
+      {
+        "Scenario": "Build agent-mode menus, continuous-test profile dropdowns, session issue pills, and the issue reporter extension table.",
+        "CriticalPath": "Existing in-memory modes/profiles/references/extensions are grouped synchronously before menu items, pills, or extension table initialization can complete. Issue reporter handleExtensionData runs during initialization.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Modes per category, continuous-run profiles per group, enabled nonbuiltin extensions per theme category, or repeated references to the same issue. Many distinct issue identities yield singleton buckets and do not create quadratic cross-issue copying.",
+        "EffectiveConcurrency": "Synchronous UI work per rebuild. Test profiles group by Run/Debug/Coverage; agent modes and extensions use two categories; session issue references group by normalized issue identity.",
+        "CacheBehavior": "These inspected grouping stages consume already available metadata, without issuing network, filesystem, or IPC reads. Grouping is recomputed per rebuild. Session issue deduplication follows grouping; hover caches do not avoid grouping. Commands and clipboard operations stored in action callbacks do not run during grouping.",
+        "MechanismConfidence": "High: direct imports/call sites and their in-memory inputs inspected; size-dependent impact distinguished from mechanism certainty.",
+        "MagnitudeUncertainty": "Most menus are small; issue reporter installations or repeated reference groups can be larger. No startup or menu timings were measured.",
+        "Verdict": "Additional manifestations of the one reported helper regression, not separate findings or new boundary calls."
+      },
+      {
+        "Scenario": "Open the local MCP server picker and react to server state changes.",
+        "CriticalPath": "_runLocal starts collection activation without awaiting it, then an autorun sorts/groups known servers and builds picker items. Picker show does not await discovery; discovered servers later update the observable list.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/workbench/contrib/mcp/common/mcpRegistry.ts:discoverCollections; src/vs/workbench/contrib/mcp/common/mcpService.ts:_activateCollections",
+            "Operation": "Invoke collection.lazy.load across the discovery-provider boundary.",
+            "Cardinality": "One load per allowed uncached lazy collection selected by discoverCollections, not one load per grouped server. Cached collections are excluded.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same lazy filtering and concurrent loads; the diff only changes local grouping cost after servers are available.",
+            "CriticalPathEffect": "Activation is not awaited before initial picker display; later discovery completion updates servers and triggers reconstruction."
+          }
+        ],
+        "ScalingInput": "Servers per collection, not number of collections squared; each autorun can incur sum of squared collection sizes.",
+        "EffectiveConcurrency": "Discovery loads uncached allowed lazy collections with Promise.all. Picker grouping is synchronous and reruns on read observable server/enablement/connection changes.",
+        "CacheBehavior": "Discovery respects lazy.isCached. Grouped picker items are rebuilt from observable server state rather than cached by group. No new server processes are started by grouping.",
+        "MechanismConfidence": "High for grouping and scheduling; discovery is unchanged and remains off the initial picker critical path.",
+        "MagnitudeUncertainty": "Server counts are generally small; large single-collection configurations and frequent state changes increase impact. Individual discovery-provider durations are outside this helper change.",
+        "Verdict": "Same shared helper copying regression; no introduced discovery fan-out or subprocess burst."
+      },
+      {
+        "Scenario": "Compute disposable-leak diagnostic details when tracking is enabled or tests request them.",
+        "CriticalPath": "computeLeakingDisposables synchronously groups stack continuations while assembling each reported leak's diagnostic string.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Leaks sharing a stack prefix and continuation; grouping cost can be quadratic in that shared subset at each visited frame, with at most maxReported displayed leaks.",
+        "EffectiveConcurrency": "Synchronous diagnostic computation. maxReported caps displayed leaks, not the size of prevStarts grouped at each stack level.",
+        "CacheBehavior": "Stack-prefix membership is already collected in SetMap, but continuations are regrouped per reported stack frame. No external I/O occurs in this computation. TRACK_DISPOSABLES is false by default; this is not unconditional production startup work.",
+        "MechanismConfidence": "High: lifecycle imports the changed helper and grouping inputs/caps inspected.",
+        "MagnitudeUncertainty": "Applies to explicit tracking/test diagnostics; runtime and leak count are unmeasured.",
+        "Verdict": "Same reported regression on a diagnostic path, not a separate normal-startup finding."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over the sole changed file and its entire diff against base 53fa24195c2b28c69f847216c3699dc1798f63d3. Submitted one medium-severity, high-confidence finding: replacing in-place bucket append with prefix-copying introduces quadratic CPU work and allocation. Traced effective grouping cardinalities, caches, UI scheduling, provider IPC, lazy discovery, and ripgrep process boundaries; no boundary-count regression or performance regression fix was identified. Static read-only review; no timing claims."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-17T22:47:33.140678788Z",
+    "CompletedAt": "2026-11-17T22:50:32.689552027Z",
+    "WallClockMilliseconds": 179548,
+    "ModelCalls": 16,
+    "InputTokens": 817210,
+    "OutputTokens": 7280,
+    "TotalTokens": 824490,
+    "ReasoningTokens": 1361,
+    "CacheReadTokens": 740436,
+    "CacheWriteTokens": 76726,
+    "APIDurationMilliseconds": 155329,
+    "ToolCalls": 57,
+    "NanoAIUnits": 33875460000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 740436,
+      "cache_write": 76726,
+      "input": 48,
+      "output": 7280
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
