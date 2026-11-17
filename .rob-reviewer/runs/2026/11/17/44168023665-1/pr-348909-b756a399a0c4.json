@@ -1,0 +1,169 @@
+{
+  "PullRequest": {
+    "Number": 348909,
+    "Title": "[Perf] arrays: adjust duplicate tracking (reviewer test)",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\n**Draft-only performance-reviewer test. Do not merge.**\n\nAdjusts the duplicate-tracking representation in `distinct` without intentionally changing its returned values. This standalone test has no associated issue.\n\nLocal checks with the checkout-required Node version:\n- `pnpm run build-fast --client-only` — passed.\n- `pnpm run oxlint src/vs/base/common/arrays.ts` — passed.\n- `./scripts/test.sh --run src/vs/base/test/common/arrays.test.ts --reporter dot` — passed, 31 tests.\n\n(Written by Copilot)\n",
+    "URL": "https://github.com/microsoft/vscode/pull/348909",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "roblourens",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "4138d130b9f47e7343ea3904a1b20f1e602ac344",
+    "HeadRef": "roblou/agents/perf-regression-draft-pr-test",
+    "HeadSHA": "b756a399a0c46b056202f37a77e60d185f6db3fb",
+    "CreatedAt": "2026-11-17T19:16:53Z",
+    "UpdatedAt": "2026-11-17T19:22:23Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-16ADB1E81A57",
+      "Focus": "performance-review",
+      "Path": "src/vs/base/common/arrays.ts",
+      "Side": "RIGHT",
+      "Line": 406,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The changed membership operation and growing collection directly establish the complexity change. Traced production callers process complete settings and command collections synchronously before rendering; actual collection sizes and elapsed time are not measured.",
+      "PerformanceCategory": "cpu",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "CPU work scanning and comparing previously seen keys.",
+      "PerformanceScaling": "For n inputs and u unique keys, membership costs O(n*u); all-unique inputs require n*(n-1)/2 comparisons instead of expected O(n) total membership work. Settings filters run this over the full settings collection before filtering, not merely the visible matches.",
+      "PerformanceOutcome": "Increased synchronous CPU time blocks the renderer event loop and delays settings/keybinding results.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "distinct retained keys in a local Set, using seen.has and seen.add for expected O(n) duplicate tracking with O(u) transient storage.",
+      "ChangedBehavior": "distinct now linearly scans accumulated unique keys for every input element, turning expected O(n) duplicate tracking into O(n*u), quadratic when most keys are unique.",
+      "CausalDiffEvidence": "At arrays.ts:406 the diff replaces seen.has(key) with seen.includes(key), while lines 402 and 409 replace the Set with a growing array and push. Consequently each new unique key scans every previously accepted key rather than performing a hash lookup.",
+      "Title": "Restore Set-based membership checks in distinct",
+      "Impact": "Filtering Settings with @modified or a broad search, and opening/rebuilding Keyboard Shortcuts, now perform quadratic duplicate checks on potentially thousands of mostly unique setting or command keys on the renderer thread, delaying results and blocking UI responsiveness even when the visible filtered result is small.",
+      "Evidence": "SettingsEditor2.createFilterModel (settingsEditor2.ts:1979-2005) collects every default/extension setting for filter-only queries such as @modified. setResult -\u003e updateChildren -\u003e getUniqueSearchResults -\u003e sortResults reaches arrays.distinct at settingsTreeModels.ts:1113 before the tag/scope filters at 1196-1202 reduce the displayed set. The result cache is cleared by each setResult. KeybindingsEditorModel.resolve likewise deduplicates all bound and unbound commands at keybindingsEditorModel.ts:211-226, and keybindingsEditor.ts:565-566 awaits it before rendering. For n distinct keys the new implementation examines n*(n-1)/2 prior entries; the removed Set implementation did expected constant-time membership per key.",
+      "Recommendation": "Keep Set-based membership tracking (a Set\u003cunknown\u003e preserves the intended typing); retain the existing filter order and keyFn invocation semantics."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "synchronous-ui-work",
+      "cache-lifecycle",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Apply Settings filters such as @modified, or display broad local text-search results.",
+        "CriticalPath": "Filter-only queries synchronously build a full settings result in SettingsEditor2.createFilterModel, call setResult/updateChildren/getUniqueSearchResults/sortResults, and finish distinct before applying tag/scope filters or refreshing the tree. Local text results also pass through this result-model path before display.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "For filter-only queries, all eligible built-in and extension settings, potentially thousands of mostly unique setting keys, regardless of how few survive @modified. For text queries, the combined matches after existing local/remote-key deduplication.",
+        "EffectiveConcurrency": "The changed distinct call is synchronous on the renderer thread. Text searches are delayed and cancellable between asynchronous steps, but the membership loop itself has no yielding or cancellation. Filter-only query construction runs directly.",
+        "CacheBehavior": "getUniqueSearchResults caches results by AI-toggle state; repeat reads of an unchanged result reuse the cache. Every setResult clears that cache, and each filter-only query constructs a new SearchResultModel, so the first calculation repeats the changed work. Empty/no-result cases do not create an accumulating cache.",
+        "MechanismConfidence": "Very high: settingsEditor2.ts:1979-2005 supplies the full collection, settingsTreeModels.ts:1113 performs deduplication, and filtering only follows at 1196-1202. The selected filter-only and local-result processing paths are in-memory; LocalSearchProvider and the standard RemoteSearchProvider's TF-IDF implementation introduce no network boundary here. Optional AI search is separate and not needed to trigger the finding.",
+        "MagnitudeUncertainty": "Exact settings counts and blocking duration vary by installed extensions and machine; no timing measurements were made. Full-collection processing before visible filtering is established by code.",
+        "Verdict": "Reportable quadratic CPU regression, covered by the single shared-helper finding. The prior Set handled membership in expected linear total time; the new growing-array scan is quadratic for mostly unique keys."
+      },
+      {
+        "Scenario": "Open Keyboard Shortcuts or rebuild it after a keybinding update.",
+        "CriticalPath": "KeybindingsEditor.render awaits input.resolve and KeybindingsEditorModel.resolve before renderKeybindingsEntries. Model resolution constructs all bound/unbound command entries and calls distinct synchronously before sorting and displaying them.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "All resolved keybindings plus unbound registered commands, potentially thousands of mostly distinct command/keybinding/when/source IDs, not merely rows matching the current search.",
+        "EffectiveConcurrency": "Single synchronous renderer-thread loop despite async resolve signatures. No parallel membership checks, batching, or yielding.",
+        "CacheBehavior": "The editor input reuses its model instance, but model.resolve clears and rebuilds the entries and invokes distinct every time render resolves it. Typing in the Keyboard Shortcuts search normally filters existing entries rather than rerunning this full-resolution distinct.",
+        "MechanismConfidence": "Very high: keybindingsEditor.ts:560-566 awaits the resolution; keybindingsEditorModel.ts:211-226 fills the entire collection and deduplicates it before rendering. keybindingsEditorInput.ts returns its existing model without external I/O.",
+        "MagnitudeUncertainty": "Command counts depend on built-ins and extensions; no elapsed-time measurements. Model/input resolution and its in-memory service accesses were inspected, with no subprocess, filesystem, network, or IPC operation added on this path.",
+        "Verdict": "Same reportable quadratic duplicate-tracking mechanism; deduplicated into the one arrays.ts finding rather than reported again."
+      },
+      {
+        "Scenario": "Refresh extension-contributed tree views after a batch of change events.",
+        "CriticalPath": "The 200ms event debounce combines elements, then synchronously invokes distinct before enqueuing _refresh. _refresh checks root invalidation or suppresses descendants, refreshes surviving nodes, and submits a grouped refresh to the main thread.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostTreeViews.ts:_refresh and _refreshHandles, lines 801-860",
+            "Operation": "Send a root invalidation or grouped changed tree-item payload to the main thread.",
+            "Cardinality": "At most one $refresh IPC for a batch: one for a root refresh, or one containing refreshed items when the surviving handle refreshes produce items; none if no handles/items remain.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same debounce, ancestor grouping, Promise.all callbacks, payload cardinality, and single grouped IPC followed expected-linear Set-based element deduplication.",
+            "CriticalPathEffect": "Tree-view UI refresh cannot be sent until synchronous deduplication and any required node-refresh callbacks finish."
+          }
+        ],
+        "ScalingInput": "m element references accumulated in a debounced batch and u unique references govern the new O(m*u) scan. Subsequent ancestor/root suppression may reduce downstream work to h handles or a single root refresh, but occurs after distinct.",
+        "EffectiveConcurrency": "Refresh work is chained per tree through _refreshQueue. Within a batch, _refreshHandles uses Promise.all for h provider getTreeItem callbacks, followed by one grouped IPC. The newly slower synchronous distinct runs before that queue step.",
+        "CacheBehavior": "Every distinct call has a fresh local seen collection. Existing tree-node caches map references to handles; refresh clears affected child caches. Neither the debounce nor node caching avoids scanning unique references in a new batch.",
+        "MechanismConfidence": "High: constructor debounce and distinct at 409-437, queue chaining, and _refresh/_refreshHandles at 801-860 establish ordering and effective grouping.",
+        "MagnitudeUncertainty": "Extensions determine batch sizes and provider callback work; those callbacks may do their own I/O, but no particular external I/O implementation is assumed. The PR adds CPU work, not additional refresh IPCs or callbacks.",
+        "Verdict": "Additional exposure of the same shared-helper CPU regression, not boundary fan-out or a new concurrency burst. No separate finding."
+      },
+      {
+        "Scenario": "Merge occurrence highlights when editor.occurrencesHighlightFromAllProviders is enabled.",
+        "CriticalPath": "For a new queried word in an active model, selected providers are awaited together. mergeHighlights flattens their results and invokes distinct before the result can reach decoration rendering. The ordinary non-merge provider path does not use this distinct.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadLanguageFeatures.ts:$registerDocumentHighlightProvider, lines 336-340; src/vs/editor/contrib/wordHighlighter/browser/wordHighlighter.ts:getOccurrencesAtPosition",
+            "Operation": "Request document highlights from an extension-host provider via $provideDocumentHighlights.",
+            "Cardinality": "One IPC per selected extension-backed provider in merge mode, in parallel; in-process providers do not cross IPC. No calls are added per returned range.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical provider selection, concurrency, IPC count, and returned highlight payloads; subsequent merging used Set-based membership.",
+            "CriticalPathEffect": "Provider responses precede merging; the new CPU scan adds latency after those responses and before decorations can render."
+          }
+        ],
+        "ScalingInput": "Total returned highlight ranges across selected providers, with uniqueness determined by four range coordinates. A heavily repeated symbol can yield many unique ranges even from a single selected provider in merge mode.",
+        "EffectiveConcurrency": "Selected providers run concurrently through Promise.all; deduplication then runs synchronously on the renderer thread. Existing request tokens suppress obsolete rendering but do not interrupt a running includes loop.",
+        "CacheBehavior": "WordHighlighter._run returns early when the cursor remains inside an existing highlighted range. New-word requests cancel/replace previous work. Each actual merge uses a fresh seen collection and has no dedup-result cache.",
+        "MechanismConfidence": "High: wordHighlighter.ts:46-88 directly ties Promise.all results to distinct, and 675-795 connects requests to rendering and documents the existing cache/early-return behavior.",
+        "MagnitudeUncertainty": "Affected only when provider merging is enabled and enough distinct ranges are returned. Range counts and actual duration are not measured.",
+        "Verdict": "Same quadratic post-response CPU regression in an opt-in scenario; no separate finding and no assertion of additional IPC volume."
+      },
+      {
+        "Scenario": "Resolve language-specific configuration values from already loaded configuration models.",
+        "CriticalPath": "Configuration.getValue consolidates workspace/folder models, then override(identifier) may create an override model. Creation deduplicates base and override top-level keys; configuration merges may also deduplicate language-specific key lists before returning the requested value.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Unique top-level configuration namespaces for createOverrideConfigurationModel, not all leaf setting keys. Other merge calls scale with override key lists and model layers.",
+        "EffectiveConcurrency": "Synchronous in-memory configuration resolution; caches bound how often the changed helper is reached. No new concurrent operations or external boundaries in the inspected model-resolution path.",
+        "CacheBehavior": "Workspace consolidation is cached, folder consolidation is cached by folder URI, and override configurations are cached per identifier on each ConfigurationModel. Warm reads generally avoid rebuilding the affected collections; new models or new identifiers incur cold work.",
+        "MechanismConfidence": "High for cold-path reachability and caching: configurationModels.ts:146-153, 174-197, and 1063-1113 show the call chain. No filesystem/network work is introduced by this pure helper change.",
+        "MagnitudeUncertainty": "Typical top-level namespace and language-override key counts are not measured. Existing caches and smaller effective cardinality reduce exposure compared with the settings/commands workflows.",
+        "Verdict": "The same membership complexity worsens cold model creation, but warm caches limit repeated work. No independent finding or claim that all configuration reads now scan every setting."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over the full inventory (one reviewable file) and complete diff against base 4138d130b9f47e7343ea3904a1b20f1e602ac344. Submitted one medium-severity, high-confidence finding at arrays.ts:406: replacing Set membership with growing-array includes makes distinct quadratic on realistic mostly-unique settings and command collections. Reviewed UI and extension-host call paths, grouping, caches, allocation lifetime, and unchanged IPC boundaries. No new retention leak or independent boundary/concurrency regression was established. This PR does not fix a pre-existing performance regression, so no regression-fix provenance report applies. Static review only; no benchmarks or repository scripts were run."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-17T20:19:59.338114352Z",
+    "CompletedAt": "2026-11-17T20:22:39.298942682Z",
+    "WallClockMilliseconds": 159960,
+    "ModelCalls": 10,
+    "InputTokens": 314470,
+    "OutputTokens": 5985,
+    "TotalTokens": 320455,
+    "ReasoningTokens": 1770,
+    "CacheReadTokens": 264635,
+    "CacheWriteTokens": 49805,
+    "APIDurationMilliseconds": 128236,
+    "ToolCalls": 36,
+    "NanoAIUnits": 21088600000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 264635,
+      "cache_write": 49805,
+      "input": 30,
+      "output": 5985
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
