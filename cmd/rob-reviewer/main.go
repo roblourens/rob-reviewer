@@ -336,7 +336,11 @@ func newApp(configPath string, logger *slog.Logger) (*app.App, error) {
 func newReviewApp(configPath string, logger *slog.Logger, analysisOnly bool, stateUpdate string) (*app.App, error) {
 	reviewToken := os.Getenv("REVIEW_GITHUB_TOKEN")
 	if analysisOnly {
-		reviewToken = os.Getenv("GITHUB_TOKEN")
+		reviewToken = os.Getenv("REVIEW_READ_TOKEN")
+		if strings.TrimSpace(reviewToken) == "" {
+			reviewToken = os.Getenv("COPILOT_GITHUB_TOKEN")
+			logger.Warn("using the Copilot credential for read-only PR metadata; configure REVIEW_READ_TOKEN with organization visibility to separate these credentials")
+		}
 	}
 	return app.New(app.Options{
 		ConfigPath:   configPath,

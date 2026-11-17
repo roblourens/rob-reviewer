@@ -74,7 +74,7 @@ func New(options Options) (*App, error) {
 	}
 	if strings.TrimSpace(options.ReviewToken) == "" {
 		if options.AnalysisOnly {
-			return nil, errors.New("GITHUB_TOKEN is required for analysis-only GitHub reads")
+			return nil, errors.New("a GitHub read credential with organization visibility is required for analysis")
 		}
 		return nil, errors.New("REVIEW_GITHUB_TOKEN is required")
 	}

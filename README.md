@@ -110,7 +110,7 @@ The active analysis workflow requires one Actions secret:
 
 - `COPILOT_GITHUB_TOKEN`: a GitHub user token accepted by the Copilot SDK for an account with Copilot access.
 
-The analysis job uses a read-only, repository-scoped `GITHUB_TOKEN` for public PR metadata and reviewer state. `publication.reviewerLogin` identifies the author whose existing public review markers should suppress duplicate analysis; update it if the publication identity changes. Analysis does not need the publishing user's token or access to the private opt-in repository.
+The analysis job uses a read-only, repository-scoped `GITHUB_TOKEN` for reviewer state. PR metadata also requires visibility of private organization membership: without it, GitHub may report team authors as outside contributors. Configure the optional `REVIEW_READ_TOKEN` secret with public PR read access and organization-membership read access. Until that separate credential is available, the host explicitly warns and uses the existing Copilot credential for GET-only PR metadata requests. This does not narrow that credential's actual grants. `publication.reviewerLogin` identifies the author whose existing public review markers should suppress duplicate analysis; update it if the publication identity changes. Analysis never needs the publishing user's token or access to the private opt-in file.
 
 The separate persistence job receives a different repository-scoped token with `contents: write` only for this reviewer repository. It downloads the current run/attempt's artifacts, applies any staged state update, and archives reports. The separate guidance workflow uses its own token to apply host-owned templates. Neither job receives the Copilot or publication secret.
 
