@@ -1,0 +1,148 @@
+{
+  "PullRequest": {
+    "Number": 346926,
+    "Title": "test: use a fixture for the Markdown rich editor diagnostics test",
+    "Body": "Refs #343832\n\n`Markdown editor pull diagnostics › validates and clears diagnostics with only a custom-editor tab open` keeps failing in the Linux `Remote` integration run. The `No header found: 'missing'` warning is never cleared after the edit, most recently in main CI build 494170. This PR stops the test from racing a file watcher event. The underlying server bug is described below so it can be fixed separately.\n\n## What happens\n\nThe test creates its Markdown file with `workspace.fs.writeFile` and opens it in the rich editor right away. The language client forwards file watcher events to the server through a 250 ms debounce (`_fileEventDelayer` in `vscode-languageclient`). Over a remote connection, the watcher event for the new file can reach the server after the test's edit.\n\nIn `vscode-markdown-languageserver` 0.5.0, `VsCodeClientWorkspace` handles a `Changed` (or `Created`) event for a cached document by calling `openMarkdownDocumentFromFs`. That re-reads the file and **replaces** the cache entry with a new disk-only document, dropping the in-memory one. Every later diagnostics pull is then computed from the old on-disk text, so the warning keeps coming back until the next edit. Locally, the event arrives before `didOpen` and is ignored, which is why only Remote fails.\n\n## Proof\n\nI couldn't reproduce the remote timing locally, so I drove the server's real `VsCodeClientWorkspace` and `createPullDiagnosticsManager` (upstream `main`) through the sequence directly: open the document with the broken link, apply the fix edit, then deliver a late watched-file event whose file read returns the unsaved disk content.\n\n| Late event | Diagnostics after the edit | Server's text for the open document |\n|---|---|---|\n| none | `[]` | edited text, version 2 |\n| `Created` | `[]` | **on-disk text, version 0** |\n| `Changed` | **`No header found: 'missing'`** | **on-disk text, version 0** |\n| `Created` + `Changed` | **`No header found: 'missing'`** | **on-disk text, version 0** |\n\nThe last two rows match the CI failure exactly. Keeping the existing cache entry and only updating its on-disk document in `openMarkdownDocumentFromFs` makes all four rows clear.\n\n## The change\n\nThe test now uses a committed fixture (`test-workspace/markdown-rich-diagnostics.md`) instead of creating the file, so no Markdown file watcher event fires for it during the test. In `finally` it restores the original text before saving, so the fixture stays byte-identical. What the test checks hasn't changed: diagnostics appear and clear with only the custom-editor tab open.\n\nThe server bug is real but outside this repo (`vscode-markdown-languageserver`). It only matters when a file changes on disk while it has unsaved edits, so I'm reporting it separately rather than masking it here.\n\n## Validation\n\n- Mechanism reproduced with the harness above. The proposed server fix clears all four cases.\n- `tsc -p extensions/markdown-language-features/tsconfig.json --noEmit` and eslint are clean.\n- I couldn't run the integration suite locally (this machine can't install main's current dependencies), so PR CI's Linux Electron and Remote runs are the end-to-end check.\n\n\u003e Authored with Copilot\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/346926",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "eb50e1bf17fc87a192079dda6ab5d2b6523ee68c",
+    "HeadRef": "copilot/vscode/md-diagnostics-fixture",
+    "HeadSHA": "7489385a024cec2d71b78765542e03366193c3e1",
+    "CreatedAt": "2026-11-09T10:25:36Z",
+    "UpdatedAt": "2026-11-17T02:49:42Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Run custom-editor Markdown diagnostics integration test in Electron, web, or remote environments.",
+        "CriticalPath": "Read the committed fixture, update two settings, open the custom editor and text document, await initial diagnostics, apply the link edit, and await cleared diagnostics. The two diagnostic waits and editor-opening sequence are unchanged.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/markdown-language-features/src/test/markdownEditorDiagnostics.test.ts:23",
+            "Operation": "Read the fixture through workspace.fs and decode its original text.",
+            "Cardinality": "One read of one three-line fixture per execution.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Awaited one workspace.fs.writeFile to create equivalent tiny content before entering the test body.",
+            "CriticalPathEffect": "Awaited before configuring and opening the editor; remote filesystem transport may add one bounded round trip."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/markdown-language-features/src/test/markdownEditorDiagnostics.test.ts:25-42; extensions/markdown-language-features/src/client/client.ts:71-86",
+            "Operation": "Update workspace configuration, open a custom editor, apply the link edit, and synchronize documents/diagnostics with the language server and webview.",
+            "Cardinality": "Two setup configuration updates, one editor open, and one test edit; diagnostics for one document. Existing server-driven filesystem callbacks remain available, with no changed per-collection invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same operations and diagnostics waits for a newly created document instead of a committed fixture.",
+            "CriticalPathEffect": "Settings, editor open, edit application, and diagnostics completion gate test progress."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "extensions/markdown-language-features/src/extension.ts:startServer; extensions/markdown-language-features/src/extension.browser.ts:startServer",
+            "Operation": "Start the Markdown language server using a Node IPC transport, or one web worker in browser builds.",
+            "Cardinality": "One server per extension activation, not per fixture read or edit.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical server initialization and transport.",
+            "CriticalPathEffect": "Required on cold extension activation; already initialized in a warm extension host."
+          }
+        ],
+        "ScalingInput": "One committed three-line document and one link edit per test execution. Diagnostics polling remains every 50 ms for up to 10 seconds per wait, reading the local diagnostics collection rather than initiating a new server request itself.",
+        "EffectiveConcurrency": "One fixture and one custom-editor instance; test operations are sequentially awaited. Existing language-server and webview processing is asynchronous; no new parallel fan-out or subprocess creation loop.",
+        "CacheBehavior": "The initial explicit filesystem read is unconditional. Existing Markdown parsing uses the resource cache, then an open TextDocument, then filesystem loading on a miss (src/client/workspace.ts). Language-server initialization occurs only on extension activation; warm activation reuses it. The fixed URI introduces no growing cache-key set.",
+        "MechanismConfidence": "High: the complete diff and test establish bounded sequential fixture I/O; inspected client initialization, diagnostic configuration, parser-cache fallback, and editor lifecycle confirm no new scaling path.",
+        "MagnitudeUncertainty": "Remote round-trip times and whether the extension is already active vary. The changed work is fixed-size and test-only; there is no evidence of a meaningful performance degradation.",
+        "Verdict": "No reportable performance regression. Fixture setup substitutes one small read for one small write; production runtime implementation is unchanged."
+      },
+      {
+        "Scenario": "Restore the fixture and dispose the custom editor after successful, failed, or auto-saved test edits.",
+        "CriticalPath": "Finally optionally applies a restoration edit and saves, reads the disk contents, conditionally writes a fallback restoration, closes matching custom-editor tabs, and restores settings. Cleanup is awaited before the test completes.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "extensions/markdown-language-features/src/test/markdownEditorDiagnostics.test.ts:47-51; extensions/markdown-language-features/src/preview/markdownEditorProvider.ts:645-665",
+            "Operation": "Apply a full-fixture restoration edit, triggering existing document synchronization, diagnostics invalidation, and a webview authoritative update.",
+            "Cardinality": "At most one added restoration edit of a fixed three-line document per test.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Saved a dirty edited document without first restoring its original content.",
+            "CriticalPathEffect": "Edit application is awaited during cleanup, after the diagnostics assertions."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/markdown-language-features/src/test/markdownEditorDiagnostics.test.ts:51-54",
+            "Operation": "Save restored content when necessary, verify disk content with readFile, and conditionally restore disk content with writeFile.",
+            "Cardinality": "At most one explicit document.save, exactly one cleanup read, and at most one fallback write per test.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "At most one dirty-document save followed by an unconditional filesystem delete; no cleanup read or fallback write. The PR removes that deletion.",
+            "CriticalPathEffect": "Sequential cleanup I/O can add bounded remote round trips before the test finishes."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/markdown-language-features/src/test/markdownEditorDiagnostics.test.ts:56-60; extensions/markdown-language-features/src/preview/markdownEditorProvider.ts:747-777",
+            "Operation": "Close fixture tabs, dispose panel-owned transports/listeners, and restore two workspace configuration values.",
+            "Cardinality": "One close call for matching tabs and two setting restorations; the test opens one fixture tab.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same tab-close and configuration-restoration operations, with fixture deletion between them.",
+            "CriticalPathEffect": "Awaited cleanup; panel disposal releases existing editor resources."
+          }
+        ],
+        "ScalingInput": "One three-line fixture; at most one restoration edit, one save, one verification read, and one fallback write per execution. Existing tab/document scans are unchanged in structure and operate on the integration-test window.",
+        "EffectiveConcurrency": "Restoration edit, save, read, optional write, tab close, and configuration restoration are sequentially awaited. An existing editor change handler may asynchronously publish an authoritative document update. No input-sized concurrent boundary calls are added.",
+        "CacheBehavior": "Disk verification is unconditional even if the TextDocument is clean; fallback writing occurs only on mismatch. The restore content is retained only for this test's lifetime. Existing watcher invalidation clears resource-cache entries; panel disposal removes listeners and panel maps.",
+        "MechanismConfidence": "High: explicit conditions bound all new cleanup operations, and inspected panel disposal releases listeners, transports, and panel references. No new retained-resource owner or retry loop is introduced.",
+        "MagnitudeUncertainty": "Autosave timing determines whether save/fallback write is needed; remote I/O duration varies. Additional work remains constant and isolated to one tiny test fixture.",
+        "Verdict": "No actionable performance regression: small bounded restoration costs preserve a committed test fixture, and existing editor cleanup remains intact. The described stale-diagnostics race is correctness-related, not evidence of a shipped performance-regression fix."
+      }
+    ],
+    "Summary": "Reviewed both changed files and all diff pages in a distinct performance-review pass. Traced fixture setup, diagnostics execution, cleanup I/O, cache behavior, language-server startup, webview synchronization, and disposal. No high-confidence diff-introduced performance issue or qualifying performance-regression fix found."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-17T06:40:39.567699113Z",
+    "CompletedAt": "2026-11-17T06:42:05.911099082Z",
+    "WallClockMilliseconds": 86343,
+    "ModelCalls": 9,
+    "InputTokens": 178108,
+    "OutputTokens": 3017,
+    "TotalTokens": 181125,
+    "ReasoningTokens": 540,
+    "CacheReadTokens": 148501,
+    "CacheWriteTokens": 29580,
+    "APIDurationMilliseconds": 68430,
+    "ToolCalls": 24,
+    "NanoAIUnits": 11902410000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 148501,
+      "cache_write": 29580,
+      "input": 27,
+      "output": 3017
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

@@ -1,0 +1,138 @@
+{
+  "PullRequest": {
+    "Number": 348682,
+    "Title": "agentHost: wait for a spawned subagent's recorded agent instead of sleeping 10 ms",
+    "Body": "Fixes the flake `AH-AGENTSERVICE-PERSIST-SLEEP-10`, seen on Windows in release/1.147 pipeline 727 run [497609](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=497609) (main CI): `AgentService - chats with their own agent › a subagent of a chat with its own agent runs in that agent and records it with its row` returned `recorded: undefined` where it expected `'second'`. Its agent and state provider were already correct.\n\n## Mechanism\n\nWhen a subagent of a chat with its own agent is spawned, `AgentService._onChatSpawned` records that agent through a fire-and-forget chain: `void this._recordOwnChatAgentProvider(...).then(...)`, which writes to `AgentHostDatabase` with asynchronous SQLite. The test slept `timeout(10)` and then read `readChatAgentProviders()`, so on a slow agent the write hadn't landed yet. `deleting a chat forgets the agents of its subagents too` has the same 10 ms sleep before reading its `before` list.\n\n## Change\n\nTest-only. A small `waitForRecordedAgent` helper polls `readChatAgentProviders()` until the chat's agent is recorded, with a 5 s bound. Both tests use it in place of the fixed sleep, and the assertions are unchanged. If the record never appears, the test still fails with `recorded: undefined`.\n\n## Validation\n\nLocal node unit runs of `agentServiceChatProviders.test.ts`, with every `AgentHostDatabase` write delayed by 30 ms in order (FIFO, like a slow disk):\n- `main`: both tests fail, the first with the same `recorded: undefined` as CI.\n- this change: 39 passing.\n- Without the delay: 39 passing, 5 runs in a row.\n- `tsc --noEmit` reports no errors in the touched file.\n\nThe test file is identical on `release/1.147`, so this change cherry-picks there cleanly. Whether it goes into 1.147 is the endgame champ's call.\n\n\u003e Authored with Copilot\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/348682",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "708b13c0bb03bb92c9a2f0316539dd98e5126430",
+    "HeadRef": "copilot/vscode/subagent-agent-record-wait",
+    "HeadSHA": "0b14ca82f43dbb941627b0fb6810306928f7d2bf",
+    "CreatedAt": "2026-11-16T20:09:21Z",
+    "UpdatedAt": "2026-11-16T21:11:40Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Persist a spawned subagent's agent and catalog row, then assert its routing in the node test.",
+        "CriticalPath": "The test now awaits the existing private-chat insertion completing instead of sleeping 10 ms. AgentService still registers and routes the spawned chat synchronously; its existing persistence chain remains background work in the product.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_recordOwnChatAgentProvider; src/vs/platform/agentHost/node/agentHostDatabase.ts:recordChatAgentProvider/readChatAgentProviders",
+            "Operation": "Persist the subagent's provider and read recorded provider keys for the assertion.",
+            "Cardinality": "One provider write for the single spawned subagent and one explicit assertion read; the service's provider-map load is cached and already exercised by creating the parent chat.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same write and explicit assertion read occurred, separated only by an unreliable 10 ms sleep.",
+            "CriticalPathEffect": "The existing provider write precedes private-chat persistence. The assertion read now follows actual persistence completion, not a timer."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostPeerChatStore.ts:persistPrivateChat; src/vs/platform/agentHost/node/agentHostDatabase.ts:insertPrivateChatV2",
+            "Operation": "Read the session catalog and insert the spawned private chat into the normalized catalog.",
+            "Cardinality": "One new subagent in one session per test; normally one insertion, with the existing conflict-retry behavior unchanged. The new wrapper invokes the original insertion exactly once per invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The identical persistence work ran asynchronously while the test slept and could outlast that sleep.",
+            "CriticalPathEffect": "Completion now releases the test's DeferredPromise; no new query, polling, or product-path await is introduced."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:_recordLegacyPrivateChatStorage",
+            "Operation": "Read catalog authority to determine whether legacy storage bookkeeping is required.",
+            "Cardinality": "One existing catalog lookup per spawn; normalized test sessions return without legacy storage writes.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same background catalog lookup.",
+            "CriticalPathEffect": "Separate pre-existing background task; not awaited by the new helper."
+          }
+        ],
+        "ScalingInput": "Exactly one observed spawned subagent per test; helper is installed once on a fresh :memory: database instance.",
+        "EffectiveConcurrency": "The provider write precedes private persistence; peer-chat writes remain serialized per session. The helper adds one completion observer and does not launch concurrent work.",
+        "CacheBehavior": "Fresh database per test; database initialization and parent-chat provider-map loading occur during setup. The helper adds no cache or polling and does not invalidate existing caches.",
+        "MechanismConfidence": "High: both helper call sites, fresh database ownership, synchronous spawn registration, asynchronous persistence chain, and single original-insert invocation were inspected.",
+        "MagnitudeUncertainty": "SQLite completion time varies, but there is no newly multiplied boundary work. Test-only completion waiting is intentional and necessary for the assertion.",
+        "Verdict": "No actionable performance regression. A constant-size test observer replaces a fixed delay without changing production work or boundary cardinality."
+      },
+      {
+        "Scenario": "Delete a parent chat and verify removal of its own and its spawned subagent's recorded agents.",
+        "CriticalPath": "The test first waits for the spawned chat row, reads the recorded agents, awaits the existing disposeChat flow, and reads the remaining agents. Deletion already waits for session persistence to become idle before removing membership.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/test/node/agentServiceChatProviders.test.ts:664-678; src/vs/platform/agentHost/node/agentService.ts:disposeChat",
+            "Operation": "Persist the single spawned subagent and read the provider-key map before and after deletion.",
+            "Cardinality": "One observed spawn and two explicit provider-map reads over two relevant recorded chat keys. No repeated polling or new read is added.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same spawn writes and before/after reads; the initial read could race the writes after the fixed sleep.",
+            "CriticalPathEffect": "Only the test's pre-deletion synchronization changes from 10 ms to actual insertion completion."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts:disposeChat/_deleteChatAgentProviders; src/vs/platform/agentHost/node/agentHostDatabase.ts:deleteChatAgentProviders",
+            "Operation": "Remove catalog membership, delete the parent's and descendant's provider keys, and perform existing chat-state cleanup.",
+            "Cardinality": "One parent and one descendant; provider keys fit in one existing batched DELETE. Existing catalog and cleanup operations are unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same disposal path and batched cleanup once the subagent's persistence had completed.",
+            "CriticalPathEffect": "Existing awaited deletion path, serialized under the session's catalog mutation sequencer; no new deletion operation is introduced."
+          }
+        ],
+        "ScalingInput": "One parent chat and one spawned descendant in each fresh test service; no suite-wide helper accumulation.",
+        "EffectiveConcurrency": "One helper invocation in this test. Session catalog mutations and peer writes retain their existing serialization; disposeChat already drains pending session writes. Providers, Git, and file services are test doubles/in-memory, with no introduced subprocess, IPC, or network boundary.",
+        "CacheBehavior": "Provider map is maintained by existing record/delete operations. Each test owns a fresh in-memory catalog database and teardown clears its disposable service/database; the helper does not extend lifetime beyond that ownership.",
+        "MechanismConfidence": "High: inspected the changed test, database ownership/teardown, per-session write queue, deletion ordering, and provider-key batching.",
+        "MagnitudeUncertainty": "Exact existing cleanup duration is not measured; changed code adds neither fan-out nor persistent retention. A failed insertion leaving the test wait unresolved is a test failure-handling concern, not independently established scaling performance degradation.",
+        "Verdict": "No actionable performance regression. Waiting for the state needed by the assertion preserves existing cleanup work and avoids a timing race."
+      }
+    ],
+    "Summary": "Reviewed the entire one-file inventory and all four diff hunks in the performance-review pass. Traced both changed test workflows through spawned-chat persistence, provider-map caching, per-session serialization, and deletion. The test-local wrapper forwards each insertion once and adds no polling, boundary fan-out, or unbounded retention. No findings or concrete shipped performance-regression fixes to record."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-17T06:44:12.300408938Z",
+    "CompletedAt": "2026-11-17T06:45:27.705461482Z",
+    "WallClockMilliseconds": 75405,
+    "ModelCalls": 8,
+    "InputTokens": 178288,
+    "OutputTokens": 2779,
+    "TotalTokens": 181067,
+    "ReasoningTokens": 453,
+    "CacheReadTokens": 142191,
+    "CacheWriteTokens": 36073,
+    "APIDurationMilliseconds": 55569,
+    "ToolCalls": 23,
+    "NanoAIUnits": 13223960000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 142191,
+      "cache_write": 36073,
+      "input": 24,
+      "output": 2779
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
