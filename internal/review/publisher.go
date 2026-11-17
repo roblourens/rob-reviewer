@@ -137,9 +137,8 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 	if existing != nil {
 		if err := publisher.submitPendingReview(
 			ctx,
-			result.PullRequest.Number,
+			result.PullRequest,
 			existing.ID,
-			marker,
 		); err != nil {
 			return false, fmt.Errorf("resume pending performance review %d: %w", existing.ID, err)
 		}
@@ -161,9 +160,8 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 	}
 	if err := publisher.submitPendingReview(
 		ctx,
-		result.PullRequest.Number,
+		result.PullRequest,
 		pendingReviewID,
-		marker,
 	); err != nil {
 		return false, fmt.Errorf("submit pending performance review %d: %w", pendingReviewID, err)
 	}
@@ -173,24 +171,15 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 func (publisher *Publisher) ResumePending(
 	ctx context.Context,
 	analyzed PullRequest,
-	reviewID int64,
+	pending ExistingReview,
 ) ([]Comment, error) {
-	current, err := publisher.client.GetPullRequest(ctx, publisher.owner, publisher.repo, analyzed.Number)
-	if err != nil {
-		return nil, fmt.Errorf("refresh pull request before resuming pending review: %w", err)
+	if pending.ID < 1 || !strings.EqualFold(pending.State, "PENDING") || !pendingMatchesTarget(pending, analyzed) {
+		return nil, errors.New("pending performance review does not match the reviewed pull request revision")
 	}
-	if err := publisher.validatePublicationTarget(analyzed, current); err != nil {
-		if errors.Is(err, ErrPublicationSuppressed) {
-			if deleteErr := publisher.client.DeletePendingReview(
-				ctx,
-				publisher.owner,
-				publisher.repo,
-				analyzed.Number,
-				reviewID,
-			); deleteErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("delete suppressed pending review %d: %w", reviewID, deleteErr))
-			}
-		}
+	if publisher.summary == automaticSummary && strings.Contains(pending.Body, humanApprovedSummary) {
+		return nil, fmt.Errorf("%w: a human-approved review is pending", ErrPublicationSuppressed)
+	}
+	if err := publisher.refreshPendingTarget(ctx, analyzed, pending.ID); err != nil {
 		return nil, err
 	}
 	comments, err := publisher.client.GetReviewComments(
@@ -198,32 +187,33 @@ func (publisher *Publisher) ResumePending(
 		publisher.owner,
 		publisher.repo,
 		analyzed.Number,
-		reviewID,
+		pending.ID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("load pending performance review %d comments: %w", reviewID, err)
+		return nil, fmt.Errorf("load pending performance review %d comments: %w", pending.ID, err)
 	}
 	if len(comments) == 0 {
-		return nil, fmt.Errorf("pending performance review %d has no inline comments", reviewID)
+		return nil, fmt.Errorf("pending performance review %d has no inline comments", pending.ID)
 	}
-	marker := ReviewMarker(analyzed.Number, analyzed.HeadSHA)
-	if err := publisher.submitPendingReview(ctx, analyzed.Number, reviewID, marker); err != nil {
-		return nil, fmt.Errorf("resume pending performance review %d: %w", reviewID, err)
+	if err := publisher.submitPendingReview(ctx, analyzed, pending.ID); err != nil {
+		return nil, fmt.Errorf("resume pending performance review %d: %w", pending.ID, err)
 	}
 	return comments, nil
 }
 
 func (publisher *Publisher) submitPendingReview(
 	ctx context.Context,
-	number int,
+	analyzed PullRequest,
 	reviewID int64,
-	marker string,
 ) error {
+	if err := publisher.refreshPendingTarget(ctx, analyzed, reviewID); err != nil {
+		return err
+	}
 	submitErr := publisher.client.SubmitPendingReview(
 		ctx,
 		publisher.owner,
 		publisher.repo,
-		number,
+		analyzed.Number,
 		reviewID,
 	)
 	if submitErr == nil {
@@ -233,8 +223,8 @@ func (publisher *Publisher) submitPendingReview(
 		ctx,
 		publisher.owner,
 		publisher.repo,
-		number,
-		marker,
+		analyzed.Number,
+		ReviewMarker(analyzed.Number, analyzed.HeadSHA),
 	)
 	if confirmErr != nil {
 		return errors.Join(submitErr, fmt.Errorf("confirm pending review submission: %w", confirmErr))
@@ -245,16 +235,41 @@ func (publisher *Publisher) submitPendingReview(
 	return submitErr
 }
 
+func (publisher *Publisher) refreshPendingTarget(ctx context.Context, analyzed PullRequest, reviewID int64) error {
+	current, err := publisher.client.GetPullRequest(ctx, publisher.owner, publisher.repo, analyzed.Number)
+	if err != nil {
+		return fmt.Errorf("refresh pull request before submitting pending review: %w", err)
+	}
+	if err := publisher.validatePublicationTarget(analyzed, current); err != nil {
+		if deleteErr := publisher.client.DeletePendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number, reviewID); deleteErr != nil {
+			return fmt.Errorf("delete stale pending review %d after %v: %w", reviewID, err, deleteErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func publicationBaseMarker(pull PullRequest) string {
+	return fmt.Sprintf("<!-- rob-reviewer-base:v1 sha=%s -->", pull.BaseSHA)
+}
+
+func pendingMatchesTarget(pending ExistingReview, pull PullRequest) bool {
+	return strings.Contains(pending.Body, ReviewMarker(pull.Number, pull.HeadSHA)) &&
+		strings.Contains(pending.Body, publicationBaseMarker(pull))
+}
+
 func (publisher *Publisher) PrepareAutomaticReview(
 	ctx context.Context,
 	analyzed PullRequest,
 ) (*ExistingReview, error) {
-	marker := ReviewMarker(analyzed.Number, analyzed.HeadSHA)
 	pending, err := publisher.client.FindPendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number)
 	if err != nil {
 		return nil, fmt.Errorf("find pending automatic review: %w", err)
 	}
-	if pending != nil && (!strings.Contains(pending.Body, marker) || strings.Contains(pending.Body, humanApprovedSummary)) {
+	if pending != nil && strings.Contains(pending.Body, humanApprovedSummary) {
+		return nil, fmt.Errorf("%w: a human-approved review is pending", ErrPublicationSuppressed)
+	}
+	if pending != nil && !pendingMatchesTarget(*pending, analyzed) {
 		if err := publisher.client.DeletePendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number, pending.ID); err != nil {
 			return nil, fmt.Errorf("delete stale pending review %d: %w", pending.ID, err)
 		}
@@ -300,7 +315,7 @@ func buildReviewRequest(result Result, marker, summaryText string) ReviewRequest
 	var summary strings.Builder
 	summary.WriteString(experimentalReviewPrefix)
 	fmt.Fprintf(&summary, "\n\n%s\n\n", summaryText)
-	fmt.Fprintf(&summary, "%s\n\n%s", generatedDisclosure, marker)
+	fmt.Fprintf(&summary, "%s\n\n%s\n%s", generatedDisclosure, marker, publicationBaseMarker(result.PullRequest))
 
 	return ReviewRequest{
 		CommitID: result.PullRequest.HeadSHA,

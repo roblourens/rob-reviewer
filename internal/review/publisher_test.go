@@ -25,6 +25,7 @@ type fakePublisherClient struct {
 	createErr         error
 	submitErr         error
 	deletedID         int64
+	deleteErr         error
 }
 
 func (client *fakePublisherClient) GetPullRequest(context.Context, string, string, int) (PullRequest, error) {
@@ -96,7 +97,7 @@ func (client *fakePublisherClient) DeletePendingReview(
 	reviewID int64,
 ) error {
 	client.deletedID = reviewID
-	return nil
+	return client.deleteErr
 }
 
 func TestPublisherCreatesCommentReview(t *testing.T) {
@@ -218,7 +219,7 @@ func TestPublisherResumesOnlyMatchingPendingReview(t *testing.T) {
 		PullRequest: pull,
 		Findings:    []Finding{{ID: "PERF-1234567890AB"}},
 	}
-	baseMarker := "<!-- rob-reviewer:v1 pr=7 head=head -->"
+	baseMarker := ReviewMarker(7, "head")
 	client := &fakePublisherClient{
 		current: pull,
 		markerReview: &ExistingReview{
@@ -372,7 +373,8 @@ func TestPublisherRejectsSuppressionLabelAndResumesPendingReview(t *testing.T) {
 	pull.Labels = nil
 	client.current = pull
 	client.reviewComments = []Comment{{Path: "src/file.ts", Line: 3, Side: SideRight, Body: "comment"}}
-	comments, err := publisher.ResumePending(context.Background(), pull, 77)
+	pending := ExistingReview{ID: 77, State: "PENDING", Body: ReviewMarker(7, "head") + "\n" + publicationBaseMarker(pull)}
+	comments, err := publisher.ResumePending(context.Background(), pull, pending)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,14 +384,15 @@ func TestPublisherRejectsSuppressionLabelAndResumesPendingReview(t *testing.T) {
 
 	client.submitErr = errors.New("response read failed")
 	client.markerAfterSubmit = &ExistingReview{ID: 77, State: "COMMENTED"}
-	comments, err = publisher.ResumePending(context.Background(), pull, 77)
+	comments, err = publisher.ResumePending(context.Background(), pull, pending)
 	if err != nil || len(comments) != 1 {
 		t.Fatalf("confirmed comments = %+v, err = %v", comments, err)
 	}
 
 	pull.Labels = []string{"performance-reviewer:skip"}
 	client.current = pull
-	if _, err := publisher.ResumePending(context.Background(), pull, 88); !errors.Is(err, ErrPublicationSuppressed) {
+	pending.ID = 88
+	if _, err := publisher.ResumePending(context.Background(), pull, pending); !errors.Is(err, ErrPublicationSuppressed) {
 		t.Fatalf("expected suppressed pending review, got %v", err)
 	}
 	if client.deletedID != 88 {
@@ -438,11 +441,93 @@ func TestAutomaticPublisherRejectsClosedPRAndDeletesStalePendingReview(t *testin
 		Body:  "<!-- rob-reviewer:v1 pr=7 head=new-head -->\n" + humanApprovedSummary,
 	}
 	existing, err = publisher.PrepareAutomaticReview(context.Background(), open)
-	if err != nil {
+	if !errors.Is(err, ErrPublicationSuppressed) || client.deletedID != 0 {
+		t.Fatalf("human-approved pending review was not preserved: existing=%+v deleted=%d err=%v", existing, client.deletedID, err)
+	}
+}
+
+func TestAutomaticPublisherDiscardsPendingReviewAfterBaseAdvances(t *testing.T) {
+	analyzed := PullRequest{Number: 7, BaseSHA: "old-base", HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
+	pending := buildReviewRequest(Result{PullRequest: analyzed}, ReviewMarker(7, "head"), automaticSummary)
+	current := analyzed
+	current.BaseSHA = "new-base"
+	client := &fakePublisherClient{
+		current:       current,
+		pendingReview: &ExistingReview{ID: 91, State: "PENDING", Body: pending.Body},
+	}
+
+	if _, err := NewAutomaticPublisher(client, "microsoft", "vscode").PrepareAutomaticReview(context.Background(), current); err != nil {
 		t.Fatal(err)
 	}
-	if existing != nil || client.deletedID != 92 {
-		t.Fatalf("legacy pending review was not replaced: existing=%+v deleted=%d", existing, client.deletedID)
+	if client.deletedID != 91 || client.published {
+		t.Fatalf("deleted=%d published=%v", client.deletedID, client.published)
+	}
+}
+
+func TestPublisherRevalidatesAfterCreatingPendingReview(t *testing.T) {
+	analyzed := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
+	for _, change := range []string{"head", "base", "draft", "skip-label", "closed"} {
+		t.Run(change, func(t *testing.T) {
+			changed := analyzed
+			switch change {
+			case "head":
+				changed.HeadSHA = "new-head"
+			case "base":
+				changed.BaseSHA = "new-base"
+			case "draft":
+				changed.Draft = true
+			case "skip-label":
+				changed.Labels = []string{"performance-reviewer:skip"}
+			case "closed":
+				changed.State = "closed"
+			}
+			client := &fakePublisherClient{currents: []PullRequest{analyzed, analyzed, changed}}
+			published, err := NewAutomaticPublisher(client, "microsoft", "vscode", "performance-reviewer:skip").Publish(
+				context.Background(), Result{PullRequest: analyzed, Findings: []Finding{{ID: "PERF-1234567890AB"}}}, false,
+			)
+			if err == nil || published || client.submitAttempted || client.deletedID != 42 {
+				t.Fatalf("published=%v submitAttempted=%v deleted=%d err=%v", published, client.submitAttempted, client.deletedID, err)
+			}
+		})
+	}
+}
+
+func TestPublisherRevalidatesAfterLoadingPendingComments(t *testing.T) {
+	analyzed := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
+	changed := analyzed
+	changed.Labels = []string{"performance-reviewer:skip"}
+	client := &fakePublisherClient{
+		currents:       []PullRequest{analyzed, changed},
+		reviewComments: []Comment{{Path: "src/file.ts", Line: 1, Side: SideRight, Body: "comment"}},
+	}
+	pending := ExistingReview{ID: 77, State: "PENDING", Body: ReviewMarker(7, "head") + "\n" + publicationBaseMarker(analyzed)}
+	_, err := NewAutomaticPublisher(client, "microsoft", "vscode", "performance-reviewer:skip").ResumePending(context.Background(), analyzed, pending)
+	if !errors.Is(err, ErrPublicationSuppressed) || client.submitAttempted || client.deletedID != 77 {
+		t.Fatalf("submitAttempted=%v deleted=%d err=%v", client.submitAttempted, client.deletedID, err)
+	}
+}
+
+func TestPublisherSurfacesPendingCleanupFailure(t *testing.T) {
+	analyzed := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
+	suppressed := analyzed
+	suppressed.Labels = []string{"performance-reviewer:skip"}
+	deleteErr := errors.New("delete failed")
+	client := &fakePublisherClient{currents: []PullRequest{analyzed, analyzed, suppressed}, deleteErr: deleteErr}
+	_, err := NewAutomaticPublisher(client, "microsoft", "vscode", "performance-reviewer:skip").Publish(
+		context.Background(), Result{PullRequest: analyzed, Findings: []Finding{{ID: "PERF-1234567890AB"}}}, false,
+	)
+	if !errors.Is(err, deleteErr) || errors.Is(err, ErrPublicationSuppressed) || client.submitAttempted {
+		t.Fatalf("submitAttempted=%v err=%v", client.submitAttempted, err)
+	}
+}
+
+func TestPublisherDoesNotResumePendingReviewForAnotherBase(t *testing.T) {
+	analyzed := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
+	client := &fakePublisherClient{current: analyzed}
+	pending := ExistingReview{ID: 77, State: "PENDING", Body: ReviewMarker(7, "head")}
+	publisher := NewAutomaticPublisher(client, "microsoft", "vscode")
+	if _, err := publisher.ResumePending(context.Background(), analyzed, pending); err == nil || client.submitAttempted {
+		t.Fatalf("submitAttempted=%v err=%v", client.submitAttempted, err)
 	}
 }
 

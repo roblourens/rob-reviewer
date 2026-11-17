@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -167,6 +168,63 @@ func TestEnsureBranchUsesDefaultBranchRef(t *testing.T) {
 	}
 	if requestedRef != "/repos/owner/repo/git/ref/heads/trunk" {
 		t.Fatalf("requested ref = %q", requestedRef)
+	}
+}
+
+func TestGetContentReadsLargeFileFromImmutableBlob(t *testing.T) {
+	payload := strings.Repeat("x", (1<<20)+1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/owner/repo/contents/state.json":
+			if request.URL.Query().Get("ref") != "reviewer-state" {
+				t.Errorf("query = %q", request.URL.RawQuery)
+			}
+			fmt.Fprint(writer, `{"sha":"original-blob","encoding":"none","content":""}`)
+		case "/repos/owner/repo/git/blobs/original-blob":
+			if request.Header.Get("Accept") != "application/vnd.github.raw+json" {
+				t.Errorf("Accept = %q", request.Header.Get("Accept"))
+			}
+			fmt.Fprint(writer, payload)
+		default:
+			t.Errorf("unexpected request %s %s", request.Method, request.URL.Path)
+			writer.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	client := NewClientWithBaseURL(server.Client(), "token", server.URL)
+	content, exists, err := client.GetContent(context.Background(), "owner", "repo", "state.json", "reviewer-state")
+	if err != nil || !exists || content.SHA != "original-blob" || string(content.Content) != payload {
+		t.Fatalf("exists=%v sha=%q bytes=%d err=%v", exists, content.SHA, len(content.Content), err)
+	}
+}
+
+func TestGetContentSurfacesLargeBlobReadFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/repos/owner/repo/contents/state.json" {
+			fmt.Fprint(writer, `{"sha":"blob","encoding":"none","content":""}`)
+			return
+		}
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(writer, `{"message":"blob read failed"}`)
+	}))
+	defer server.Close()
+	client := NewClientWithBaseURL(server.Client(), "token", server.URL)
+	_, exists, err := client.GetContent(context.Background(), "owner", "repo", "state.json", "reviewer-state")
+	var apiErr *APIError
+	if exists || !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("exists=%v err=%v", exists, err)
+	}
+}
+
+func TestGitHubResponseLimitIsExplicit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		fmt.Fprint(writer, strings.Repeat("x", (10<<20)+1))
+	}))
+	defer server.Close()
+	client := NewClientWithBaseURL(server.Client(), "token", server.URL)
+	content, _, err := client.do(context.Background(), http.MethodGet, "/large-response", nil)
+	if err == nil || !strings.Contains(err.Error(), "response byte limit exceeded") || content != nil {
+		t.Fatalf("bytes=%d err=%v", len(content), err)
 	}
 }
 

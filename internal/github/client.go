@@ -18,7 +18,10 @@ import (
 	"github.com/roblourens/rob-reviewer/internal/review"
 )
 
-const defaultBaseURL = "https://api.github.com"
+const (
+	defaultBaseURL   = "https://api.github.com"
+	maxResponseBytes = 10 << 20
+)
 
 type Client struct {
 	httpClient *http.Client
@@ -289,12 +292,24 @@ func (client *Client) GetContent(ctx context.Context, owner, repo, path, branch 
 	if err := json.Unmarshal(responseBody, &response); err != nil {
 		return FileContent{}, false, fmt.Errorf("decode content response: %w", err)
 	}
-	if response.Encoding != "base64" {
+	var content []byte
+	switch response.Encoding {
+	case "base64":
+		content, err = base64.StdEncoding.DecodeString(strings.ReplaceAll(response.Content, "\n", ""))
+		if err != nil {
+			return FileContent{}, false, fmt.Errorf("decode content: %w", err)
+		}
+	case "none":
+		if response.SHA == "" {
+			return FileContent{}, false, errors.New("large content response has no blob SHA")
+		}
+		blobPath := fmt.Sprintf("/repos/%s/%s/git/blobs/%s", url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(response.SHA))
+		content, _, err = client.doWithAccept(ctx, http.MethodGet, blobPath, nil, "application/vnd.github.raw+json")
+		if err != nil {
+			return FileContent{}, false, fmt.Errorf("read large content blob: %w", err)
+		}
+	default:
 		return FileContent{}, false, fmt.Errorf("unsupported content encoding %q", response.Encoding)
-	}
-	content, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(response.Content, "\n", ""))
-	if err != nil {
-		return FileContent{}, false, fmt.Errorf("decode content: %w", err)
 	}
 	return FileContent{Content: content, SHA: response.SHA}, true, nil
 }
@@ -334,6 +349,10 @@ func (err *APIError) Error() string {
 }
 
 func (client *Client) do(ctx context.Context, method, path string, body []byte) ([]byte, http.Header, error) {
+	return client.doWithAccept(ctx, method, path, body, "application/vnd.github+json")
+}
+
+func (client *Client) doWithAccept(ctx context.Context, method, path string, body []byte, accept string) ([]byte, http.Header, error) {
 	var requestBody io.Reader
 	if body != nil {
 		requestBody = bytes.NewReader(body)
@@ -343,7 +362,7 @@ func (client *Client) do(ctx context.Context, method, path string, body []byte) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("create GitHub request: %w", err)
 	}
-	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Accept", accept)
 	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	request.Header.Set("User-Agent", "rob-reviewer")
 	if client.token != "" {
@@ -359,9 +378,12 @@ func (client *Client) do(ctx context.Context, method, path string, body []byte) 
 	}
 	defer response.Body.Close()
 
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 10<<20))
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read GitHub response: %w", err)
+	}
+	if len(responseBody) > maxResponseBytes {
+		return nil, response.Header, fmt.Errorf("GitHub response byte limit exceeded: more than %d bytes", maxResponseBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		message := strings.TrimSpace(string(responseBody))

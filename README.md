@@ -13,6 +13,7 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 - Newly eligible PRs are reviewed in the same poll, subject to the per-run and per-day caps.
 - Each PR is reviewed at most once. Later pushes, rebases, and reopenings do not trigger another review. Persistent PR-level completion state prevents repeat analysis, and an authenticated GitHub review marker independently prevents repeat publication.
 - `publication.mode: approval` writes and archives JSON and Markdown reports without commenting on the PR. `publication.mode: automatic` publishes every validated finding after the report is durable. The checked-in mode is `approval`.
+- Pending automatic reviews are bound to both reviewed base and head revisions. The target is refreshed immediately before submission; stale or newly suppressed drafts are discarded. Human-approved pending reviews are left for explicit publication, never deleted or submitted by the poller.
 - Automatic publication requires the PR to remain open, non-draft, unsuppressed, team-authored, and on the reviewed base/head at the final GitHub refresh. Explicitly approved saved reports may still be published to a closed or merged PR when the reviewed head matches.
 - Per-run and per-UTC-day review caps bound model usage. A pending head older than the configured maximum age is skipped rather than producing a surprising late review.
 - Adding the configured `performance-reviewer:skip` label suppresses that head.
@@ -21,6 +22,8 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 - Published summaries and inline comments begin with **Experimental performance review bot**.
 - Findings must be performance-only, high confidence, anchored to an added or deleted line, and explicitly prove through before/after evidence that the PR introduced or materially amplified the performance mechanism. Pre-existing non-critical optimization opportunities are rejected.
 - State is committed to a dedicated `reviewer-state` branch, including PR-level review completion, reviewed and pending heads, and daily review/publication counters.
+
+State files larger than GitHub's 1 MiB inline-content limit are read by immutable blob SHA, preserving the SHA used for optimistic updates. GitHub responses over 10 MiB fail explicitly.
 
 Scheduled workflows are eventually consistent: GitHub may delay cron jobs. GitHub also disables scheduled workflows in an inactive public repository after 60 days, so keep the repository active or re-enable the workflow when needed.
 

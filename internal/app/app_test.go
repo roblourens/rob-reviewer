@@ -2,16 +2,20 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/roblourens/rob-reviewer/internal/config"
 	"github.com/roblourens/rob-reviewer/internal/github"
 	"github.com/roblourens/rob-reviewer/internal/review"
+	"github.com/roblourens/rob-reviewer/internal/state"
 )
 
 func TestPollIsNoOpWhenAutomationDisabled(t *testing.T) {
@@ -65,6 +69,74 @@ func TestReviewPullRequestSkipsWhenEarlierHeadWasReviewed(t *testing.T) {
 	result, analyzed, err := app.ReviewPullRequest(context.Background(), 7, true)
 	if err != nil || analyzed || result.PullRequest.HeadSHA != "new-head" {
 		t.Fatalf("analyzed=%v result=%+v err=%v", analyzed, result, err)
+	}
+}
+
+func TestPollPreservesHumanApprovedPendingReview(t *testing.T) {
+	var saved state.State
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/owner/reviewer/contents/state.json":
+			if request.Method == http.MethodPut {
+				var update struct {
+					Content []byte `json:"content"`
+				}
+				if err := json.NewDecoder(request.Body).Decode(&update); err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(update.Content, &saved); err != nil {
+					t.Fatal(err)
+				}
+				io.WriteString(writer, `{}`)
+				return
+			}
+			content, err := json.Marshal(state.State{Version: state.CurrentVersion, Initialized: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			json.NewEncoder(writer).Encode(map[string]string{
+				"sha": "state-sha", "encoding": "base64", "content": base64.StdEncoding.EncodeToString(content),
+			})
+		case "/repos/microsoft/vscode/pulls", "/repos/microsoft/vscode/pulls/7":
+			pull := map[string]any{
+				"number": 7, "state": "open", "author_association": "MEMBER", "updated_at": time.Now().UTC(),
+				"head": map[string]string{"sha": "head"}, "base": map[string]string{"sha": "base"},
+			}
+			if request.URL.Path == "/repos/microsoft/vscode/pulls" {
+				json.NewEncoder(writer).Encode([]any{pull})
+			} else {
+				json.NewEncoder(writer).Encode(pull)
+			}
+		case "/user":
+			io.WriteString(writer, `{"login":"review-bot"}`)
+		case "/repos/microsoft/vscode/pulls/7/reviews":
+			io.WriteString(writer, `[{
+				"id":42,
+				"body":"Human-approved experimental performance review.\n<!-- rob-reviewer:v1 pr=7 head=head -->",
+				"state":"PENDING",
+				"user":{"login":"review-bot"}
+			}]`)
+		default:
+			t.Errorf("unexpected request %s %s", request.Method, request.URL.Path)
+			writer.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	client := github.NewClientWithBaseURL(server.Client(), "token", server.URL)
+	app := &App{
+		config: config.Config{
+			Target:      config.TargetConfig{Owner: "microsoft", Repo: "vscode"},
+			Poll:        config.PollConfig{MaxPerRun: 5, MaxPerDay: 25, ScanWindowHours: 168, MaxPendingHours: 24},
+			Automation:  config.AutomationConfig{Enabled: true},
+			Publication: config.PublicationConfig{Mode: "automatic"},
+			State:       config.StateConfig{Branch: "reviewer-state", Path: "state.json"},
+		},
+		reviewClient: client, stateClient: client, hasStateToken: true,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	result, err := app.Poll(context.Background(), "owner/reviewer", t.TempDir())
+	if err != nil || len(result.Poll.Published) != 0 || !saved.PullRequests[7].Reviewed {
+		t.Fatalf("result=%+v saved=%+v err=%v", result, saved, err)
 	}
 }
 

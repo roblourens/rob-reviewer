@@ -160,11 +160,15 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 					pull,
 				)
 				if err != nil {
+					if errors.Is(err, review.ErrPublicationSuppressed) {
+						app.logger.Info("automatic publication suppressed", "pr", pull.Number, "reason", err)
+						return poller.ReviewOutcome{}, nil
+					}
 					return poller.ReviewOutcome{}, fmt.Errorf("check automatic review marker: %w", err)
 				}
 				if existing != nil {
 					if strings.EqualFold(existing.State, "PENDING") {
-						comments, err := automaticPublisher.ResumePending(reviewContext, pull, existing.ID)
+						comments, err := automaticPublisher.ResumePending(reviewContext, pull, *existing)
 						if err != nil {
 							if errors.Is(err, review.ErrPublicationSuppressed) {
 								return poller.ReviewOutcome{}, nil
