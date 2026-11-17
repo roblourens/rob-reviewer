@@ -34,7 +34,7 @@ This is prioritization, not exclusion. Cross-cutting bugs still require followin
 - [Sphinx](https://arxiv.org/abs/2601.04252) evaluates review quality through structured verification checklists rather than prose similarity.
 - Google's [ML code-review comment resolution](https://research.google/blog/resolving-code-review-comments-with-ml/) traded quantity for quality through confidence filtering and curated feedback.
 
-The framework therefore uses a typed finding tool, changed-line validation, a confidence threshold, deduplication, a finding cap, and host-side publication. Confidence also needs a rationale so human adjudicators can distinguish traced facts from assumptions.
+The hosted framework uses a typed finding tool, changed-line validation, a confidence threshold, deduplication, a finding cap, and host-side publication. The standalone skill applies the same evidence standard in its chat response without those host tools. Confidence also needs a rationale so human adjudicators can distinguish traced facts from assumptions.
 
 ### Evaluate with replay and human adjudication
 

@@ -14,7 +14,7 @@ import (
 
 func TestAnalysisOnlyCannotPublishOrPersistRemoteState(t *testing.T) {
 	root := t.TempDir()
-	skill := filepath.Join(root, "reviewers", "performance", "SKILL.md")
+	skill := filepath.Join(root, "skills", "performance-review", "SKILL.md")
 	if err := os.MkdirAll(filepath.Dir(skill), 0o700); err != nil {
 		t.Fatal(err)
 	}

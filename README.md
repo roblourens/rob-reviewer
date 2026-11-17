@@ -4,6 +4,49 @@
 
 The framework runs one Copilot session per pull request. All enabled review-focus skills share that session, checkout, diff, and repository context. A custom reviewer agent performs a distinct pass for every focus and submits findings through typed host tools instead of returning prose that must be parsed.
 
+## Local performance review in Copilot
+
+Install **rob-reviewer** to run the same performance review skill locally in Copilot. This is an [Agent Plugins 1.0](https://code.visualstudio.com/docs/agents/reference/agent-plugin-reference) package, not a VS Code extension or VSIX. The plugin contributes only the [performance-review skill](skills/performance-review/SKILL.md) and its reference documents: no custom agents, hooks, scripts, MCP servers, Go executable, background jobs, or GitHub publication.
+
+[Install in VS Code](https://vscode.dev/redirect?url=vscode%3A%2F%2Fchat-plugin%2Finstall%3Fsource%3Droblourens%252Frob-reviewer%26plugin%3Drob-reviewer) | [Install in VS Code Insiders](https://vscode.dev/redirect?url=vscode-insiders%3A%2F%2Fchat-plugin%2Finstall%3Fsource%3Droblourens%252Frob-reviewer%26plugin%3Drob-reviewer)
+
+### Discover and install
+
+1. In VS Code, select the **Copilot** harness, sign in, and enable `chat.plugins.enabled` if needed. Organization policy can restrict plugin availability.
+2. Run **Chat: Open Customizations**. Under **Browse**, open the source menu, choose **Configure Marketplaces > Add Marketplace**, and enter `roblourens/rob-reviewer`. In clients with the older UI, use **Plugins > Browse Marketplace** and add the marketplace through `chat.plugins.marketplaces` in user settings.
+3. Browse the **rob-reviewer** marketplace, select **rob-reviewer**, inspect its skill and README, and install it. Confirm the marketplace trust prompt only after reviewing the source.
+
+Alternatively, run **Chat: Install Plugin from Source** and enter `https://github.com/roblourens/rob-reviewer`. The repository root is both the plugin source and a one-plugin marketplace. It is discoverable after adding this marketplace; it is not automatically listed in the default community marketplaces.
+
+Copilot CLI can install the same package:
+
+```bash
+copilot plugin marketplace add roblourens/rob-reviewer
+copilot plugin marketplace browse rob-reviewer
+copilot plugin install rob-reviewer@rob-reviewer
+```
+
+### Run a local review
+
+Start a fresh Copilot session in the project you want reviewed. Type `/` and select **performance-review** (the client may qualify its name with the plugin name), then specify the scope. For example:
+
+```text
+Use the performance-review skill to review my branch against origin/main.
+Do not edit files or post anything to GitHub.
+```
+
+You can instead request staged changes or all uncommitted changes. The skill establishes the selected scope, compares the correct before/after snapshots, traces relevant hot paths and resource costs, and returns only concrete changed-line performance findings. It asks for clarification when the review scope is ambiguous. It never needs a PR, a publishing token, the private opt-in file, Go, or the hosted reviewer. Your agent's normal Git inspection tools and existing Copilot access are sufficient.
+
+This is static code review using your selected model, not a benchmark run. It does not execute repository code or fix findings. It reuses the hosted reviewer's principles and learned mechanism guidance but does not reproduce the host's structured-output validation or replay/learning automation. The skill requests read-only behavior; tool permissions are still controlled by your agent and client, not enforced by a Markdown file.
+
+### Updates and publishing
+
+Use **Chat: Update Plugins** or **Check for and Apply Updates** in the Customizations editor, then start a fresh session. CLI users can run `copilot plugin marketplace update rob-reviewer` followed by `copilot plugin update rob-reviewer@rob-reviewer`. Review changes before updating; clients and organization policies control automatic updates. To pin a reproducible marketplace revision, VS Code supports `roblourens/rob-reviewer#<full-commit-SHA>`.
+
+The [plugin manifest](plugin.json) uses the portable Agent Plugins 1.0 schema; the [marketplace catalog](.github/plugin/marketplace.json) follows the [GitHub marketplace guidance](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/create-and-share-plugin-marketplaces). Keep names stable and bump the plugin and catalog versions together when shipping skill changes. The hosted reviewer loads the same `skills/` directory, and its learning updater writes into that directory, so no separate copy of the guidance needs synchronization. Installed copies receive changes through plugin updates.
+
+For development, **Chat: Install Plugin from Source** also accepts a local checkout. Test against a known regression and a nearby clean change, inspect the reported evidence, and confirm the working tree is unchanged. Go CI checks that the catalog resolves to the same skill and documents used by the hosted reviewer; plugin users do not need Go.
+
 ## Behavior
 
 - A GitHub Actions workflow polls every five minutes when the `ROB_REVIEWER_ENABLED` repository variable is `true`. Checked-in configuration also requires `automation.enabled: true`.
@@ -310,11 +353,11 @@ The manual workflow uses the same isolated publisher: leave `pr_number` empty to
 
 ## Adding a review focus
 
-Create a directory under [`reviewers/`](reviewers/) with a `SKILL.md`:
+Create a directory under [`skills/`](skills/) with a `SKILL.md`:
 
 ```text
-reviewers/
-  my-focus/
+skills/
+  my-focus-review/
     SKILL.md
     references/
       evidence.md
@@ -329,11 +372,11 @@ description: Find a narrow class of high-confidence bugs introduced by a diff.
 ---
 ```
 
-Put stable reviewer behavior in `SKILL.md`. Put evolving examples, incident evidence, and longer domain references in supporting Markdown documents. The skill can direct the reviewer to load those documents with the bounded focus-document tool.
+Put portable reviewer behavior in `SKILL.md`. Put evolving examples, incident evidence, and longer domain references in supporting Markdown documents. Use relative links so the same documents work in an installed plugin and with the hosted focus-document tool. Keep custom host-tool instructions in the hosted agent prompt, not in the portable skill.
 
 Add the skill name, not the directory name, to `review.focuses`. The framework validates every configured name, preloads all enabled skills into one custom agent, and requires the agent to complete every focus pass exactly once.
 
-The starter [`performance-review` skill](reviewers/performance/SKILL.md) loads a generic [performance review guide](reviewers/performance/references/performance-review-guide.md) covering scaling, hot paths, rendering, memory, caching, I/O, concurrency, startup, scheduling, and evidence standards. [External research foundations](reviewers/performance/references/research-foundations.md) record the LLM-review and browser/Electron sources behind the workflow, while short [VS Code regression case notes](reviewers/performance/references/vscode-regressions.md) preserve project-specific provenance rather than serving as the review checklist.
+The starter [`performance-review` skill](skills/performance-review/SKILL.md) loads a generic [performance review guide](skills/performance-review/references/performance-review-guide.md) covering scaling, hot paths, rendering, memory, caching, I/O, concurrency, startup, scheduling, and evidence standards. [External research foundations](skills/performance-review/references/research-foundations.md) record the LLM-review and browser/Electron sources behind the workflow, while short [VS Code regression case notes](skills/performance-review/references/vscode-regressions.md) preserve project-specific provenance rather than serving as the review checklist.
 
 ## Testing
 
@@ -365,3 +408,5 @@ Use a manual dry-run workflow for the real SDK smoke test. Publishing happens se
 - Clean dry-run reports are persisted and advance polling state without creating any public marker or comment.
 - UTC daily counters reset on date change. The per-day cap is persisted with the state branch, so separate workflow runs share one budget.
 - Authentication, unavailable models, SDK startup, invalid tool submissions, incomplete focus passes, checkout errors, stale heads, and GitHub API errors fail explicitly; none are converted into clean reviews.
+
+(Written by Copilot)

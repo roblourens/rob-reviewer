@@ -86,7 +86,7 @@ func New(options Options) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve config directory: %w", err)
 	}
-	focusCatalog, err := focus.Load(filepath.Join(configDirectory, "reviewers"))
+	focusCatalog, err := focus.Load(filepath.Join(configDirectory, "skills"))
 	if err != nil {
 		return nil, err
 	}

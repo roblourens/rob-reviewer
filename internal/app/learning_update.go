@@ -15,7 +15,7 @@ import (
 	"github.com/roblourens/rob-reviewer/internal/learning"
 )
 
-const learnedGuidancePath = "reviewers/performance/references/learned-regressions.md"
+const learnedGuidancePath = "skills/performance-review/references/learned-regressions.md"
 
 func PublishLearnedGuidance(
 	ctx context.Context,

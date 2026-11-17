@@ -55,3 +55,20 @@ func TestValidateLearningProposalBindings(t *testing.T) {
 		t.Fatal("expected detected case rejection")
 	}
 }
+
+func TestLearningUpdatesTheInstalledSkillGuidance(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("../..", learnedGuidancePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(filepath.Join("skills", "performance-review"), learnedGuidancePath)
+	if err != nil || relative != filepath.Join("references", "learned-regressions.md") {
+		t.Fatalf("learning path is not inside the published skill: path=%s err=%v", relative, err)
+	}
+	_, _, err = learning.ApplyProposals(string(content), []learning.Proposal{{
+		CaseID: "REG-CHECK", MechanismFamily: review.RegressionRepeatedWork,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
