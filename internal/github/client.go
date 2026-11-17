@@ -28,6 +28,7 @@ type Client struct {
 	baseURL    string
 	token      string
 	readOnly   bool
+	reviewOnly string
 
 	userMutex sync.Mutex
 	userLogin string
@@ -71,6 +72,12 @@ func NewReadOnlyClient(httpClient *http.Client, token, reviewAuthor string) *Cli
 	client := NewClient(httpClient, token)
 	client.readOnly = true
 	client.userLogin = strings.TrimSpace(reviewAuthor)
+	return client
+}
+
+func NewReviewPublisherClient(httpClient *http.Client, token, owner, repo string) *Client {
+	client := NewClient(httpClient, token)
+	client.reviewOnly = fmt.Sprintf("/repos/%s/%s/pulls/", url.PathEscape(owner), url.PathEscape(repo))
 	return client
 }
 
@@ -363,6 +370,9 @@ func (client *Client) do(ctx context.Context, method, path string, body []byte) 
 func (client *Client) doWithAccept(ctx context.Context, method, path string, body []byte, accept string) ([]byte, http.Header, error) {
 	if client.readOnly && method != http.MethodGet {
 		return nil, nil, fmt.Errorf("read-only GitHub client rejects %s requests", method)
+	}
+	if client.reviewOnly != "" && method != http.MethodGet && !client.allowedReviewWrite(method, path, body) {
+		return nil, nil, fmt.Errorf("review publisher rejects %s outside COMMENT review operations on the configured repository", method)
 	}
 	var requestBody io.Reader
 	if body != nil {

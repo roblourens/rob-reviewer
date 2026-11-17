@@ -29,7 +29,7 @@ func main() {
 
 func run(logger *slog.Logger) (returnErr error) {
 	if len(os.Args) < 2 {
-		return errors.New("usage: rob-reviewer <poll|review|publish-report|apply-state-update|apply-learnings|update-published-index|track-comment-outcomes> [options]")
+		return errors.New("usage: rob-reviewer <poll|review|publish-run|publish-report|apply-state-update|apply-learnings|update-published-index|track-comment-outcomes> [options]")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -167,6 +167,22 @@ func run(logger *slog.Logger) (returnErr error) {
 		}
 		return nil
 
+	case "publish-run":
+		flags := flag.NewFlagSet("publish-run", flag.ContinueOnError)
+		configPath := flags.String("config", "reviewer.yaml", "path to trusted reviewer configuration")
+		runDirectory := flags.String("run-dir", "", "current workflow run's downloaded analysis reports")
+		if err := flags.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*runDirectory) == "" {
+			return errors.New("--run-dir is required")
+		}
+		publisher, err := app.NewSavedReportPublisher(*configPath, os.Getenv("REVIEW_GITHUB_TOKEN"))
+		if err != nil {
+			return err
+		}
+		return publisher.PublishRun(ctx, *runDirectory, app.PollRunMetadataFromEnvironment(time.Time{}, time.Time{}, os.Getenv), logger)
+
 	case "publish-report":
 		flags := flag.NewFlagSet("publish-report", flag.ContinueOnError)
 		configPath := flags.String("config", "reviewer.yaml", "path to reviewer configuration")
@@ -201,13 +217,14 @@ func run(logger *slog.Logger) (returnErr error) {
 		configPath := flags.String("config", "reviewer.yaml", "path to trusted reviewer configuration")
 		repository := flags.String("state-repository", os.Getenv("GITHUB_REPOSITORY"), "repository used for durable state")
 		updatePath := flags.String("state-update", "", "staged reviewer state update")
+		publishedRun := flags.String("published-run", "", "current run manifest containing successful publications")
 		if err := flags.Parse(os.Args[2:]); err != nil {
 			return err
 		}
 		if strings.TrimSpace(*updatePath) == "" {
 			return errors.New("--state-update is required")
 		}
-		return app.ApplyStateUpdate(ctx, *configPath, *repository, *updatePath, os.Getenv("GITHUB_TOKEN"))
+		return app.ApplyStateUpdate(ctx, *configPath, *repository, *updatePath, os.Getenv("GITHUB_TOKEN"), *publishedRun)
 
 	case "apply-learnings":
 		flags := flag.NewFlagSet("apply-learnings", flag.ContinueOnError)
@@ -310,7 +327,7 @@ func run(logger *slog.Logger) (returnErr error) {
 		}, numbers, *maxPulls, *maxAssessments)
 
 	default:
-		return fmt.Errorf("unknown command %q; use poll, review, publish-report, apply-state-update, apply-learnings, update-published-index, or track-comment-outcomes", os.Args[1])
+		return fmt.Errorf("unknown command %q; use poll, review, publish-run, publish-report, apply-state-update, apply-learnings, update-published-index, or track-comment-outcomes", os.Args[1])
 	}
 }
 

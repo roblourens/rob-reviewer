@@ -301,3 +301,28 @@ func TestReadOnlyClientUsesConfiguredReviewIdentityAndRejectsWrites(t *testing.T
 		t.Fatalf("read-only client issued %d HTTP requests", requests)
 	}
 }
+
+func TestReviewPublisherRejectsOtherRepositoriesAndNonCommentMutations(t *testing.T) {
+	client := NewReviewPublisherClient(nil, "token", "microsoft", "vscode")
+	for _, test := range []struct {
+		method, path, body string
+		allowed            bool
+	}{
+		{"POST", "/repos/microsoft/vscode/pulls/7/reviews", `{"body":"review","comments":[]}`, true},
+		{"POST", "/repos/microsoft/vscode/pulls/7/reviews/42/events", `{"event":"COMMENT"}`, true},
+		{"DELETE", "/repos/microsoft/vscode/pulls/7/reviews/42", "", true},
+		{"POST", "/repos/microsoft/another/pulls/7/reviews", `{}`, false},
+		{"POST", "/repos/microsoft/vscode/pulls/7/reviews", `{"event":"APPROVE"}`, false},
+		{"POST", "/repos/microsoft/vscode/pulls/7/reviews/42/events", `{"event":"REQUEST_CHANGES"}`, false},
+		{"PUT", "/repos/microsoft/vscode/pulls/7/merge", `{}`, false},
+		{"PATCH", "/repos/microsoft/vscode/pulls/7", `{"state":"closed"}`, false},
+		{"PUT", "/repos/microsoft/vscode/contents/file", `{}`, false},
+	} {
+		if allowed := client.allowedReviewWrite(test.method, test.path, []byte(test.body)); allowed != test.allowed {
+			t.Fatalf("%s %s allowed=%v want=%v", test.method, test.path, allowed, test.allowed)
+		}
+	}
+	if err := client.PutContent(context.Background(), "microsoft", "vscode", "file", "main", "write", nil, "sha"); err == nil {
+		t.Fatal("publisher allowed a repository write")
+	}
+}

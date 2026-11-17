@@ -22,6 +22,41 @@ type reviewResponse struct {
 	} `json:"user"`
 }
 
+func (client *Client) allowedReviewWrite(method, path string, body []byte) bool {
+	if !strings.HasPrefix(path, client.reviewOnly) {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, client.reviewOnly), "/")
+	if len(parts) < 2 || parts[1] != "reviews" {
+		return false
+	}
+	number, err := strconv.Atoi(parts[0])
+	if err != nil || number < 1 {
+		return false
+	}
+	if method == http.MethodPost && len(parts) == 2 {
+		var request CreateReviewRequest
+		return json.Unmarshal(body, &request) == nil && request.Event == ""
+	}
+	if len(parts) < 3 {
+		return false
+	}
+	id, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || id < 1 {
+		return false
+	}
+	if method == http.MethodDelete && len(parts) == 3 {
+		return true
+	}
+	if method == http.MethodPost && len(parts) == 4 && parts[3] == "events" {
+		var request struct {
+			Event string `json:"event"`
+		}
+		return json.Unmarshal(body, &request) == nil && request.Event == "COMMENT"
+	}
+	return false
+}
+
 func (client *Client) HasReviewMarker(ctx context.Context, owner, repo string, number int, marker string) (bool, error) {
 	existing, err := client.FindReviewMarker(ctx, owner, repo, number, marker)
 	return existing != nil, err

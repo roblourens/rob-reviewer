@@ -39,7 +39,7 @@ func (store *stagedStateStore) Save(_ context.Context, current state.State, sha 
 	return nil
 }
 
-func ApplyStateUpdate(ctx context.Context, configPath, repository, path, token string) error {
+func ApplyStateUpdate(ctx context.Context, configPath, repository, path, token, publishedRun string) error {
 	if token == "" {
 		return errors.New("GITHUB_TOKEN is required to persist staged reviewer state")
 	}
@@ -52,16 +52,33 @@ func ApplyStateUpdate(ctx context.Context, configPath, repository, path, token s
 		return err
 	}
 	store := state.NewStore(github.NewClient(nil, token), owner, repo, cfg.State.Branch, cfg.State.Path)
-	return applyStateUpdate(ctx, path, store)
+	return applyStateUpdate(ctx, path, publishedRun, store)
 }
 
-func applyStateUpdate(ctx context.Context, path string, store poller.StateStore) error {
+func applyStateUpdate(ctx context.Context, path, publishedRun string, store poller.StateStore) error {
 	var update stagedStateUpdate
 	if err := decodeStrictJSONFile(path, &update, maxSavedReportBytes); err != nil {
 		return fmt.Errorf("load staged state update: %w", err)
 	}
 	if update.State.Version != state.CurrentVersion || !update.State.Initialized || update.State.PullRequests == nil {
 		return errors.New("staged state update is missing initialized current-version state")
+	}
+	if publishedRun != "" {
+		record, err := loadPollRunRecord(publishedRun)
+		if err != nil {
+			return err
+		}
+		seen := make(map[int]bool)
+		for _, number := range record.Published {
+			tracked := update.State.PullRequests[number]
+			if seen[number] || !tracked.Reviewed {
+				return errors.New("publication record does not match staged reviewed PR state")
+			}
+			seen[number] = true
+		}
+		if update.State.Daily.Date == record.Metadata.CompletedAt.UTC().Format(time.DateOnly) {
+			update.State.Daily.Publications += len(record.Published)
+		}
 	}
 	return store.Save(ctx, update.State, update.SHA)
 }

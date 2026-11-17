@@ -31,7 +31,7 @@ func NewSavedReportPublisher(configPath, reviewToken string) (*SavedReportPublis
 	if strings.TrimSpace(reviewToken) == "" {
 		return nil, errors.New("REVIEW_GITHUB_TOKEN is required")
 	}
-	client := github.NewClient(nil, reviewToken)
+	client := github.NewReviewPublisherClient(nil, reviewToken, cfg.Target.Owner, cfg.Target.Repo)
 	return &SavedReportPublisher{
 		config: cfg,
 		client: client,

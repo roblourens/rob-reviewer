@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -56,7 +57,7 @@ func TestWorkflowSeparatesAnalysisFromRepositoryWrites(t *testing.T) {
 	var workflow struct {
 		Permissions map[string]string `yaml:"permissions"`
 		Jobs        map[string]struct {
-			Needs       string            `yaml:"needs"`
+			Needs       any               `yaml:"needs"`
 			Permissions map[string]string `yaml:"permissions"`
 			Steps       []struct {
 				Uses string            `yaml:"uses"`
@@ -94,8 +95,12 @@ func TestWorkflowSeparatesAnalysisFromRepositoryWrites(t *testing.T) {
 		t.Fatalf("analysis command coverage = %d", analysisCommands)
 	}
 	persist, exists := workflow.Jobs["persist"]
-	if !exists || persist.Needs != "review" || persist.Permissions["contents"] != "write" {
+	if !exists || persist.Permissions["contents"] != "write" {
 		t.Fatal("state persistence is not isolated after analysis")
+	}
+	deps, ok := persist.Needs.([]any)
+	if !ok || !slices.Contains(deps, any("review")) || !slices.Contains(deps, any("publish")) {
+		t.Fatal("persistence does not wait for both analysis and publication")
 	}
 	for _, step := range persist.Steps {
 		for _, value := range step.Env {
@@ -106,5 +111,29 @@ func TestWorkflowSeparatesAnalysisFromRepositoryWrites(t *testing.T) {
 		if strings.HasPrefix(step.Uses, "actions/setup-go@") && step.With["cache"] != false {
 			t.Fatal("privileged persistence shares writable build caches with analysis")
 		}
+	}
+	publish, exists := workflow.Jobs["publish"]
+	if !exists || publish.Needs != "review" || publish.Permissions["contents"] != "read" {
+		t.Fatal("publisher is not isolated after analysis")
+	}
+	publishCommands := 0
+	for _, step := range publish.Steps {
+		for key, value := range step.Env {
+			if strings.Contains(value, "COPILOT_GITHUB_TOKEN") || strings.Contains(value, "REVIEW_READ_TOKEN") {
+				t.Fatal("publisher receives analysis credentials")
+			}
+			if key == "REVIEW_GITHUB_TOKEN" {
+				publishCommands++
+				if step.Run != "go run ./cmd/rob-reviewer publish-run --run-dir review-results" {
+					t.Fatal("publication credential is available outside the trusted publisher")
+				}
+			}
+		}
+		if strings.HasPrefix(step.Uses, "actions/setup-go@") && step.With["cache"] != false {
+			t.Fatal("publisher shares writable build caches with analysis")
+		}
+	}
+	if publishCommands != 1 {
+		t.Fatal("workflow has no unique isolated publication step")
 	}
 }

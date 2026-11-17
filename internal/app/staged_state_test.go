@@ -6,7 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/roblourens/rob-reviewer/internal/poller"
+	"github.com/roblourens/rob-reviewer/internal/review"
 	"github.com/roblourens/rob-reviewer/internal/state"
 )
 
@@ -47,7 +50,7 @@ func TestStagedStateDefersWritesAndPreservesOptimisticSHA(t *testing.T) {
 		t.Fatal("analysis persisted state remotely")
 	}
 	target := &stateStoreSpy{}
-	if err := applyStateUpdate(context.Background(), path, target); err != nil {
+	if err := applyStateUpdate(context.Background(), path, "", target); err != nil {
 		t.Fatal(err)
 	}
 	if target.saves != 1 || target.sha != "original-sha" || !target.current.PullRequests[7].Reviewed {
@@ -55,7 +58,7 @@ func TestStagedStateDefersWritesAndPreservesOptimisticSHA(t *testing.T) {
 	}
 	conflict := errors.New("state changed concurrently")
 	target.saveErr = conflict
-	if err := applyStateUpdate(context.Background(), path, target); !errors.Is(err, conflict) {
+	if err := applyStateUpdate(context.Background(), path, "", target); !errors.Is(err, conflict) {
 		t.Fatalf("lost optimistic update failure: %v", err)
 	}
 }
@@ -73,8 +76,36 @@ func TestApplyStagedStateRejectsInvalidOrInjectedTargets(t *testing.T) {
 			t.Fatal(err)
 		}
 		store := &stateStoreSpy{}
-		if err := applyStateUpdate(context.Background(), path, store); err == nil || store.saves != 0 {
+		if err := applyStateUpdate(context.Background(), path, "", store); err == nil || store.saves != 0 {
 			t.Fatalf("saves=%d err=%v", store.saves, err)
 		}
+	}
+}
+
+func TestApplyStagedStateCountsPublishedPollReviews(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "state-update.json")
+	current := state.New()
+	current.Initialized = true
+	now := time.Now().UTC()
+	current.ResetDaily(now)
+	current.Daily.Reviews = 1
+	current.PullRequests[7] = state.PullRequestState{Reviewed: true, ReviewedHeadSHA: "head"}
+	staged := &stagedStateStore{path: path}
+	if err := staged.Save(context.Background(), current, "original-sha"); err != nil {
+		t.Fatal(err)
+	}
+	result := review.Result{PullRequest: review.PullRequest{Number: 7, HeadSHA: "head"}}
+	if _, err := WritePollRunFiles(directory, PollResult{
+		Poll: poller.Result{Reviewed: []int{7}, Published: []int{7}}, Reviews: []review.Result{result},
+	}, nil, PollRunMetadata{CompletedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	target := &stateStoreSpy{}
+	if err := applyStateUpdate(context.Background(), path, filepath.Join(directory, "run.json"), target); err != nil {
+		t.Fatal(err)
+	}
+	if target.current.Daily.Publications != 1 || target.sha != "original-sha" {
+		t.Fatalf("publications=%d sha=%s", target.current.Daily.Publications, target.sha)
 	}
 }

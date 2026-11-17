@@ -32,6 +32,7 @@ type PollRunRecord struct {
 	Metadata                     PollRunMetadata   `json:"metadata"`
 	Succeeded                    bool              `json:"succeeded"`
 	Error                        string            `json:"error,omitempty"`
+	PublicationError             string            `json:"publicationError,omitempty"`
 	Bootstrapped                 int               `json:"bootstrapped"`
 	Reviewed                     []int             `json:"reviewed"`
 	Published                    []int             `json:"published"`
@@ -227,6 +228,9 @@ func formatPollRunMarkdown(record PollRunRecord) string {
 	fmt.Fprintf(&output, "- Unresolved regression fixes: %d\n", record.UnresolvedRegressionFixCount)
 	if record.Error != "" {
 		fmt.Fprintf(&output, "\n## Error\n\n%s\n", review.SanitizeMarkdownTextWithCodeSpans(record.Error))
+	}
+	if record.PublicationError != "" {
+		fmt.Fprintf(&output, "\n## Publication error\n\n%s\n", review.SanitizeMarkdownTextWithCodeSpans(record.PublicationError))
 	}
 	if len(record.Reviews) > 0 {
 		output.WriteString("\n## Reviewed PRs\n")

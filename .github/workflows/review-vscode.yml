@@ -70,8 +70,65 @@ jobs:
           path: state-update.json
           if-no-files-found: error
 
-  persist:
+  publish:
     needs: review
+    if: >-
+      ${{
+        always() &&
+        needs.review.result != 'skipped' &&
+        (github.event_name == 'workflow_dispatch' || vars.ROB_REVIEWER_ENABLED == 'true') &&
+        github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Download exact analysis reports
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          name="performance-review-reports-${RUN_ID}-${RUN_ATTEMPT}"
+          artifact_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+            --jq ".artifacts[] | select(.name == \"${name}\") | .id")"
+          if [[ -z "$artifact_id" ]]; then
+            echo "No analysis reports were produced."
+            exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > reports.zip
+          mkdir review-results
+          unzip -q reports.zip -d review-results
+      - run: go mod download
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+      - run: go tool bundler
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        working-directory: cmd/rob-reviewer
+      - name: Publish opted-in PR reviews
+        if: ${{ hashFiles('review-results/run.json') != '' }}
+        env:
+          REVIEW_GITHUB_TOKEN: ${{ secrets.REVIEW_GITHUB_TOKEN }}
+        run: go run ./cmd/rob-reviewer publish-run --run-dir review-results
+      - name: Preserve publication results including partial failures
+        if: ${{ always() && hashFiles('review-results/run.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: performance-publication-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: review-results/
+          if-no-files-found: error
+
+  persist:
+    needs: [review, publish]
     if: >-
       ${{
         always() &&
@@ -101,7 +158,14 @@ jobs:
           artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts")"
           for kind in reports state; do
             if [[ "$kind" == reports ]]; then
-              name="performance-review-reports-${RUN_ID}-${RUN_ATTEMPT}"
+              published_name="performance-publication-reports-${RUN_ID}-${RUN_ATTEMPT}"
+              name="$(
+                jq -r --arg name "$published_name" \
+                  'if any(.artifacts[]; .name == $name) then $name else empty end' <<< "$artifacts"
+              )"
+              if [[ -z "$name" ]]; then
+                name="performance-review-reports-${RUN_ID}-${RUN_ATTEMPT}"
+              fi
               directory=review-results
             else
               name="reviewer-state-update-${RUN_ID}-${RUN_ATTEMPT}"
@@ -124,7 +188,7 @@ jobs:
         if: ${{ hashFiles('state-update/state-update.json') != '' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: go run ./cmd/rob-reviewer apply-state-update --state-update state-update/state-update.json
+        run: go run ./cmd/rob-reviewer apply-state-update --state-update state-update/state-update.json --published-run review-results/run.json
       - name: Ensure reviewer history branch
         if: ${{ always() && hashFiles('review-results/**') != '' }}
         env:
