@@ -53,7 +53,15 @@ type AutomationConfig struct {
 }
 
 type PublicationConfig struct {
-	Mode string `yaml:"mode"`
+	Mode  string       `yaml:"mode"`
+	OptIn *OptInConfig `yaml:"optIn,omitempty"`
+}
+
+type OptInConfig struct {
+	Owner  string `yaml:"owner"`
+	Repo   string `yaml:"repo"`
+	Branch string `yaml:"branch"`
+	Path   string `yaml:"path"`
 }
 
 type LearningConfig struct {
@@ -165,6 +173,15 @@ func (cfg Config) Validate() error {
 	}
 	if !slices.Contains([]string{"approval", "automatic"}, cfg.Publication.Mode) {
 		validationErrors = append(validationErrors, errors.New("publication.mode must be approval or automatic"))
+	}
+	if optIn := cfg.Publication.OptIn; optIn != nil {
+		for name, value := range map[string]string{
+			"owner": optIn.Owner, "repo": optIn.Repo, "branch": optIn.Branch, "path": optIn.Path,
+		} {
+			if strings.TrimSpace(value) == "" {
+				validationErrors = append(validationErrors, fmt.Errorf("publication.optIn.%s is required", name))
+			}
+		}
 	}
 	if cfg.Learning.MaxCasesPerRun < 0 || cfg.Learning.MaxCasesPerRun > 3 {
 		validationErrors = append(validationErrors, errors.New("learning.maxCasesPerRun must be between 0 and 3"))

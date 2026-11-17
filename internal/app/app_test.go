@@ -31,14 +31,14 @@ func TestPollIsNoOpWhenAutomationDisabled(t *testing.T) {
 	}
 }
 
-func TestReviewPullRequestSkipsWhenEarlierHeadWasReviewed(t *testing.T) {
+func TestReviewDraftPullRequestSkipsWhenEarlierHeadWasReviewed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/repos/microsoft/vscode/pulls/7":
 			io.WriteString(writer, `{
 				"number":7,
 				"state":"open",
-				"draft":false,
+				"draft":true,
 				"author_association":"MEMBER",
 				"user":{"login":"member"},
 				"base":{"ref":"main","sha":"base"},

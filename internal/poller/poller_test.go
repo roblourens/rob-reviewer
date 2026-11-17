@@ -3,6 +3,7 @@ package poller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -173,8 +174,52 @@ func TestRunBootstrapsOpenHeadsWithoutReviewingBacklog(t *testing.T) {
 		t.Fatalf("result=%+v calls=%d state=%+v", result, reviewCalls, store.current)
 	}
 	if store.current.PullRequests[12].ReviewedHeadSHA != "ready" ||
-		store.current.PullRequests[11].PendingHeadSHA != "draft" {
+		store.current.PullRequests[11].ReviewedHeadSHA != "draft" ||
+		store.current.PullRequests[11].PendingHeadSHA != "" {
 		t.Fatalf("state = %+v", store.current)
+	}
+}
+
+func TestRunReviewsDraftImmediatelyAndOnlyOnce(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	draft := pull(12, "draft-head", now)
+	draft.Draft = true
+	for _, pending := range []bool{false, true} {
+		t.Run(fmt.Sprint("previously-pending=", pending), func(t *testing.T) {
+			current := initializedState()
+			if pending {
+				current.PullRequests[12] = state.PullRequestState{
+					PendingHeadSHA: draft.HeadSHA, Draft: true, State: "open",
+				}
+			}
+			client := &fakePullClient{
+				updatedPages: map[int][]review.PullRequest{1: {draft}},
+				pulls:        map[int]review.PullRequest{12: draft},
+			}
+			store := &fakeStateStore{current: current, exists: true}
+			calls := 0
+			poller := New(client, store, testOptions(&now), func(_ context.Context, reviewed review.PullRequest) (ReviewOutcome, error) {
+				calls++
+				if !reviewed.Draft {
+					t.Fatal("expected to review a draft")
+				}
+				return ReviewOutcome{}, nil
+			})
+			if _, err := poller.Run(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			ready := draft
+			ready.Draft = false
+			ready.HeadSHA = "ready-head"
+			client.updatedPages[1] = []review.PullRequest{ready}
+			client.pulls[12] = ready
+			if _, err := poller.Run(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 1 || !store.current.PullRequests[12].Reviewed {
+				t.Fatalf("calls=%d state=%+v", calls, store.current)
+			}
+		})
 	}
 }
 

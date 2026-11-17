@@ -190,14 +190,10 @@ func (poller *Poller) bootstrap(ctx context.Context, current *state.State) (int,
 				continue
 			}
 			tracked := state.PullRequestState{
-				State:     pull.State,
-				Draft:     pull.Draft,
-				UpdatedAt: pull.UpdatedAt,
-			}
-			if pull.Draft {
-				tracked.PendingHeadSHA = pull.HeadSHA
-			} else {
-				tracked.ReviewedHeadSHA = pull.HeadSHA
+				State:           pull.State,
+				Draft:           pull.Draft,
+				UpdatedAt:       pull.UpdatedAt,
+				ReviewedHeadSHA: pull.HeadSHA,
 			}
 			current.PullRequests[pull.Number] = tracked
 			count++
@@ -242,7 +238,6 @@ func (poller *Poller) updatedSince(ctx context.Context, boundary time.Time) ([]r
 func (poller *Poller) observe(current *state.State, pull review.PullRequest, now time.Time, result *Result) {
 	tracked, existed := current.PullRequests[pull.Number]
 	previousState := tracked.State
-	previousDraft := tracked.Draft
 	tracked.State = pull.State
 	tracked.Draft = pull.Draft
 	tracked.UpdatedAt = pull.UpdatedAt
@@ -264,18 +259,12 @@ func (poller *Poller) observe(current *state.State, pull review.PullRequest, now
 	case !strings.EqualFold(pull.State, "open"):
 		tracked.PendingHeadSHA = ""
 		tracked.PendingSince = time.Time{}
-	case pull.Draft:
-		if tracked.PendingHeadSHA != pull.HeadSHA {
-			tracked.PendingHeadSHA = pull.HeadSHA
-			tracked.PendingSince = time.Time{}
-		}
-		appendUnique(&result.Deferred, pull.Number)
 	case tracked.ReviewedHeadSHA == pull.HeadSHA && tracked.PendingHeadSHA == "" &&
-		(!existed || (strings.EqualFold(previousState, "open") && !previousDraft)):
+		(!existed || strings.EqualFold(previousState, "open")):
 		tracked.PendingHeadSHA = ""
 		tracked.PendingSince = time.Time{}
 	default:
-		if tracked.PendingHeadSHA != pull.HeadSHA || previousDraft || !strings.EqualFold(previousState, "open") {
+		if tracked.PendingHeadSHA != pull.HeadSHA || tracked.PendingSince.IsZero() || !strings.EqualFold(previousState, "open") {
 			tracked.PendingHeadSHA = pull.HeadSHA
 			tracked.PendingSince = now
 		}
@@ -292,7 +281,7 @@ func (poller *Poller) readyCandidates(current state.State, now time.Time) []cand
 	var result []candidate
 	for number, tracked := range current.PullRequests {
 		if tracked.Reviewed || tracked.PendingHeadSHA == "" || tracked.PendingSince.IsZero() ||
-			tracked.Draft || !strings.EqualFold(tracked.State, "open") {
+			!strings.EqualFold(tracked.State, "open") {
 			continue
 		}
 		result = append(result, candidate{number: number, pendingSince: tracked.PendingSince})
@@ -309,7 +298,7 @@ func (poller *Poller) readyCandidates(current state.State, now time.Time) []cand
 func (poller *Poller) stillReady(current *state.State, pull review.PullRequest, now time.Time, result *Result) bool {
 	tracked := current.PullRequests[pull.Number]
 	if tracked.Reviewed || !pull.IsTeamAuthored() || pull.HasAnyLabel(poller.options.SkipLabels) ||
-		!strings.EqualFold(pull.State, "open") || pull.Draft || pull.HeadSHA != tracked.PendingHeadSHA {
+		!strings.EqualFold(pull.State, "open") || pull.HeadSHA != tracked.PendingHeadSHA {
 		poller.observe(current, pull, now, result)
 		return false
 	}

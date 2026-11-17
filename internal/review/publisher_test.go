@@ -352,6 +352,41 @@ func TestPublisherAllowsClosedPullRequestWithAdvancedBase(t *testing.T) {
 	}
 }
 
+func TestAutomaticPublisherAllowsDraftReviewedAsDraft(t *testing.T) {
+	analyzed := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER", Draft: true}
+	for _, stillDraft := range []bool{true, false} {
+		current := analyzed
+		current.Draft = stillDraft
+		client := &fakePublisherClient{current: current}
+		published, err := NewAutomaticPublisher(client, "microsoft", "vscode").Publish(context.Background(), Result{
+			PullRequest: analyzed, Findings: []Finding{{ID: "PERF-1234567890AB"}},
+		}, false)
+		if err != nil || !published || !client.published {
+			t.Fatalf("draft=%v published=%v err=%v", stillDraft, published, err)
+		}
+	}
+}
+
+func TestAutomaticPublisherRechecksOptInWhenResuming(t *testing.T) {
+	pull := PullRequest{Number: 7, BaseSHA: "base", HeadSHA: "head", State: "open", AuthorAssociation: "MEMBER"}
+	client := &fakePublisherClient{
+		current: pull, reviewComments: []Comment{{Path: "src/file.ts", Side: SideRight, Line: 1}},
+	}
+	pending := ExistingReview{ID: 77, State: "PENDING", Body: ReviewMarker(7, "head") + "\n" + publicationBaseMarker(pull)}
+	checks := 0
+	publisher := NewAutomaticPublisher(client, "microsoft", "vscode").WithPublicationCheck(func(context.Context, PullRequest) error {
+		checks++
+		if checks > 1 {
+			return ErrPublicationSuppressed
+		}
+		return nil
+	})
+	_, err := publisher.ResumePending(context.Background(), pull, pending)
+	if !errors.Is(err, ErrPublicationSuppressed) || client.submitAttempted || client.deletedID != 77 || checks != 2 {
+		t.Fatalf("err=%v submitted=%v deleted=%d checks=%d", err, client.submitAttempted, client.deletedID, checks)
+	}
+}
+
 func TestPublisherRejectsSuppressionLabelAndResumesPendingReview(t *testing.T) {
 	pull := PullRequest{
 		Number:            7,

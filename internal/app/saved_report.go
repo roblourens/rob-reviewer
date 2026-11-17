@@ -20,6 +20,7 @@ const maxSavedReportBytes = 20 << 20
 type SavedReportPublisher struct {
 	config config.Config
 	client review.PublisherClient
+	check  review.PublicationCheck
 }
 
 func NewSavedReportPublisher(configPath, reviewToken string) (*SavedReportPublisher, error) {
@@ -30,9 +31,11 @@ func NewSavedReportPublisher(configPath, reviewToken string) (*SavedReportPublis
 	if strings.TrimSpace(reviewToken) == "" {
 		return nil, errors.New("REVIEW_GITHUB_TOKEN is required")
 	}
+	client := github.NewClient(nil, reviewToken)
 	return &SavedReportPublisher{
 		config: cfg,
-		client: github.NewClient(nil, reviewToken),
+		client: client,
+		check:  publicationOptInCheck(client, cfg.Publication.OptIn),
 	}, nil
 }
 
@@ -54,7 +57,7 @@ func (publisher *SavedReportPublisher) Publish(
 		publisher.config.Target.Owner,
 		publisher.config.Target.Repo,
 		publisher.config.Automation.SkipLabels...,
-	).Publish(ctx, selected, false)
+	).WithPublicationCheck(publisher.check).Publish(ctx, selected, false)
 	if err != nil {
 		return review.Result{}, false, err
 	}

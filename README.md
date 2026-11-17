@@ -9,12 +9,13 @@ The framework runs one Copilot session per pull request. All enabled review-focu
 - A GitHub Actions workflow polls every five minutes when the `ROB_REVIEWER_ENABLED` repository variable is `true`. Checked-in configuration also requires `automation.enabled: true`.
 - The first enabled poll records every current open team PR and its current head without reviewing that backlog.
 - Only PRs whose GitHub `author_association` is `MEMBER` or `OWNER` are eligible. Outside collaborators, contributors, bots, and other non-team authors are skipped.
-- The poller detects newly opened PRs and drafts becoming ready by scanning recently updated PRs.
+- The poller detects newly opened PRs, including drafts, by scanning recently updated PRs. Drafts are analyzed immediately instead of waiting for ready-for-review.
 - Newly eligible PRs are reviewed in the same poll, subject to the per-run and per-day caps.
-- Each PR is reviewed at most once. Later pushes, rebases, and reopenings do not trigger another review. Persistent PR-level completion state prevents repeat analysis, and an authenticated GitHub review marker independently prevents repeat publication.
+- Each PR is reviewed at most once. Later pushes, rebases, reopenings, and draft-to-ready transitions do not trigger another review. Persistent PR-level completion state prevents repeat analysis, and an authenticated GitHub review marker independently prevents repeat publication.
 - `publication.mode: approval` writes and archives JSON and Markdown reports without commenting on the PR. `publication.mode: automatic` publishes every validated finding after the report is durable. The checked-in mode is `approval`.
 - Pending automatic reviews are bound to both reviewed base and head revisions. The target is refreshed immediately before submission; stale or newly suppressed drafts are discarded. Human-approved pending reviews are left for explicit publication, never deleted or submitted by the poller.
-- Automatic publication requires the PR to remain open, non-draft, unsuppressed, team-authored, and on the reviewed base/head at the final GitHub refresh. Explicitly approved saved reports may still be published to a closed or merged PR when the reviewed head matches.
+- Automatic publication requires the PR to remain open, unsuppressed, team-authored, and on the reviewed base/head at the final GitHub refresh. PRs analyzed as drafts may receive comments while still drafts; a ready PR converted back to draft during analysis is rejected. Explicitly approved saved reports may still be published to a closed or merged PR when the reviewed head matches.
+- When `publication.optIn` is configured, publication also requires an explicit `true` for the PR author's GitHub username in that file. This applies to automatic reviews, pending retries, and explicitly selected saved reports, not to analysis or learning.
 - Per-run and per-UTC-day review caps bound model usage. A pending head older than the configured maximum age is skipped rather than producing a surprising late review.
 - Adding the configured `performance-reviewer:skip` label suppresses that head.
 - Every finding has a stable `PERF-...` ID for local reports and explicit publication. Automatic mode posts all host-validated findings.
@@ -66,6 +67,11 @@ learning:
   maxCasesPerRun: 1
 publication:
   mode: approval
+  optIn:
+    owner: microsoft
+    repo: vscode-internalbacklog
+    branch: main
+    path: .github/performance-reviewer.json
 review:
   model: gpt-6.1-sol
   reasoningEffort: high
@@ -80,14 +86,30 @@ state:
 
 `COPILOT_MODEL` overrides the configured model. The reviewer calls `ListModels` at startup and fails with the available model IDs if the configured model is unavailable.
 
+### Author opt-in
+
+The configured private file contains a JSON object mapping GitHub usernames to booleans:
+
+```json
+{
+  "username": true
+}
+```
+
+Username matching is case-insensitive. Missing usernames and `false` do not authorize comments. The file is read again immediately before submission, so removing an entry or setting it to `false` also suppresses pending reviews. A missing, inaccessible, malformed, or oversized file fails publication explicitly; it never enables comments by default. File contents are not passed to the model or copied into public reports.
+
+The global `publication.mode: approval` switch still prevents all automatic comments, including for opted-in authors. The opt-in file does not cause old reports or already-reviewed PRs to be published later.
+
 ## Credentials
 
 Configure two Actions secrets:
 
 - `COPILOT_GITHUB_TOKEN`: a GitHub user token accepted by the Copilot SDK for an account with Copilot access.
-- `REVIEW_GITHUB_TOKEN`: a GitHub user credential that can read public PRs and submit reviews to `microsoft/vscode`. The repository-scoped Actions token cannot write to another repository. Confirm the selected credential's scope and organization policy before enabling publication.
+- `REVIEW_GITHUB_TOKEN`: a GitHub user credential that can read PRs and submit reviews to `microsoft/vscode`, and read the private publication opt-in file. The repository-scoped Actions token cannot write to another repository. Confirm the selected credential's scope and organization policy before enabling publication.
 
 The workflow-provided `GITHUB_TOKEN` is used only for the state branch in this repository and has `contents: write`. Keep the Copilot and review credentials separate even if one user owns both. Workflow actions are pinned to immutable commits, checkout credentials are not persisted, and the review/Copilot secrets are scoped only to the application steps.
+
+The model's tool restrictions do not reduce the host process's credential permissions. Do not use a broad `repo`-scoped credential as a least-privilege boundary: it can authorize repository writes wherever its owner has access. Prefer short-lived GitHub App installation tokens or repository-selected fine-grained tokens, with read-only credentials for source/opt-in reads and a separate publisher credential limited to the target repository's pull requests. GitHub's `Pull requests: write` permission is broader than comment-only. Strict comment-only enforcement requires a separate publisher that holds that credential and exposes only validated review operations; the analysis process must not receive the write credential. The current workflow does not provide that process isolation. For Copilot inference, use a personal-account fine-grained token with only the `Copilot Requests` permission where supported by the bundled runtime; this is separate from repository authentication.
 
 The first enabled scheduled poll creates `reviewer-state` from the default branch when needed, upgrades any version-1 high-water state, snapshots current open heads, and exits. Branch protection must allow the workflow token to update that branch.
 

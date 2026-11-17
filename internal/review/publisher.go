@@ -50,6 +50,8 @@ type PublisherClient interface {
 	DeletePendingReview(ctx context.Context, owner, repo string, number int, reviewID int64) error
 }
 
+type PublicationCheck func(context.Context, PullRequest) error
+
 type Publisher struct {
 	client      PublisherClient
 	owner       string
@@ -57,6 +59,7 @@ type Publisher struct {
 	skipLabels  []string
 	allowClosed bool
 	summary     string
+	check       PublicationCheck
 }
 
 func ReviewMarkerPrefix(number int) string {
@@ -87,6 +90,11 @@ func NewAutomaticPublisher(client PublisherClient, owner, repo string, skipLabel
 		allowClosed: false,
 		summary:     automaticSummary,
 	}
+}
+
+func (publisher *Publisher) WithPublicationCheck(check PublicationCheck) *Publisher {
+	publisher.check = check
+	return publisher
 }
 
 func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun bool) (bool, error) {
@@ -133,6 +141,11 @@ func (publisher *Publisher) Publish(ctx context.Context, result Result, dryRun b
 	}
 	if err := publisher.validatePublicationTarget(result.PullRequest, current); err != nil {
 		return false, err
+	}
+	if publisher.check != nil {
+		if err := publisher.check(ctx, current); err != nil {
+			return false, err
+		}
 	}
 	if existing != nil {
 		if err := publisher.submitPendingReview(
@@ -240,11 +253,18 @@ func (publisher *Publisher) refreshPendingTarget(ctx context.Context, analyzed P
 	if err != nil {
 		return fmt.Errorf("refresh pull request before submitting pending review: %w", err)
 	}
-	if err := publisher.validatePublicationTarget(analyzed, current); err != nil {
-		if deleteErr := publisher.client.DeletePendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number, reviewID); deleteErr != nil {
-			return fmt.Errorf("delete stale pending review %d after %v: %w", reviewID, err, deleteErr)
+	targetErr := publisher.validatePublicationTarget(analyzed, current)
+	if targetErr == nil && publisher.check != nil {
+		targetErr = publisher.check(ctx, current)
+		if targetErr != nil && !errors.Is(targetErr, ErrPublicationSuppressed) {
+			return targetErr
 		}
-		return err
+	}
+	if targetErr != nil {
+		if deleteErr := publisher.client.DeletePendingReview(ctx, publisher.owner, publisher.repo, analyzed.Number, reviewID); deleteErr != nil {
+			return fmt.Errorf("delete stale pending review %d after %v: %w", reviewID, targetErr, deleteErr)
+		}
+		return targetErr
 	}
 	return nil
 }
@@ -420,7 +440,7 @@ func validatePublicationTarget(analyzed, current PullRequest) error {
 	}
 	switch {
 	case strings.EqualFold(current.State, "open"):
-		if current.Draft {
+		if current.Draft && !analyzed.Draft {
 			return fmt.Errorf("pull request %d became a draft during review", analyzed.Number)
 		}
 		if current.BaseSHA != analyzed.BaseSHA {

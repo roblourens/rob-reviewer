@@ -154,7 +154,7 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 					app.config.Target.Owner,
 					app.config.Target.Repo,
 					app.config.Automation.SkipLabels...,
-				)
+				).WithPublicationCheck(publicationOptInCheck(app.reviewClient, app.config.Publication.OptIn))
 				existing, err := automaticPublisher.PrepareAutomaticReview(
 					reviewContext,
 					pull,
@@ -225,7 +225,7 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 				app.config.Target.Owner,
 				app.config.Target.Repo,
 				app.config.Automation.SkipLabels...,
-			).Publish(reviewContext, result, false)
+			).WithPublicationCheck(publicationOptInCheck(app.reviewClient, app.config.Publication.OptIn)).Publish(reviewContext, result, false)
 			if err != nil {
 				if errors.Is(err, review.ErrPublicationSuppressed) {
 					return poller.ReviewOutcome{}, nil
@@ -270,9 +270,6 @@ func (app *App) ReviewPullRequest(ctx context.Context, number int, publish bool)
 			pull.AuthorLogin,
 			pull.AuthorAssociation,
 		)
-	}
-	if pull.Draft {
-		return review.Result{}, false, fmt.Errorf("pull request %d is still a draft", number)
 	}
 	return app.reviewOne(ctx, pull, publish)
 }
@@ -355,7 +352,7 @@ func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish 
 		app.config.Target.Owner,
 		app.config.Target.Repo,
 		app.config.Automation.SkipLabels...,
-	)
+	).WithPublicationCheck(publicationOptInCheck(app.reviewClient, app.config.Publication.OptIn))
 	published, err := publisher.Publish(ctx, result, !publish)
 	if err != nil {
 		return review.Result{}, false, err

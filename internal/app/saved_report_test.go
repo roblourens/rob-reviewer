@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,6 +142,26 @@ func TestSavedReportPublisherPublishesOnlyApprovedFinding(t *testing.T) {
 	}
 	if client.submitted != 42 {
 		t.Fatalf("submitted review ID = %d", client.submitted)
+	}
+}
+
+func TestSavedReportPublisherHonorsPublicationOptIn(t *testing.T) {
+	result := savedResult()
+	paths, err := WriteResultFiles(t.TempDir(), result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeSavedReportClient{pull: result.PullRequest}
+	publisher := &SavedReportPublisher{
+		config: configForTest(),
+		client: client,
+		check: func(context.Context, review.PullRequest) error {
+			return review.ErrPublicationSuppressed
+		},
+	}
+	_, published, err := publisher.Publish(context.Background(), paths[0], []string{result.Findings[0].ID})
+	if !errors.Is(err, review.ErrPublicationSuppressed) || published || len(client.published.Comments) != 0 {
+		t.Fatalf("published=%v request=%+v err=%v", published, client.published, err)
 	}
 }
 

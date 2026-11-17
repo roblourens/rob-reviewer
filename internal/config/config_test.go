@@ -57,6 +57,29 @@ unknown: true
 	}
 }
 
+func TestValidateRequiresCompletePublicationOptInLocation(t *testing.T) {
+	cfg, err := Decode(strings.NewReader(`
+target:
+  owner: microsoft
+  repo: vscode
+review:
+  focuses: [performance-review]
+publication:
+  optIn:
+    owner: microsoft
+    repo: vscode-internalbacklog
+    branch: main
+    path: .github/performance-reviewer.json
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Publication.OptIn.Path = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "publication.optIn.path") {
+		t.Fatalf("expected incomplete location error, got %v", err)
+	}
+}
+
 func TestValidateRejectsDuplicateFocus(t *testing.T) {
 	_, err := Decode(strings.NewReader(`
 version: 1
