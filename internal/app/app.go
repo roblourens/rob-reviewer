@@ -35,6 +35,8 @@ type App struct {
 	focusCatalog  *focus.Catalog
 	copilotToken  string
 	hasStateToken bool
+	analysisOnly  bool
+	stateUpdate   string
 
 	runnerMutex sync.Mutex
 	runner      *reviewcopilot.Runner
@@ -46,6 +48,8 @@ type Options struct {
 	StateToken   string
 	ReviewToken  string
 	CopilotToken string
+	AnalysisOnly bool
+	StateUpdate  string
 }
 
 type PollResult struct {
@@ -69,6 +73,9 @@ func New(options Options) (*App, error) {
 		return nil, err
 	}
 	if strings.TrimSpace(options.ReviewToken) == "" {
+		if options.AnalysisOnly {
+			return nil, errors.New("GITHUB_TOKEN is required for analysis-only GitHub reads")
+		}
 		return nil, errors.New("REVIEW_GITHUB_TOKEN is required")
 	}
 	if strings.TrimSpace(options.CopilotToken) == "" {
@@ -87,14 +94,27 @@ func New(options Options) (*App, error) {
 		return nil, err
 	}
 
+	reviewClient := github.NewClient(nil, options.ReviewToken)
+	stateClient := github.NewClient(nil, options.StateToken)
+	if options.AnalysisOnly {
+		if strings.TrimSpace(cfg.Publication.ReviewerLogin) == "" {
+			return nil, errors.New("publication.reviewerLogin is required for analysis-only review marker checks")
+		}
+		cfg.Publication.Mode = "approval"
+		reviewClient = github.NewReadOnlyClient(nil, options.ReviewToken, cfg.Publication.ReviewerLogin)
+		stateClient = github.NewReadOnlyClient(nil, options.StateToken, "")
+	}
+
 	return &App{
 		config:        cfg,
 		logger:        options.Logger,
-		reviewClient:  github.NewClient(nil, options.ReviewToken),
-		stateClient:   github.NewClient(nil, options.StateToken),
+		reviewClient:  reviewClient,
+		stateClient:   stateClient,
 		focusCatalog:  focusCatalog,
 		copilotToken:  options.CopilotToken,
 		hasStateToken: strings.TrimSpace(options.StateToken) != "",
+		analysisOnly:  options.AnalysisOnly,
+		stateUpdate:   options.StateUpdate,
 	}, nil
 }
 
@@ -124,13 +144,19 @@ func (app *App) Poll(ctx context.Context, stateRepository, outputDirectory strin
 	if strings.TrimSpace(outputDirectory) == "" {
 		return PollResult{}, errors.New("poll output directory is required so review state cannot advance without durable reports")
 	}
-	store := state.NewStore(
+	var store poller.StateStore = state.NewStore(
 		app.stateClient,
 		stateOwner,
 		stateRepo,
 		app.config.State.Branch,
 		app.config.State.Path,
 	)
+	if app.analysisOnly {
+		if strings.TrimSpace(app.stateUpdate) == "" {
+			return PollResult{}, errors.New("analysis-only polling requires a local state-update output")
+		}
+		store = &stagedStateStore{source: store, path: app.stateUpdate}
+	}
 	var reviews []review.Result
 	var resumedPublications []ResumedPublication
 	var learningEvaluation learning.Evaluation
@@ -328,6 +354,9 @@ func (app *App) ReviewHistoricalPullRequest(ctx context.Context, number int) (re
 }
 
 func (app *App) reviewOne(ctx context.Context, pull review.PullRequest, publish bool) (_ review.Result, analyzed bool, returnErr error) {
+	if app.analysisOnly && publish {
+		return review.Result{}, false, errors.New("publication is disabled for an analysis-only application")
+	}
 	existing, err := app.reviewClient.FindReviewMarker(
 		ctx,
 		app.config.Target.Owner,

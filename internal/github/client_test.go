@@ -266,3 +266,38 @@ func TestHasReviewMarkerRequiresAuthenticatedAuthor(t *testing.T) {
 		t.Fatal("did not accept marker from authenticated reviewer")
 	}
 }
+
+func TestReadOnlyClientUsesConfiguredReviewIdentityAndRejectsWrites(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.Method != http.MethodGet || request.URL.Path != "/repos/owner/repo/pulls/7/reviews" {
+			t.Errorf("unexpected request %s %s", request.Method, request.URL.Path)
+			writer.WriteHeader(http.StatusForbidden)
+			return
+		}
+		fmt.Fprint(writer, `[
+			{"id":1,"body":"marker","state":"COMMENTED","user":{"login":"someone-else"}},
+			{"id":2,"body":"marker","state":"COMMENTED","user":{"login":"review-bot"}}
+		]`)
+	}))
+	defer server.Close()
+	client := NewReadOnlyClient(server.Client(), "read-only-token", "review-bot")
+	client.baseURL = server.URL
+	existing, err := client.FindReviewMarker(context.Background(), "owner", "repo", 7, "marker")
+	if err != nil || existing == nil || existing.ID != 2 {
+		t.Fatalf("existing=%+v err=%v", existing, err)
+	}
+	if _, err := client.CreatePendingReview(context.Background(), "owner", "repo", 7, review.ReviewRequest{}); err == nil {
+		t.Fatal("read-only client allowed review creation")
+	}
+	if err := client.PutContent(context.Background(), "owner", "repo", "state.json", "state", "update", nil, "sha"); err == nil {
+		t.Fatal("read-only client allowed a repository write")
+	}
+	if err := client.DeletePendingReview(context.Background(), "owner", "repo", 7, 42); err == nil {
+		t.Fatal("read-only client allowed review deletion")
+	}
+	if requests != 1 {
+		t.Fatalf("read-only client issued %d HTTP requests", requests)
+	}
+}

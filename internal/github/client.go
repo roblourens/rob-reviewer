@@ -27,6 +27,7 @@ type Client struct {
 	httpClient *http.Client
 	baseURL    string
 	token      string
+	readOnly   bool
 
 	userMutex sync.Mutex
 	userLogin string
@@ -64,6 +65,13 @@ func NewClient(httpClient *http.Client, token string) *Client {
 		baseURL:    defaultBaseURL,
 		token:      strings.TrimSpace(token),
 	}
+}
+
+func NewReadOnlyClient(httpClient *http.Client, token, reviewAuthor string) *Client {
+	client := NewClient(httpClient, token)
+	client.readOnly = true
+	client.userLogin = strings.TrimSpace(reviewAuthor)
+	return client
 }
 
 func NewClientWithBaseURL(httpClient *http.Client, token, baseURL string) *Client {
@@ -353,6 +361,9 @@ func (client *Client) do(ctx context.Context, method, path string, body []byte) 
 }
 
 func (client *Client) doWithAccept(ctx context.Context, method, path string, body []byte, accept string) ([]byte, http.Header, error) {
+	if client.readOnly && method != http.MethodGet {
+		return nil, nil, fmt.Errorf("read-only GitHub client rejects %s requests", method)
+	}
 	var requestBody io.Reader
 	if body != nil {
 		requestBody = bytes.NewReader(body)

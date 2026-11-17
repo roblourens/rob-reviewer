@@ -89,10 +89,14 @@ func NewRunner(ctx context.Context, options Options) (*Runner, error) {
 		return nil, fmt.Errorf("create Copilot base directory: %w", err)
 	}
 	client := sdk.NewClient(&sdk.ClientOptions{
-		GitHubToken:   options.GitHubToken,
-		BaseDirectory: baseDirectory,
-		LogLevel:      "error",
-		Mode:          sdk.ModeEmpty,
+		Connection:       sdk.StdioConnection{},
+		Env:              runtimeEnvironment(baseDirectory, os.Environ()),
+		GitHubToken:      options.GitHubToken,
+		UseLoggedInUser:  sdk.Bool(false),
+		BaseDirectory:    baseDirectory,
+		WorkingDirectory: baseDirectory,
+		LogLevel:         "error",
+		Mode:             sdk.ModeEmpty,
 	})
 	if err := client.Start(ctx); err != nil {
 		os.RemoveAll(baseDirectory)
@@ -109,6 +113,19 @@ func NewRunner(ctx context.Context, options Options) (*Runner, error) {
 		return nil, errors.Join(err, closeErr)
 	}
 	return runner, nil
+}
+
+func runtimeEnvironment(home string, parent []string) []string {
+	environment := []string{"HOME=" + home, "USERPROFILE=" + home, "XDG_CONFIG_HOME=" + home, "XDG_CACHE_HOME=" + home}
+	for _, entry := range parent {
+		key, _, _ := strings.Cut(entry, "=")
+		switch strings.ToUpper(key) {
+		case "PATH", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "TMPDIR", "LANG", "LC_ALL",
+			"SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY":
+			environment = append(environment, entry)
+		}
+	}
+	return environment
 }
 
 func (runner *Runner) Close() error {

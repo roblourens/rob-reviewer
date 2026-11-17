@@ -214,3 +214,26 @@ func int64Pointer(value int64) *int64 {
 func float64Pointer(value float64) *float64 {
 	return &value
 }
+
+func TestRuntimeEnvironmentExcludesHostCredentialsAndConfiguration(t *testing.T) {
+	parent := []string{
+		"PATH=/bin", "HTTPS_PROXY=http://proxy", "SSL_CERT_FILE=/cert.pem",
+		"HOME=/real-home", "XDG_CONFIG_HOME=/real-config", "USERPROFILE=/real-profile",
+		"REVIEW_GITHUB_TOKEN=review-secret", "GITHUB_TOKEN=state-secret",
+		"COPILOT_GITHUB_TOKEN=model-secret", "COPILOT_SDK_AUTH_TOKEN=old-secret",
+		"ACTIONS_RUNTIME_TOKEN=actions-secret", "GH_TOKEN=gh-secret", "SSH_AUTH_SOCK=/ssh",
+		"NODE_OPTIONS=--require=/untrusted.js", "COPILOT_SDK_DEFAULT_CONNECTION=inprocess",
+	}
+	environment := runtimeEnvironment("/isolated", parent)
+	joined := strings.Join(environment, "\n")
+	for _, forbidden := range []string{"secret", "/real-", "/ssh", "NODE_OPTIONS", "inprocess"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("runtime inherited forbidden host configuration %q", forbidden)
+		}
+	}
+	for _, expected := range []string{"PATH=/bin", "HOME=/isolated", "HTTPS_PROXY=http://proxy", "SSL_CERT_FILE=/cert.pem"} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("runtime environment is missing %q", expected)
+		}
+	}
+}

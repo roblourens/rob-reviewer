@@ -190,7 +190,7 @@ func loadPublishedReviewIndex(path string) (PublishedReviewIndex, error) {
 }
 
 type strictJSONTarget interface {
-	PollRunRecord | PublishedReviewIndex | outcomes.Ledger
+	PollRunRecord | PublishedReviewIndex | outcomes.Ledger | stagedStateUpdate
 }
 
 func decodeStrictJSONFile[T strictJSONTarget](path string, target *T, maxBytes int64) error {

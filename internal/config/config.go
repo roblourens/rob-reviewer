@@ -53,8 +53,9 @@ type AutomationConfig struct {
 }
 
 type PublicationConfig struct {
-	Mode  string       `yaml:"mode"`
-	OptIn *OptInConfig `yaml:"optIn,omitempty"`
+	Mode          string       `yaml:"mode"`
+	ReviewerLogin string       `yaml:"reviewerLogin,omitempty"`
+	OptIn         *OptInConfig `yaml:"optIn,omitempty"`
 }
 
 type OptInConfig struct {

@@ -29,7 +29,7 @@ func main() {
 
 func run(logger *slog.Logger) (returnErr error) {
 	if len(os.Args) < 2 {
-		return errors.New("usage: rob-reviewer <poll|review|publish-report|apply-learnings|update-published-index|track-comment-outcomes> [options]")
+		return errors.New("usage: rob-reviewer <poll|review|publish-report|apply-state-update|apply-learnings|update-published-index|track-comment-outcomes> [options]")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -41,10 +41,12 @@ func run(logger *slog.Logger) (returnErr error) {
 		configPath := flags.String("config", "reviewer.yaml", "path to reviewer configuration")
 		stateRepository := flags.String("state-repository", os.Getenv("GITHUB_REPOSITORY"), "owner/name repository used for durable state")
 		outputDirectory := flags.String("output-dir", "", "directory for JSON and Markdown dry-run reports")
+		analysisOnly := flags.Bool("analysis-only", false, "use read-only GitHub access and stage state locally without publication")
+		stateUpdate := flags.String("state-update-output", "", "local state update for a separate trusted persistence job")
 		if err := flags.Parse(os.Args[2:]); err != nil {
 			return err
 		}
-		reviewer, err := newApp(*configPath, logger)
+		reviewer, err := newReviewApp(*configPath, logger, *analysisOnly, *stateUpdate)
 		if err != nil {
 			_, recordErr := app.WritePollRunFiles(
 				*outputDirectory,
@@ -86,6 +88,7 @@ func run(logger *slog.Logger) (returnErr error) {
 		historical := flags.Bool("historical", false, "review a closed/merged PR without any publication or marker lookup")
 		outputFormat := flags.String("format", "json", "local output format: json or markdown")
 		outputDirectory := flags.String("output-dir", "", "directory for both JSON and Markdown dry-run reports")
+		analysisOnly := flags.Bool("analysis-only", false, "use read-only GitHub access without publication")
 		if err := flags.Parse(os.Args[2:]); err != nil {
 			return err
 		}
@@ -108,7 +111,7 @@ func run(logger *slog.Logger) (returnErr error) {
 		if *outputFormat != "json" && *outputFormat != "markdown" {
 			return recordFailure(fmt.Errorf("--format must be json or markdown, got %q", *outputFormat))
 		}
-		reviewer, err := newApp(*configPath, logger)
+		reviewer, err := newReviewApp(*configPath, logger, *analysisOnly, "")
 		if err != nil {
 			return recordFailure(err)
 		}
@@ -192,6 +195,19 @@ func run(logger *slog.Logger) (returnErr error) {
 			"published", published,
 		)
 		return nil
+
+	case "apply-state-update":
+		flags := flag.NewFlagSet("apply-state-update", flag.ContinueOnError)
+		configPath := flags.String("config", "reviewer.yaml", "path to trusted reviewer configuration")
+		repository := flags.String("state-repository", os.Getenv("GITHUB_REPOSITORY"), "repository used for durable state")
+		updatePath := flags.String("state-update", "", "staged reviewer state update")
+		if err := flags.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*updatePath) == "" {
+			return errors.New("--state-update is required")
+		}
+		return app.ApplyStateUpdate(ctx, *configPath, *repository, *updatePath, os.Getenv("GITHUB_TOKEN"))
 
 	case "apply-learnings":
 		flags := flag.NewFlagSet("apply-learnings", flag.ContinueOnError)
@@ -294,7 +310,7 @@ func run(logger *slog.Logger) (returnErr error) {
 		}, numbers, *maxPulls, *maxAssessments)
 
 	default:
-		return fmt.Errorf("unknown command %q; use poll, review, publish-report, apply-learnings, update-published-index, or track-comment-outcomes", os.Args[1])
+		return fmt.Errorf("unknown command %q; use poll, review, publish-report, apply-state-update, apply-learnings, update-published-index, or track-comment-outcomes", os.Args[1])
 	}
 }
 
@@ -314,11 +330,21 @@ func (flag *stringListFlag) Set(value string) error {
 }
 
 func newApp(configPath string, logger *slog.Logger) (*app.App, error) {
+	return newReviewApp(configPath, logger, false, "")
+}
+
+func newReviewApp(configPath string, logger *slog.Logger, analysisOnly bool, stateUpdate string) (*app.App, error) {
+	reviewToken := os.Getenv("REVIEW_GITHUB_TOKEN")
+	if analysisOnly {
+		reviewToken = os.Getenv("GITHUB_TOKEN")
+	}
 	return app.New(app.Options{
 		ConfigPath:   configPath,
 		Logger:       logger,
 		StateToken:   os.Getenv("GITHUB_TOKEN"),
-		ReviewToken:  os.Getenv("REVIEW_GITHUB_TOKEN"),
+		ReviewToken:  reviewToken,
 		CopilotToken: os.Getenv("COPILOT_GITHUB_TOKEN"),
+		AnalysisOnly: analysisOnly,
+		StateUpdate:  stateUpdate,
 	})
 }

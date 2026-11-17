@@ -11,7 +11,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: vscode-pr-reviewer
@@ -44,16 +44,15 @@ jobs:
         if: ${{ github.event_name == 'schedule' || inputs.pr_number == '' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          REVIEW_GITHUB_TOKEN: ${{ secrets.REVIEW_GITHUB_TOKEN }}
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-        run: go run ./cmd/rob-reviewer poll --output-dir review-results
+        run: go run ./cmd/rob-reviewer poll --analysis-only --state-update-output state-update.json --output-dir review-results
       - name: Review one pull request
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number != '' }}
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
-          REVIEW_GITHUB_TOKEN: ${{ secrets.REVIEW_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-        run: go run ./cmd/rob-reviewer review --pr "$PR_NUMBER" --output-dir review-results
+        run: go run ./cmd/rob-reviewer review --analysis-only --pr "$PR_NUMBER" --output-dir review-results
       - name: Upload review reports
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -61,6 +60,69 @@ jobs:
           name: performance-review-reports-${{ github.run_id }}-${{ github.run_attempt }}
           path: review-results/
           if-no-files-found: ignore
+      - name: Upload staged poll state
+        if: ${{ always() && hashFiles('state-update.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reviewer-state-update-${{ github.run_id }}-${{ github.run_attempt }}
+          path: state-update.json
+          if-no-files-found: error
+
+  persist:
+    needs: review
+    if: >-
+      ${{
+        always() &&
+        needs.review.result != 'skipped' &&
+        github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      }}
+    permissions:
+      actions: read
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Download exact analysis artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts")"
+          for kind in reports state; do
+            if [[ "$kind" == reports ]]; then
+              name="performance-review-reports-${RUN_ID}-${RUN_ATTEMPT}"
+              directory=review-results
+            else
+              name="reviewer-state-update-${RUN_ID}-${RUN_ATTEMPT}"
+              directory=state-update
+            fi
+            artifact_id="$(jq -r --arg name "$name" '.artifacts[] | select(.name == $name) | .id' <<< "$artifacts")"
+            if [[ -z "$artifact_id" ]]; then
+              continue
+            fi
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "${kind}.zip"
+            mkdir "$directory"
+            unzip -q "${kind}.zip" -d "$directory"
+          done
+      - run: go mod download
+        if: ${{ hashFiles('state-update/state-update.json') != '' }}
+      - run: go tool bundler
+        if: ${{ hashFiles('state-update/state-update.json') != '' }}
+        working-directory: cmd/rob-reviewer
+      - name: Persist staged poll state
+        if: ${{ hashFiles('state-update/state-update.json') != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: go run ./cmd/rob-reviewer apply-state-update --state-update state-update/state-update.json
       - name: Ensure reviewer history branch
         if: ${{ always() && hashFiles('review-results/**') != '' }}
         env:
