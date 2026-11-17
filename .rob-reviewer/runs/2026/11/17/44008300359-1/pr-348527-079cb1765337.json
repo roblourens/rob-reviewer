@@ -1,0 +1,185 @@
+{
+  "PullRequest": {
+    "Number": 348527,
+    "Title": "Monaco: bundle the @vscode/diff TypeScript backend in the editor worker",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nVS Code loads `@vscode/diff` at runtime from `node_modules` (`resolveAmdNodeModulePath` and a dynamic `import()` hidden from bundlers), like other npm packages in browser and worker code. In the standalone editor that path doesn't exist, so `advanced-external` and `advanced-wasm` always fell back to the built-in algorithm there.\n\nMonaco's users bundle `monaco-editor-core`'s npm dependencies themselves (like `marked` and `dompurify`), so the standalone editor's worker can import the package statically:\n\n- `vs/editor/standalone/common/bundledDiffComputer.ts` imports the TypeScript backend from `@vscode/diff/core` (no wasm) and registers it with `setBundledExternalDiffComputer`. When registered, `getExternalLinesDiffComputer` returns it synchronously, for both `advanced-external` and `advanced-wasm`.\n- Both standalone worker entries import it: `editor.worker.start.ts`, and the new `standaloneEditorWebWorkerMain.ts`, which `editorWorkerService.ts` now gives as `esmModuleLocationBundler` (only the standalone editor uses that URL).\n- `monaco-editor-core`'s `package.json` gets `@vscode/diff` (the root's version) as a dependency.\n- VS Code's own editor worker is unchanged. No changes are needed in the monaco-editor repository.\n\nThe default `advanced` algorithm is unchanged; this prepares the standalone editor for when `advanced` moves to the package.\n\nValidation:\n- `pnpm run gulp editor-distro`: passed. The extracted sources keep `import { createTsDiffComputer } from '@vscode/diff/core'`, and `out-monaco-editor-core/package.json` lists `@vscode/diff`.\n- Bundling `out-monaco-editor-core/esm/vs/editor/standalone/common/standaloneEditorWebWorkerMain.js` with esbuild (platform browser) includes only the package's TS files, no wasm loader.\n- Loading the output in Node: `getExternalLinesDiffComputer(true)` is synchronous and computes a correct diff.\n- `pnpm run typecheck-client`, `node build/oxlint.ts` on the changed files, `pnpm run valid-layers-check`: passed.\n- `scripts\\test.bat --run src/vs/editor/test/node/diffing/fixtures.test.ts --run src/vs/editor/test/common/services/editorWebWorker.test.ts`: 150 passing.\n- Not run: a monaco-editor build and the Monaco playground against this `monaco-editor-core`.",
+    "URL": "https://github.com/microsoft/vscode/pull/348527",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "hediet",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "6e6bf2f369faad9ac783014571b1ba1e91cfa01c",
+    "HeadRef": "hediet/monaco-bundled-diff",
+    "HeadSHA": "079cb17653376b876323e3b10d0779463c1e5b68",
+    "CreatedAt": "2026-11-16T11:57:40Z",
+    "UpdatedAt": "2026-11-16T13:29:01Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-C4BFD4CC6C14",
+      "Focus": "performance-review",
+      "Path": "src/vs/editor/standalone/common/bundledDiffComputer.ts",
+      "Side": "RIGHT",
+      "Line": 6,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The static import and top-level constructor call are direct changed-code evidence. The worker entries import this module unconditionally, while `editorWorkerService.ts` shows the same worker is created for ordinary links, Unicode highlighting, colors, word ranges, and default word completions. `diffEditorDefaultOptions` remains `advanced`, and `linesDiffComputers.ts` reaches this package only for the opt-in `advanced-external`/`advanced-wasm` algorithms. Exact added byte and millisecond cost depends on each consumer's bundler and browser, which affects severity but not the mechanism.",
+      "PerformanceCategory": "startup",
+      "MechanismFamily": "eager-work",
+      "PerformanceResource": "JavaScript bytes for the `@vscode/diff/core` import graph plus browser parse/evaluation CPU and the eagerly created diff-computer object",
+      "PerformanceScaling": "The cost is paid once per Monaco editor-worker creation rather than once per external-diff use; cold loads additionally transfer the package bytes, and workers recreated after the five-minute idle shutdown repeat parse/evaluation regardless of whether any external diff is ever requested.",
+      "PerformanceOutcome": "blocked worker startup and increased first-interaction latency, with repeated parse/evaluation CPU after idle worker recreation",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Before this diff, the Monaco worker entries loaded only the built-in editor worker. `@vscode/diff` was requested lazily by `getExternalLinesDiffComputer()` only when `advanced-external` or `advanced-wasm` was selected, so routine worker features and the default `advanced` algorithm did not carry this package on their startup path.",
+      "ChangedBehavior": "Every Monaco editor worker now includes, loads, parses, evaluates, and instantiates the `@vscode/diff` TypeScript backend at worker startup, before any external diff algorithm is requested.",
+      "CausalDiffEvidence": "The added static import `import { createTsDiffComputer } from '@vscode/diff/core';` at line 6 is reached unconditionally because both Monaco worker entry points newly import `bundledDiffComputer.ts`; line 11 also constructs and registers the backend during module evaluation.",
+      "Title": "Defer the bundled diff backend until an external algorithm is selected",
+      "Impact": "A standalone editor's first worker-backed interaction—commonly word completion, link computation, highlighting, or a default `advanced` diff—must wait for additional JavaScript download on a cold cache and additional parse/evaluation/initialization on every worker creation, increasing interaction latency even for applications that never opt into the package algorithms.",
+      "Evidence": "`editor.worker.start.ts:7` and `standaloneEditorWebWorkerMain.ts:7` unconditionally import this module. `EditorWorkerService.workerDescriptor` selects the new standalone entry for bundlers, and `WorkerManager.withWorker()` creates that worker on first use. Ordinary hot interactions such as `WordBasedCompletionItemProvider.provideCompletionItems()` call `withWorker()`, so the optional backend is on their startup critical path. The worker is also disposed after five idle minutes, making parse/evaluation recur on later worker recreation even when browser caching avoids another transfer. The package was previously loaded only from `getExternalLinesDiffComputer()` after an external algorithm was selected; ordinary worker startup did not import it.",
+      "Recommendation": "Register a lazy bundled provider from the worker entry and dynamically import `@vscode/diff/core` inside it on the first `advanced-external`/`advanced-wasm` request, caching that promise/computer. This lets bundlers emit the backend as an on-demand worker chunk while preserving one-time initialization and fallback semantics."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "serialization-allocation",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First routine Monaco worker-backed interaction, such as word completion, links, highlighting, colors, or a default `advanced` diff",
+        "CriticalPath": "The first worker-backed operation waits for worker creation, module loading/evaluation, `$ping`, and any required model synchronization. The newly imported backend is evaluated before the worker can answer the ping, so it is on this critical path even though no external diff is requested.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/editor/standalone/common/bundledDiffComputer.ts:6 via both changed worker entry imports",
+            "Operation": "Fetch/load the Monaco worker module graph, now including `@vscode/diff/core`.",
+            "Cardinality": "One worker-resource fetch per cold worker URL/cache state; the diff package expands that resource for every worker creation path, regardless of algorithm use.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The worker resource excluded `@vscode/diff`; package loading occurred only after selecting an external algorithm.",
+            "CriticalPathEffect": "The worker cannot answer its initial ping until the fetched module graph is parsed and evaluated."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/editor/browser/services/editorWorkerService.ts:487 and worker-backed service methods",
+            "Operation": "Initialize the editor-worker proxy, synchronize models, and invoke the requested worker method.",
+            "Cardinality": "One initial `$ping`, followed by resource synchronization and one request for the triggering operation; model cardinality depends on that operation, such as all matching models for word completions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same IPC calls occurred, but worker initialization did not first evaluate the optional diff backend.",
+            "CriticalPathEffect": "Existing worker IPC gates completion of the first interaction, but the diff does not increase IPC cardinality; it delays when the worker is ready to service it."
+          }
+        ],
+        "ScalingInput": "Worker creations across page loads and post-idle recreations; cost is one package load/evaluation per worker lifetime, not proportional to documents and not deduplicated by whether external diff is used.",
+        "EffectiveConcurrency": "One shared editor worker is lazily created per `EditorWorkerService`; requests use that worker and JavaScript execution is serialized on its event loop. Idle disposal can cause a later operation to create and initialize another worker.",
+        "CacheBehavior": "On a cold browser cache, the enlarged worker resource must be transferred; a warm HTTP cache can avoid the transfer but each newly created worker still parses/evaluates the statically imported package and constructs the computer. The worker-level registration lasts until disposal, and the five-minute idle shutdown resets it.",
+        "MechanismConfidence": "High: static imports in both worker entries and the top-level `createTsDiffComputer()` call prove eager inclusion/evaluation, while worker call sites prove routine non-diff reachability.",
+        "MagnitudeUncertainty": "The exact package byte size, bundler chunk layout, browser parse time, and prevalence of idle recreation are not available in the repository evidence. The unconditional startup placement and affected interactions are certain; this uncertainty keeps severity at medium.",
+        "Verdict": "Reportable eager-work regression: optional external-diff code is newly placed on the startup critical path for common operations that do not use it."
+      },
+      {
+        "Scenario": "Monaco application explicitly selects `advanced-external` or `advanced-wasm`",
+        "CriticalPath": "For `advanced-external` or `advanced-wasm`, worker startup, synchronization of the original and modified models, and one compute IPC must complete. Loading the backend is required work for this scenario, so bundling can avoid the former separate runtime package import failure/latency.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/editor/standalone/common/bundledDiffComputer.ts:6",
+            "Operation": "Load the statically bundled TypeScript diff backend with the editor worker.",
+            "Cardinality": "One worker module fetch containing the backend per cold cache/worker resource; no separate backend fetch after startup in the changed path.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The base worker loaded first, then the first package-algorithm request attempted one cached dynamic import from the resolved `node_modules` URL; standalone deployments without that path fell back to the built-in algorithm.",
+            "CriticalPathEffect": "Required before an explicitly requested external diff can run."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/editor/browser/services/editorWorkerService.ts:107",
+            "Operation": "Synchronize the two text models and request diff computation in the editor worker.",
+            "Cardinality": "Model synchronization for two grouped resources plus one `$computeDiff` request per requested diff computation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same model synchronization and compute IPC occurred; only backend resolution inside the worker differed.",
+            "CriticalPathEffect": "The caller awaits synchronization and the compute result."
+          }
+        ],
+        "ScalingInput": "One computation over two documents, with CPU scaling in document size inside the selected algorithm; boundary cardinality remains grouped and constant per computation.",
+        "EffectiveConcurrency": "The two models are synchronized as one resource set, then one `$computeDiff` request runs on the single worker event loop. No per-line or per-change boundary fan-out and no changed aggregate concurrency burst were found.",
+        "CacheBehavior": "The bundled computer is constructed once per worker and reused for both package algorithm names. Browser/module caching applies within the worker lifetime; disposing the worker discards the instance. There is no per-document package reload or negative-cache retry.",
+        "MechanismConfidence": "High for loading and call cardinality; insufficient evidence for a compute-speed regression.",
+        "MagnitudeUncertainty": "Relative runtime performance of the package TypeScript backend versus the previous built-in fallback is not established, so no algorithm-throughput finding is asserted.",
+        "Verdict": "No additional finding: backend loading is necessary for this opt-in scenario, is cached once per worker, and does not introduce per-item boundary fan-out."
+      },
+      {
+        "Scenario": "VS Code's non-standalone editor-worker runtime",
+        "CriticalPath": "VS Code's own editor worker follows `esmModuleLocation`, then existing ping, model synchronization, and compute IPC. The changed standalone module is off this path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/editor/browser/services/editorWorkerService.ts:63",
+            "Operation": "Load `vs/editor/common/services/editorWebWorkerMain.js` for the non-bundler runtime.",
+            "Cardinality": "One worker module load per worker lifecycle plus existing IPC per operation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical module location and boundary count.",
+            "CriticalPathEffect": "Existing worker startup and IPC remain on the operation path; the new package import is not reached."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/editor/browser/services/editorWorkerService.ts",
+            "Operation": "Communicate with VS Code's editor worker.",
+            "Cardinality": "Existing ping, grouped model synchronization, and one operation request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical IPC behavior.",
+            "CriticalPathEffect": "Unchanged critical-path IPC."
+          }
+        ],
+        "ScalingInput": "Normal VS Code worker operations and worker lifetimes; no changed multiplicity.",
+        "EffectiveConcurrency": "Unchanged single editor worker and existing serialized worker execution.",
+        "CacheBehavior": "The non-bundler descriptor still points to `editorWebWorkerMain.js`, which does not import the new standalone registration. Existing worker and model caches therefore remain unchanged for this path.",
+        "MechanismConfidence": "High: the unchanged `esmModuleLocation` resolves to an entry that has no bundled-diff import.",
+        "MagnitudeUncertainty": "None material for reachability: the descriptor explicitly separates this runtime path from the changed bundler entry.",
+        "Verdict": "No performance regression on this path because the changed standalone backend is not imported."
+      }
+    ],
+    "Summary": "Completed the performance pass over all seven changed files and full diffs. Traced standalone and non-standalone worker startup, routine worker features, opt-in external diff resolution, worker lifetime/cache behavior, model-sync and compute IPC, and build-only package generation. Submitted one medium-confidence-severity eager startup finding; no boundary fan-out, concurrency burst, unbounded retention, repeated serialization, or qualifying regression fix was found."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-17T03:19:08.072584578Z",
+    "CompletedAt": "2026-11-17T03:21:06.617337187Z",
+    "WallClockMilliseconds": 118544,
+    "ModelCalls": 10,
+    "InputTokens": 251960,
+    "OutputTokens": 7005,
+    "TotalTokens": 258965,
+    "ReasoningTokens": 2458,
+    "CacheReadTokens": 211968,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 97624,
+    "ToolCalls": 56,
+    "NanoAIUnits": 38485520000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 211968,
+      "cache_write": 0,
+      "input": 39992,
+      "output": 7005
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

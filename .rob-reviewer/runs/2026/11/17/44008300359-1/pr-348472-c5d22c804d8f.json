@@ -1,0 +1,156 @@
+{
+  "PullRequest": {
+    "Number": 348472,
+    "Title": "test: make Firefox prefer the address family the web test server bound",
+    "Body": "Windows `Browser \u0026 Remote Tests › Run integration tests (Browser, Firefox)` has failed 3 times on main CI with the same 9 `vscode API - workspace › encoding:` failures: [493794](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=493794) (Nov 6), [496418](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=496418) (Nov 13) and [497338](https://dev.azure.com/monacotools/Monaco/_build/results?buildId=497338) (Nov 16). In each run, Firefox failed to load `iconv-lite-umd.js` from the local test server with `NS_ERROR_CONNECTION_REFUSED`. The encoding APIs need that module, so they all fail together. The server didn't exit: #347059 would have reported that, and the other tests pass.\n\n## Cause\n\nThe test server listens on `localhost`, which Node resolves to `::1` only on Windows (`Server bound to ::1:\u003cport\u003e (IPv6)`). Playwright's Firefox tries `127.0.0.1` first for `localhost`. So every new connection starts with an IPv4 attempt that is refused, and a refused loopback connection takes about 2 s on Windows. Firefox then normally falls back to `::1`.\n\n- **Measured locally (Windows, Playwright Firefox 151):** with an IPv6-only server, each fresh connection took about 2,040 ms (10 of 10 rounds). A listener on `127.0.0.1` with the same port saw Firefox's first request, which confirms the IPv4-first order.\n- **CI matches:** in all 3 failing runs, the `NS_ERROR_CONNECTION_REFUSED` came 2.23 to 2.26 s after the previous log line, right when the encoding suite loads iconv lazily over a new connection. In those runs Firefox reported the refusal instead of falling back.\n- The existing `gotoWithRetry` (#315504) works around the same refusal for the initial navigation.\n\n## Change\n\nThe harness now reads the address family from the server's `Server bound to … (IPv4|IPv6)` line and launches Firefox with `network.dns.preferIPv6` set to match it, so Firefox's first attempt goes to the address the server is listening on. Other browsers are unchanged. On Linux, where the server binds `127.0.0.1`, the pref stays `false`, which is Firefox's default. If the line isn't found, nothing changes.\n\n## Validation\n\n- With `network.dns.preferIPv6: true`, the same fresh-connection rounds took 9 to 16 ms instead of about 2,040 ms, with no refused attempt.\n- A dev server launched through `scripts/code-server.bat` on Windows prints `Server bound to ::1:9890 (IPv6)`, and the harness regex picks it up.\n- Ran the real Firefox API suite (`test-web-integration` API folder tests) on Windows with this harness. Firefox launches with the pref and the run completes, with no `NS_ERROR_CONNECTION_REFUSED`. My local tree has unrelated failures from a stale prebuilt test extension, and they're the same with and without this change.\n- `tsc` for `test/integration/browser` is clean.\n\nI couldn't make Firefox fail outright locally (it fell back every time across 25 parallel bursts under full CPU load), so the CI timing above is the link between the 2 s refused attempt and the 3 failures.\n\n\u003e Authored with Copilot\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/348472",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "bryanchen-d",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "e9906360ae071077119da6652658ff3e0f385ea5",
+    "HeadRef": "flake-fixer/firefox-localhost-family",
+    "HeadSHA": "c5d22c804d8fa7e91eaf46ac1de0877f96af37a4",
+    "CreatedAt": "2026-11-16T07:29:40Z",
+    "UpdatedAt": "2026-11-16T17:31:13Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "repeated-work",
+      "boundary-fanout"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Windows CI browser integration suites running Firefox against the packaged web server",
+        "CriticalPath": "Each of the seven sequential suite invocations spawns one server, waits for the Web UI readiness line, launches one Firefox process, navigates to localhost, and loads test assets. The changed DNS preference is applied before Firefox launch and therefore affects the critical-path navigation and later fresh localhost connections.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/integration/browser/src/index.ts:224 launchServer",
+            "Operation": "Spawn the packaged VS Code web server and pipe stdout/stderr",
+            "Cardinality": "One server process per test-runner invocation; the Windows script invokes the runner seven times sequentially.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same server subprocess was spawned once per invocation with the same stdio pipes.",
+            "CriticalPathEffect": "Server startup and the readiness URL must complete before the browser can launch and navigate."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "test/integration/browser/src/index.ts:74 runTestsInBrowser",
+            "Operation": "Launch Firefox through Playwright",
+            "Cardinality": "One Firefox process per test-runner invocation, seven sequential launches in the full script.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same Firefox process launch occurred, but without an explicit loopback-family preference.",
+            "CriticalPathEffect": "Browser launch must complete before context/page creation and initial navigation."
+          },
+          {
+            "Kind": "network",
+            "Location": "test/integration/browser/src/index.ts:152 gotoWithRetry and subsequent page requests",
+            "Operation": "Navigate to the local HTTP server and fetch web client/test assets",
+            "Cardinality": "One initial navigation plus asset/module requests per suite; browser connection reuse and HTTP caching reduce effective connection count, but fresh connections can still occur within each newly launched browser.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same localhost requests occurred; Firefox used its default address-family order, which could try a non-listening IPv4 loopback endpoint before the IPv6 listener on Windows.",
+            "CriticalPathEffect": "Initial navigation and required assets block test execution; the changed preference directs Firefox to the address family parsed from the server's own startup output."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "test/integration/browser/src/index.ts:282-293 launchServer",
+            "Operation": "Decode and concatenate server stdout until the Web UI readiness line, then regex-match the bind family",
+            "Cardinality": "One temporary buffer per server launch; it contains startup output only and is released immediately when readiness is detected.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Each stdout chunk was decoded and matched independently without retaining prior chunks, so split readiness lines could be missed.",
+            "CriticalPathEffect": "The parsing is synchronous on stdout chunks but performs only string append and two regex matches during server startup; no additional wait or boundary call is introduced."
+          }
+        ],
+        "ScalingInput": "Seven sequential suite invocations; within each suite, the number of fresh localhost connections after browser connection reuse. The new stdout buffer scales with bytes emitted before the single readiness line, not with test count after startup.",
+        "EffectiveConcurrency": "The Windows test script runs suite invocations sequentially. Within an invocation there is one server and one browser; Playwright/Firefox may issue asset requests concurrently, but the diff adds no concurrency or fan-out.",
+        "CacheBehavior": "Every suite launches a fresh Firefox process and temporary server data directory, so DNS/profile and HTTP cache state do not carry across suites. The parsed family is per-launch and has no persistent cache or negative-cache lifecycle.",
+        "MechanismConfidence": "High: the code parses the server's actual IPv4/IPv6 listener family before launch and passes the matching Firefox preference; authoritative server code emits that family before the readiness URL.",
+        "MagnitudeUncertainty": "Exact connection reuse and OS refusal latency vary by Firefox and Windows version, but the changed routing mechanism is clear. Startup stdout volume varies in source runs; repository paths show packaged CI startup is small, and there is no evidence that temporary buffering is materially costly.",
+        "Verdict": "No reportable regression. The change removes wrong-family connection attempts on the affected Firefox path and adds only bounded, startup-only parsing work."
+      },
+      {
+        "Scenario": "Chromium/WebKit runs and Firefox runs where the server binds IPv4, including local source-server execution",
+        "CriticalPath": "The runner starts the server, collects output through the readiness URL, launches the selected browser, and navigates to localhost. For non-Firefox browsers the new preference is undefined; for IPv4 Firefox it is false, matching the normal IPv4-first behavior.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "test/integration/browser/src/index.ts:224 and scripts/code-server.sh:14 / scripts/code-server.bat:15",
+            "Operation": "Run scripts/code-server and, in source mode, its prelaunch checks before starting the Node server",
+            "Cardinality": "One server process per suite invocation; source mode may invoke prelaunch checks once per invocation, while packaged CI bypasses this script via VSCODE_REMOTE_SERVER_PATH.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical source-server and prelaunch subprocess behavior; stdout was scanned one chunk at a time.",
+            "CriticalPathEffect": "All source prelaunch output and server initialization precede readiness. The diff observes this existing stdout but does not add subprocesses or filesystem/network work."
+          },
+          {
+            "Kind": "network",
+            "Location": "test/integration/browser/src/index.ts:152",
+            "Operation": "Load the localhost workbench and integration-test resources",
+            "Cardinality": "One page navigation and its resource graph per suite, with browser-managed request concurrency and caching within that browser process.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same browser requests and retry policy occurred.",
+            "CriticalPathEffect": "Required resources block test progress. The diff leaves address-family behavior unchanged for Chromium/WebKit and effectively unchanged for IPv4-bound Firefox."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "test/integration/browser/src/index.ts:282-293",
+            "Operation": "Accumulate stdout across chunks until readiness so both server-address and URL lines can be parsed",
+            "Cardinality": "One buffer per launch, released before tests begin; source prelaunch output can make it larger than packaged-server output.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No cross-chunk accumulation; only the current chunk was converted and searched.",
+            "CriticalPathEffect": "Adds allocation and repeated string concatenation during startup, but normal scripts only run prelaunch checks/downloads when dependencies or build outputs are missing, and no concrete material startup or memory regression is established."
+          }
+        ],
+        "ScalingInput": "Bytes emitted by prelaunch/server startup before the readiness line, and seven independent suite launches in a full run. The retained buffer resets for every suite and is discarded at readiness.",
+        "EffectiveConcurrency": "Suite processes are sequential in the provided scripts; browser resource requests may be concurrent but the diff neither increases their count nor removes backpressure.",
+        "CacheBehavior": "Prelaunch checks use existing node_modules/out/Electron artifacts as warm-state gates; missing artifacts can trigger cold installs/downloads/compile, but those are pre-existing operations. Browser/server state is fresh per suite.",
+        "MechanismConfidence": "High for the temporary allocation mechanism and unchanged browser paths; low for any meaningful adverse magnitude, so no issue is reported.",
+        "MagnitudeUncertainty": "A pathological cold source setup could emit more stdout and make concatenation cost grow, but the data remains startup-scoped and repository evidence does not establish a realistic material regression; this is insufficient for a finding.",
+        "Verdict": "No reportable regression. Non-Firefox behavior is unchanged, IPv4 Firefox retains its default preference, and temporary stdout retention is not evidenced as materially harmful."
+      }
+    ],
+    "Summary": "Completed the performance pass over the sole changed file and traced server startup, stdout parsing, browser launch, local HTTP requests, suite multiplicity, cache state, and concurrency. No actionable diff-introduced performance issue was found. The PR appears to fix a connection-delay mechanism, but the available base-line blame does not reliably identify the commit that introduced the underlying Windows/Firefox address-family mismatch, so no regression-fix record was submitted."
+  },
+  "Stats": {
+    "Model": "gpt-5.6-sol",
+    "ActualModels": [
+      "gpt-5.6-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-17T03:15:11.811198264Z",
+    "CompletedAt": "2026-11-17T03:17:38.864011034Z",
+    "WallClockMilliseconds": 147052,
+    "ModelCalls": 10,
+    "InputTokens": 181616,
+    "OutputTokens": 4761,
+    "TotalTokens": 186377,
+    "ReasoningTokens": 1574,
+    "CacheReadTokens": 134656,
+    "CacheWriteTokens": 0,
+    "APIDurationMilliseconds": 74428,
+    "ToolCalls": 37,
+    "NanoAIUnits": 33692240000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 134656,
+      "cache_write": 0,
+      "input": 46960,
+      "output": 4761
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
