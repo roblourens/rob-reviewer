@@ -1,0 +1,230 @@
+{
+  "PullRequest": {
+    "Number": 349200,
+    "Title": "agentHost: Keep responsive relay reconnects alive",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nA reachable host can answer a liveness `ping` while its `reconnect` reply is still on the way. The Web PubSub transport used to discard the ping reply before it reached the protocol client; the client then closed the connection for silence. In a localhost reproduction, holding just the reconnect reply for 27 seconds caused a second reconnect even though the host answered the probe.\n\nThis change delivers only a reply to a ping sent during the pending handshake, on the joined reply lane. It cannot mark the connection ready, select a generation, release session traffic, or extend the handshake deadline. The change applies to the shared Web PubSub client, including GitHub-registered hosts; other transports are unchanged. No wire or timeout change.\n\n**Trade-off:** if the handshake reply is lost but pings still get through, the unchanged 30-second handshake deadline now wins instead of the 25-second silence watchdog. If all return traffic stops, the watchdog still fires as before.\n\n**Verification**\n- `pnpm run build-fast --client-only` and `pnpm run typecheck-client` — passed.\n- `VSCODE_SKIP_PRELAUNCH=1 ./scripts/test.sh --run src/vs/platform/agentHost/test/electron-browser/agentHostProtocolClient.test.ts --run src/vs/platform/agentHost/test/browser/webPubSubRelayTransport.test.ts --reporter dot` — 541 passed.\n- `node test/unit/browser/index.js --run src/vs/platform/agentHost/test/browser/webPubSubRelayTransport.test.ts --browser chromium --reporter dot` — 77 passed.\n- Six standalone, local WebSocket fault scenarios using the actual VS Code protocol client and agent host plus a test relay: the 27-second reply was accepted on the first reconnect when pings returned; losing the request or reply still timed out; holding all return traffic still triggered the watchdog. The same held session was verified after every recovery. This was not a live-service test and does not establish how common the problem is.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/349200",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "osortega",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "22d53a1ff6572fcdd77a2f919fff96e1f7741e94",
+    "HeadRef": "osortega/relay-handshake-liveness",
+    "HeadSHA": "6790070081bca399c7584988de9739db37f0bc34",
+    "CreatedAt": "2026-11-19T06:23:39Z",
+    "UpdatedAt": "2026-11-19T06:40:05Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/browser/webPubSubRelayTransport.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 487,
+      "BasePath": "src/vs/platform/agentHost/browser/webPubSubRelayTransport.ts",
+      "BaseLine": 478,
+      "IntroducingPath": "src/vs/platform/agentHost/browser/webPubSubRelayTransport.ts",
+      "IntroducingCommit": "431af7bbe286c90b2df828d495cf31e3e33f0fd7",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "latency",
+      "Mechanism": "Dropping live probe replies during a pending relay handshake made the client watchdog dispose a reachable connection at 25s, aborting 25-30s handshakes and repeating serialized credential preparation, WebSocket connection/join setup and protocol recovery, while session requests remained gated.",
+      "Symptom": "A reachable host whose reconnect response arrives at 27s could not complete that attempt despite replying to pings, delaying session recovery by another retry/backoff and network setup, or exhausting the retry policy.",
+      "FixedBehavior": "Changed lines 487-492 admit a response only to an outstanding ping tagged with the current handshake ID on a joined to-client lane, excluding closed generations. This reaches the existing inbound-liveness reset without completing the handshake or rescheduling its 30s deadline, allowing a responsive slow reconnect to finish instead of triggering redundant recovery.",
+      "Evidence": "The deleted base line 478 unconditionally discarded every non-handshake response while _handshakeId was set. AgentHostProtocolClient._installTransport (756) routes onMessage to _handleMessage, whose line 3296 resets inbound liveness; its _onPingTimer (4108) already sends probes during reconnect, and ProtocolLivenessMonitor arms the close timer for 5s + 20s. Thus answered probes were discarded and a reconnect reply taking 27s was preempted at 25s. _onLivenessTimeout (4122-4127) disposes the transport and _attemptReconnect/_scheduleReconnect (1196-1330) retries serially, repeating connection preparation, WebSocket joins, capability advertisement and reconnect RPC. Added integration test lines 996-1007 models a 27s reconnect response with immediate ping replies and asserts successful recovery on the first replacement socket; this is static and test-source evidence, not a benchmark run. blame_base_line identifies the unconditional discard as introduced by 431af7bbe286c90b2df828d495cf31e3e33f0fd7.",
+      "Confidence": 0.96
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "unbounded-retention",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Initial connection or reconnect to a responsive relay host with a slow initialize/reconnect response, including cloud and user-local Mission Control hosts.",
+        "CriticalPath": "Credential preparation, WebSocket opening, group joins and capability acknowledgement precede the protocol handshake; authentication and subscription restoration then precede releasing queued session traffic. Admitted pong responses only reset liveness and resolve ping requests, not the handshake or session gate.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/contrib/chat/browser/remoteAgentHost/cloudSandboxCredentialRefresh.ts:_ensureCredentials/_doRefresh; cloudSandboxApiService.ts:_connectRequest",
+            "Operation": "Acquire replacement admission credentials through the existing Mission Control environment reconnect API.",
+            "Cardinality": "Zero acquisition calls when the valid-ticket ensure path applies; otherwise one logical environment reconnect API invocation per coalesced acquisition, with existing request policy and retry/backoff. Not one call per subscription.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same credential cache, coalescing and API placement, but dropping answered probes could abort a responsive handshake and force another credential-preparation cycle.",
+            "CriticalPathEffect": "Awaited before creating a replacement transport; avoiding a false watchdog close can avoid an entire subsequent acquisition/backoff."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/webPubSubRelayTransport.ts:connect/_handleHandshakeFrame/send/_sendRaw",
+            "Operation": "Open WebSocket, join two groups, advertise capabilities, send one handshake request and periodic ping probes; acknowledge received sequence IDs.",
+            "Cardinality": "One socket and two joins per actual attempt, one pre-handshake capability publication and another on handshake success. A small ping uses one application publish; approximately five during a 27-second responsive handshake, with existing per-frame receipt acknowledgements.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same setup and initial probe boundaries. The first probe reply was dropped during the protocol handshake, so later probes were not rearmed and the watchdog discarded the attempt at 25 seconds. The diff enables additional bounded probe round trips by accepting replies, while avoiding repeated setup.",
+            "CriticalPathEffect": "Socket setup and handshake response are awaited; ping replies preserve that wait without releasing session work early."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/protocolServerHandler.ts:_handleNewConnection/_restoreReconnectSubscriptions",
+            "Operation": "Answer ping statelessly; restore unique subscribed channels before sending reconnect replay or snapshots.",
+            "Cardinality": "Constant-cost ping response per probe; existing subscription service calls occur once per eligible unique classified URI, collected in Promise.all. Reconnect carries subscriptions together in one RPC.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The host already answered pings while restoration was pending. The client discarded those replies and could start a redundant restoration attempt.",
+            "CriticalPathEffect": "Ping is answered independently of pending asynchronous handshake restoration; restoration still gates the handshake response."
+          }
+        ],
+        "ScalingInput": "Number of connected hosts, handshake duration, and unique subscriptions in a reconnect. With prompt pong responses and a 27-second complete handshake, approximately five watchdog ping round trips occur, versus one previously before the 25-second watchdog aborted the attempt. Production joinGroups contains exactly broadcast and to-client; batches are capped at 256 messages.",
+        "EffectiveConcurrency": "AgentHostProtocolClient._attemptReconnect uses reconnect.inFlight to allow one attempt per client; retries are sequential with backoff. The liveness monitor has one ping timer, rearmed on inbound traffic, normally producing one outstanding watchdog ping. Independent host clients remain independent. Host subscription restoration uses existing Promise.all with deduplication by classified URI.",
+        "CacheBehavior": "Existing credentials are reused on initial setup and the first cloud recovery while unexpired; user-local recovery and subsequent cloud recovery request refreshes. Refreshes coalesce per refresher, preserve failure/backoff state across replacements and rate-limit forced refreshes to 30 seconds. The new request Map is capped at 1024 and ping entries are deleted on delivery; all entries clear on handshake response or closure.",
+        "MechanismConfidence": "High: traced transport delivery, client inbound-liveness reset, 5-second probe/25-second silence timers, serialized retry handling, production two-group factory, credential coalescing and stateless host ping dispatch.",
+        "MagnitudeUncertainty": "The actual frequency of 25–30-second complete handshakes and live-service boundary durations is unknown. The added fake-timer test models a 27-second reply; it is not a production benchmark.",
+        "Verdict": "No introduced performance regression. This fixes false watchdog cancellation and redundant network recovery; the regression fix was recorded separately with base-line blame provenance."
+      },
+      {
+        "Scenario": "Handshake reply is lost, but complete ping replies continue arriving.",
+        "CriticalPath": "Session traffic remains gated until a handshake response or failure. Pongs reset the silence watchdog, but the existing 30-second handshake timer still terminates an unanswered complete-message handshake; pong delivery does not schedule that timer.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/agentHostProtocolClient.ts:_onPingTimer; webPubSubRelayTransport.ts:_deliver/send",
+            "Operation": "Existing watchdog probes and relay acknowledgements continue until the host-handshake deadline.",
+            "Cardinality": "Approximately five prompt-response ping round trips in a 30-second unanswered complete handshake, versus one probe and a watchdog close at 25 seconds before this diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Probe sending already existed, but its reply was dropped and the earlier silence deadline won. Additional timer rearming follows from the intentionally admitted host responses.",
+            "CriticalPathEffect": "Recovery can wait up to five additional seconds for this specific lost-handshake/responding-ping case; no session requests are released by the pongs."
+          }
+        ],
+        "ScalingInput": "Pending-handshake lifetime and number of clients. Prompt complete pongs produce roughly five probes before the original 30-second handshake deadline, not unbounded background probing for a lost complete reply.",
+        "EffectiveConcurrency": "One recovery attempt per client and one watchdog probe timer, normally one ping in flight; next attempts wait for existing retry and credential-rate-limit policy.",
+        "CacheBehavior": "Each admitted reply deletes its request Map entry and completes the client's pending ping. Closure cancels timers and clears request, publish-ack and closure-generation tracking. Credential caches and negative/backoff states are unchanged.",
+        "MechanismConfidence": "High: the added transport test accepts current pongs yet asserts hostHandshakeTimeout at 30 seconds; matching replies fall through delivery without clearing handshake state or rescheduling the timer.",
+        "MagnitudeUncertainty": "Prevalence of selectively lost handshake replies is unknown. The five-second deadline difference follows directly from unchanged timers rather than measured service latency.",
+        "Verdict": "No reportable regression: bounded, explicit liveness/handshake scheduling tradeoff preserves the opportunity for slow valid handshakes and does not create unbounded work or retention."
+      },
+      {
+        "Scenario": "All host return traffic stops, or only relay acknowledgements/system frames arrive.",
+        "CriticalPath": "The client watchdog still closes after the existing 25-second inbound-silence window, rejects pending handshake requests and schedules serialized recovery. Relay connectivity alone does not allow session progress.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/common/protocolLivenessMonitor.ts:_armTimers; browser/agentHostProtocolClient.ts:_onLivenessTimeout/_attemptReconnect",
+            "Operation": "Send the existing idle ping, dispose the silent socket and perform credential preparation/WebSocket recovery.",
+            "Cardinality": "One ordinary idle probe per silent attempt; one replacement setup per permitted sequential retry, subject to existing credential reuse/coalescing.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical probe, timeout and retry behavior because no host ping response reaches the newly allowed branch.",
+            "CriticalPathEffect": "The 25-second silence timeout still bounds waiting for complete return silence; socket setup remains on recovery's critical path."
+          }
+        ],
+        "ScalingInput": "Number of disconnected clients and existing retry-policy limits; no additional frequency or fan-out is introduced when host pongs do not arrive.",
+        "EffectiveConcurrency": "One initial idle probe and one close timer per client in ordinary load; existing high-load and reverse-request deferral rules remain unchanged. Recovery attempts remain serialized and backoff-controlled.",
+        "CacheBehavior": "No accepted ping reply means no new liveness reset. Existing cleanup clears the new Map just as it cleared the old Set; failed credential acquisition retains existing bounded backoff and permanent-failure state.",
+        "MechanismConfidence": "High: relay ack handling never fires onMessage/onDidReceiveData, and the only new fallthrough requires a tracked ping response on a joined reply lane.",
+        "MagnitudeUncertainty": "Simultaneous disconnected-client count and network recovery latency are deployment-dependent, but the diff does not increase their cardinality or concurrency.",
+        "Verdict": "No performance regression; no new retries, boundaries or retained resources for total return-traffic failure."
+      },
+      {
+        "Scenario": "Warm established sessions receiving normal, duplicate, batched or unrelated relay traffic.",
+        "CriticalPath": "Existing JSON parsing, sequence acknowledgement, reassembly, generation filtering and synchronous message dispatch precede applying received session updates. The new lane check adds no awaited operation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/browser/webPubSubRelayTransport.ts:_startObserving/_handleInboundFrame; common/webPubSub/framing.ts:parseInbound",
+            "Operation": "Parse reliable JSON, validate capped batches and reassemble chunks.",
+            "Cardinality": "Existing work once per frame, with up to 256 batch messages; diff adds only one short group-list membership check per completed frame and an O(1) tagged request lookup when a handshake is pending.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same payload parsing, allocation, reassembly and batch iteration; no richer session payload or additional full-message transformation is introduced.",
+            "CriticalPathEffect": "Synchronous receive work remains unchanged apart from bounded scalar checks."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/browser/webPubSubRelayTransport.ts:_handleInboundFrame/_sendRaw",
+            "Operation": "Send existing reliable-subprotocol sequence acknowledgement.",
+            "Cardinality": "One acknowledgement per valid sequence-bearing message frame, including duplicates; unaffected by payload batching or the new lane flag.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same acknowledgement count and placement.",
+            "CriticalPathEffect": "Still sent before application delivery; no added wait."
+          }
+        ],
+        "ScalingInput": "Received frames and payloads. The new joinGroups.includes runs once per complete frame over the production two-group list, not once per batch item. Outstanding requests remain capped at 1024 and closure generations at 128.",
+        "EffectiveConcurrency": "Receive processing remains synchronous per WebSocket event; batch payloads are delivered sequentially. Sequence IDs are acknowledged before reassembly/application processing, and existing sequence deduplication is unchanged.",
+        "CacheBehavior": "No response cache is added. Request lookup remains constant-time via Map instead of Set; replies delete IDs, handshake completion clears request tracking and transport close clears tracking and cancels timers. Duplicate ping replies cannot repeatedly reset liveness during a handshake once their tracked entry is deleted.",
+        "MechanismConfidence": "High: complete transport lifecycle and framing code establish bounded collection sizes, per-frame rather than per-item membership work, and unchanged acknowledgements/serialization.",
+        "MagnitudeUncertainty": "Session event rate and batch prevalence vary; the additional constant-sized checks do not establish an actionable degradation at realistic production group counts.",
+        "Verdict": "No performance regression. The Set-to-Map metadata change preserves bounded lifecycle and does not introduce collection-wide work, cache leaks or network fan-out."
+      },
+      {
+        "Scenario": "Optional AHP JSONL logging while a relay handshake accepts liveness replies.",
+        "CriticalPath": "A newly admitted pong is synchronously serialized into the existing optional logger before onMessage dispatch. File creation, size resolution and append writes run on the logger's promise queue and are not awaited by handshake or message delivery.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/browser/webPubSubRelayTransport.ts:_deliver/_logProtocolMessage; common/ahpJsonlLogger.ts:log",
+            "Operation": "Measure and serialize accepted ping responses for the optional transcript.",
+            "Cardinality": "One new transcript entry per tracked handshake ping response; normal host ping responses are stateless success null or a small unsupported-method error. All regular-message logging is unchanged.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Handshake ping replies returned before _logProtocolMessage, so their inbound transcript entries were absent; outgoing pings and normal established messages were already logged.",
+            "CriticalPathEffect": "Small synchronous serialization precedes liveness reset; does not process a collection of session snapshots."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/common/ahpJsonlLogger.ts:_scheduleDrain/_writeBuffers/_rotate",
+            "Operation": "Existing optional folder creation, file-size resolution, coalesced append and size-based rotation/deletion.",
+            "Cardinality": "Folder creation once per logger, initial size resolution per segment, and append calls per coalesced batch, not necessarily one per message. Newly admitted pongs add a few small entries; logger budgets and batching remain in force.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Same logging machinery and lifecycle, but handshake pongs did not enqueue inbound entries. Avoided redundant recovery can also avoid another logger/socket instance.",
+            "CriticalPathEffect": "Off the session/handshake critical path; asynchronous queue is not awaited by transport delivery."
+          }
+        ],
+        "ScalingInput": "Number of admitted small pong responses during a pending handshake and enabled cloud-host loggers; approximately five entries for a 27-second responsive handshake. This does not admit arbitrary session payloads during the handshake.",
+        "EffectiveConcurrency": "Existing logger drain scheduling coalesces entries and serializes writes per logger; each append batch is capped at 1 MiB. The production transport logger is optional for non-user-local cloud hosts and absent for user-local hosts.",
+        "CacheBehavior": "Logger folder creation is memoized per logger; pending log bytes are capped at 4 MiB and the process log-home byte budget at 500 MiB. Request Map entries are removed after one accepted response. Existing rotation and write-queue behavior are unchanged.",
+        "MechanismConfidence": "High: logging reachability, optional production construction, asynchronous append placement, coalescing and budgets are all traced. The incremental cost is real but small and bounded in the reviewed scenario.",
+        "MagnitudeUncertainty": "Logging enablement and filesystem speed vary; there is no evidence of large legitimate pong payloads or enough added frequency to cause meaningful CPU/I/O pressure.",
+        "Verdict": "No reportable performance regression; newly delivered liveness replies add bounded optional diagnostic work, without increasing session serialization scale or placing filesystem waits on recovery's critical path."
+      }
+    ],
+    "Summary": "Completed the sole enabled performance-review pass. Inspected the complete four-file inventory and all diff pages, transport receive/send/cleanup paths, framing, client initialization/watchdog/reconnect/request gates, production factory and credential caching/coalescing, host ping/restoration dispatch, optional logging boundaries, and added tests. No high-confidence diff-introduced performance issues qualified. Recorded the concrete avoided redundant-reconnect regression fix against introducing commit 431af7bbe286c90b2df828d495cf31e3e33f0fd7. Static read-only review; no runtime profiling or live-service measurements."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-20T04:29:44.497971876Z",
+    "CompletedAt": "2026-11-20T04:32:49.434829071Z",
+    "WallClockMilliseconds": 184936,
+    "ModelCalls": 11,
+    "InputTokens": 556824,
+    "OutputTokens": 7205,
+    "TotalTokens": 564029,
+    "ReasoningTokens": 1594,
+    "CacheReadTokens": 469812,
+    "CacheWriteTokens": 86979,
+    "APIDurationMilliseconds": 150706,
+    "ToolCalls": 41,
+    "NanoAIUnits": 33654470000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 469812,
+      "cache_write": 86979,
+      "input": 33,
+      "output": 7205
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
