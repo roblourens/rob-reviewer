@@ -1,0 +1,287 @@
+{
+  "PullRequest": {
+    "Number": 349291,
+    "Title": "files: allow cancelling downloads and uploads between local and remote",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #111578\n\nIn the desktop app, downloading a file from a remote (Codespaces, SSH, WSL…) or uploading one to it could not be cancelled. The only way out was to reload the window. Cancelling a multi-item Explorer copy also did not stop the item being copied (#111624), because the token never reached the file service.\n\n## Changes\n\n- **File service:** `IFileService.copy` and `move` accept an optional cancellation token. When the file service copies the contents itself, which includes every copy across providers, it checks the token before each chunk and between files. When cancelled, it removes the partial target and rejects with `CancellationError`. Providers that read a whole file at once receive the token too. A move across providers can only be cancelled while it copies, never once it deletes the source.\n- **Working copy file service:** checks the token between operations. A cancelled `move` or `copy` rejects with the new `WorkingCopyFileOperationCancellationError`, which lists the operations that completed.\n- **Bulk file edits:** after a cancellation, undo covers exactly the copies and moves that completed. A cancellation before anything changed no longer adds an empty undo step.\n- **Explorer:**\n  - Desktop download now offers Cancel (before, only web did).\n  - Download and drag-and-drop import pass their token through and show a single cancellable progress notification. Before, a download showed two notifications and neither could cancel.\n  - Other Explorer operations only offer Cancel when it can take effect.\n- **Progress service:** progress shown in a view no longer throws `Cannot access 'promise' before initialization` when a task reports progress before it returns. Explorer progress hit this once downloads stopped using a second notification.\n\n## Notes for reviewers\n\n- **Behavior changes:**\n  - A cancelled `IWorkingCopyFileService.move` or `copy` now rejects instead of resolving.\n  - Multi-item delete and single renames within one provider no longer show a Cancel button. It never had an effect there.\n- **Still cannot stop partway through one item:**\n  - copies that a provider performs itself (for example, a large folder copied on local disk, or a copy within one remote);\n  - renames and deletes.\n\n  Those still stop between items.\n- **Partial cancellation:** when a multi-item operation is cancelled partway, files that already moved and had unsaved changes are handled the same way as today's partial failures.\n\n## How to test\n\nManual: open a remote window (for example with **Remote-TestResolver: New TestResolver Window**, then **Remote-TestResolver: Slowdown Connection** so transfers are slow). Then:\n\n1. Right-click a large file and choose **Download...**: there should be one \"Downloading\" notification with **Cancel**. Cancelling should remove the partially downloaded file.\n2. Drag a large local file onto the remote Explorer: there should be one \"Copying\" notification with **Cancel**. Cancelling should remove the partial file on the remote.\n\nValidation (macOS arm64, dev build from this branch):\n\n- `pnpm run typecheck-client`: passed\n- `pnpm run oxlint \u003cchanged files\u003e` and the pre-commit hygiene check: passed\n- Unit tests, 180 passing:\n  ```\n  ./scripts/test.sh --run src/vs/platform/files/test/browser/fileService.test.ts --run src/vs/workbench/contrib/bulkEdit/test/browser/bulkFileEdits.test.ts --run src/vs/workbench/services/workingCopy/test/browser/workingCopyFileService.test.ts --run src/vs/workbench/contrib/files/test/browser/explorerService.test.ts --run src/vs/workbench/contrib/files/test/browser/explorerView.test.ts --run src/vs/workbench/contrib/files/test/browser/fileActions.test.ts --run src/vs/workbench/services/progress/test/browser/progressService.test.ts --run src/vs/workbench/services/progress/test/browser/progressIndicator.test.ts\n  ```\n  The new tests fail without the changes they cover.\n- End to end, in a remote window through the test resolver, with the connection slowed down:\n  ```\n  node test/scenario/out/runScenario.js issue-111578.cjs --dev --remote\n  ```\n  - **This branch:** all 7 steps passed. A 64 MB download and a 64 MB upload were each cancelled after about 1.25 MB. The partial file was removed and stayed removed, the source was intact, and no error appeared.\n  - **`main`:** fails at step 3, because one download shows two notifications (\"Downloading large-download.bin\" and \"Downloading: large-download.bin\") and neither has Cancel.\n\n  The upload step sends the drag data VS Code uses for files dragged between its windows, which goes through the same import as a drop from the OS. Real OS drags cannot be scripted.\n\n\u003cdetails\u003e\n\u003csummary\u003eEnd-to-end scenario (\u003ccode\u003eissue-111578.cjs\u003c/code\u003e)\u003c/summary\u003e\n\n```js\n/*---------------------------------------------------------------------------------------------\n *  Copyright (c) Microsoft Corporation. All rights reserved.\n *  Licensed under the MIT License. See License.txt in the project root for license information.\n *--------------------------------------------------------------------------------------------*/\n\n// Run with: node test/scenario/out/runScenario.js .build/vscode-playwright-mcp/issue-111578.cjs --dev --remote\n//\n// The `--remote` flag opens the workspace through the built-in test resolver\n// (`vscode-remote://test+test/...`), which runs a remote server from this\n// checkout. The scenario slows that connection down so that a transfer between\n// the local machine and the remote takes long enough to be cancelled.\n\nconst fs = require('fs');\nconst os = require('os');\nconst path = require('path');\n\nconst SIZE = 64 * 1024 * 1024;\n\nconst root = path.join(os.tmpdir(), 'issue-111578');\nconst workspacePath = path.join(root, 'remote-workspace');\nconst localDir = path.join(root, 'local');\nconst remoteSource = path.join(workspacePath, 'large-download.bin');\nconst downloadTarget = path.join(localDir, 'large-download.bin');\nconst localSource = path.join(localDir, 'large-upload.bin');\nconst uploadTarget = path.join(workspacePath, 'large-upload.bin');\n\nfs.rmSync(root, { recursive: true, force: true });\nfs.mkdirSync(workspacePath, { recursive: true });\nfs.mkdirSync(localDir, { recursive: true });\nfor (const file of [remoteSource, localSource]) {\n\tfs.writeFileSync(file, Buffer.alloc(SIZE, 0x2a));\n}\n\nfunction sizeOf(file) {\n\ttry {\n\t\treturn fs.statSync(file).size;\n\t} catch {\n\t\treturn undefined;\n\t}\n}\n\nasync function waitFor(description, predicate, timeoutMs, intervalMs = 250) {\n\tconst end = Date.now() + timeoutMs;\n\tfor (; ;) {\n\t\tconst result = await predicate();\n\t\tif (result) {\n\t\t\treturn result;\n\t\t}\n\t\tif (Date.now() \u003e end) {\n\t\t\tthrow new Error(`Timed out after ${timeoutMs}ms waiting for ${description}.`);\n\t\t}\n\t\tawait new Promise(resolve =\u003e setTimeout(resolve, intervalMs));\n\t}\n}\n\nasync function waitForGrowingFile(file) {\n\tconst first = await waitFor(`${path.basename(file)} to receive data`, () =\u003e sizeOf(file) \u003e 0 ? sizeOf(file) : undefined, 60000);\n\tawait new Promise(resolve =\u003e setTimeout(resolve, 3000));\n\tconst second = sizeOf(file);\n\tif (!(second \u003e first) || second \u003e= SIZE) {\n\t\tthrow new Error(`Expected ${path.basename(file)} to be growing while incomplete, but it went from ${first} to ${second} of ${SIZE} bytes.`);\n\t}\n\treturn { first, second };\n}\n\nasync function showNotificationsCenter(context) {\n\tawait context.workbench.quickaccess.runCommand('notifications.showList');\n\tawait context.page.waitForSelector('.notifications-center', { state: 'visible', timeout: 10000 });\n}\n\nfunction readNotifications(page) {\n\treturn page.evaluate(() =\u003e [...document.querySelectorAll('.notifications-center .notification-list-item')].map(item =\u003e ({\n\t\tmessage: item.querySelector('.notification-list-item-message')?.textContent?.trim() ?? '',\n\t\tbuttons: [...item.querySelectorAll('.notification-list-item-buttons-container .monaco-button')].map(button =\u003e button.textContent.trim()),\n\t\terror: !!item.querySelector('.notification-list-item-icon.codicon-error')\n\t})));\n}\n\n/**\n * Returns the single notification whose message matches the pattern, expanded\n * so that its buttons are rendered. Fails when there is not exactly one.\n */\nasync function getSingleNotification(context, pattern) {\n\tawait showNotificationsCenter(context);\n\tconst matching = await waitFor(`a notification matching ${pattern}`, async () =\u003e {\n\t\tconst all = await readNotifications(context.page);\n\t\tconst found = all.filter(notification =\u003e pattern.test(notification.message));\n\t\treturn found.length ? { all, found } : undefined;\n\t}, 15000);\n\n\tif (matching.found.length !== 1) {\n\t\tthrow new Error(`Expected exactly one notification matching ${pattern}, found ${matching.found.length}: ${JSON.stringify(matching.all)}`);\n\t}\n\n\tconst item = context.page.locator('.notifications-center .notification-list-item').filter({ hasText: pattern });\n\tif (!matching.found[0].buttons.length) {\n\t\tconst expand = item.locator('.codicon-notifications-expand');\n\t\tif (await expand.count()) {\n\t\t\tawait expand.first().click();\n\t\t} else {\n\t\t\tawait item.locator('.notification-list-item-message').click();\n\t\t}\n\t}\n\n\tconst [notification] = (await readNotifications(context.page)).filter(notification =\u003e pattern.test(notification.message));\n\treturn { item, notification };\n}\n\nasync function cancelAndVerifyCleanup(context, pattern, target, source, location) {\n\tconst { item, notification } = await getSingleNotification(context, pattern);\n\tawait item.locator('.notification-list-item-buttons-container .monaco-button', { hasText: 'Cancel' }).click();\n\tconst sizeAtCancel = sizeOf(target);\n\n\tawait waitFor(`the partial ${location} file to be removed`, () =\u003e sizeOf(target) === undefined, 30000);\n\n\t// Make sure nothing keeps writing to the target after the cancellation\n\tawait new Promise(resolve =\u003e setTimeout(resolve, 5000));\n\tif (sizeOf(target) !== undefined) {\n\t\tthrow new Error(`The ${location} file reappeared after the cancellation with ${sizeOf(target)} bytes.`);\n\t}\n\tif (sizeOf(source) !== SIZE) {\n\t\tthrow new Error(`The source changed after the cancellation: ${sizeOf(source)} of ${SIZE} bytes.`);\n\t}\n\n\tconst remaining = await readNotifications(context.page);\n\tif (remaining.some(entry =\u003e pattern.test(entry.message))) {\n\t\tthrow new Error(`The progress notification is still shown after the cancellation: ${JSON.stringify(remaining)}`);\n\t}\n\tconst errors = remaining.filter(entry =\u003e entry.error);\n\tif (errors.length) {\n\t\tthrow new Error(`The cancellation showed an error: ${JSON.stringify(errors)}`);\n\t}\n\n\treturn `Clicked Cancel on \"${notification.message}\" with ${sizeAtCancel} of ${SIZE} bytes transferred. The partial ${location} file was removed and stayed removed for 5s, the source is intact (${SIZE} bytes) and no error was shown.`;\n}\n\nfunction explorerRow(page, name) {\n\treturn page.locator('.explorer-folders-view .monaco-list-row').filter({ hasText: name });\n}\n\nmodule.exports = {\n\tid: 'vscode-111578-cancel-remote-transfer',\n\ttitle: 'Cancel downloads and uploads between the local machine and a remote',\n\tsource: 'https://github.com/microsoft/vscode/issues/111578',\n\tworkspacePath,\n\tuserSettings: {\n\t\t'window.menuStyle': 'custom',\n\t\t'security.workspace.trust.enabled': false,\n\t\t'workbench.startupEditor': 'none'\n\t},\n\tsteps: [\n\t\t{\n\t\t\tid: 'RT-01',\n\t\t\ttitle: 'Open a remote workspace and slow its connection down',\n\t\t\tasync run(context) {\n\t\t\t\tawait context.workbench.quickaccess.runCommand('workbench.view.explorer');\n\t\t\t\tawait explorerRow(context.page, 'large-download.bin').waitFor({ state: 'visible', timeout: 60000 });\n\t\t\t\tconst remoteIndicator = (await context.page.locator('[id=\"status.host\"]').textContent({ timeout: 10000 }))?.trim();\n\n\t\t\t\tawait context.workbench.quickaccess.runCommand('vscode-testresolver.toggleConnectionSlowdown');\n\t\t\t\tawait context.page.locator('.statusbar-item', { hasText: 'Remote connection slowed down' }).waitFor({ state: 'visible', timeout: 10000 });\n\n\t\t\t\treturn `The Explorer shows large-download.bin from the remote (indicator \"${remoteIndicator}\") and the test resolver reports the connection as slowed down.`;\n\t\t\t}\n\t\t},\n\t\t{\n\t\t\tid: 'RT-02',\n\t\t\ttitle: 'Download the remote file to the local machine',\n\t\t\tasync run(context) {\n\t\t\t\tawait explorerRow(context.page, 'large-download.bin').click({ button: 'right' });\n\t\t\t\tconst download = context.page.locator('.monaco-menu .action-item', { hasText: 'Download...' });\n\t\t\t\tawait download.waitFor({ state: 'visible', timeout: 10000 });\n\t\t\t\tawait download.click();\n\n\t\t\t\tconst input = context.page.locator('.quick-input-widget .quick-input-box input');\n\t\t\t\tawait input.waitFor({ state: 'visible', timeout: 20000 });\n\t\t\t\tawait input.fill(downloadTarget);\n\t\t\t\tawait new Promise(resolve =\u003e setTimeout(resolve, 1000));\n\t\t\t\tawait context.page.keyboard.press('Enter');\n\t\t\t\tawait context.page.locator('.quick-input-widget').waitFor({ state: 'hidden', timeout: 10000 });\n\n\t\t\t\tconst { first, second } = await waitForGrowingFile(downloadTarget);\n\t\t\t\treturn `Saved to ${downloadTarget}. The local file grew from ${first} to ${second} of ${SIZE} bytes while the download runs.`;\n\t\t\t}\n\t\t},\n\t\t{\n\t\t\tid: 'RT-03',\n\t\t\ttitle: 'The download shows a single progress notification with Cancel',\n\t\t\tasync run(context) {\n\t\t\t\tconst { notification } = await getSingleNotification(context, /Downloading/);\n\t\t\t\tif (notification.message !== 'Downloading: large-download.bin') {\n\t\t\t\t\tthrow new Error(`Unexpected notification text: \"${notification.message}\".`);\n\t\t\t\t}\n\t\t\t\tif (!notification.buttons.includes('Cancel')) {\n\t\t\t\t\tthrow new Error(`The download notification has no Cancel button. Buttons: ${JSON.stringify(notification.buttons)}`);\n\t\t\t\t}\n\t\t\t\treturn `Exactly one notification matches \"Downloading\": \"${notification.message}\" with buttons ${JSON.stringify(notification.buttons)}.`;\n\t\t\t}\n\t\t},\n\t\t{\n\t\t\tid: 'RT-04',\n\t\t\ttitle: 'Cancelling stops the download and removes the partial local file',\n\t\t\tasync run(context) {\n\t\t\t\treturn cancelAndVerifyCleanup(context, /Downloading/, downloadTarget, remoteSource, 'local');\n\t\t\t}\n\t\t},\n\t\t{\n\t\t\tid: 'RT-05',\n\t\t\ttitle: 'Drop a local file onto the remote Explorer to upload it',\n\t\t\tasync run(context) {\n\t\t\t\tconst types = await context.page.evaluate(paths =\u003e {\n\t\t\t\t\tconst row = [...document.querySelectorAll('.explorer-folders-view .monaco-list-row')].find(candidate =\u003e candidate.textContent.includes('large-download.bin'));\n\t\t\t\t\tif (!row) {\n\t\t\t\t\t\tthrow new Error('Explorer row for large-download.bin is missing.');\n\t\t\t\t\t}\n\t\t\t\t\t// The same data transfer that VS Code uses for files dragged from\n\t\t\t\t\t// another window. It goes through the same import as files dragged\n\t\t\t\t\t// from the OS, whose paths only Electron can attach to a drag.\n\t\t\t\t\tconst dataTransfer = new DataTransfer();\n\t\t\t\t\tdataTransfer.setData('CodeFiles', JSON.stringify(paths));\n\t\t\t\t\tconst rect = row.getBoundingClientRect();\n\t\t\t\t\tconst init = { bubbles: true, cancelable: true, composed: true, dataTransfer, clientX: rect.x + 20, clientY: rect.y + rect.height / 2 };\n\t\t\t\t\tfor (const type of ['dragenter', 'dragover', 'drop']) {\n\t\t\t\t\t\trow.dispatchEvent(new DragEvent(type, init));\n\t\t\t\t\t}\n\t\t\t\t\treturn [...dataTransfer.types];\n\t\t\t\t}, [localSource]);\n\n\t\t\t\tconst { first, second } = await waitForGrowingFile(uploadTarget);\n\t\t\t\treturn `Dropped ${localSource} (data transfer types ${JSON.stringify(types)}). The remote file grew from ${first} to ${second} of ${SIZE} bytes while the upload runs.`;\n\t\t\t}\n\t\t},\n\t\t{\n\t\t\tid: 'RT-06',\n\t\t\ttitle: 'The upload shows a single progress notification with Cancel',\n\t\t\tasync run(context) {\n\t\t\t\tconst { notification } = await getSingleNotification(context, /Copying/);\n\t\t\t\tif (notification.message !== 'Copying large-upload.bin') {\n\t\t\t\t\tthrow new Error(`Unexpected notification text: \"${notification.message}\".`);\n\t\t\t\t}\n\t\t\t\tif (!notification.buttons.includes('Cancel')) {\n\t\t\t\t\tthrow new Error(`The upload notification has no Cancel button. Buttons: ${JSON.stringify(notification.buttons)}`);\n\t\t\t\t}\n\t\t\t\treturn `Exactly one notification matches \"Copying\": \"${notification.message}\" with buttons ${JSON.stringify(notification.buttons)}.`;\n\t\t\t}\n\t\t},\n\t\t{\n\t\t\tid: 'RT-07',\n\t\t\ttitle: 'Cancelling stops the upload and removes the partial remote file',\n\t\t\tasync run(context) {\n\t\t\t\treturn cancelAndVerifyCleanup(context, /Copying/, uploadTarget, localSource, 'remote');\n\t\t\t}\n\t\t}\n\t]\n};\n```\n\n\u003c/details\u003e\n",
+    "URL": "https://github.com/microsoft/vscode/pull/349291",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "699a5b3c87724894758220a1fb87fdeb18c14336",
+    "HeadRef": "agents/cancellation-feature-review-vscode-issue",
+    "HeadSHA": "dd5b4995cc4106bf510d6fe268de917dc3923f9c",
+    "CreatedAt": "2026-11-19T17:30:27Z",
+    "UpdatedAt": "2026-11-19T21:52:48Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/services/workingCopy/common/workingCopyFileService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 440,
+      "BasePath": "src/vs/workbench/services/workingCopy/common/workingCopyFileService.ts",
+      "BaseLine": 432,
+      "IntroducingPath": "src/vs/workbench/services/workingCopy/common/workingCopyFileService.ts",
+      "IntroducingCommit": "5d6f7a65d38bd14a2c80094cc0531fec07f15d9e",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "io",
+      "Mechanism": "A cancellation token supplied for a multi-item Explorer copy was ignored inside the sequential working-copy copy loop and not forwarded to the underlying transfer. Remaining files in the same homogeneous group continued consuming disk I/O, IPC/network bandwidth, and per-target queue time after cancellation; cost scaled with the remaining file count and bytes.",
+      "Symptom": "Cancelling a large multi-item copy could leave the full remaining homogeneous group transferring and its operation promise pending. Static call-path evidence establishes the wasted work; no timing measurements are claimed.",
+      "FixedBehavior": "Cancellation now terminates the sequential operation loop before starting another copy and reaches the file-service transfer loop for an active cross-provider copy. Already-open handles close and the partial target is deleted before the target queue is released. Provider-native copies remain non-interruptible while active but no longer force later items to run.",
+      "Evidence": "Before the diff, ExplorerService.applyBulkEdit already exposed cancellation for edit.length \u003e 1 and passed its token into bulkEditService.apply. BulkFileEdits.apply groups consecutive copies into one CopyOperation and checks cancellation only between groups; CopyOperation passes the token into WorkingCopyFileService.copy. The base doMoveOrCopy loop nevertheless invoked fileService.copy(source, target, overwrite) for every operation without checking that token. Thus cancelling an in-progress homogeneous copy group still copied all remaining files. The added check at workingCopyFileService.ts:440-441 stops subsequent operations, and token forwarding at :457 plus fileService.ts:1499 stops buffered cross-provider copies between chunks. DiskFileSystemProviderClient.read/write cross channel.call boundaries, so this removes actual unnecessary filesystem/IPC/network work rather than merely changing progress presentation. Blame of the old unconditional copy at base line 432 identifies commit 5d6f7a65d38bd14a2c80094cc0531fec07f15d9e.",
+      "Confidence": 0.94
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "cleanup-lifecycle",
+      "boundary-fanout",
+      "concurrency-burst",
+      "repeated-work",
+      "serialization-allocation",
+      "unbounded-retention",
+      "synchronous-ui-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Desktop downloads between remote and local filesystems, including cancellation during a large file",
+        "CriticalPath": "Selected sources are processed sequentially. Each source waits for the save dialog, bulk-edit validation and participants, provider transfer, handle closure, metadata resolution, and operation completion. Cancellation during a buffered transfer now waits for the current read/write iteration, closes handles, and deletes the partial destination before releasing its target queue.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/files/browser/fileImportExport.ts:FileDownload.doDownloadNative",
+            "Operation": "Show a native save dialog and obtain a destination.",
+            "Cardinality": "One dialog per selected source reached before cancellation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same per-source dialog ran before each download.",
+            "CriticalPathEffect": "User selection precedes that source's transfer."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/files/common/fileService.ts:doCanMoveCopy, doMoveCopy, mkdirp, resolve",
+            "Operation": "Validate destination existence, create missing parent directories, resolve source metadata, and resolve the completed destination.",
+            "Cardinality": "Existing validation/stat operations per top-level edit, plus missing ancestor checks and directory entries for folder sources. Successful file copies retain the same metadata-call structure.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same validation, parent creation, and metadata resolution occurred.",
+            "CriticalPathEffect": "Validation and parent creation precede transfer; final resolution precedes successful completion."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/platform/files/common/diskFileSystemProviderClient.ts:open, read, write, close; src/vs/workbench/services/remote/common/remoteFileSystemProviderClient.ts:RemoteFileSystemProviderClient",
+            "Operation": "Transfer file contents through local-process and remote filesystem channels.",
+            "Cardinality": "Two opens and two closes per opened source/target pair, read calls scaling with transferred chunks, and write calls scaling with bytes and partial writes. Remote and local legs use their existing channels.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical buffering and channel operations, but the transfer did not receive cancellation and continued reading/writing the remaining bytes.",
+            "CriticalPathEffect": "Sequential transfer iterations determine file-completion latency."
+          },
+          {
+            "Kind": "filesystem/IPC",
+            "Location": "src/vs/platform/files/common/fileService.ts:deleteCancelledCopy and doPipeBufferedQueued",
+            "Operation": "Delete an owned partial target after closing handles.",
+            "Cardinality": "One delete attempt for an interrupted opened file; folder cleanup is accounted for separately.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No cancellation cleanup occurred; the active copy instead continued transferring to completion.",
+            "CriticalPathEffect": "Awaited while holding the existing per-target write queue."
+          }
+        ],
+        "ScalingInput": "Number of selected sources and total transferred bytes. Buffered files use a 256 KiB reusable buffer; ordinary full-sized reads require approximately ceil(fileBytes/256 KiB) data-read iterations plus EOF, with writes potentially subdivided by partial-write results.",
+        "EffectiveConcurrency": "One selected download source at a time; each buffered file alternates awaited reads and writes. ResourceQueue serializes writes to the same target, not all targets globally. Source and target closes run concurrently.",
+        "CacheBehavior": "Registered providers and the remote environment are reused. The stored last-download path avoids recomputing the default dialog directory when present. File contents are not cached or coalesced by this change; cold and warm transfers still read their bytes.",
+        "MechanismConfidence": "High: traced FileDownload through ExplorerService, BulkFileEdits, WorkingCopyFileService, the buffered transfer loop, ResourceQueue, and both filesystem-provider channel implementations.",
+        "MagnitudeUncertainty": "Actual throughput and cancellation latency depend on remote round-trip time, filesystem speed, and partial-write behavior; no timings were measured.",
+        "Verdict": "No introduced regression. Successful transfers retain their existing boundary counts and buffering; cancellation removes remaining transfer work and adds bounded, required target cleanup."
+      },
+      {
+        "Scenario": "External drag-and-drop import, including collisions and recursive folder merges",
+        "CriticalPath": "Drop-data extraction, provider activation, source resolution, target collision checks and user decisions, and merge-edit construction precede copying. The existing bulk-edit pipeline then completes before optional auto-opening of a dropped file. Cancellation now reaches that pipeline and suppresses auto-opening after cancellation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/IPC/network",
+            "Location": "src/vs/workbench/contrib/files/browser/fileImportExport.ts:ExternalFileImport.doImport, importResources, getMergeFileEdits, collectMergeFileEdits",
+            "Operation": "Activate providers, resolve dropped sources and target children, test source existence, and inspect matching source/target directories for merge planning.",
+            "Cardinality": "Existing source-resolution/existence work scales with N; merge metadata scales with traversed matching directories and resultant E edits. Provider environment acquisition is shared by the registered provider, not repeated for every candidate.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same extraction, activation, source/target resolution, collision checks, and merge traversal occurred before copying.",
+            "CriticalPathEffect": "All planning and collision decisions precede transfer."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/workingCopy/common/workingCopyFileService.ts:runFileOperationParticipants; src/vs/workbench/api/browser/mainThreadFileSystemEventService.ts:$onWillRunFileOperation call",
+            "Operation": "Run registered file-operation participants, including the extension-host will-run request.",
+            "Cardinality": "Participants receive the files collection once per working-copy operation group, not once per copied chunk; registered participants are awaited sequentially.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same participants already received the operation token and grouped files.",
+            "CriticalPathEffect": "Participant completion precedes disk changes, subject to the existing participant timeout configuration."
+          },
+          {
+            "Kind": "filesystem/IPC/network",
+            "Location": "src/vs/workbench/services/workingCopy/common/workingCopyFileService.ts:doMoveOrCopy; src/vs/platform/files/common/fileService.ts:doMoveCopy",
+            "Operation": "Execute E planned copy edits using provider-native or existing fallback transfers.",
+            "Cardinality": "One working-copy copy invocation for the homogeneous group, with sequential per-edit file-service calls; byte and subtree work depends on each selected provider path. Cancellation can now reduce the reached edits.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same E edits were copied; the outer import cancellation token was not connected to the bulk-edit copy.",
+            "CriticalPathEffect": "Import completion waits for actual copies or cancellation cleanup."
+          }
+        ],
+        "ScalingInput": "N accessible dropped resources after filtering, target directory entry count, and E resulting copy edits after recursive merges. E can exceed N when existing folders are merged.",
+        "EffectiveConcurrency": "Provider activation and resolveAll run concurrently across candidates. Collision checks use Promises.settled across resources. Merge construction runs concurrently across dropped roots but traverses each merged subtree sequentially. Actual working-copy operations remain sequential within a homogeneous edit group; fallback folder copies retain their pre-existing child concurrency.",
+        "CacheBehavior": "Provider registration/activation is reused per scheme; repeated activation does not imply a fresh remote environment request per file. Collision and merge metadata have no newly introduced cache. Warm imports still perform their existing metadata checks.",
+        "MechanismConfidence": "High: traced filtering, merge expansion, batching, participants, and the newly connected cancellation token.",
+        "MagnitudeUncertainty": "Dropped-root count, merge expansion, extension behavior, and network latency vary. Preflight planning can still be substantial but its scheduling and cardinality are unchanged.",
+        "Verdict": "No introduced regression. Existing metadata fan-out is not increased, notifications are consolidated, and cancellation now bounds transfer work."
+      },
+      {
+        "Scenario": "Recursive cross-provider folder copying and cancellation cleanup",
+        "CriticalPath": "Resolve each source directory, create its target directory, and await all child operations. On cancellation, interrupted file handles close before their targets are removed; each failing folder waits for all its children to settle before removing its own subtree and propagating failure.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/IPC/network",
+            "Location": "src/vs/platform/files/common/fileService.ts:doCopyFolder, doCopyFile, resolve",
+            "Operation": "Resolve directories, create target directories, and copy child file bytes.",
+            "Cardinality": "Existing directory resolution and mkdir work scales with D; file opens/reads/writes/closes scale with F and bytes. Already-scheduled subdirectory resolution can finish after cancellation, as its placement in the map is unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same recursive sibling fan-out occurred, but children continued transferring without a cancellation token.",
+            "CriticalPathEffect": "All children must settle before a parent copy completes or cleans up."
+          },
+          {
+            "Kind": "filesystem/IPC/network",
+            "Location": "src/vs/platform/files/common/fileService.ts:doCopyFolder catch; deleteCancelledCopy",
+            "Operation": "Remove interrupted files and cancellation-failed directories that this copy created.",
+            "Cardinality": "At most one direct cleanup attempt per interrupted opened file and per unwinding cancellation-failed created directory. Completed subtrees are removed by their enclosing cleanup rather than receiving a new explicit per-completed-file IPC request.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No partial-target cancellation cleanup; the tree instead continued copying.",
+            "CriticalPathEffect": "Cleanup is awaited during cancellation unwinding, after children settle; file cleanup remains inside its target write queue."
+          }
+        ],
+        "ScalingInput": "Directory-tree file count F, directory count D, tree breadth/depth, total bytes, and number of opened files still active when cancellation occurs.",
+        "EffectiveConcurrency": "Promises.settled starts sibling copies concurrently and recursively. ResourceQueue limits only identical target keys; there is no new global limiter. This existing cross-target concurrency is unchanged. Folder deletion is ordered after the settlement of its subtree.",
+        "CacheBehavior": "Directory resolution reads current provider metadata without a new content or negative cache. Queue entries are removed when drained. Cancellation does not introduce persistent per-file cache entries.",
+        "MechanismConfidence": "High: both old and new recursive map/Promises.settled structure are visible in the diff, and cleanup ownership/order were traced through the file and folder helpers.",
+        "MagnitudeUncertainty": "Cleanup cost depends on the tree already copied and backend recursive-delete behavior. Large sibling concurrency is pre-existing, not introduced by the cancellation plumbing.",
+        "Verdict": "No high-confidence introduced regression. Cleanup adds necessary bounded I/O to an interrupted operation while eliminating its remaining transfer work; pre-existing unbounded sibling concurrency is out of scope."
+      },
+      {
+        "Scenario": "Copy fallbacks involving whole-file-only providers and clone fallback",
+        "CriticalPath": "Depending on source/target capabilities, await a whole-file read followed by a whole-file write, await a whole-file read and buffered-target writes, or buffer a streamed source before one target write. Clone fallback continues using CancellationToken.None.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/IPC/network",
+            "Location": "src/vs/platform/files/common/fileService.ts:doPipeUnbufferedQueued, doPipeUnbufferedToBufferedQueued, doPipeBufferedToUnbuffered, cloneFile",
+            "Operation": "Read complete file contents or accumulate existing streamed chunks, then write the destination.",
+            "Cardinality": "Existing one whole-file read and one whole-file write where both providers are unbuffered; mixed providers retain their existing read/write chunk cardinality. Clone fallback still issues the same operations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same complete-file allocations and I/O occurred without the newly forwarded token or intervening cancellation checks.",
+            "CriticalPathEffect": "Read and write phases are sequential; added cancellation checks can terminate before an unnecessary phase."
+          },
+          {
+            "Kind": "filesystem/IPC",
+            "Location": "src/vs/platform/files/common/fileService.ts:doPipeUnbufferedToBufferedQueued finally",
+            "Operation": "Close the created target handle and remove an interrupted owned target.",
+            "Cardinality": "Existing one close plus a new single cleanup-delete attempt on cancellation after target creation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The target handle closed, but the operation did not support this cancellation cleanup.",
+            "CriticalPathEffect": "Target queue remains held through close and cancellation cleanup."
+          }
+        ],
+        "ScalingInput": "File byte size B and number of concurrent independent fallback copies. Whole-file paths already allocate O(B) data; buffered-to-buffered copies continue using a fixed-size buffer.",
+        "EffectiveConcurrency": "Unbuffered and unbuffered-to-buffered copies use the existing per-target queue. Buffered-to-unbuffered reading precedes its existing queued target write. Independent target keys can run concurrently; clone's existing source queue is preserved.",
+        "CacheBehavior": "No new content cache, duplicate reads, or retained whole-file buffers are introduced. A supplied token reaches supporting source readFile implementations; unsupported cancellation during an already-started write remains pre-existing.",
+        "MechanismConfidence": "High: capability dispatch and all four fallback implementations were inspected, including the unchanged clone scheduling.",
+        "MagnitudeUncertainty": "Provider cancellation support and file sizes vary; the diff does not introduce the whole-file memory requirement.",
+        "Verdict": "No introduced allocation or throughput regression. Richer cancellation metadata alone does not increase expensive read/write work."
+      },
+      {
+        "Scenario": "Explorer multi-item native copy/move, cancellation between items, and undo after partial completion",
+        "CriticalPath": "Validate the edit collection, run participants and before-events, then process edits sequentially. Native copy/rename must finish once started. Cancellation skips subsequent edits, emits the existing failure event, and records undo only for completed results. Undo's actual disk work occurs only when invoked.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/IPC/network",
+            "Location": "src/vs/platform/files/common/fileService.ts:doMoveCopy; src/vs/platform/files/common/diskFileSystemProviderClient.ts:copy, rename",
+            "Operation": "Execute one native provider copy or rename per reached edit, plus existing validations and final metadata resolution.",
+            "Cardinality": "Up to N sequential native calls before this change; after cancellation only the active call finishes and later calls are skipped. A native folder operation remains one channel request, not one request per contained file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical native calls, but the loop continued through the remaining homogeneous group after token cancellation.",
+            "CriticalPathEffect": "Each native operation blocks the next edit; active provider-native work remains non-interruptible."
+          },
+          {
+            "Kind": "serialization/filesystem",
+            "Location": "src/vs/workbench/services/workingCopy/common/storedFileWorkingCopyManager.ts:onWillRunWorkingCopyFileOperation; src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:onWillRunWorkingCopyFileOperation",
+            "Operation": "Capture existing dirty-model snapshots and participate in operation events.",
+            "Cardinality": "Existing work scales with related open/dirty models across the grouped sources; no additional snapshot pass is introduced.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same snapshot preparation ran, with entries released on normal success or failure.",
+            "CriticalPathEffect": "Before-events finish before disk edits. Failure events release the captured correlation state."
+          },
+          {
+            "Kind": "filesystem/IPC/network",
+            "Location": "src/vs/workbench/contrib/bulkEdit/browser/bulkFileEdits.ts:FileUndoRedoElement._reverse, DeleteOperation.perform, RenameOperation.perform",
+            "Operation": "On user undo, reverse completed moves or delete completed copies, retaining the existing content-backup behavior for delete redo.",
+            "Cardinality": "Partial cancellation now records K completed operations rather than continuing all N; follow-up undo work scales with K. No backup file reads are added merely by catching cancellation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Successful full groups used the same undo machinery for N operations; partially cancelled groups were not stopped at individual edits.",
+            "CriticalPathEffect": "Off the original copy critical path; required only when undo is invoked."
+          }
+        ],
+        "ScalingInput": "N edits in a homogeneous group, K completed edits at cancellation, matching open/dirty working copies, and bytes read for existing delete-undo restoration.",
+        "EffectiveConcurrency": "Working-copy move/copy loop is serial. Native backend operations can internally traverse directories as before. Dirty-copy reverts use Promises.settled. Undo operations run sequentially; no new parallel batch of native operations is introduced.",
+        "CacheBehavior": "Working-copy restore maps are removed on both success and failure; inspected text-file and stored-file managers release correlation entries on the cancellation failure path. Explorer move batches also finish on either event. CancellationTokenSource now disposes in finally, including failures.",
+        "MechanismConfidence": "High: traced homogeneous grouping, sequential file operations, native provider boundaries, undo construction, token disposal, and success/failure cleanup consumers.",
+        "MagnitudeUncertainty": "Native operation duration, edit count, dirty-model size, and redo backup sizes vary. No timing or memory measurements are claimed.",
+        "Verdict": "No introduced regression. Recorded an internal regression-fix signal for eliminated post-cancellation copy work with base-line blame provenance. Extra rename-array slicing is linear bookkeeping, not a demonstrated actionable performance issue."
+      },
+      {
+        "Scenario": "View and Explorer progress when tasks report synchronously before returning their promise",
+        "CriticalPath": "Invoke the task, buffer only reports made before its promise is returned, initialize progress using that promise, and replay the pending reports once in order. The underlying task's promise remains the operation completion condition.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "S synchronous progress reports before the task returns its promise, plus later asynchronous reports. The traced bulk-edit path reports initial progress once, then reports completion per operation group rather than per file chunk.",
+        "EffectiveConcurrency": "Buffering and replay run synchronously on the renderer thread. Subsequent reports go directly to the existing indicator. ScopedProgressIndicator joins overlapping infinite-progress promises; no new worker, IPC request, or asynchronous task fan-out is introduced.",
+        "CacheBehavior": "The pending array is disabled immediately after task invocation and is not an accumulating history for later reports. Existing delayed progress display and scope visibility rules remain in effect; there is no new cache lifecycle.",
+        "MechanismConfidence": "High: inspected withCompositeProgress, BulkEdit.perform's report frequency, and ScopedProgressIndicator's show/worked/showWhile and promise lifecycle.",
+        "MagnitudeUncertainty": "Other progress clients can issue different synchronous report counts, but no realistic newly expensive high-cardinality producer was established. No forced-layout regression was demonstrated.",
+        "Verdict": "No high-confidence performance regression. The change fixes premature access to the task promise; its temporary synchronous report buffering does not establish unbounded lifetime retention or new collection-wide work."
+      }
+    ],
+    "Summary": "Completed the performance-review pass across all 12 changed files and every diff page against base 699a5b3c87724894758220a1fb87fdeb18c14336. Traced transfer dispatch, native and fallback provider I/O, remote/local channel calls, preflight and merge expansion, per-resource queues, participants, cancellation cleanup, undo, model/batch ownership, and progress replay. No diff-introduced high-confidence performance findings qualified. Submitted one internal regression-fix record for stopping remaining copies after cancellation, backed by base blame. Static analysis only; tool output for the supporting performance guide exceeded its display bound."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-20T21:31:41.829605957Z",
+    "CompletedAt": "2026-11-20T21:35:40.037970833Z",
+    "WallClockMilliseconds": 238208,
+    "ModelCalls": 14,
+    "InputTokens": 879916,
+    "OutputTokens": 10435,
+    "TotalTokens": 890351,
+    "ReasoningTokens": 3547,
+    "CacheReadTokens": 778840,
+    "CacheWriteTokens": 101034,
+    "APIDurationMilliseconds": 194235,
+    "ToolCalls": 62,
+    "NanoAIUnits": 43490300000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 778840,
+      "cache_write": 101034,
+      "input": 42,
+      "output": 10435
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
