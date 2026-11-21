@@ -41,3 +41,8 @@ Distinguish per-key serialization from global concurrency. When one event schedu
 ## Cache lifecycle revealed by shipped fixes
 
 Evaluate positive and negative cache states separately. Check whether misses, empty successes, failures, and not-yet-discovered resources are distinguishable, bounded, invalidated, and coalesced rather than retried per item or pinned indefinitely.
+
+<!-- learned-family:missing-coalescing -->
+## Missing coalescing revealed by shipped fixes
+
+Check work triggered by rapid successive versions or events before the expensive boundary. Establish whether cancellation occurs before issuance or only after work has started, and report changed debounce, batching, or in-flight joining that increases issued operations.
