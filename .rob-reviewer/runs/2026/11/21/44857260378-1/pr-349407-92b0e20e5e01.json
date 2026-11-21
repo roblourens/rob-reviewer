@@ -1,0 +1,210 @@
+{
+  "PullRequest": {
+    "Number": 349407,
+    "Title": "agentHost: diff Branch Changes of an existing worktree against its branch base",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #337971\n\n## Why\n\nA session that works in an existing linked worktree, or directly in a folder, computed Branch Changes against the remote's default branch (`origin/HEAD`). A branch that was created from another branch and tracks it, such as `feat/test` from `origin/dev`, listed that branch's commits as its own changes. It also offered to merge into the default branch.\n\n## Repro\n\n1. Create a remote with `main` and `dev`, where `dev` has two extra commits. `origin/HEAD` points at `main`.\n2. `git worktree add -b feat/test ../test-worktree origin/dev`. The upstream is now `origin/dev`. Commit one file (`feature.txt`).\n3. In the Agents window, open `test-worktree` in Direct mode and send a message.\n4. Open Changes. Before this change it lists `dev1.txt`, `dev2.txt` and `feature.txt`. After it lists only `feature.txt`.\n\n## Root cause\n\nThe base for these sessions is persisted once and then used by Branch Changes before the git-state fallback. Both places that persist it read only the default branch:\n\n- `WorktreeIsolation._resolveLinkedWorktree` (an adopted or external linked worktree) used `getDefaultBranch(primaryRoot)`.\n- `AgentService` folder-mode first send used `getDefaultBranch2` (`origin/HEAD`).\n\nThe branch's upstream was read, but only for divergence counts and the GitHub lookup.\n\n## Fix\n\n`IAgentHostGitService.getBranchBase` returns the checked-out branch's upstream when it exists and tracks a differently named branch. An upstream with the same name (`origin/feat/test`) is the branch's own remote copy, not its base. Both callers prefer this value and keep the default branch as the fallback. How `origin/HEAD` is resolved does not change. Detached HEAD, branches without an upstream, and branches that track their own name behave as before.\n\nThis deliberately does not read the git extension's `branch.\u003cname\u003e.vscode-merge-base`. Only the extension writes it, lazily from the SCM graph, and it caches the default branch when the reflog has no answer, so preferring it could pin a session back to `origin/HEAD`.\n\n## Validation\n\n| Command | Result |\n| --- | --- |\n| `pnpm run typecheck-client` | Passed |\n| `pnpm run oxlint \u003c7 changed files\u003e` | Passed |\n| `pnpm run test-node --run src/vs/platform/agentHost/test/node/shared/worktreeIsolation.test.ts` | 106 passing |\n| `pnpm run test-node --run src/vs/platform/agentHost/test/node/agentService.test.ts` | 1420 passing, 16 pending |\n| `pnpm run test-node --run src/vs/platform/agentHost/test/node/agentHostGitService.integrationTest.ts` | 124 passing, 1 failing. The failure is the existing `fetch bounds an unresponsive remote…` test, which can't open a local TCP listener in my sandbox (`listen EPERM`). It is unrelated to this change. |\n| `./scripts/test.sh --run …` | Not run. Electron can't start in my sandbox (`sandbox_parameters_mac.mm` check failed), so I used the Node runner above. |\n\nThe three new tests fail without the source change and pass with it:\n\n- `getBranchBase returns an existing upstream that tracks a different branch` uses real git. It covers a different-name upstream, an upstream whose remote ref is gone, a same-name upstream, no upstream, and detached HEAD.\n- `resolveExternalWorktreeProject records the linked worktree branch base instead of the default branch`.\n- A `checked-out branch base` row in the existing folder-session diff-base table.\n\n## Evidence\n\nThe before/after recordings and screenshots are available. They were recorded on a Code OSS dev build of this branch, in the Agents window, against the local standalone agent host with `--enable-mock-agent`, using a scratch repo with a local bare `origin`, following the repro above.\n\n- **Side-by-side video.** The left half is the unfixed build, the right half is this branch. They are aligned by step: select the mock host, open `test-worktree` in Direct mode, send `hello`, open Changes. At the last step the left lists 3 files and the right lists 1.\n- **Before screenshot.** Changes for `feat/test` lists `dev1.txt`, `dev2.txt`, `feature.txt` (\"3 Files\").\n- **After screenshot.** Changes for `feat/test` lists only `feature.txt` (\"1 File\").\n\nThe agent host trace for the fixed run shows the base being read from the `feat/test` upstream `refs/remotes/origin/dev`, and Branch Changes being recomputed with `git merge-base HEAD origin/dev`.\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/349407",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "lszomoru",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "c132f72ae9f5ff80093e7d722c36f03755865b20",
+    "HeadRef": "lszomoru/agents/fix-agents-window-base-branch-bug",
+    "HeadSHA": "92b0e20e5e01916764532e10a411dc9f9ca50880",
+    "CreatedAt": "2026-11-20T10:15:54Z",
+    "UpdatedAt": "2026-11-20T10:38:58Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle",
+      "eager-work",
+      "serialization-allocation",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First message in a persistent folder-mode session or a new folder changeset scope",
+        "CriticalPath": "AgentSideEffects._sendTurnMessage awaits _resolveWorkingDirectoryBeforeSend before provider preparation and dispatch. The new branch-base lookup is awaited before existing default-branch lookup and immediate base persistence. Checkpoint capture starts through onResolved before these reads and can overlap them.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:getBranchBase, getHEAD, _readBranch, _runGit",
+            "Operation": "Read HEAD with symbolic-ref, inspect the local branch with a ref-filtered for-each-ref, and resolve an upstream remote ref plus its remote name when present.",
+            "Cardinality": "Normally four newly added Git processes with an existing upstream; two with no upstream or detached HEAD; three with an upstream whose ref is missing. Concurrent identical getBranch calls can share the ref reads, but symbolic-ref is not coalesced.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This send path did not perform branch-base probes. It ran getDefaultBranch2 and, if configuration did not supply a branch, getCurrentBranch. Those existing fallback reads remain.",
+            "CriticalPathEffect": "Adds a bounded local Git read sequence before provider dispatch; no fetch or remote network access is performed."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionStateStore.ts:readBaseBranchWithoutImport, writeMetadata",
+            "Operation": "Read the stored scope base and write central state plus the immediate legacy metadata mirror.",
+            "Cardinality": "Loaded base read is in memory; an unloaded read can access central state/catalog or the legacy database. One logical base write per newly initialized scope, with the same central/mirror persistence structure as before.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same scope read, immediate base write and mirror flush occurred, using the default/configured branch instead.",
+            "CriticalPathEffect": "Immediate persistence is awaited before dispatch, unchanged by the PR."
+          }
+        ],
+        "ScalingInput": "One primary working directory and one previously uninitialized folder scope, not every configured root or changed file. Successful base persistence suppresses resolution on subsequent messages.",
+        "EffectiveConcurrency": "The new lookup executes its Git commands sequentially. Existing getDefaultBranch2 overlaps origin/HEAD and remote enumeration. The path has no global Git limiter, but introduces no collection fan-out. Session metadata writes serialize per session.",
+        "CacheBehavior": "Repository roots use a 100-entry positive/negative LRU and in-flight coalescing. Loaded session state supplies the persisted base without database reads. getBranch coalesces only concurrent identical directory/ref requests and removes pending entries on settlement; there is no completed branch-base cache. If no base can be persisted, a later send can retry, as it could before.",
+        "MechanismConfidence": "High confidence in the bounded additional subprocess sequence and first-send critical-path reachability, supported by implementations and the two-send persistence test.",
+        "MagnitudeUncertainty": "No runtime timings; local process startup and ref access depend on OS and disk cache. This does not establish a substantial scaling regression.",
+        "Verdict": "No reportable high-confidence regression. The added local reads implement the requested base selection, are first-use scoped when persistence succeeds, and do not introduce per-file work, network access, unbounded retention or a new fan-out."
+      },
+      {
+        "Scenario": "Restore or adopt a session whose working directory is an existing linked worktree",
+        "CriticalPath": "AgentService._restoreSessionState awaits probe-based worktree adoption or external project discovery before completing catalog hydration. Adoption with authoritative predecessor worktree metadata bypasses the changed probe path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:_readRepositoryRoot",
+            "Operation": "Check whether an uncached directory exists before resolving its repository root.",
+            "Cardinality": "One directory check per uncached repository-root request; zero for a cached root.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same root-existence check preceded linked-worktree discovery.",
+            "CriticalPathEffect": "Part of awaited discovery, unchanged."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/common/agentHostGitService.ts:PrimaryWorktreeRootResolver.resolve; src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:_resolveLinkedWorktree",
+            "Operation": "Resolve repository roots, list worktrees on a primary-root cache miss, and select the checked-out branch base.",
+            "Cardinality": "Uncached root discovery uses one rev-parse; a cold primary mapping uses one worktree listing serving all reported linked checkouts. For a linked worktree, the PR adds two to four branch-base commands. A usable differently named upstream replaces the default lookup; otherwise the old default lookup follows. A normal default lookup used two commands.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Identical root discovery and grouped worktree listing, followed directly by getDefaultBranch(primaryRoot). With a usable default ref this was two base-selection subprocesses rather than four for a usable upstream, or the new probes plus fallback.",
+            "CriticalPathEffect": "Discovery is awaited during restore/adoption. Primary checkouts return before the new branch-base lookup."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:adoptExistingWorktreeMetadata, recordExternalWorktreeProject",
+            "Operation": "Persist discovered repository/worktree identity and the selected base.",
+            "Cardinality": "One logical metadata write per discovery/adoption, with unchanged metadata persistence ownership.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same metadata was persisted with the default branch as base.",
+            "CriticalPathEffect": "Awaited during restore, unchanged."
+          }
+        ],
+        "ScalingInput": "One primary checkout per restored session needing discovery. Sessions with an existing project or authoritative adoption metadata bypass this work. Repository discovery groups linked checkouts, but branch bases remain checkout-specific.",
+        "EffectiveConcurrency": "Primary-root discovery misses serialize per Git service, including a cache recheck. After root resolution, branch-base queries are sequential within each invocation and can overlap across sessions. There is no new loop or bulk scheduling operation.",
+        "CacheBehavior": "Repository roots are bounded and coalesced. PrimaryWorktreeRootResolver serializes cache misses and stores every root from one repository listing in a 100-entry cache; successful warm lookups avoid the listing. Branch ref lookups only share concurrent identical keys and clear on completion. The PR adds no retained cache.",
+        "MechanismConfidence": "High confidence in the call path, primary-root grouping/cache behavior, early return for primary checkouts and two-to-four-command branch lookup.",
+        "MagnitudeUncertainty": "Concurrent adoption prevalence and process latency are unknown. Additional work is bounded per discovery and uses small local ref queries.",
+        "Verdict": "No high-confidence actionable performance bug. The PR changes base selection with bounded extra work; it neither defeats the existing grouped root discovery nor introduces a catalog-wide loop or persistent allocation."
+      },
+      {
+        "Scenario": "Convert a session or chat workspace to an existing linked worktree",
+        "CriticalPath": "When shown, the workspace transition is created before conversion and uses resolveExternalWorktreeProject to classify the folder. Conversion resolves the external project again before committing workspace metadata and continuing the turn. Thus transition classification can reach the changed branch lookup even though it needs only worktree identity.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionService.ts:_createWorkspaceTransition, _isExistingWorktree, _convert, _convertChat; src/vs/platform/agentHost/node/shared/worktreeIsolation.ts:_resolveLinkedWorktree",
+            "Operation": "Discover the target worktree and select its branch base for project metadata.",
+            "Cardinality": "For a shown transition followed by normal conversion, up to two linked-worktree resolutions: commonly eight branch-base commands total with an upstream, replacing four successful default-branch commands; fallback cases add the new probes to the old default reads. Root/worktree-list probes are avoided on the second warm discovery.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same two external-project calls occurred and each queried the default branch. The PR does not introduce the duplicated discovery call sites, only their new branch-base selection work.",
+            "CriticalPathEffect": "Classification precedes provider movement; project resolution precedes persistence and continuation."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/chatContributions/sessionWorkspaceConversion/sessionWorkspaceConversionService.ts:_convert, _convertChat",
+            "Operation": "Commit workspace/configuration metadata and working-directory changes.",
+            "Cardinality": "One logical conversion commit, with existing per-chat working-directory updates where applicable.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same conversion persistence ran with default-branch external-worktree metadata.",
+            "CriticalPathEffect": "Must finish before continuing the turn, unchanged."
+          }
+        ],
+        "ScalingInput": "A single selected target folder. The ordinary shown-transition folder conversion performs up to two sequential external-worktree resolutions, not one per sibling chat or changed file.",
+        "EffectiveConcurrency": "Transition classification precedes conversion, so these discovery calls are sequential. Conversion is guarded by its pending phase; the session-replacement chat path can also run under the existing chat catalog lock. No new concurrency burst is introduced.",
+        "CacheBehavior": "The second discovery reuses repository-root and primary-root caches. Branch-base reads are not completed-result cached, and sequential invocations do not share the pending ref cache. This is also true of the prior default-branch reads.",
+        "MechanismConfidence": "High confidence in the sequential two-call path and cache reuse; the duplicated discovery structure predates the diff.",
+        "MagnitudeUncertainty": "No timing data for Git process startup or conversion duration. This is a bounded explicit workspace change, not a per-keystroke or collection-sized operation.",
+        "Verdict": "No high-confidence reportable regression. Extra ref discovery is real, but repeated project resolution is pre-existing, the effective cardinality is at most two on this ordinary path, and no evidence establishes a substantial performance defect rather than bounded behavior-supporting work."
+      },
+      {
+        "Scenario": "Display and refresh Branch Changes using the newly persisted base",
+        "CriticalPath": "Changeset computation resolves the persisted folder base, computes a fingerprint, and performs the existing Git diff on a cache miss before publishing changes. These computations are not awaited by the new first-send base-selection statement itself.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:getBranchDiffFingerprint, computeSessionFileDiffs, _resolveBranchMergeBaseCommit",
+            "Operation": "Resolve the baseline, inspect HEAD/status and compute raw/numstat diffs; use a temporary index when untracked files are present.",
+            "Cardinality": "One existing fingerprint sequence per effective repository per recompute; one existing diff sequence per repository cache miss. A plain tracked-file diff uses one raw diff process, not one process per output file. The PR changes the selected ref, not scheduling or command multiplicity.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical fingerprint/diff algorithms and cache behavior, using the persisted default-branch base.",
+            "CriticalPathEffect": "Required before a refreshed changeset can publish; unchanged."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:getBranchDiffFingerprint, _runWithTempIndex",
+            "Operation": "Stat changed paths for fingerprints; create and remove a temporary index directory for untracked-file diffs.",
+            "Cardinality": "Up to 2,000 stats per repository fingerprint, concurrency 16; one temporary directory lifecycle per untracked-file diff. Both are existing behaviors.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same path stats and temporary index lifecycle occurred.",
+            "CriticalPathEffect": "Fingerprint and untracked-file diff preparation are awaited; unchanged."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts:_resolveBranchBaseBranch",
+            "Operation": "Load the session-state snapshot and select the persisted folder base before the Git-state fallback.",
+            "Cardinality": "One logical state load per resolution, served by existing loaded-state caching when warm.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same loaded snapshot supplied the old persisted base.",
+            "CriticalPathEffect": "Precedes fingerprint/diff computation, unchanged."
+          }
+        ],
+        "ScalingInput": "One canonical folder changeset owner; for multi-folder changes, deduplicated repository roots rather than every supplied folder or file. Git diff/output work depends on repository state and changed paths relative to the selected base.",
+        "EffectiveConcurrency": "Static recomputations serialize/coalesce by changeset key and mid-turn work is debounced. Multi-repository diff computations use Limiter(5); fingerprint probes use Promise.all across deduplicated repositories, and each fingerprint uses a 16-wide stat limiter. These existing limits are unchanged.",
+        "CacheBehavior": "The fingerprint includes the base branch, directories, merge-base/HEAD/status and up to 2,000 changed-path stats. Equal ready fingerprints can skip recomputation; multi-repository results also reuse unchanged per-repository fingerprints. Changed bases correctly cause new results. All of this behavior predates the PR.",
+        "MechanismConfidence": "High confidence that downstream expensive operations, grouping, fingerprints and scheduling are unchanged; the diff passes a different base into existing consumers.",
+        "MagnitudeUncertainty": "The selected baseline can change result size in either direction depending on branch history. No evidence proves added scaling work, and a smaller correct diff is not sufficient to identify a historical performance regression fix.",
+        "Verdict": "No reportable regression and no qualifying regression-fix provenance signal. Different metadata alone does not establish increased subprocess frequency, serialization, allocation or retained lifetime."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over all seven changed files and all diff pages against base c132f72ae9f5ff80093e7d722c36f03755865b20. Traced first-send, restore/adoption, conversion and Branch Changes paths, including actual local Git commands, grouped primary-root discovery, warm state/cache behavior and existing concurrency limits. No high-confidence performance regressions found. The added branch lookup is bounded local first-use/discovery work; unchanged fallback queries and duplicated conversion discovery do not independently establish a substantial new performance bug. Static review only; no runtime performance measurements or qualifying concrete regression fix were established."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-21T03:02:15.869299722Z",
+    "CompletedAt": "2026-11-21T03:04:46.488794977Z",
+    "WallClockMilliseconds": 150619,
+    "ModelCalls": 11,
+    "InputTokens": 585675,
+    "OutputTokens": 6751,
+    "TotalTokens": 592426,
+    "ReasoningTokens": 1530,
+    "CacheReadTokens": 493606,
+    "CacheWriteTokens": 92036,
+    "APIDurationMilliseconds": 127265,
+    "ToolCalls": 49,
+    "NanoAIUnits": 34702660000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 493606,
+      "cache_write": 92036,
+      "input": 33,
+      "output": 6751
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
