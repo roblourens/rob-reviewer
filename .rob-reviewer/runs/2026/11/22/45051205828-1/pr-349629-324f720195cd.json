@@ -1,0 +1,265 @@
+{
+  "PullRequest": {
+    "Number": 349629,
+    "Title": "Agent host: let the Copilot runtime fetch its own experiment assignments",
+    "Body": "Fixes #349625. Builds on the ideas in #344777.\n\nThe agent host sends the Copilot runtime an empty ExP assignment that carries only VS Code's assignment context. A host-supplied assignment turns off the runtime's own experiment fetch, so the runtime's experiments never apply in the agent window.\n\nWith this change, `toSdkExpAssignments` asks the runtime to fetch its own assignments (`fetchAssignments: true`) and passes VS Code's context as `hostAssignmentContext`:\n\n- **VS Code's experiments don't change:** treatments still reach the session as `flags`, and the runtime gives them precedence over its own.\n- **Context:** the runtime sends VS Code's context after its own to CAPI and on its exposure telemetry.\n- **Same opt-out:** the options are only sent when VS Code has an assignment context, as today, so `workbench.enableExperiments` and telemetry settings still turn this off.\n\n**Dependency:** the options are internal to the Copilot SDK. The SDK version here drops them, which would also drop VS Code's context from CAPI requests, and older runtimes reject them. This PR needs to merge together with an SDK update that carries them. Draft until then.\n\n**Verification:** updated `CopilotSessionLauncher ExP assignment context` tests for create and resume, with and without a context; the context case fails on the old launcher.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/349629",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "sbaidon",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "bfbf12b35b9978b92b2d341e81ade49f2b18c68c",
+    "HeadRef": "sbaidon/agent-host-runtime-exp-fetch",
+    "HeadSHA": "324f720195cd0984787dc8ace655a6b158a0cdff",
+    "CreatedAt": "2026-11-21T21:05:05Z",
+    "UpdatedAt": "2026-11-21T21:11:43Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "eager-work",
+      "missing-coalescing",
+      "repeated-work",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create or prewarm a regular Copilot agent-host chat with a nonempty VS Code assignment context, then send its first turn.",
+        "CriticalPath": "CopilotAgentSession.initializeSession awaits sandbox preparation, launcher configuration, SDK createSession, authentication when applicable, and finalization before registration. Configuration resolves independent preparation tasks with Promise.all, then managed settings. _warmChat starts the same launch while composing; a first send arriving during launch waits on the chat queue, while a completed matching warm launch is reused. Subsequent warm-up is scheduled outside that queue. The diff requests runtime experiment fetching but SDK/runtime source is unavailable, so its actual issuance and await placement cannot be established.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_buildSessionConfig; copilotPluginConverters.ts:toSdkCustomAgents; prompts/promptOverride.ts:resolveConfiguredPromptOverride; getCopilotRuntimeWorkingDirectory",
+            "Operation": "Resolve local plugin directories, read explicit custom-agent files and an optional prompt override, and canonicalize the working directory.",
+            "Cardinality": "One resolve per configured local plugin-directory entry, one read per explicit custom-agent resource, at most one prompt-override read, and working-directory canonicalization during configuration and create. Warm reuse does not repeat launch preparation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same paths, input collections, and number of operations before the diff.",
+            "CriticalPathEffect": "Launch configuration awaits this preparation before SDK creation."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotManagedSettings.ts:CopilotManagedSettingsResolver.resolve and resolveCopilotManagedSettings",
+            "Operation": "Ask runtime managedSettings.resolve for authoritative policy; runtime may perform remote policy retrieval.",
+            "Cardinality": "One in-flight request per RPC object, token and working-directory tuple, shared by concurrent matching callers. Later queries depend on unchanged runtime freshness handling.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same query, in-flight grouping, timeout and placement.",
+            "CriticalPathEffect": "Awaited before creating the session."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_createSession and _finalizeSession; copilotAccountService.ts:authenticateConversation",
+            "Operation": "Create the runtime session, optionally authenticate it, list/select agents, configure sandbox and execution-subagent tools, and apply conditional options.",
+            "Cardinality": "Normally one create per distinct launch, with a bounded existing sandbox-conflict retry. Agent listing is one call per finalization; selection and other updates are conditional. Authentication uses an existing login flow, not a new per-item loop.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same SDK calls and scheduling. Only experiment option values passed with session creation change.",
+            "CriticalPathEffect": "Awaited before the session is usable; connector reconciliation is adopted asynchronously rather than newly awaited by this diff."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:toSdkExpFetchOptions, line 178, and _buildSessionConfig, line 1878",
+            "Operation": "Newly request the external runtime's own experiment assignments instead of supplying an empty assignment response carrying host context.",
+            "Cardinality": "One fetch request option per launch configuration with a nonempty string context. Actual HTTP request count after runtime caching/grouping is not established; it cannot be equated to launch count.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Provided assignments with empty Features, Flights and Configs plus VS Code AssignmentContext; no host-side experiment-network call existed.",
+            "CriticalPathEffect": "The option reaches the awaited SDK session-open call, but whether the selected SDK forwards it and whether runtime fetching is awaited, cached or deferred is unavailable."
+          }
+        ],
+        "ScalingInput": "Distinct SDK session launches, including replacements after model/agent/trust changes or warm expiry; not individual keystrokes or tools. Existing matching warm launches are retained. Unchanged preparation scales with local plugin directories and explicit custom-agent files.",
+        "EffectiveConcurrency": "Chat operations are serialized per chat key; distinct chats can progress independently. Configuration preparation uses Promise.all, custom-agent reads are serial within their list, and plugin-directory checks are concurrent. Extension launch admission records roots rather than imposing a global limiter. The diff changes none of these controls.",
+        "CacheBehavior": "Matching warm launches are reused and their lifetime extended; warm failures are not retried on every edit. BYOK proxy creation is promise-memoized. Managed-settings requests join in flight per RPC object plus token and working directory, then release their keys; durable freshness remains runtime-owned. Runtime experiment positive/negative caching and in-flight joining cannot be inspected.",
+        "MechanismConfidence": "High confidence in the changed option construction and host launch path. Insufficient evidence of an actual additional blocking or repeated network operation in the selected dependency.",
+        "MagnitudeUncertainty": "No latency measurements or external SDK/runtime implementation are available. In particular, runtime fetch cardinality, timeout, cache behavior and scheduling are unknown, not merely its duration.",
+        "Verdict": "No reportable performance regression established. Enabling runtime assignments is the explicit behavior change; inferring uncached or blocking network work solely from fetchAssignments would not meet the evidence standard."
+      },
+      {
+        "Scenario": "Resume a cold chat or fork a conversation; reuse an already live chat.",
+        "CriticalPath": "Cold resume awaits launcher configuration, SDK resumeSession and finalization. Missing-custom-agent, managed-sandbox and empty-history fallbacks use existing bounded retry paths. Fork first resolves the source and history boundary, forks the SDK session and attempts a database copy, then resumes the child. Already live sessions are reused instead of re-entering the launcher.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_resumeSession, launch and _finalizeSession",
+            "Operation": "Resume a runtime session and perform existing policy, authentication and finalization calls.",
+            "Cardinality": "Normally one resume for each distinct cold session after in-flight joining. Existing error-specific retries are bounded and sequential; live-session reuse does not perform another launcher open.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same resume call count, retries and finalization; experiment payload changes as on create.",
+            "CriticalPathEffect": "Awaited before resuming the chat."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_forkSdkChat, line 10191",
+            "Operation": "Call client.rpc.sessions.fork at the resolved source-history boundary.",
+            "Cardinality": "One SDK fork per requested child conversation, not one call per source turn.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same source-history processing and single SDK fork.",
+            "CriticalPathEffect": "Must complete before child resume."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_forkSdkChat, lines 10202-10215",
+            "Operation": "Open the source database and copy it with vacuumInto when available.",
+            "Cardinality": "At most one source-database copy per fork; bytes scale with source database size.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical database-copy operation and placement.",
+            "CriticalPathEffect": "Copy attempt precedes child launch."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_forkSdkChat, lines 10206-10209; copilotSessionLauncher.ts:_buildSessionConfig",
+            "Operation": "Prepare the fork database directory and target file, plus unchanged launch plugin/agent/working-directory preparation.",
+            "Cardinality": "One mkdir and one target-file removal when a source database exists; launch preparation follows the same resource cardinality as create.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same filesystem work; no new history-sized loop.",
+            "CriticalPathEffect": "Awaited before child resume."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:toSdkExpFetchOptions and _resumeSession",
+            "Operation": "Request runtime experiment fetching and pass hostAssignmentContext through resume configuration.",
+            "Cardinality": "One requested option per nonempty-context launch configuration; actual fetch count for an unloaded versus already runtime-loaded session is externally owned and unverified.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Resume received the empty host-supplied assignment response. Existing history/database boundaries were unchanged.",
+            "CriticalPathEffect": "SDK resume is awaited, but experiment fetch scheduling and forwarding are not visible."
+          }
+        ],
+        "ScalingInput": "Distinct cold/resumed/forked SDK sessions, not messages within a conversation. Fork database-copy work scales with source history size, unchanged by the diff.",
+        "EffectiveConcurrency": "Duplicate resumes for a chat join; chat work is serialized per key. Different chat keys may resume concurrently. Existing fallback attempts for one launch are sequential, not a new concurrency burst.",
+        "CacheBehavior": "CopilotSessionLifetime joins default resumes with one promise and peer resumes per chat key, removing promises after settlement. Live-session maps avoid reopening already live chats. Managed-settings joining remains per runtime/token/directory. Runtime assignment cache behavior is inaccessible; no host cache is added or removed.",
+        "MechanismConfidence": "High confidence in per-chat resume joining and unchanged fork boundaries. No high-confidence uncached assignment fan-out or added history-proportional work demonstrated.",
+        "MagnitudeUncertainty": "External runtime loaded-session behavior and assignment caches cannot be independently confirmed; fork size and timing are not measured.",
+        "Verdict": "No actionable performance issue: the diff adds no host retry, history scan, database copy or concurrency change, and external fetch behavior is not proven."
+      },
+      {
+        "Scenario": "Use ephemeral editor-inline or terminal agent-host chat.",
+        "CriticalPath": "InlineChatSessionResolver and TerminalChatSessionResolver request ephemeral sessions. Deferred backing is materialized for use, or warmed through the existing path, then awaits the same launcher create/finalize sequence. The experiment options are not gated by isEphemeral, so these launches receive them when context is present.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/inlineChat/browser/inlineChatSessionResolver.ts:resolve; terminalContrib/chat/browser/terminalChatSessionResolver.ts:resolve; platform/agentHost/node/copilot/copilotSessionLauncher.ts:_createSession",
+            "Operation": "Create the ephemeral host backing and open its SDK session through existing session services.",
+            "Cardinality": "One real SDK open per actual ephemeral launch after deferred/live/warm reuse; not per input event.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same ephemeral backing and SDK launch path.",
+            "CriticalPathEffect": "Must complete before a cold ephemeral session can perform its turn."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_buildSessionConfig and getCopilotRuntimeWorkingDirectory",
+            "Operation": "Perform unchanged plugin-directory and working-directory preparation; explicit custom-agent reads remain skipped for ephemeral sessions.",
+            "Cardinality": "Per configured local plugin-directory entry and launch canonicalization; zero explicit custom-agent enumeration reads.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same preparation and ephemeral exclusions.",
+            "CriticalPathEffect": "Awaited during launch preparation."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotManagedSettings.ts:CopilotManagedSettingsResolver.resolve",
+            "Operation": "Resolve managed policy using the existing runtime request and grouping.",
+            "Cardinality": "One in-flight query per runtime/token/working-directory tuple, shared by matching callers.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical query and joining behavior.",
+            "CriticalPathEffect": "Awaited during launch configuration."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_buildSessionConfig, line 1878",
+            "Operation": "Supply fetchAssignments true and hostAssignmentContext to ephemeral launches as well as regular launches.",
+            "Cardinality": "One requested option per nonempty-context ephemeral launch; external cache and actual network-call count are unknown.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Ephemeral launches also received the empty host-supplied assignment response.",
+            "CriticalPathEffect": "Potentially inside awaited SDK create/resume, but no runtime implementation proves blocking placement."
+          }
+        ],
+        "ScalingInput": "Separate ephemeral chat lifetimes and actual SDK launches, not each edit, token or terminal command. Existing live/warm reuse still applies.",
+        "EffectiveConcurrency": "Per-chat serialization and matching warm-launch reuse remain in effect; different ephemeral chats can launch independently. There is no diff-introduced parallel loop.",
+        "CacheBehavior": "Ephemeral launch skips explicit custom-agent enumeration, memory and computer-use activation. Existing BYOK proxy and managed-settings sharing remain. Assignment caching inside the external runtime is unknown.",
+        "MechanismConfidence": "High confidence that ephemeral launches receive the changed options, but insufficient confidence in a concrete expensive mechanism rather than intended feature enablement.",
+        "MagnitudeUncertainty": "Inline and terminal agent-host use is configuration-gated. Runtime experiment handling is unavailable, so additional first-use latency cannot be established.",
+        "Verdict": "No finding: applying the new option to ephemeral sessions alone does not prove repeated or eager heavyweight work after runtime caching."
+      },
+      {
+        "Scenario": "Refresh VS Code assignment context, disable experiments, and continue using a loaded conversation.",
+        "CriticalPath": "AgentHostPrewarmer asynchronously resolves the workbench assignment list and dispatches the newest context into root configuration. The launcher reads that string only when constructing a session configuration. No new listener, launcher invocation or await is added to refresh handling or ongoing turns.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/agentHost/electron-browser/agentHostService.ts:AgentHostPrewarmer.doUpdateAssignmentContext, lines 112-120",
+            "Operation": "Dispatch RootConfigChanged carrying the assignment-context string.",
+            "Cardinality": "One dispatch per latest resolved refresh request; obsolete overlapping results return before dispatch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Exactly the same context resolution, request-id suppression and root-config dispatch.",
+            "CriticalPathEffect": "Async refresh, not a new gate on existing chat turns."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:toSdkExpFetchOptions and experiments configuration",
+            "Operation": "Replace the small empty assignment-response object with a boolean and the existing host-context string in session options.",
+            "Cardinality": "Constant-size wrapper per launch; string bytes are the existing assignment-context length. No new whole-history or whole-collection serialization is added in host code.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same host-context string was already included in the SDK session-open payload inside assignments.AssignmentContext.",
+            "CriticalPathEffect": "Part of existing session-open payload construction, not an additional ongoing-turn loop."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/AGENTS.md:assignment-context description; copilotSessionLauncher.ts:experiments configuration",
+            "Operation": "Runtime may combine its assignment context with host context on existing CAPI requests and exposure telemetry.",
+            "Cardinality": "No new host-side CAPI call is added. Additional runtime context/header bytes and exposure behavior cannot be inspected; no demonstrated request-frequency increase.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Host context was already supplied for existing CAPI headers; diff changes experiment configuration, not host inference request scheduling.",
+            "CriticalPathEffect": "Existing inference requests remain required for turns; the diff does not add a host await or per-turn fetch."
+          }
+        ],
+        "ScalingInput": "Workbench assignment-refresh events and assignment-context string length. The diff performs a type/nonempty check and references the existing string; it does not iterate assignments or retain a growing collection.",
+        "EffectiveConcurrency": "Workbench context requests may overlap, with stale results discarded before dispatch. Existing loaded sessions and matching warm launches are not reopened by the changed helper. Independent turns use unchanged scheduling.",
+        "CacheBehavior": "A monotonically increasing request id suppresses outdated context-update results. Undefined or empty context produces no fetch/context options. No host cache or retention lifecycle changes. Context handling and exposure/header serialization inside the SDK/runtime are unavailable.",
+        "MechanismConfidence": "High confidence that the host introduces no refresh-triggered launch, unbounded retained state, or per-turn fetch loop. External metadata effects are not enough to establish regression.",
+        "MagnitudeUncertainty": "SDK forwarding, runtime header construction and exposure telemetry implementation are external and unavailable. No measured extra serialization or network overhead.",
+        "Verdict": "No reportable regression in refresh/opt-out or continuing turns. Unchanged metadata transport is not causal evidence of an increased expensive operation."
+      }
+    ],
+    "Summary": "Completed the distinct performance-review pass over the complete three-file inventory and every diff page. Investigated session creation/prewarming, cold/live resumption and forks, ephemeral inline/terminal sessions, and assignment refresh/opt-out, including host caches, per-chat sequencing and expensive boundaries. No high-confidence introduced performance regression or concrete performance-regression fix established. The change requests external runtime experiment fetching; the selected repository pins Copilot SDK 2.0.1, SDK/runtime internals were unavailable through read-only tools, and changed tests use mocked SDK calls, leaving actual fetching, caching and blocking placement unproven."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-22T17:46:28.140702007Z",
+    "CompletedAt": "2026-11-22T17:49:05.132112608Z",
+    "WallClockMilliseconds": 156991,
+    "ModelCalls": 12,
+    "InputTokens": 465681,
+    "OutputTokens": 6885,
+    "TotalTokens": 472566,
+    "ReasoningTokens": 1164,
+    "CacheReadTokens": 399777,
+    "CacheWriteTokens": 65868,
+    "APIDurationMilliseconds": 130841,
+    "ToolCalls": 49,
+    "NanoAIUnits": 27356970000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 399777,
+      "cache_write": 65868,
+      "input": 36,
+      "output": 6885
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
