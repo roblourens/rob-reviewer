@@ -1,0 +1,369 @@
+{
+  "PullRequest": {
+    "Number": 349692,
+    "Title": "Share identical in-flight git reads and cap concurrent git reads in the agent host (experiment-controlled)",
+    "Body": "\nFixes #349691\n\n## Root cause\n\nSee the issue: `AgentHostGitService._runGit` has no in-flight de-duplication and no host-wide limit, so concurrent turn-end refreshes spawn many identical read-only git processes that slow each other down until they time out.\n\n## Fix\n\nThe new behavior is behind the setting `chat.agentHost.git.coalesceReads` (boolean, default `false`, application scope, tags `experimental` and `advanced`, `experiment: { mode: 'auto' }`), mirrored to the agent host through the existing `agentHost` setting key (`gitCoalesceReads`). With the setting off, read-only git commands spawn exactly as before.\n\nWith the setting on, in `agentHostGitService.ts`:\n\n- Identical concurrent read-only git commands (same directory, arguments and options) share one process. Read-only means `status`, `rev-parse`, `show-ref`, `for-each-ref`, `merge-base`, `rev-list`, `ls-files`, `diff`, `show`, `cat-file`, `ls-tree`, `log`, without stdin or a stderr listener.\n- At most 8 read-only git processes run at once host-wide. Further reads wait for a free slot. The cap and the cooldown below are constants; tuning them is a later iteration.\n- Any other git command goes through a mutation path. It stops later reads from sharing reads that were already in flight, except for commands that only write objects or use a throwaway index.\n- Opt-in fail-fast: the background status probes (session file diffs, branch diff fingerprint, untracked paths, working tree capture, git state) return `undefined` right away for 10 s after the same command timed out, instead of queuing another probe behind it. That is the same result a timeout already produces, so callers show their previous state. `hasUncommittedChanges` does not use it, because its `undefined` means \"clean\" and it gates commit, merge, PR and worktree removal. Reads with `throwOnError` never fail fast.\n\nIn both arms:\n\n- The spawn timer is cleared when git finishes or fails to start. Before, a spawn failure (for example for a deleted worktree directory) left the timer running until the timeout.\n- Experiment trigger: `AgentHostGitService._runGit` reports `experimentTrigger` for the setting (treatment `config.chat.agentHost.git.coalesceReads`) on every shareable read-only git command, before the arms diverge, so control and treatment reach it alike. It is held until the workbench has forwarded the assignment context to the agent host. Mutations and commands with stdin or a stderr listener behave the same in both arms and do not trigger.\n- Telemetry: the event `agentHost.gitReads` (owner `sandy081`) reports one aggregated window per arm, at most every 5 minutes and when the host shuts down. Properties: `arm` (`coalesced` or `passthrough`), `spawns`, `peakLiveProcesses`, `timeouts`, `reads`, `sharedReads`, `queuedReads`, `queueWaitTotalMs`, `queueWaitMaxMs`, `failFastSkips`, `readTotalMs`, `readMaxMs`, `slowReads` (over 5 s) and `verySlowReads` (over 15 s). Every number is a measurement; nothing is derived from paths, commands or repository names.\n- Policy: no policy is needed. The setting only schedules the host's own read-only git processes and governs no tool, shell, file, URL, MCP, plugin, permission or model behavior.\n\n## Tests\n\n- New unit tests in `agentHostGitService.test.ts`: identical reads share one process and later reads spawn again; a write makes later reads start their own process; 50 distinct reads never exceed 8 concurrent; the fail-fast cooldown applies only when the caller opts in; with the setting off every read spawns its own process, unlimited and never skipped; the trigger and one aggregated event per arm; a git command that fails to start leaves no live process counted. With `_runGit` temporarily replaced by a straight passthrough, 3 of the original 4 tests fail (unit run, local). The write-ordering test and the failed-start test are regression guards; depending on scheduling they may also pass or fail on the old code, so they are not counted as evidence of the change.\n- Local runs of mine, on the final head (rebased on origin/main 619bd729381): one complete run of the git-service unit and integration, checkpoint, changeset (service, coordinator, operation, strategy), git-state, configuration, review and mission-control suites together: 832 passing, 37 pending, 0 failing; `oxlint` on the 10 changed files and `typecheck-client` clean. The telemetry extractor resolves `agentHost.gitReads` with its owner and `isMeasurement` on every number.\n\n## Measurements\n\nAll numbers below come from my own runs of a service-level node harness (not independently verified), run against the previous revision of this change that had no setting, which behaves like the setting on; \"before\" is the old passthrough, which is also what the setting off does. The harness uses the real compiled service with real git, 24 dirty worktrees of one repository (4 with deleted directories), 8 read paths per worktree, 3 rounds at turn end. Agents-window UI and Windows not run.\n\n| Scenario | Before | After |\n| --- | --- | --- |\n| Peak live git children, no load, 3 trials | 187–201 | 8 |\n| Median per-call latency, no load | 4.7–5.3 s | 1.8–2.0 s |\n| Spawns per run | 1288 | 1024 (remaining spawns are distinct commands) |\n| Timeouts with a 2 s limit | about 358 | 0 |\n| Peak live git under 12 CPU spinners | 248 | 23 (read cap plus uncapped object-writing git) |\n| Median latency under 12 CPU spinners | 15.0 s | 6.4 s |\n| Max latency under 12 CPU spinners | 18.1 s | 21.8 s |\n\nLive check: partial. Service level only (real compiled service, real git); the Agents-window UI was not run.\n\nHonest note on the tail: under heavy machine load the median improves about 2.5x, but the maximum is not better (21.8 s vs 18.1 s), because queued reads wait for one of the 8 slots; total wall time is about equal. Without load the maximum is about the same.\n\n## Follow-ups (not in this PR)\n\n- Direct `status` calls on deleted worktree directories still spawn git and fail with `ENOENT`. `getRepositoryRoot` already skips them without spawning.\n- One status read per refresh across checkpoint, changeset and git-state, instead of sharing only identical in-flight reads.\n- Cache remote lookups.\n- Tune the cap of 8 and the 10 s cooldown, or scale the cap with CPU count.\n\n---\nWritten by GitHub Copilot on behalf of @sandy081\n",
+    "URL": "https://github.com/microsoft/vscode/pull/349692",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "58a9245ffe53ec35991e7d5b08bf2e37f2acedb2",
+    "HeadRef": "agents/health-agenthost-git-storm",
+    "HeadSHA": "25e8927e56fcd124af5785071e84e14ff66bd6b1",
+    "CreatedAt": "2026-11-22T20:19:21Z",
+    "UpdatedAt": "2026-11-22T22:53:40Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-579CAA7B3AA5",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostGitService.ts",
+      "Side": "RIGHT",
+      "Line": 1622,
+      "Severity": "medium",
+      "Confidence": 0.96,
+      "ConfidenceRationale": "The diff inserts a host-wide FIFO Limiter before _spawnGit, while the timeout is created only inside _spawnGit. Turn-end captures and foreground turn-start captures both reach it, and Copilot's pre-tool hook awaits the latter. Existing directory grouping cannot combine reads from distinct worktrees. Exact delay depends on repository/I/O speed; the unbudgeted wait is statically established.",
+      "PerformanceCategory": "latency",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "Git-read queue slots held by slow status/diff/ls-files subprocesses; pending foreground read promises",
+      "PerformanceScaling": "Queue delay grows with distinct slow reads ahead of the request after directory/command coalescing: eight slow worktree probes can delay an unrelated read for one timeout interval, and additional distinct worktrees add further waves. Identical callers in one worktree may share, but different worktree directories do not.",
+      "PerformanceOutcome": "Foreground turn-start tools and commit/merge operations can be blocked for multiple command-timeout intervals by unrelated background repository work, even when their own Git commands are fast.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Each _runGit call spawned immediately and began its timeout immediately; a fast read in another repository did not have to wait for previously requested status/diff commands to finish.",
+      "ChangedBehavior": "With coalescing enabled, all shareable foreground and background reads enter the same eight-slot FIFO queue, with no enqueue deadline or cancellation. Only execution after dequeue is timed.",
+      "CausalDiffEvidence": "Added line 1622 queues every shareable read through _gitReadLimiter, and line 1627 calls _spawnGit only when that queue grants a slot. _spawnGit still starts its 30-second default timer at line 1740, so none of the new queue wait consumes the command's timeout budget.",
+      "Title": "Include queue wait in the Git-read timeout budget",
+      "Impact": "When multiple large or slow worktrees refresh together, starting a turn or invoking commit/merge in a healthy repository waits behind their probes. The normal 30-second Git timeout no longer bounds even a single read's request-to-result latency; several queued batches can turn this into a multi-minute stall.",
+      "Evidence": "CheckpointAndChangesetContribution.onTurnEnd starts captures without awaiting them; AgentHostCheckpointService captures independently per session and calls captureWorkingTreeAsTree (line 415). That method issues status, HEAD-tree and cold index-path reads in parallel (1235–1239). The same method is awaited by _captureTurnStartCheckpoint (262), and CopilotAgentSession._handlePreToolUse awaits _turnStartCheckpoint (11209). CommitOperationHandler awaits hasUncommittedChanges (93), which also enters this queue. Limiter.consume uses FIFO outstandingPromises.shift and keeps a slot until its factory promise settles (async.ts 833–858). The timeout and cooldown apply only after spawn; neither bounds time spent waiting.",
+      "Recommendation": "Keep the concurrency cap, but assign queued reads an end-to-end deadline and expire/remove queued work before spawning when that budget is exhausted; pass only the remaining budget to _spawnGit and preserve existing throwOnError versus undefined timeout semantics. Alternatively reserve/prioritize capacity for foreground reads while still bounding their queue wait."
+    }
+  ],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/platform/agentHost/node/agentHostGitService.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 1700,
+      "BasePath": "src/vs/platform/agentHost/node/agentHostGitService.ts",
+      "BaseLine": 1597,
+      "IntroducingPath": "src/vs/platform/agentHost/node/agentHostGitService.ts",
+      "IntroducingCommit": "d9eb8ee3a902bdf8f3735fd74e7e4c2eb827e2d9",
+      "MechanismFamily": "cleanup-lifecycle",
+      "PerformanceCategory": "memory",
+      "Mechanism": "The manually created Git timeout was cleared only by the child's exit event. A failed spawn, such as ENOENT for a deleted worktree cwd, invokes the execFile error callback without an exit event, leaving a referenced timer and its child/service closure alive until the timeout.",
+      "Symptom": "Repeated direct status probes of deleted worktrees retained one timer/closure per failed spawn for the default 30 seconds, with unnecessary timer wakeups and an event-loop liveness tail despite requests already having finished.",
+      "FixedBehavior": "The execFile callback now clears the timer before either success or error handling, releasing the timeout resource promptly even when no child exit event occurs.",
+      "Evidence": "The diff adds clearTimeout(timer) at RIGHT line 1700 in _spawnGit's execFile callback; the base timer creation at 1597 and exit-only clearing at 1605 both blame to d9eb8ee3a902bdf8f3735fd74e7e4c2eb827e2d9. Public hasUncommittedChanges calls _runGitStatus directly without the getRepositoryRoot missing-directory guard, making failed cwd spawns reachable during worktree lifecycle races. Previously the callback settled the request but did not clear the timer; Node failed-spawn error/close delivery does not emit exit. The added failed-directory test corroborates reachability, although its counter assertions alone do not measure timer retention.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "concurrency-burst",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "unbounded-retention",
+      "serialization-allocation",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Concurrent turn-end refreshes across sessions/worktrees",
+        "CriticalPath": "CheckpointAndChangesetContribution starts checkpoint capture without awaiting it, then schedules changeset recomputation; GitHubReferencesContribution also starts reconciliation without blocking subsequent contributions. Publishing updated changesets/Git state awaits their probes. Background reads nevertheless occupy the new queue used by later foreground work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts: captureWorkingTreeAsTree, computeSessionFileDiffs, getBranchDiffFingerprint, _computeSessionGitState, _spawnGit",
+            "Operation": "Git status, ref/HEAD/index-path lookups, merge-base, diff and divergence probes",
+            "Cardinality": "Scales with distinct resolved repository/worktree directories and distinct command/options tuples, not every folder or chat. Identical overlapping reads may share; linked worktree directories remain distinct. Capture ordinarily requests status and HEAD-tree plus a cold index-path lookup; Git state uses a different status format. Multi-folder changesets deduplicate roots and limit repository work to five per computation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same logical Git probes already existed; root and Git-state service-level joining already reduced duplicate work. This diff introduces lower-level joining and an eight-slot host-wide queue, not new probe types.",
+            "CriticalPathEffect": "Results gate each background publication; slow children can also delay unrelated foreground reads through shared queue occupancy."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts: _tryCopyIndex, _stageChangedPaths, _runWithTempIndex, getBranchDiffFingerprint",
+            "Operation": "Create/delete temporary directories, copy/stamp index, write grouped pathspecs, stat changed paths",
+            "Cardinality": "One temporary index/pathspec per dirty capture or untracked diff; fingerprint stats at most 2,000 changed paths with local concurrency 16. Clean captures avoid temporary-index work.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical operations and cardinality; the PR changes scheduling of surrounding Git reads only.",
+            "CriticalPathEffect": "Needed for capture/diff/fingerprint completion; not newly performed per file by this diff."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCheckpointService.ts: _captureTurnCheckpoint; agentHostChangesetService.ts: checkpoint and tracked-diff reads",
+            "Operation": "Read baseline/parent/checkpoint records and persist checkpoint metadata and changes summaries",
+            "Cardinality": "Per captured turn and deduplicated repository; capture is sequenced per session, not globally.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same database work and session sequencing.",
+            "CriticalPathEffect": "Required before checkpoint completion/publication; unchanged boundary count."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostPullRequestAssociationResolver.ts: resolveForCheckout; agentHostGitStateService.ts: _attachSessionGitHubPullRequest",
+            "Operation": "GitHub pull-request list by head branch, optionally listForCommit after a HEAD lookup",
+            "Cardinality": "Zero when the branch is already associated or is the base branch; otherwise one logical branch-list request and at most one commit-list fallback per lookup. Service/client scopes are reused; lookup sequencing is per session or folder.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same lookup requests and association checks; only the fallback HEAD read now may queue.",
+            "CriticalPathEffect": "Required for PR reconciliation, off the turn-end contribution critical path; unchanged API issuance conditions."
+          }
+        ],
+        "ScalingInput": "Independent sessions and unique worktree/repository roots after grouping; multiple roots within one repository do not multiply full repository diff work.",
+        "EffectiveConcurrency": "Previously no host-wide limit for _runGit; local per-session sequencers and per-computation limits remained independent. Treatment limits shareable reads to eight host-wide using FIFO; object/temp-index writes, other mutations and direct showBlob/deleteRefs spawns bypass it. Control remains immediate spawning.",
+        "CacheBehavior": "Root and index-path LRUs each have capacity 100. Confirmed non-repositories are cached; missing directories and transient root failures are not pinned. Git-state reads already join per folder/base, refreshes throttle per key for five seconds, and matching branch fingerprints reuse diffs. New in-flight entries are removed on resolve/reject. Timeout history is capped at 100 and only opt-in nonthrowing status probes skip within ten seconds; first cold reads are not skipped. Mutation invalidation may reduce sharing but does not introduce additional logical caller requests.",
+        "MechanismConfidence": "High: complete changed hunks, service registration, callers, local limiters, cache cleanup and FIFO implementation were traced.",
+        "MagnitudeUncertainty": "No runtime profiling; simultaneous session count, repository size, I/O speed and timeout prevalence are unknown. The setting defaults off but can be experiment-enabled.",
+        "Verdict": "Coalescing/capping removes a real resource-burst mechanism. The same queue causes the submitted unbudgeted foreground-wait regression; no additional boundary-fanout or unbounded-cache finding."
+      },
+      {
+        "Scenario": "Start a new agent turn while other worktrees refresh",
+        "CriticalPath": "AgentSideEffects starts a turn-start checkpoint. AgentHostCheckpointService resolves roots, records the turn and awaits captureWorkingTreeAsTree for each unique repository before completing treesCaptured. CopilotAgentSession._handlePreToolUse awaits this checkpoint before root tools execute; some send paths await it even earlier.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts: getRepositoryRoot, captureWorkingTreeAsTree, _spawnGit",
+            "Operation": "Resolve repository root, run status, resolve HEAD tree and index path; optionally seed/stage/write a temporary tree",
+            "Cardinality": "Per unique repository in the turn, processed serially by capture; each capture issues two warm read probes plus a cold index-path probe. Reads in another worktree cannot join background reads by directory key.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "These existing probes spawned immediately with execution timers starting immediately, without waiting for unrelated queued repositories.",
+            "CriticalPathEffect": "Root lookup/capture reads enter the same FIFO as unrelated background probes. Their execution timeout starts only after dequeue, allowing multiple slow batches to block first tool execution."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts: captureWorkingTreeAsTree, _tryCopyIndex, _stageChangedPaths",
+            "Operation": "Temporary-index folder/index/pathspec creation and cleanup for dirty captures",
+            "Cardinality": "One grouped temporary-index operation per dirty repository; none for a clean tree with HEAD.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same dirty/clean branches and cleanup.",
+            "CriticalPathEffect": "Required to obtain the captured tree; unchanged cardinality."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostCheckpointService.ts: _captureTurnStartCheckpoint",
+            "Operation": "Resolve chat storage, create/read turn metadata and read baseline checkpoint",
+            "Cardinality": "Per turn and repository baseline, with baseline lookup overlapping the capture.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same metadata and baseline work and overlap.",
+            "CriticalPathEffect": "Turn metadata and tree capture must complete before tools proceed; remaining baseline creation runs after treesCaptured and can be off that immediate path."
+          }
+        ],
+        "ScalingInput": "Distinct slow reads already queued host-wide, after command/directory joining; even one foreground repository can wait behind many other worktrees.",
+        "EffectiveConcurrency": "Capture is sequenced per session, roots within it are captured serially, and its initial status/HEAD/index probes overlap. New FIFO globally admits eight shareable processes; no queue deadline, foreground priority or queue cancellation is supplied.",
+        "CacheBehavior": "Warm root/index caches remove discovery probes but not status and HEAD-tree reads. The foreground status may share an identical pending probe only in the same directory. Its lack of previous timeout history gives no fail-fast protection from other repositories' backlog.",
+        "MechanismConfidence": "High: queue placement, timeout placement and pre-tool await are directly established.",
+        "MagnitudeUncertainty": "Exact delay is workload-dependent; eight timeout-length probes yield one wave of waiting and larger distinct queues yield more. These are static bounds/examples, not measured timings.",
+        "Verdict": "Reportable introduced latency regression, submitted at agentHostGitService.ts:1622. Preserving the cap while bounding queue time addresses it without removing required checkpoint ordering."
+      },
+      {
+        "Scenario": "Commit, merge, create a PR, mark files reviewed, or preserve/remove a worktree",
+        "CriticalPath": "Operation handlers await repository/branch/state/dirty checks before writes. Commit also awaits changeset computation before commit-message generation. Review marking awaits a capture and an overlay-tree read. Worktree preservation awaits capture and HEAD/ref reads before removal.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostCommitOperationHandler.ts: _invoke; agentHostMergeOperationHandler.ts: _invoke; agentHostGitService.ts: hasUncommittedChanges, overlayPathIntoTree, removeWorktree",
+            "Operation": "Foreground status/ref/diff/ls-tree checks, followed by Git mutations or temporary-index/object writes",
+            "Cardinality": "A bounded sequence per invoked operation/repository; preservation/review includes one tree capture. Multi-repository reviewed-ref copying deduplicates repositories. Mutations retain their existing count.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Same Git commands, with precondition reads spawning immediately rather than entering the new global FIFO.",
+            "CriticalPathEffect": "Precondition reads now queue behind background reads before their timers start; mutations themselves bypass the cap, but cannot proceed before required reads."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostCommitOperationHandler.ts: utilityChatCompletion; agentHostPullRequestOperationHandler.ts: _invoke; agentHostGitService.ts: fetch/push/pull",
+            "Operation": "Generate a commit/branch message, access GitHub PR APIs, and run remote Git mutations",
+            "Cardinality": "Existing workflow-dependent requests per operation, not per changed file; Git push/fetch/pull remain uncapped mutation commands.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same request conditions and remote Git process count.",
+            "CriticalPathEffect": "Existing downstream network work is delayed by queued prerequisites; no new network fan-out is introduced."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts: overlayPathIntoTree, captureWorkingTreeAsTree, removeWorktree",
+            "Operation": "Temporary index creation/deletion and worktree residue access/removal",
+            "Cardinality": "Per review/preservation operation and deduplicated repository; existing retry/backoff remains bounded.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same temporary resources and cleanup; no independent newly missing disposal established.",
+            "CriticalPathEffect": "Required for the operation, with temporary resources potentially living longer while ls-tree reads queue."
+          }
+        ],
+        "ScalingInput": "Foreground requests versus independent background repository backlog; not the number of files in the generated commit prompt.",
+        "EffectiveConcurrency": "Required operation ordering is retained. Read prerequisites share the eight-slot FIFO; mutation work is immediate and uncapped as before.",
+        "CacheBehavior": "Warm roots shorten discovery. hasUncommittedChanges explicitly opts out of cooldown because undefined has safety-sensitive meaning, so prior timeouts do not provide a queue-wait shortcut. Writes invalidate in-flight joining before/after execution; object/temp-index-only writes do not. Timeout history remains bounded.",
+        "MechanismConfidence": "High for queue reachability and blocked preconditions; downstream network scheduling is unchanged.",
+        "MagnitudeUncertainty": "Operation prevalence and background contention vary; no performance measurements were run.",
+        "Verdict": "Same submitted queue-time regression, deduplicated rather than separate findings on each caller. Conservative invalidation and omitted read-only subcommands alone do not establish extra pre-diff work."
+      },
+      {
+        "Scenario": "Repository-info telemetry captures and patch collection",
+        "CriticalPath": "Capture checks Git state, branch/baseline and safety, captures a tree, computes file descriptors, checks exclusions, reads patches and rechecks the tree. End capture awaits the recorded begin result. Telemetry emission itself is fire-and-forget after capture.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostRepoInfoTelemetry.ts: _capture; agentHostGitService.ts: getBranchDiffSafetyInfo, getDiffPatchBetweenRefs",
+            "Operation": "Existing Git status/safety/tree/diff probes and bounded per-descriptor patch reads",
+            "Cardinality": "At most 100 changed descriptors, with at most four patch reads active per capture before the new host-wide cap. Rename source/destination paths are grouped into one patch command per descriptor. Begin is joined by message ID and end runs only after a successful/noChanges begin.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Same bounded descriptor reads with local concurrency four; no host-wide queue across independent captures.",
+            "CriticalPathEffect": "Reads gate completion of this telemetry task and consume slots shared with foreground work; existing descriptor fan-out is not newly introduced."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/agentHostRepoInfoTelemetry.ts: _filterContentExclusionAllowedDescriptors",
+            "Operation": "Call the supplied content-exclusion checker with deduplicated paths",
+            "Cardinality": "One grouped checker invocation per eligible capture, not one per file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical grouping and gate.",
+            "CriticalPathEffect": "Needed before allowed patches are requested; its provider-specific transport is unchanged."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/agentHostTelemetryReporter.ts: reportRepoInfo; agentHostRepoInfoTelemetry.ts: _capture",
+            "Operation": "Serialize bounded diff payloads and multiplex restricted telemetry properties",
+            "Cardinality": "One report per completed begin/end capture; existing 100-change, patch-buffer and JSON-size limits apply.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same payload transformation, limits and restricted telemetry submission.",
+            "CriticalPathEffect": "Existing reporting is off the foreground path and not changed into per-read serialization by this PR."
+          }
+        ],
+        "ScalingInput": "Eligible independent message captures and up to 100 allowed changed descriptors per capture; effective patch concurrency four locally/eight globally.",
+        "EffectiveConcurrency": "Four patches per capture locally; treatment additionally caps shareable reads across all captures at eight. No newly increased subprocess or serialization concurrency.",
+        "CacheBehavior": "Begin results join by telemetry message ID and are removed on end, clearTurn or disposal. Root/index caches and new in-flight Git joining apply; unique file-path commands remain distinct. Existing capture gates skip unsupported/oversized cases.",
+        "MechanismConfidence": "High for bounded cardinality and changed scheduling; checker transport depends on the supplied provider.",
+        "MagnitudeUncertainty": "Number of eligible parallel telemetry captures and patch durations are unknown; no independent new per-descriptor fan-out inferred.",
+        "Verdict": "No separate finding: existing expensive work is now bounded globally, with foreground interference covered by the queue-time finding."
+      },
+      {
+        "Scenario": "Open Git-backed diff content",
+        "CriticalPath": "GitBlobResourceProvider resolves trusted session directories and repository selection, then awaits showBlob before returning content. Saved-session directory/state reads may occur first.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts: getRepositoryRoot and showBlob",
+            "Operation": "Cold root discovery and direct buffer-mode git show",
+            "Cardinality": "One showBlob process per blob content request, unchanged; cold root resolution joins by directory. Multi-root selection deduplicates repositories with a local root-resolution limit of five.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same direct show process and root-discovery count; scheduling of the root helper is changed as documented in the foreground scenario.",
+            "CriticalPathEffect": "Only cold root discovery enters the new FIFO. showBlob continues using direct execFile with its own timeout and does not enter the read limiter."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/resourceProviders/gitBlobResourceProvider.ts: read",
+            "Operation": "Read saved working-directory ownership or restore session metadata when necessary",
+            "Cardinality": "Conditional existing saved-session lookup and ownership recheck per request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same saved-state reads/restoration.",
+            "CriticalPathEffect": "Needed for repository selection when session data is not resident; unchanged."
+          }
+        ],
+        "ScalingInput": "Requested blob sides and unique repository roots, not every file in the repository.",
+        "EffectiveConcurrency": "showBlob remains uncapped/direct, as before; cold root requests encounter the new eight-read queue in addition to existing local limits.",
+        "CacheBehavior": "Warm repository roots bypass queued discovery; same-directory cold lookups already joined before the PR. Blob content itself is not cached/coalesced here in either revision.",
+        "MechanismConfidence": "High: direct execFile is visibly separate from _runGit.",
+        "MagnitudeUncertainty": "Diff request concurrency and cold-root frequency vary; existing uncapped blob spawns are out of scope.",
+        "Verdict": "No new blob-read burst finding. Cold discovery can suffer the same submitted queue delay; passing through this unchanged blob path is insufficient for another report."
+      },
+      {
+        "Scenario": "Setting evaluation, aggregated telemetry and graceful shutdown",
+        "CriticalPath": "Each shareable read checks the forwarded boolean and reports the experiment trigger before arm selection. Read completion updates numeric counters. Shutdown flushes the final aggregate before closing the orchestrator database and before callers unload telemetry.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts: _runGit; agentHostGitReadTelemetry.ts: flush; src/vs/platform/telemetry/common/telemetryService.ts: _doLog",
+            "Operation": "Serialize argument/options keys and submit fixed-size numeric aggregate telemetry",
+            "Cardinality": "One key serialization per treatment read, proportional to its existing arguments/options, not Git output. One aggregate per active five-minute window and arm transition/final flush; no telemetry event per spawn/read.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No coalescing keys or Git-read aggregate events; other telemetry infrastructure already existed.",
+            "CriticalPathEffect": "Small key/counter work precedes reads; aggregate sanitization/submission occurs only at bounded flush points and does not await upload."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/platform/agentHost/node/agentHostSettingExperimentTrigger.ts: report; src/vs/platform/telemetry/common/experimentTrigger.ts: logExperimentTrigger",
+            "Operation": "Submit experimentTrigger through the telemetry service after assignment context is available",
+            "Cardinality": "At most once per treatment/telemetry service; pending assignment state is a boolean, not a growing per-read collection.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This setting-specific trigger did not exist.",
+            "CriticalPathEffect": "No awaited remote boundary on the read path."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentService.ts: shutdown",
+            "Operation": "Wait for existing session-state writes and close orchestrator database",
+            "Cardinality": "One shutdown sequence, unchanged; a fixed-size Git telemetry flush is inserted before database close.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same state drain and database close, without the new aggregate submission.",
+            "CriticalPathEffect": "Existing flush/close ordering remains; new telemetry flush is synchronous submission rather than awaited network completion."
+          }
+        ],
+        "ScalingInput": "Read frequency affects counters/key allocation, while telemetry event size is fixed and volume follows time windows, not repository/file count.",
+        "EffectiveConcurrency": "Counters run on the host event loop, one flush scheduler; downstream telemetry uses existing opt-out/metered gates, bounded assignment buffer and appenders. Changing arms flushes the old window.",
+        "CacheBehavior": "Configuration getters access the raw property and validate a boolean, not clone all root state. Trigger logging uses existing once-per-treatment tracking. Pending Git entries remove on settlement and cooldown history caps at 100. The scheduler is registered for disposal; graceful shutdown flushes before collector teardown.",
+        "MechanismConfidence": "High for fixed-size aggregation, getter cost and lifecycle ordering; exact telemetry uploader transport is outside this unchanged API.",
+        "MagnitudeUncertainty": "No measured allocation cost, but no large per-read payload transformation or new per-read upload is established.",
+        "Verdict": "No high-confidence serialization, retention or telemetry-volume regression."
+      },
+      {
+        "Scenario": "Git probes fail to spawn after a worktree directory disappears",
+        "CriticalPath": "Direct status callers can reach execFile without root discovery's missing-directory guard. Its callback returns the existing failure result; the timer must be released even when there is no child exit event.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts: _runGitStatus and _spawnGit",
+            "Operation": "Attempt Git spawn with missing cwd and settle its failure callback",
+            "Cardinality": "One attempt per unshared direct probe. Failed spawn is not a timeout, so the new timeout cooldown does not negative-cache ENOENT; this retry behavior already existed.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same failed spawn attempt, but the timer was cleared only on exit, an event not emitted on failed spawn.",
+            "CriticalPathEffect": "Failure callback now promptly clears its timeout; no retained event-loop timer remains for an already completed failed request."
+          }
+        ],
+        "ScalingInput": "Frequency of direct probes during deleted-worktree lifecycle races; previously each failure retained a timer/closure until its execution budget expired.",
+        "EffectiveConcurrency": "Control spawn attempts remain immediate; treatment may join identical reads and admits at most eight shareable reads. Callback cleanup applies in both arms.",
+        "CacheBehavior": "Missing-directory root lookups already avoid spawning, while direct status calls do not. Timeout history remains bounded and applies only to actual timeouts.",
+        "MechanismConfidence": "High: timer creation and exit-only cleanup provenance were resolved by base blame; added callback clear handles Node's failed-spawn lifecycle.",
+        "MagnitudeUncertainty": "Race frequency and retained closure sizes were not measured; retention lifetime follows the known default 30-second budget.",
+        "Verdict": "Concrete cleanup-lifecycle performance fix recorded internally with introducing commit d9eb8ee3a902bdf8f3735fd74e7e4c2eb827e2d9; not a finding against the fixing PR."
+      }
+    ],
+    "Summary": "Completed the performance-review pass against base 58a9245ffe53ec35991e7d5b08bf2e37f2acedb2. Inspected all 14 changed-file entries and every diff page (all pagination ended at zero), then traced relevant callers, grouping, caches, limiters, subprocesses and downstream boundaries. Submitted one medium-severity, high-confidence regression for unbudgeted global read-queue latency and recorded one proven failed-spawn timer cleanup fix with blame provenance. Other candidates were existing work, bounded state/aggregation, or intentional coalescing/concurrency reductions rather than independently introduced performance regressions. Static review only; runtime latency and workload prevalence remain unmeasured."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-23T03:28:48.125690526Z",
+    "CompletedAt": "2026-11-23T03:36:01.713246462Z",
+    "WallClockMilliseconds": 433587,
+    "ModelCalls": 18,
+    "InputTokens": 1578007,
+    "OutputTokens": 14572,
+    "TotalTokens": 1592579,
+    "ReasoningTokens": 4346,
+    "CacheReadTokens": 1449157,
+    "CacheWriteTokens": 128796,
+    "APIDurationMilliseconds": 316194,
+    "ToolCalls": 100,
+    "NanoAIUnits": 61273370000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 1449157,
+      "cache_write": 128796,
+      "input": 54,
+      "output": 14572
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

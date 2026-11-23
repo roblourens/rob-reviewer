@@ -1,0 +1,237 @@
+{
+  "PullRequest": {
+    "Number": 349717,
+    "Title": "Extension host: activate a file system provider's scheme once, not before every call",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nWhen a file system provider lives in the extension host itself (for example the built-in disk provider for `file` URIs), `vscode.workspace.fs` calls it directly, but before every `stat`, `readFile`, `readDirectory`, `writeFile`, `delete` and `createDirectory` it awaited `$ensureActivation`, a round trip to the renderer. This PR stores the activation promise on the provider registration, so the round trip happens once per registration:\n\n- A failed activation is retried on the next call.\n- A new registration for the same scheme activates again, so the first call after re-registering still waits for the renderer.\n\nNo issue is associated; this came from profiling.\n\n## Why\n\nI profiled Code OSS on my machine while Copilot Chat answered a question in a clone of this repository. Chat's code-search index calls `vscode.workspace.fs.stat` once per workspace file, and the extension host spent 1.67 s in these `$ensureActivation` round trips. The renderer also had to handle every one of those messages.\n\n## Why it is safe\n\n- `$ensureActivation` calls `IFileService.activateProvider`. That fires `onWillActivateFileSystemProvider`, whose only listeners start extensions:\n  - [abstractExtensionService.ts](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/services/extensions/common/abstractExtensionService.ts) activates `onFileSystem:\u003cscheme\u003e`;\n  - [remoteFileSystemProviderClient.ts](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/services/remote/common/remoteFileSystemProviderClient.ts) joins the remote environment for `vscode-remote`.\n\n  Both are idempotent. The extension service records requested activation events and replays them for extensions added later and when an extension host restarts.\n- One case gets different timing: a remote Node extension host behind a web window that has no `file` provider. There, calls after the first no longer wait for extensions installed afterwards to activate. Those calls use the extension host's own provider, so their result can't depend on that activation.\n\n## How to test\n\n`src/vs/workbench/api/test/common/extHostFileSystemConsumer.test.ts` is new. Its 3 tests fail without the change:\n- activation happens once per registration;\n- a failed activation is retried;\n- a new registration activates again.\n\n| Command | Result |\n|---|---|\n| `node build/next/index.ts transpile` | passed |\n| `./scripts/test.sh --run src/vs/workbench/api/test/common/extHostFileSystemConsumer.test.ts --run src/vs/workbench/api/test/browser/extHostNotebook.test.ts --run src/vs/workbench/api/test/browser/extHostNotebookKernel.test.ts --run src/vs/workbench/api/test/browser/extHostNotebookSerializer.test.ts` | passed, 39 passing, 0 failing |\n| `node_modules/.bin/tsc --project ./src/tsconfig.json --noEmit --skipLibCheck` | passed |\n| `pnpm run oxlint src/vs/workbench/api/common/extHostFileSystemConsumer.ts src/vs/workbench/api/test/common/extHostFileSystemConsumer.test.ts` | passed |\n\nNot tested: a before/after profile of a signed-in Chat session.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/349717",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "federicobrancasi",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "742a9ae378720f2526ed7128fbc47ec2a285f1b1",
+    "HeadRef": "fbrancasi/ext-host-fs-activate-scheme-once",
+    "HeadSHA": "b52b5f6825ed6c4535d4791c99992ac5be036486",
+    "CreatedAt": "2026-11-23T00:20:06Z",
+    "UpdatedAt": "2026-11-23T00:25:51Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/api/common/extHostFileSystemConsumer.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 163,
+      "BasePath": "src/vs/workbench/api/common/extHostFileSystemConsumer.ts",
+      "BaseLine": 46,
+      "IntroducingPath": "src/vs/workbench/api/common/extHostFileSystemConsumer.ts",
+      "IntroducingCommit": "e2834de739e7505aa8e72f314f11187652d8bbb3",
+      "MechanismFamily": "boundary-fanout",
+      "PerformanceCategory": "ipc",
+      "Mechanism": "For N workspace.fs shortcut operations on a registered local scheme, the base performed N separately serialized activation requests and awaited N renderer replies before the otherwise-local provider calls, despite cached extension activation. This adds IPC processing and critical-path latency proportional to operation count, including watcher-event fan-out and repeated metadata reads.",
+      "Symptom": "Statically established redundant renderer round trips delay local filesystem API completion and consume extension-host/renderer serialization and dispatch work. No measured duration is asserted.",
+      "FixedBehavior": "One successful activation IPC round trip per local provider registration, shared by concurrent first calls and reused by subsequent stat/read/list/mutation operations; rejected activations are cleared for retry and re-registration gets a new cache object.",
+      "Evidence": "The deleted stat line 46 awaited _proxy.$ensureActivation(uri.scheme) on every call; five other shortcut operations did the same. workspace.fs exposes this consumer directly (extHost.api.impl.ts:1408-1409), and the Node host installs a local file provider (extHostExtensionService.ts:168; extHostDiskFileSystemProvider.ts:24,36-37). A parent-directory creation invokes stat for each interested TypeScript watcher (extensions/typescript-language-features/src/tsServer/fileWatchingManager.ts:81-84), providing a concrete repeated-call path. RPCProtocol._remoteCall serializes and sends every invocation and allocates a pending reply (rpcProtocol.ts:476-495); MainThreadFileSystem.$ensureActivation calls FileService.activateProvider, which fires an activation event even for an already-present provider (fileService.ts:95-108). Existing per-event extension-host activation caching does not eliminate these consumer-to-renderer requests. Added lines 162-169 cache one activation promise on the registration; the new tests demonstrate joining concurrent calls, reuse across operations, retry after rejection, and fresh activation after re-registration. Blame resolves the old stat await to the supplied introducing commit.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "unbounded-retention",
+      "concurrency-burst",
+      "serialization-allocation",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Extension reads and metadata/listing requests using an extension-host-local provider, including Node file URIs and watcher-event fan-out.",
+        "CriticalPath": "Each request must pass activation before calling provider.stat/readFile/readDirectory; it then awaits provider I/O and any existing safe-copy. Only the first successful activation per registration now awaits a renderer round trip. Provider construction remains at the existing Node-host initialization point; the change does not eagerly activate anything at startup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostFileSystemConsumer.ts:46,68,96,161-169; src/vs/workbench/services/extensions/common/rpcProtocol.ts:_remoteCall",
+            "Operation": "Serialize and send $ensureActivation(scheme), dispatch FileService.activateProvider in the renderer, and receive a reply.",
+            "Cardinality": "On successful activation, at most one round trip per touched registration, S rather than N; concurrent first calls for the same registration join one promise. Warm calls send none.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every shortcut API call serialized a separate activation request and awaited its reply, including warm calls on an already-registered provider.",
+            "CriticalPathEffect": "The first request and concurrent cold requests await the shared reply; subsequent calls await an already-settled promise rather than a new IPC round trip."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/api/node/extHostDiskFileSystemProvider.ts:36-58; src/vs/platform/files/node/diskFileSystemProvider.ts:stat,readdir,readFile",
+            "Operation": "Disk stat through SymlinkSupport, directory enumeration with symlink target stats, or open/read/close file contents.",
+            "Cardinality": "N logical provider operations; directory listing uses one enumeration plus K symlink-resolution stats, and reads perform open/read/close work proportional to B. No file-content or stat-result cache is added.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical provider calls and I/O cardinality, preceded by activation IPC on every invocation.",
+            "CriticalPathEffect": "Provider I/O remains awaited after activation; the diff removes repeated preliminary IPC, not actual filesystem operations."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/services/extensions/common/abstractExtensionService.ts:131-134,993-1052; src/vs/workbench/services/extensions/common/extensionHostManager.ts:328-355",
+            "Operation": "Activate interested extensions across extension-host managers via the existing onFileSystem event.",
+            "Cardinality": "Actual activation is already cached per activation event per extension-host manager, rather than starting extensions once per file. If a renderer provider exists, FileService does not await the activation joiners.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every consumer activation IPC fired the event; underlying extension activation promises were already cached.",
+            "CriticalPathEffect": "Cold activation joiners are awaited only when the renderer has no provider; otherwise this extension activation work is initiated off the filesystem request's joined critical path."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/api/common/extHostFileSystemConsumer.ts:69,97",
+            "Operation": "Existing shallow directory-result copy and Uint8Array safe-copy.",
+            "Cardinality": "O(L) array references per listing and O(B) bytes per local read, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same copies of the same provider results.",
+            "CriticalPathEffect": "Copies remain on API completion path."
+          }
+        ],
+        "ScalingInput": "N API calls distributed across S live provider registrations, including many files watched under one newly created parent directory; B bytes read and L listed entries, of which K are symlinks.",
+        "EffectiveConcurrency": "Concurrent initial calls coalesce activation per registration; after activation, provider reads/stats remain caller-concurrent without a global consumer limiter. The old RPC implementation also issued requests immediately without a protective concurrency limiter.",
+        "CacheBehavior": "Lazy activation promise stored on each registration object, not each URI. Pending and successful promises are reused. No result caching or file invalidation semantics change. Retained successful state is bounded by live registrations; RPC pending-reply entries are deleted when replies arrive.",
+        "MechanismConfidence": "High: all changed call sites, local disk-provider registration, a concrete watcher caller, RPC serialization/dispatch, and existing activation caching were traced.",
+        "MagnitudeUncertainty": "Workspace sizes, caller concurrency, disk speed, and actual IPC duration vary; no runtime measurements were taken and arbitrary third-party provider internals cannot be characterized.",
+        "Verdict": "No introduced performance regression. The change removes a concrete per-operation activation IPC fan-out; this fix was recorded separately with base-line blame provenance."
+      },
+      {
+        "Scenario": "Local createDirectory/writeFile/delete operations during extension-generated file creation, saving, and cleanup.",
+        "CriticalPath": "Activation is awaited first; createDirectory and writeFile then await mkdirp ancestor stats and directory creation. writeFile finally enters the existing URI-specific queue and awaits the write; delete awaits provider deletion. Readonly providers and useTrash bypass the shortcut as before.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostFileSystemConsumer.ts:82,111,126,161-169",
+            "Operation": "Ensure renderer scheme activation before a local mutation.",
+            "Cardinality": "One successful activation per touched registration, shared with reads and concurrent mutations, rather than one per mutation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "One awaited activation round trip per shortcut mutation.",
+            "CriticalPathEffect": "Only cold registration requests wait for a fresh IPC response."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/api/common/extHostFileSystemConsumer.ts:mkdirp; src/vs/platform/files/node/diskFileSystemProvider.ts:doWriteFile,mkdir,delete",
+            "Operation": "Stat ancestors, create missing folders, open/write/close files, and unlink/rmdir or recursively remove a tree.",
+            "Cardinality": "Up to D+1 ancestor stats and D mkdir calls per applicable mkdirp; open/write/close per file write with byte work proportional to B; recursive removal scales with T. Existing folders still require the existing lookup; no new coalescing or duplication is introduced.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same mkdirp traversal, write queue, filesystem operations, and deletion behavior.",
+            "CriticalPathEffect": "These filesystem calls remain awaited before mutation completion; mkdirp remains outside the per-URI write queue."
+          }
+        ],
+        "ScalingInput": "M mutation requests across S registrations, missing ancestor depth D per mkdirp invocation, content bytes B, and subtree size T for recursive deletion.",
+        "EffectiveConcurrency": "ResourceQueue.queueFor serializes writes to the same comparison-key URI and disposes drained queues; different URIs remain concurrent. Ancestor discovery/creation and deletions have the same caller-controlled concurrency as before.",
+        "CacheBehavior": "Reads and mutations share the same registration activation promise. Existing mkdirp does not cache directory existence; this is unchanged. No content or mutation-result cache is introduced.",
+        "MechanismConfidence": "High: all changed mutation branches, mkdirp, ResourceQueue, and disk mutation methods were inspected.",
+        "MagnitudeUncertainty": "Depth, subtree size, storage performance, and third-party mutation backends vary; none of these scaling mechanisms is added by this PR.",
+        "Verdict": "No reportable regression: activation IPC is reduced while existing ordering, queue ownership, and filesystem cardinality remain unchanged."
+      },
+      {
+        "Scenario": "Concurrent cold requests, rejected activation retry, provider disposal/re-registration, and a remote Node host using its own file provider behind a web renderer.",
+        "CriticalPath": "Cold requests await one registration-owned activation promise. A rejection propagates to its callers and clears that promise before later requests retry. A new registration has no activation field and must await a new first activation. If a web renderer lacks a file provider, its activation call may await extension activation joiners before the local Node provider is invoked.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostFileSystemConsumer.ts:161-169,259-262; src/vs/workbench/api/common/extHostFileSystem.ts:registerFileSystemProvider",
+            "Operation": "Activation request/reply and existing custom-provider registration/unregistration notifications.",
+            "Cardinality": "One activation request per cold attempt wave; at most one concurrent attempt per registration. Failures allow another attempt, and new registrations activate again. Custom-provider registration and unregistration remain one call each per lifecycle.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Activation requests were sent per caller, even when concurrent; registration/unregistration notifications and removal of the consumer registration were already present.",
+            "CriticalPathEffect": "Cold attempts and retries are awaited; registration/unregistration notifications remain in their existing lifecycle placement."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/workbench/services/extensions/common/abstractExtensionService.ts:activateByEvent; src/vs/workbench/services/extensions/common/extensionHostManager.ts:activateByEvent; src/vs/platform/files/common/fileService.ts:activateProvider",
+            "Operation": "Join existing extension activation when the renderer lacks the requested scheme provider.",
+            "Cardinality": "One joined activation attempt per new cached consumer attempt; actual extension-host activation is already keyed and cached by event/manager.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every local request crossed to the renderer and potentially joined activation when no renderer provider existed.",
+            "CriticalPathEffect": "The initial call can wait for extension scanning/activation. After successful activation, local provider operations no longer repeatedly wait for renderer activation work."
+          }
+        ],
+        "ScalingInput": "R provider registration lifetimes and F failed activation waves; C simultaneous callers per wave. Cache cardinality is live registrations, not URI count or accumulated historical registrations.",
+        "EffectiveConcurrency": "One in-flight activation per registration; separate schemes can activate concurrently. Concurrent failures share one rejection rather than multiplying IPC attempts. Pending callers can retain their registration until settlement, as they already did before this PR.",
+        "CacheBehavior": "Failure is not permanently cached: catch resets activation to undefined. Registration disposal deletes the map entry; replacement creates a new object. A successful void-valued promise is retained only with its owning registration. Tests cover concurrent reuse, rejection retry, and re-registration. Successful activation does not require a renderer provider to exist, matching FileService.activateProvider's existing semantics; no retry loop or per-resource negative cache is added.",
+        "MechanismConfidence": "High for bounded ownership and coalescing: registration object construction/removal, rejection handling, tests, RPC pending-reply cleanup, and LazyPromise were inspected.",
+        "MagnitudeUncertainty": "Activation failures and remote-web deployment prevalence are unknown. Actual third-party extension startup durations are not measured.",
+        "Verdict": "No high-confidence performance regression: failure behavior remains retryable, registration cache ownership is bounded, and lifecycle transitions do not create accumulating retained entries or increased boundary calls."
+      },
+      {
+        "Scenario": "workspace.fs fallback operations for schemes without a local provider, including vscode-remote, readonly mutations, trash deletion, rename, and copy.",
+        "CriticalPath": "The consumer awaits its existing main-thread operation RPC; FileService activates/resolves providers, then awaits actual provider work. Remote providers use the existing channel-backed filesystem operations. For vscode-remote activation, the listener joins an environment promise that registration already started.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostFileSystemConsumer.ts:fallback branches,rename,copy; src/vs/workbench/api/browser/mainThreadFileSystem.ts:$stat,$readdir,$readFile,$writeFile,$mkdir,$delete,$rename,$copy",
+            "Operation": "Forward each fallback filesystem operation to the renderer's FileService.",
+            "Cardinality": "One consumer-to-main-thread operation request per API call, N total. FileService provider activation remains inside that existing operation, without a newly added preliminary consumer activation request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical fallback RPCs and provider-resolution paths; these branches are not modified.",
+            "CriticalPathEffect": "Operation RPC and renderer-side provider work remain on request completion path."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/remote/common/remoteFileSystemProviderClient.ts:register,constructor; src/vs/platform/files/common/diskFileSystemProviderClient.ts:stat,readdir,readFile,writeFile,mkdir,delete,rename,copy",
+            "Operation": "Use the remoteFilesystem channel for actual remote filesystem requests.",
+            "Cardinality": "Existing channel calls per underlying provider operation: one for stat/readdir/readFile/mkdir/delete/rename/copy methods, with higher-level FileService operations potentially composing multiple calls. No call count changes in this PR.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same remote channel-backed filesystem requests and same eagerly started, shared environment promise.",
+            "CriticalPathEffect": "Network replies remain awaited by actual remote operations; cold provider activation can join the already-started environment acquisition."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadFileSystem.ts:RemoteFileSystemProvider",
+            "Operation": "Forward renderer filesystem operations to a custom provider in another extension host, when applicable.",
+            "Cardinality": "Existing requests per underlying provider operation; no local registration cache is used if that provider is absent from this consumer host.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical RemoteFileSystemProvider forwarding.",
+            "CriticalPathEffect": "Actual provider reply remains required for fallback request completion."
+          }
+        ],
+        "ScalingInput": "N fallback operations on actual resources; rename/copy can involve source and destination providers and trees. Remote directory listing can add provider stat/readdir calls through FileService; exact call count depends on existing operation semantics, not the changed local activation cache.",
+        "EffectiveConcurrency": "No new global limiter, sequencer, or scheduling change on fallback paths. Existing FileService/provider queues and channel transport govern operations; remote environment initialization is shared rather than started per URI.",
+        "CacheBehavior": "The new activation cache is not consulted on fallback branches. Remote environment acquisition is already one shared promise per remote client registration. Existing extension activation is cached per event/manager, while actual filesystem results are not cached by this diff.",
+        "MechanismConfidence": "High that these paths are unchanged: consumer fallback branches, main-thread forwarding, provider activation listeners, and remote channel client methods were inspected.",
+        "MagnitudeUncertainty": "Remote RTT, file sizes, and higher-level copy/tree cardinality can be large but are pre-existing costs. No remote workload profile or arbitrary external backend implementation was available.",
+        "Verdict": "No introduced performance regression: the new cache changes only locally registered shortcut activation, not fallback network/IPC cardinality or critical-path placement."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over both files and every diff page. Traced all six changed shortcut call sites, local disk-provider initialization, API registration ownership, concurrent activation/retry behavior, actual filesystem operations and write queues, RPC serialization/cleanup, renderer activation caching, and unchanged remote/fallback boundaries. No actionable diff-introduced performance regression found. Recorded the proven removed per-operation activation IPC mechanism as an internal regression fix with base blame provenance. Static review only; no runtime duration claims."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-23T03:38:03.100970581Z",
+    "CompletedAt": "2026-11-23T03:40:49.357108981Z",
+    "WallClockMilliseconds": 166256,
+    "ModelCalls": 9,
+    "InputTokens": 294652,
+    "OutputTokens": 6065,
+    "TotalTokens": 300717,
+    "ReasoningTokens": 1052,
+    "CacheReadTokens": 241107,
+    "CacheWriteTokens": 53518,
+    "APIDurationMilliseconds": 129478,
+    "ToolCalls": 35,
+    "NanoAIUnits": 21860970000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 241107,
+      "cache_write": 53518,
+      "input": 27,
+      "output": 6065
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
