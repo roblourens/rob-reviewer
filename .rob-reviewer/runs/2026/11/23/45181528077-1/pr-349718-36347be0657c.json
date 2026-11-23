@@ -1,0 +1,228 @@
+{
+  "PullRequest": {
+    "Number": 349718,
+    "Title": "Quick open: score each item once when sorting Go to File results",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nGo to File sorts results with `compareItemsByFuzzyScore` as the comparator, which runs O(n log n) times. Each call looked both items up in the scorer cache, and that lookup reads the label and description through the accessor and hashes them with the query (`getCacheHash` → `stringHash`), even on cache hits.\n\nThis PR adds `createItemsByFuzzyScoreComparator`, which remembers each item's score for one sort, and uses it in the two places where Go to File ranks results:\n- `rawSearchService.sortResults`, in the extension host;\n- `AnythingQuickAccessProvider`, in the window.\n\n`compareItemsByFuzzyScore` itself is unchanged: its body after the two `scoreItemFuzzy` calls moved into a private `compareItemScores`. For an empty query there is nothing to remember, so the new comparator falls back to `compareItemsByFuzzyScore`.\n\nNo issue is associated; this came from profiling.\n\n## Measured on my machine (Code OSS dev build, a clone of this repository: 21,608 files)\n\n| What | Before | After |\n|---|---|---|\n| Typing 5 Go to File queries, extension host CPU profile: the ranking loop (`topStep`) | 922–938 ms (3 runs) | 753 ms |\n| Same scenario, cache key hashing (`stringHash`) | 149–159 ms | 23 ms |\n| Ranking all 21,608 paths for 70 queries, Node benchmark | 6.27 s | 3.10 s |\n\nResults were identical in all benchmark runs. In the app, most of the remaining time is the first fuzzy score of each file, which this change can't avoid.\n\n## Why it is safe\n\n- Each comparator keeps its scores in its own `Map` and is created per sort, so a scorer cache reused across queries (raw search keeps one per quick open session) never returns another query's score.\n- In `rawSearchService`, `topAsync` yields between batches, but the query is local to the call and no code writes to `IRawFileMatch.relativePath`.\n- In `anythingQuickAccess`, the picks are created per call and sorted synchronously.\n\n## How to test\n\nThe new test checks two things:\n- the new comparator sorts like `compareItemsByFuzzyScore`, with one cache shared across several queries;\n- comparing a pair with different scores again reads nothing from the accessor.\n\n| Command | Result |\n|---|---|\n| `node build/next/index.ts transpile` | passed |\n| `./scripts/test.sh --run src/vs/base/test/common/fuzzyScorer.test.ts --run src/vs/workbench/contrib/search/test/browser/anythingQuickAccess.test.ts --run src/vs/workbench/services/search/test/node/rawSearchService.integrationTest.ts` | passed, 127 passing, 0 failing |\n| `node_modules/.bin/tsc --project ./src/tsconfig.json --noEmit --skipLibCheck` | passed |\n| `pnpm run oxlint \u003cchanged files\u003e` | passed |\n\nTo try it by hand: open a large folder and type in Go to File. The results and their order are the same as before.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/349718",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "federicobrancasi",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "742a9ae378720f2526ed7128fbc47ec2a285f1b1",
+    "HeadRef": "fbrancasi/fuzzy-score-each-item-once",
+    "HeadSHA": "36347be0657c21b1181abe526e2087c9aa54bb3c",
+    "CreatedAt": "2026-11-23T00:20:20Z",
+    "UpdatedAt": "2026-11-23T00:25:37Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/base/common/fuzzyScorer.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 672,
+      "BasePath": "src/vs/base/common/fuzzyScorer.ts",
+      "BaseLine": 649,
+      "IntroducingPath": "src/vs/base/common/fuzzyScorer.ts",
+      "IntroducingCommit": "c574731ae915d9f24184baf887399ac4c1360528",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "Repeated content-based scorer-cache lookups inside the ranking comparator reread and hash label/description/query text for both operands even when fuzzy scores are already cached. In top selection with N matches and K retained results, an incumbent can be rehashed for many of the N comparisons, with additional comparisons on insertion; full history sorting performs O(H log H) such comparisons. This adds CPU/string processing on the path to displaying Go to File results.",
+      "Symptom": "Strongly evidenced redundant character-scanning hash and accessor work delays ranking and consumes extension-host/UI-thread CPU during Go to File queries over large matching file sets; warm scorer-cache hits still incurred this work before the change. No timing measurements were independently executed.",
+      "FixedBehavior": "The three ranking sites create a fresh comparator for each sort. For nonempty queries its identity Map reuses IItemScore references and bypasses accessor/cache-hash computation on subsequent comparisons of the same item, including cached no-match scores; the original comparison and tie-breaking rules remain in compareItemScores. Hash/scoring lookup multiplicity falls from two per comparison to at most one per distinct compared item. The additional Map is confined to the synchronous sort or active topAsync invocation.",
+      "Evidence": "The base comparator calls scoreItemFuzzy for both operands on every comparison at fuzzyScorer.ts:649-650. scoreItemFuzzy reads the accessor label/description and computes getCacheHash before checking the existing cache (head lines 423-446, unchanged). getCacheHash hashes label, description and query text through doHash/stringHash; hash.ts:52-57 scans every string character. rawSearchService.sortResults previously invoked this comparator from topAsync; arrays.ts:325-350 repeatedly compares the same retained top candidates while scanning all matching files, and the two browser ranking paths also repeatedly compare picks. This diff adds a per-sort identity Map at fuzzyScorer.ts:666-678 and replaces the raw and browser comparators, reducing these cache-key computations to once per distinct compared item. The added test repeats comparisons in both directions and asserts zero subsequent accessor reads. Blame resolves the old score call to c574731ae915d9f24184baf887399ac4c1360528 in src/vs/base/common/fuzzyScorer.ts. Static call-flow evidence establishes the removed CPU work independently of PR-described benchmark timings.",
+      "Confidence": 0.94
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "cache-lifecycle",
+      "unbounded-retention",
+      "serialization-allocation",
+      "synchronous-ui-work",
+      "boundary-fanout",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Rank a nonempty Go to File query in the native search provider, on cold and cached file results.",
+        "CriticalPath": "Cold enumeration or resolution of a shared cached enumeration, prefix filtering when applicable, and sortResults/topAsync must finish before selected results are serialized and delivered. Ranking remains on this path, but repeated cache-key hashing is removed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/search/node/fileSearch.ts:Walker.walk/folderTraversal and src/vs/workbench/services/search/node/ripgrepFileSearch.ts:spawnRipgrepCmd",
+            "Operation": "Spawn ripgrep --files and receive file paths; filesystem enumeration occurs in ripgrep.",
+            "Cardinality": "On a cold cache miss, one initial subprocess per root, with at most one subsequent exception subprocess for roots with exclusion exceptions. On a reusable cached enumeration, zero additional traversal subprocesses. Calls scale with roots, not matching files.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical root-level traversal and caching before this PR; only the ranking comparator changes.",
+            "CriticalPathEffect": "Cold enumeration must complete before ranking; cached searches may await the same in-flight enumeration. No enumeration is introduced within the comparator."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadSearch.ts:RemoteSearchProvider._provideSearchResults; src/vs/workbench/api/node/extHostSearch.ts:doInternalFileSearch",
+            "Operation": "Issue one file-search request to the extension host for its grouped query and deliver selected file URIs through $handleFileMatch.",
+            "Cardinality": "One request per participating scheme provider per logical search, not per file; selected matches are returned in existing batches of 512, plus completion. Native sort occurs before delivery.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same grouped requests and result batching; ranking formerly invoked scoreItemFuzzy twice per comparison.",
+            "CriticalPathEffect": "The request, native search/ranking, and response delivery precede file-pick presentation. Remote extension-host transport may add network latency, unchanged."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/services/search/node/rawSearchService.ts:doFileSearchWithEngine/rawMatchToSearchItem/sendProgress",
+            "Operation": "Convert the selected raw matches to serialized path matches and batch progress results.",
+            "Cardinality": "At most min(N,K) selected path conversions, grouped into batches of 512; full cached enumeration stays on the provider side.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same selected-result conversion and batching; this PR neither serializes the new Map nor increases response size.",
+            "CriticalPathEffect": "Runs after ranking and before response delivery."
+          }
+        ],
+        "ScalingInput": "N matching IRawFileMatch objects across workspace roots, plausibly thousands to tens of thousands; K is the requested result limit (512 for this picker). topAsync sorts the initial K and scans the remainder, with additional logarithmic comparisons on insertion. Content-score cache entries can be shared by identical label/description/query combinations; the new identity Map contains at most the distinct compared objects, U \u003c= N.",
+        "EffectiveConcurrency": "Workspace roots traverse in parallel; a root's optional exclusion-exception traversal is sequential after its initial traversal. topAsync performs single-threaded ranking in batches of 10000, yielding between later batches and retaining existing cancellation checks. Separate searches can overlap without a newly introduced global queue or increased issuance.",
+        "CacheBehavior": "Raw search retains enumeration promises by session cache key and file-pattern prefix, sharing in-flight enumeration with narrowing queries. Cold misses enumerate; warm prefix hits filter cached entries without launching a new traversal. Failed enumerations remove their cache row. Existing scorer cache already avoids recomputing fuzzy scores, including zero-score objects, but previously hashed content on every comparison. A new per-sort Map bypasses those repeated lookups and is released when ranking settles; it does not retain query history.",
+        "MechanismConfidence": "High: complete changed hunks, scoreItemFuzzy/getCacheHash/stringHash, topAsync, raw cache ownership, root traversal and extension-host delivery were traced. The optimization removes repeated accessor/hash work; added tests corroborate repeated-comparison accessor bypass.",
+        "MagnitudeUncertainty": "No independently measured timings or heap profiles; actual match counts, path lengths, tie frequency and query overlap vary. Map storage adds bounded O(U) references while the active input array and scorer cache already retain the relevant objects/scores.",
+        "Verdict": "No introduced performance regression. The additional Map is scoped to one active sort and reuses existing score objects; no new I/O, eager scoring, persistent retention or scheduling change. Recorded the removed repeated-hashing mechanism as an internal regression fix."
+      },
+      {
+        "Scenario": "Merge and rank file and optional workspace-symbol picks after typing in Quick Open, including multi-piece and path queries.",
+        "CriticalPath": "History can be presented first. Additional picks await file and symbol branches in Promise.all, then synchronously run top over their combined picks, followed by existing highlight filtering. Absolute-path detection precedes normal file searching; relative-path probes run alongside normal search.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/services/search/common/searchService.ts:doSearch",
+            "Operation": "Check existence of workspace roots before dispatching grouped searches.",
+            "Cardinality": "One exists call per root per logical file query, in Promise.all; one or two queries for the multi-piece fallback case.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical root checks and grouping before this PR.",
+            "CriticalPathEffect": "Must finish before provider dispatch; not moved by the diff."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadSearch.ts:RemoteSearchProvider._provideSearchResults",
+            "Operation": "Dispatch file searches to registered extension-host providers and receive results.",
+            "Cardinality": "One provider request per scheme group per search, normally one search, optionally a second sequential full-query search after a multi-piece limit hit. Warm provider enumeration caches can remove subprocess work but not the request.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same dispatch count, caching and multi-piece fallback. No per-pick boundary call added.",
+            "CriticalPathEffect": "File results must return before combined top ranking; native ranking is optimized by the other changed call site."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/search/common/search.ts:getWorkspaceSymbols; src/vs/workbench/api/browser/mainThreadLanguageFeatures.ts:$registerNavigateTypeSupport",
+            "Operation": "Invoke workspace-symbol providers, with extension-backed providers using $provideWorkspaceSymbols and releasing their previous result cache.",
+            "Cardinality": "One invocation per registered symbol provider for a coalesced query, concurrently; extension-backed providers make one search RPC and at most one prior-cache release RPC. Returned symbols are deduplicated before picks are ranked.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same provider calls, result-cache release and symbol deduplication; the diff only memoizes scores during the final merge ranking.",
+            "CriticalPathEffect": "Combined ranking awaits the provider aggregate when symbols are enabled. Provider-specific language-server or remote costs are outside the changed comparator."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/search/browser/anythingQuickAccess.ts:getAbsolutePathFileResult/getRelativePathFileResults/matchFilenameCasing",
+            "Operation": "Stat typed absolute or workspace-relative paths and resolve a parent directory to match filename casing when a file exists.",
+            "Cardinality": "No probes for queries without path separators. Absolute queries perform one candidate stat and one parent resolve on success; relative queries probe one candidate per root, with one parent resolve per successful file. URI deduplication removes overlap with normal file results.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical path probes and serial-per-root relative probing before the changed top comparator.",
+            "CriticalPathEffect": "Absolute probing can bypass ordinary file searching; relative probing is awaited alongside ordinary search. Remote filesystem providers may cross IPC/network boundaries, with unchanged placement."
+          }
+        ],
+        "ScalingInput": "F is the deduplicated, history-excluded file-pick count: normally up to 512 per participating scheme search, potentially another capped result set for multi-piece limit-hit fallback, plus relative-path hits. S is the deduplicated and filtered symbol count, not explicitly capped before merging. Final output is limited to 512; the new Map is bounded by F+S compared objects.",
+        "EffectiveConcurrency": "File and symbol requests run concurrently. Multiple file-query pieces cause at most two sequential searches only when the first hits its limit. SearchService groups roots by URI scheme and runs participating providers concurrently after existing parallel root-existence checks. Relative path stat/casing probes run sequentially per root. UI ranking is synchronous, with unchanged tie-breaking reads.",
+        "CacheBehavior": "Once the file-query cache is loaded, file requests bypass the cold 200ms typing delayer; otherwise the existing ThrottledDelayer coalesces pending typing and checks cancellation before search. Symbol requests retain their separate delayer. Raw enumeration and scorer caches are reused as described above. UI scorer cache resets for normal picker sessions; the identity Map is always newly created for a synchronous top invocation. Existing post-sort highlight lookups are unchanged.",
+        "MechanismConfidence": "High for changed synchronous ranking and its bounded lifetime, file query grouping/fallback, path probe counts, and symbol-provider fan-out. External providers' internal work is not needed to establish the unchanged boundary scheduling.",
+        "MagnitudeUncertainty": "Symbol-provider counts and returned symbol sizes are variable; delegate/provider implementation internals were not profiled. No elapsed-time claims are inferred from the PR's benchmark prose.",
+        "Verdict": "No high-confidence introduced performance regression. The new comparator lazily memoizes only compared picks, leaves providers and file probes unchanged, and reduces repeated content hashing. Existing filtering and deduplication still bound effective cardinality before or after their established stages."
+      },
+      {
+        "Scenario": "Show and fuzzy-sort recently opened editor history as fast picks for each nonempty filter.",
+        "CriticalPath": "History retrieval, pick construction, score filtering and synchronous sort complete before fast picks are available. Recency mode bypasses sorting; empty filters return history in existing order without using the new comparator.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/services/history/browser/historyService.ts:loadHistoryFromStorage",
+            "Operation": "Read workspace history from the storage service and JSON.parse persisted editor entries on initial history loading.",
+            "Cardinality": "One history-key read and parse on first loading, zero repeated parses from normal warm getHistory calls. Maintained history is bounded to 200 items.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same getHistory and pick-construction path loaded and parsed history before this PR.",
+            "CriticalPathEffect": "Can be part of first history retrieval when editor groups are ready; otherwise it occurs after group readiness. No loading is introduced by the new sort comparator."
+          }
+        ],
+        "ScalingInput": "HistoryService limits history to 200 items; H matching history picks are sorted with O(H log H) comparisons. The Map has at most H entries and is unreachable after the synchronous sort.",
+        "EffectiveConcurrency": "Filtering and sorting run synchronously on the window thread. Initial history loading is synchronous when groups are ready or deferred until their readiness; the diff changes neither readiness nor loading placement.",
+        "CacheBehavior": "History is loaded once from persisted state and restored editors, then served from memory. Each matching pick was already scored during filtering; the existing session scorer cache makes its first comparator lookup a warm content-score hit. The new per-sort identity Map skips subsequent lookup hashes. No Map persists across keystrokes.",
+        "MechanismConfidence": "High: traced doGetPicks, getEditorHistoryPicks, the recency/empty-query early returns, HistoryService's cap and loading, and createAnythingPick's lazy icon/button fields. Sorting does not invoke file-opening callbacks or introduce file/network access.",
+        "MagnitudeUncertainty": "No UI timing measured; the collection has a concrete 200-item cap. Initial persisted history size may vary, but its loading and parsing are unchanged.",
+        "Verdict": "No introduced regression. Warm-cache repeated hashing is reduced and the added Map is small and sort-local; no lazy widget work is forced or retained across history queries."
+      },
+      {
+        "Scenario": "Open Quick Open with an empty query while populating or refreshing the file enumeration cache in the background.",
+        "CriticalPath": "Fast history/help picks can be shown without waiting for file cache population. createFileQueryCache starts an existing maxResults=0 search; arrays.topAsync returns immediately without comparing when the limit is zero. Empty-query file/symbol picks short-circuit.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/search/browser/anythingQuickAccess.ts:createFileQueryCache; src/vs/workbench/contrib/search/common/cacheState.ts:load/dispose",
+            "Operation": "Issue the existing cache-populating search and later clear superseded cache keys.",
+            "Cardinality": "One logical prewarm per cache-state load, grouped into existing scheme-provider requests; superseded keys are cleared after replacement load completes. Not per enumerated file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical prewarming, previous-cache reuse and cache clearing.",
+            "CriticalPathEffect": "Background with respect to first fast-pick display; subsequent queries may reuse or await its enumeration."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/workbench/services/search/node/fileSearch.ts:Walker.folderTraversal; src/vs/workbench/services/search/node/ripgrepFileSearch.ts:spawnRipgrepCmd",
+            "Operation": "Enumerate workspace files into the raw provider cache.",
+            "Cardinality": "One initial ripgrep process per root, with one sequential exception pass where configured; compatible prior caches can serve typed queries while refresh runs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same enumeration and subprocess cardinality; maxResults=0 bypassed ranking before and still does.",
+            "CriticalPathEffect": "Off the initial fast-pick critical path, though cold later queries can await the enumeration."
+          }
+        ],
+        "ScalingInput": "Background enumeration scales with workspace roots and files, but the comparator creates no identity Map for the empty normalized query and performs zero score lookups when maxResults is zero.",
+        "EffectiveConcurrency": "Background traversal runs concurrently across roots; prior cache remains usable during refresh. Immediate history presentation and asynchronous prewarming stay separated. Comparator fallback adds no queue, tasks or eager score work.",
+        "CacheBehavior": "FileQueryCacheState preserves a compatible prior cache while refreshing, switches to the new cache after successful loading, and disposes the old cache. Raw result promises cache enumeration; UI scorer cache resets on normal picker creation. All lifecycle behavior is unchanged.",
+        "MechanismConfidence": "High: traced picker state setup, FileQueryCacheState ownership/rotation, maxResults=0, empty-query factory fallback and topAsync's zero-limit early return.",
+        "MagnitudeUncertainty": "Cold traversal duration depends on workspace size and filesystem locality; none of this work is added or rescheduled by the diff.",
+        "Verdict": "No eager-work or cleanup regression. The new factory does not score items during prewarming and does not interfere with existing cache replacement or cancellation."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over all four changed files and every diff page against base 742a9ae378720f2526ed7128fbc47ec2a285f1b1. No qualifying diff-introduced performance findings. Recorded one concrete repeated-hashing regression fix with base-line blame provenance. Examined ranking CPU work, short-lived Map allocation/retention, warm and negative score caching, asynchronous cancellation, file/symbol boundary cardinality, root/provider grouping, history limits and background cache rotation. Static review only; no scripts or code changes. The required performance-guide document was requested but the read tool exposed only a truncated preview; learned-regression guidance was fully available."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-23T13:12:52.053062188Z",
+    "CompletedAt": "2026-11-23T13:16:51.92011222Z",
+    "WallClockMilliseconds": 239867,
+    "ModelCalls": 14,
+    "InputTokens": 586488,
+    "OutputTokens": 8040,
+    "TotalTokens": 594528,
+    "ReasoningTokens": 1929,
+    "CacheReadTokens": 519095,
+    "CacheWriteTokens": 67351,
+    "APIDurationMilliseconds": 168598,
+    "ToolCalls": 54,
+    "NanoAIUnits": 30077100000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 519095,
+      "cache_write": 67351,
+      "input": 42,
+      "output": 8040
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
