@@ -1,0 +1,247 @@
+{
+  "PullRequest": {
+    "Number": 349506,
+    "Title": "agentHost: call Custom Endpoint BYOK models directly from the local runtime",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nRelated: #340335\n\nFirst step toward retiring the agent host BYOK bridge. Behind a new experimental setting, the **local** agent host registers **Custom Endpoint** BYOK models with the Copilot runtime as real providers: the model's own endpoint and the provider group's API key. The runtime then calls the endpoint itself instead of sending every request back to the window through the loopback proxy. All other vendors, remote agent hosts, and Custom Endpoint models whose settings the runtime can't reproduce keep using the bridge. With the setting off, behavior is unchanged. No runtime or protocol change is needed: the runtime already accepts host-supplied providers and live updates via `session.provider.sync`.\n\n## What changed\n\n**Shared URL rules (one copy).** The Custom Endpoint URL normalization and auth-header rule moved from the Copilot extension into `src/vs/platform/agentHost/common/customEndpointUrl.ts`. It has no imports, and the extension uses the copy that `copySources.ts` vendors into `src/util/vs` (the same mechanism as `promptFileParser.ts`). Core owns the logic because both the window and the agent host need it, and core can't import from the extension. Only the new file is vendored. Re-running the script also rewrites other vendored files that have drifted from core, so I left those alone.\n\n**Mapping** (`byokCustomEndpoint.ts`). Each model's settings map to a runtime endpoint that sends the same request URL and auth header as the extension. If no endpoint can, the model gets a reason to stay on the bridge.\n\n| Custom Endpoint | Runtime provider | Auth sent |\n|---|---|---|\n| `chat-completions` (incl. inferred from URL, or base URL → `/v1/chat/completions`) | `openai`, `wireApi: completions`, base URL without `/chat/completions` | `Authorization: Bearer` |\n| `responses` | `openai`, `wireApi: responses` | `Authorization: Bearer` |\n| `messages` (path must end in `/v1/messages`) | `anthropic`, base URL without `/v1/messages` | `x-api-key` |\n| URL contains `openai.azure`, or `requestHeaders: { \"api-key\": \"${apiKey}\" }` (APIM) | `azure`; `?api-version=` → `azure.apiVersion`; only paths the runtime keeps verbatim (`/openai/deployments/\u003cd\u003e/…` or `/openai/v1/…`) | `api-key` |\n| `requestHeaders: { \"Authorization\": \"Bearer ${apiKey}\" }` / `{ \"x-api-key\": \"${apiKey}\" }` | as above | as above |\n| Other `requestHeaders`, `modelOptions` (`temperature`/`top_p`), extra query params, credentials in URL, `streaming: false`, unknown `apiType`, a path the runtime would rewrite, a literal (non-secret-storage) key, any group with a discovery `url` | stays on the bridge | — |\n\nModel fields: name, `maxPromptTokens` / `maxOutputTokens` / `maxContextWindowTokens`, `capabilities.supports.vision` from `vision` (left unset when unknown, not coerced to false), `toolCalls` from `toolCalling`, and `reasoningEffort: true` when the model declares effort levels. `wireModel` and `modelId` are the configured model id, never the group-qualified one.\n\n**Key delivery.** No key is stored anywhere new.\n- `ILanguageModelsService.resolveLanguageModelsProviderGroupApiKey` is a narrow internal method. It only reads `chat.lm.secret.*` entries the service itself stored for that group, so an edited `chatLanguageModels.json` can't point it at other secrets. It isn't reachable from the extension API.\n- Window → local agent host: a separate `credential` call on the existing `agentHostClientByokLm` channel. The model list only carries a non-reversible `credentialVersion`, derived from the secret's storage reference, so a replaced key triggers a re-sync. The window enforces `clientByokEnabled` and the setting on every credential call, as the bridge does for chat requests. Neither IPC end has a payload logger attached.\n- Agent host → runtime: the static `apiKey` on the `NamedProviderConfig`, never `headers`. When the window stops reporting a direct model (BYOK disabled by policy, group removed or changed, setting off), live sessions re-point its provider at the bridge proxy under the same name, with or without a key. The selection survives transient gaps, and every request then goes through the window's checks exactly like a bridged one; if the proxy can't start, the model is withdrawn. Credential requests carry the snapshot's `credentialVersion`, and the window refuses one whose key was replaced since, so a new key never reaches an older snapshot's endpoint.\n\n**Model ids.** The runtime's selection id is `provider/id`, and provider names can't contain `/`. Per-group providers therefore can't keep `customendpoint/group/id` on their own. Each direct model gets its own provider, `customendpoint~\u003c16 hex of sha256(vendor/local id)\u003e`, and the agent host translates ids at the runtime boundary (`copilotByokModelIds.ts`). The picker, persisted selections, hidden-model state and `AgentHostByokLmHandler` keep seeing `vendor/[group/]id`. Translation happens at: create session, `setModel`, custom agents' `model`, `getCurrent` (runtime selection read-back and the model configuration report), subagent model updates, and restored history (`mapSessionEvents`). Provider names are stable, so a resumed session finds its journaled model again, and a changed endpoint or key updates the provider in place.\n\n**Gate.** `chat.agentHost.byokModels.customEndpointDirect.enabled` is `experimental` + `advanced`, default `false`, read in the window. It is a rollout switch for VS Code's own implementation, so it has no `policy:`. The existing BYOK policy remains the authority.\n\n## Not expressible yet (runtime model config)\n\n- Thinking budgets, adaptive thinking, and reasoning-effort levels and their format: the runtime takes `reasoningEffort` as a boolean only.\n- `editTools`, and Anthropic beta headers the extension adds.\n- `statefulResponses` and `zeroDataRetentionEnabled`: the runtime always sends `store: false` with full history over HTTP. That's correct, just not the stateful optimization.\n\n## Known limitations (must be addressed before default-on)\n\n1. **Tool count.** The bridge caps BYOK requests at 128 tools. The runtime does not cap or defer tools for host-supplied providers; it only caps Gemini models. A session with more than 128 tools (for example with large MCP servers) will be rejected by endpoints that enforce that limit, such as OpenAI and Azure OpenAI. This needs a runtime change (a cap or tool-search deferral for host-supplied providers).\n2. **Tool-output redaction.** Probed against the bundled runtime: a tool result that contains a host-supplied provider key, from a host tool or from built-in `view` reading a file, is not redacted. It reaches the model, the event stream and `events.jsonl`, whether the provider came from `createSession` or `provider.sync`. VS Code never puts the key anywhere the agent can read (not in a file, the runtime's environment or its command line), and the bridge had the same gap for keys in workspace files. Runtime follow-up.\n3. The runtime's 401 message tells users to check `COPILOT_PROVIDER_*` environment variables, which don't apply here.\n4. Remote agent hosts are out of scope; they need microsoft/agent-host-protocol#619. Utility-model requests (titles and similar) for these models still go through the bridge.\n\n## Verification\n\n- `pnpm run typecheck-client`: passed.\n- `./scripts/test.sh --run` with the 14 BYOK, launcher, session, agent, history, LM service and handler suites (`byokCustomEndpoint`, `copilotSessionLauncher`, `byokLmBridgeRegistry`, `agentHostClientByokLmChannel`, `mapSessionEvents`, `copilotAgentSession`, `copilotAgent`, `byokLmProxyService`, `agentHostUtilityModelService`, `agentHostByokLm`, `copilotManagedModelConfiguration`, `agentHostByokLmHandler`, `languageModels`, `chatModelsViewModel`): **3610 passing, 1 pending** (after rebasing onto `main` with `@microsoft/copilot-sdk` 2.0.1).\n- `./scripts/test-integration.sh --run src/vs/platform/agentHost/test/node/providerIntegration/copilotByokDirect.integrationTest.ts`: **passed**. This new test runs the bundled runtime (SDK 2.0.1) with the production mapping, `synthesizeByokSessionConfig` and id translation. Against a loopback server that only accepts the expected auth header, it runs **one turn each over `/chat/completions`, `/responses`, `/v1/messages`, and a versioned Azure route** (`/openai/deployments/\u003cd\u003e/chat/completions?api-version=…` with `api-key`). It then checks that no file in the isolated home contains a key.\n- `pnpm run oxlint \u003cchanged files\u003e`, `pnpm run valid-layers-check`, commit hygiene: passed.\n- Copilot extension: `tsc --noEmit --project tsconfig.json` passed; `vitest --run --pool=forks customEndpointProvider.spec.ts legacyHost.spec.ts`: **40 passed**. `pnpm run gulp compile-extensions` passed, but it doesn't build the Copilot extension, hence the direct checks.\n\nKey hygiene, from one-off probes against the bundled runtime, not committed:\n- The spawned runtime's argv and environment (`ps eww`): **no key**. Providers only travel over the session RPC after the runtime starts.\n- `~/.copilot/session-state/\u003cid\u003e/` (`events.jsonl`, `workspace.yaml`, checkpoints): **no key**, and no provider config is journaled at all.\n- Runtime process log at `logLevel: 'all'`: **no key**.\n- A 401 from the endpoint: **no key** in the error event or on disk.\n- Tool output: **not redacted** (limitation 2).\n- VS Code logs: only counts, provider names and bridge-fallback reasons; never config objects or keys.\n\nNot run:\n- A full Code OSS UI pass with a signed-in account. The window → IPC → agent host path is covered by the handler, channel and registry unit tests.\n- Azure cross-platform validation (pipeline `727`) for the new integration test. It's required before merge.\n\n\n",
+    "URL": "https://github.com/microsoft/vscode/pull/349506",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "lramos15",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "3471806d1de1a84c8984de543239b5a8a4b5a91b",
+    "HeadRef": "agents/vs-code-byok-custom-endpoint-integration",
+    "HeadSHA": "a58481169034f3f0364092d488692cdccdff931e",
+    "CreatedAt": "2026-11-20T18:22:49Z",
+    "UpdatedAt": "2026-11-23T19:06:14Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-BDC89FD1C07C",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts",
+      "Side": "RIGHT",
+      "Line": 1063,
+      "Severity": "medium",
+      "Confidence": 0.97,
+      "ConfidenceRationale": "The global live-session loop, invocation-local map, credential channel, secret-storage read, per-secret sequencer, and main-process decrypt implementation are directly traced. The number of affected live chats and platform-specific decryption duration are unmeasured.",
+      "PerformanceCategory": "ipc",
+      "MechanismFamily": "missing-coalescing",
+      "PerformanceResource": "Agent-host-to-renderer credential IPC calls, renderer-to-main encryption IPC calls, and synchronous safeStorage decryptions.",
+      "PerformanceScaling": "One snapshot-triggered update causes S × G credential calls and persisted-secret decryptions, where S is the number of live sessions and G is the number of distinct secret-backed vendor/group/credentialVersion tuples after within-session grouping. Promise.all overlaps sessions but secret storage serializes reads of the same key. Repeated resolutions recreate the map even on warm, unchanged snapshots.",
+      "PerformanceOutcome": "Redundant cross-process round trips and serialized decryption increase live-session update and model-selection latency as the number of open chats grows.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "Live-session sync used the registry's cached model list and an already memoized shared loopback proxy. It performed no group-secret reads or credential IPC before the unchanged-config equality check.",
+      "ChangedBehavior": "Every session configuration resolution now fetches all direct groups' credentials again, including resolutions triggered simultaneously for all live sessions by a single model-snapshot change.",
+      "CausalDiffEvidence": "The added invocation-local `credentials` map at copilotSessionLauncher.ts:1063 deduplicates only one session's resolution. The new resolveCredential call at :1068 is awaited for every direct group at :1076. Previously synthesizeByokSessionConfig only read the cached model snapshot and reused the memoized proxy handle; it made no credential IPC or decryption calls.",
+      "Title": "Coalesce credential reads across live-session updates",
+      "Impact": "With direct routing enabled and S live chats, a model update or bridge reconnect issues S × G credential IPC calls for G secret-backed direct groups, even if those chats use CAPI or their registered credentials have not changed. The repeated main-process decryptions serialize per secret and delay session registration; model selection also waits behind this work.",
+      "Evidence": "CopilotAgent._syncByokModelsOnLiveSessions (copilotAgent.ts:5034-5040) starts syncByokModels for every live chat without cross-session coalescing. Each sync awaits resolveByokSessionConfig before checking whether registration changed (copilotAgentSession.ts:8528-8540). resolveDirectByokSessionConfig creates this map anew and calls the renderer once per unique vendor/group/credentialVersion. AgentHostByokLmHandler.resolveCredential calls LanguageModelsService.resolveLanguageModelsProviderGroupApiKey, which calls _secretStorageService.get. BaseSecretStorageService.get (secrets.ts:139-160) queues by secret key and decrypts on every persisted read; IEncryptionService is a main-process remote service, and EncryptionMainService.decrypt synchronously calls safeStorage.decryptString. Thus concurrent sessions requesting the same group queue repeated decryptions rather than joining one read.",
+      "Recommendation": "Share in-flight credential resolution across sessions at the launcher/serving-connection scope, keyed by vendor, group, and credentialVersion. Invalidate on serving-connection or authorization/snapshot changes, and remove settled or failed entries so this need not introduce a long-lived secret cache."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "eager-work",
+      "serialization-allocation",
+      "repeated-work",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Publish the BYOK model inventory during startup, group edits, policy changes, and direct-routing setting changes.",
+        "CriticalPath": "The renderer enumerates cached LM metadata and group configuration before publishing a model snapshot. Session selection can depend on that snapshot reaching the agent host.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/common/agentHostClientByokLmChannel.ts:_modelsSnapshotEvent",
+            "Operation": "Push model metadata to the agent host.",
+            "Cardinality": "One cached model snapshot per effective changed publication and subscriber, not one IPC per model.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Used the same throttled snapshot channel and equality suppression, without direct endpoint metadata.",
+            "CriticalPathEffect": "Makes the changed inventory available to the agent host; unchanged snapshots send nothing."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/chat/browser/languageModelsConfigurationService.ts:updateLanguageModelsConfiguration/getLanguageModelsProviderGroups",
+            "Operation": "Maintain the cached language-model group configuration from the configuration file.",
+            "Cardinality": "The existing configuration watcher reloads its file on relevant file changes; the new getters and model mapping do not read the file again.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same configuration service already watched and loaded the file for LanguageModelsService.",
+            "CriticalPathEffect": "Configuration must be loaded before updated group settings are available; the handler consumes already cached settings."
+          }
+        ],
+        "ScalingInput": "M advertised models and their configured groups. Direct routing adds group matching, per-model settings lookup, URL mapping, and small metadata objects, but no credential read during enumeration.",
+        "EffectiveConcurrency": "The existing channel Throttler serializes publication and coalesces overlapping requests; structural equality suppresses unchanged snapshots. The registry caches one serving window rather than unioning windows.",
+        "CacheBehavior": "getLanguageModelsProviderGroups returns the configuration service's in-memory array; getLanguageModelGroups returns cached resolved groups. Snapshot publication and registry comparisons suppress unchanged results. Direct metadata and credentialVersion participate in equality.",
+        "MechanismConfidence": "High confidence in cached configuration access, throttled publication, and snapshot equality from the implementations.",
+        "MagnitudeUncertainty": "Configured model/group counts are unknown. No evidence that the extra in-memory matching is materially costly at normal Custom Endpoint catalogue sizes.",
+        "Verdict": "No separate reportable regression in model publication. The consequential fan-out occurs downstream during per-session credential resolution."
+      },
+      {
+        "Scenario": "Create or resume a chat, or change its model, with direct Custom Endpoint groups configured.",
+        "CriticalPath": "launch awaits _buildSessionConfig, which awaits BYOK synthesis alongside unrelated launch work before createSession/resumeSession. setModel explicitly awaits syncByokModels before sending the model change.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:resolveDirectByokSessionConfig; common/agentHostClientByokLmChannel.ts:credential",
+            "Operation": "Request each direct provider group's credential from the serving renderer.",
+            "Cardinality": "G calls per session resolution, including warm unchanged model snapshots; S × G across S concurrent sessions.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Synthesis read cached model metadata and reused the proxy handle without credential IPC.",
+            "CriticalPathEffect": "All credential replies must settle before synthesis completes, including when the selected model is not a direct BYOK model."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/chat/common/languageModels.ts:resolveLanguageModelsProviderGroupApiKey; src/vs/platform/secrets/common/secrets.ts:BaseSecretStorageService.get; src/vs/platform/encryption/electron-main/encryptionMainService.ts:decrypt",
+            "Operation": "Read the cached encrypted value and invoke main-process safeStorage.decryptString.",
+            "Cardinality": "One decrypt IPC for each successful persisted-secret lookup; no plaintext-result cache. Same-key lookups from concurrent sessions queue rather than coalesce.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "This session-configuration path performed no secret-storage read or decryption.",
+            "CriticalPathEffect": "Credential replies wait for these decryptions. Warm encrypted storage avoids a database read but not the decryption round trip."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:_startByokProxy",
+            "Operation": "Bind/reuse the loopback BYOK proxy listener.",
+            "Cardinality": "One shared proxy start on first bridged use per launcher lifecycle; zero if every model resolves directly.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Any nonempty BYOK catalogue required the same shared proxy, even if all models are now directly routable.",
+            "CriticalPathEffect": "Mixed/fallback synthesis awaits proxy readiness; warm calls reuse the memoized promise."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:launch/_createSession/_resumeSession; copilotAgentSession.ts:setModel/syncByokModels",
+            "Operation": "Pass provider/model configuration and translated model IDs to the existing Copilot runtime.",
+            "Cardinality": "Existing create/resume or setModel RPCs; provider.sync only when the merged registration differs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same session and model RPCs carried bridged providers and unmodified model IDs.",
+            "CriticalPathEffect": "Required to open the SDK session or apply its selected model after configuration is ready."
+          }
+        ],
+        "ScalingInput": "G distinct direct credential tuples per resolution, not M direct models; S concurrently resolving sessions produce S × G calls. Secretless groups still cause credential IPC but not persisted-secret decryption.",
+        "EffectiveConcurrency": "Group credentials are requested concurrently and deduplicated by vendor/group/credentialVersion within one synthesis. Each session has a Sequencer for sync; sessions do not share credential requests. Persisted secret reads serialize by secret key.",
+        "CacheBehavior": "The model registry and proxy handle are warm caches. The new credentials map exists only for a single invocation, so unchanged warm resolutions fetch credentials again. Failures/refusals are shared within that invocation only. Config equality can skip provider.sync only after credential reads finish.",
+        "MechanismConfidence": "High: traced from launch and setModel through the channel, LM service, per-key secret sequencer, remote encryption service, and synchronous main-process decryption.",
+        "MagnitudeUncertainty": "Actual IPC and safeStorage duration and the number of simultaneous chats are unmeasured; slower decryption and more chats increase the impact. Direct routing is opt-in.",
+        "Verdict": "Reported one missing-coalescing regression: repeated credential resolution across sessions introduces unnecessary boundary calls and serialized decryption on session-control critical paths."
+      },
+      {
+        "Scenario": "Update all live chats after a model snapshot, key rotation, renderer connection change, or withdrawal of direct routing.",
+        "CriticalPath": "The catalogue refresh schedules every live session's sync. Each sync resolves the full current BYOK config before equality checking and provider.sync. Model changes queue behind a session's outstanding sync work. Catalogue publication itself does not await all sessions.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgent.ts:_syncByokModelsOnLiveSessions; copilotSessionLauncher.ts:resolveDirectByokSessionConfig",
+            "Operation": "Resolve the same snapshot's group credentials independently for every live chat.",
+            "Cardinality": "S × G credential calls per effective refresh, with matching persisted-secret decryption calls for secret-backed groups.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The pre-existing live-session sync loop used cached metadata and the shared proxy, without reading group secrets.",
+            "CriticalPathEffect": "Delays registration updates and subsequent session model changes; publication is fire-and-forget relative to this work."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotAgentSession.ts:syncByokModels; copilotSessionLauncher.ts:resolveByokBridgeProvider/mergeByokSessionConfig",
+            "Operation": "Start/reuse the bridge if necessary and replace direct endpoint registrations with bridge-backed registrations.",
+            "Cardinality": "At most one memoized loopback bind per launcher lifecycle, then one provider.sync per session whose registration actually changes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Direct providers did not exist; disabling BYOK did not require replacing direct registrations. The proxy implementation and provider.sync transport already existed.",
+            "CriticalPathEffect": "Withdrawn direct providers must be redirected or removed before their updated registration is applied."
+          }
+        ],
+        "ScalingInput": "S live chats times G distinct direct credential tuples remaining in the current snapshot. This is group-level fan-out, not per-model credential fan-out. A fully disabled/empty snapshot has G=0.",
+        "EffectiveConcurrency": "The live-session loop starts all session syncs without a global limiter or shared credential promise. Per-session Sequencers serialize that session's updates; secret-storage sequencing serializes each group's decryptions across sessions.",
+        "CacheBehavior": "Channel equality suppresses duplicate snapshots, but registry connection changes can still trigger refresh. Every effective sync recreates the credential map. Provider/model equality prevents redundant provider.sync after resolution. Bridge fallback uses the shared memoized proxy and retains stable provider names.",
+        "MechanismConfidence": "High: the global loop, per-session queue, local credential map, and per-secret sequencing are explicit.",
+        "MagnitudeUncertainty": "The number of live sessions and frequency of effective model/connection changes determine magnitude. No timings are claimed.",
+        "Verdict": "Same root cause as the submitted finding; not reported twice. Withdrawal sync is an intentional authorization tradeoff and its bounded proxy/provider RPCs are not independently reported."
+      },
+      {
+        "Scenario": "Run inference against direct Chat Completions, Responses, Messages, or Azure endpoints, with bridged fallback for unsupported configurations.",
+        "CriticalPath": "After provider registration, the runtime calls the configured endpoint and waits for streamed model output. Unsupported configurations and credential refusals keep the existing bridge path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts:resolveDirectByokSessionConfig/toDirectByokModelConfig; test/node/providerIntegration/copilotByokDirect.integrationTest.ts",
+            "Operation": "Configure the runtime to call the model's actual endpoint directly.",
+            "Cardinality": "A provider HTTP request per inference attempt; the integration test demonstrates one accepted request for each of the four wire formats.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The runtime called the loopback proxy, which forwarded through renderer IPC and the extension's provider before reaching the model endpoint.",
+            "CriticalPathEffect": "The endpoint response remains the essential inference dependency."
+          },
+          {
+            "Kind": "IPC/network/serialization",
+            "Location": "src/vs/platform/agentHost/node/copilot/byokLmProxyService.ts:_handleResponses; src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts:chat",
+            "Operation": "Translate and forward bridged requests and output deltas.",
+            "Cardinality": "For direct models, zero bridge chat/delta IPC operations and no inference hop through the loopback proxy. For fallback models, the existing chat call and streamed delta events remain.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "All models traversed these existing boundaries; the diff bypasses them only for directly registered models.",
+            "CriticalPathEffect": "Direct routing removes intermediate forwarding from the inference critical path."
+          }
+        ],
+        "ScalingInput": "Inference requests and output deltas; direct provider configuration scales with directly routed models, while credential requests scale with groups.",
+        "EffectiveConcurrency": "Provider groups share credential resolution during a single configuration build, while each direct model receives a stable provider. The diff adds no request-turn concurrency scheduler. Bridged requests retain the existing streaming subscription and cleanup behavior.",
+        "CacheBehavior": "Credentials are registered as static provider configuration, not resolved for each token. The bridge listener is shared and lazy. Endpoint-specific runtime connection/prompt caching is outside the supplied implementation.",
+        "MechanismConfidence": "High for routing and removal of bridge boundaries, supported by configuration and integration assertions; limited for internal runtime performance behavior.",
+        "MagnitudeUncertainty": "Bundled runtime internals and multi-turn wire behavior cannot be inspected with the supplied repository tools. Claims about stateful-history loss, prompt caching, retries, or per-provider SDK allocation therefore lack sufficient independent evidence for another finding.",
+        "Verdict": "No additional high-confidence inference regression. Tool-limit rejection is correctness-only and was not reported. The new direct route is not treated as an internal regression fix merely because it removes forwarding overhead."
+      },
+      {
+        "Scenario": "Translate direct model IDs for session selection, custom agents, current-model readback, subagent updates, and restored history.",
+        "CriticalPath": "Small ID transformations execute before the existing runtime call or as part of the existing event replay/readback. No additional authoritative reads are introduced by translation.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Configured custom agents and registered models at launch; relevant model-bearing history events during replay. SHA-256 provider naming occurs during registration/to-runtime translation, not for every replayed token.",
+        "EffectiveConcurrency": "Synchronous string/regex operations; launch-time custom-agent translation scans registered models. Existing replay iteration and runtime RPC scheduling remain unchanged.",
+        "CacheBehavior": "Stable names derive from model identity; existing latest/registered config snapshots drive lookup. No unbounded global ID cache or new listener/resource lifecycle is introduced.",
+        "MechanismConfidence": "High: added helpers perform only bounded per-ID string work and registered-model scans; runtime and history call sites preserve existing boundary counts.",
+        "MagnitudeUncertainty": "Catalogue/history sizes vary, but the inspected changes do not establish materially expensive additional work at realistic sizes. Existing replay resource I/O is not increased by these ID transformations.",
+        "Verdict": "No reportable performance regression from ID translation or readback allocation."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over all 29 changed files and every diff page. Traced inventory publication, session launch/resume/model changes, live-session fan-out and withdrawal, direct/fallback inference, and model-ID/history translation. Submitted one high-confidence missing-coalescing finding for per-session credential IPC and serialized persisted-secret decryption. No concrete historical regression fix was established for internal blame reporting. Review was read-only; runtime-internal multi-turn costs remain a stated limitation."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-24T10:34:46.577295036Z",
+    "CompletedAt": "2026-11-24T10:38:58.072782295Z",
+    "WallClockMilliseconds": 251495,
+    "ModelCalls": 14,
+    "InputTokens": 962093,
+    "OutputTokens": 10019,
+    "TotalTokens": 972112,
+    "ReasoningTokens": 2962,
+    "CacheReadTokens": 849077,
+    "CacheWriteTokens": 112974,
+    "APIDurationMilliseconds": 222604,
+    "ToolCalls": 81,
+    "NanoAIUnits": 46761670000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 849077,
+      "cache_write": 112974,
+      "input": 42,
+      "output": 10019
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
