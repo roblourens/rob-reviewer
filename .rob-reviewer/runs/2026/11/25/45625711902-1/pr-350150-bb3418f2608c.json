@@ -1,0 +1,170 @@
+{
+  "PullRequest": {
+    "Number": 350150,
+    "Title": "agentHost: remove values the telemetry service doesn't redact from Dev Container state errors",
+    "Body": "Keeps `src/vs/platform/agentHost/node/devContainerState.ts` in sync with its copy in the Dev Containers extension, which changes in microsoft/vscode-remote-containers#1307. The copies differ only in their copyright header and `path` import.\n\nThe state volume telemetry's error sanitizer (`devContainer/stateVolume` `errorMessage`) relied on the telemetry service to redact paths and other values, but the telemetry service redacts a path only up to its first space and doesn't redact host names or IP addresses. The sanitizer now also removes:\n- Command names other than those Dev Containers runs itself (docker, podman, docker-compose, sh, bash, cmd, set, test, id), which become `\u003ccommand\u003e`. Before, for a command path with a space, the sanitizer kept the last segment of the path's first word, e.g., the user name in `C:\\Users\\John Doe\\...\\docker.exe`. User command names were kept too.\n- Paths in parentheses, e.g., `Dev container config (\u003cpath\u003e) not found.`, since paths with spaces are only partially redacted.\n- Host names and addresses after Node.js network errors (`ENOTFOUND`, `ECONNREFUSED`, ...) and IPv4 addresses.\n\nThe GDPR comment of `errorMessage` in the `devContainer/stateVolume` event now describes what is removed.\n\n`getFailedCommandName` comes along to keep the copies identical; it is used by the extension's resolver telemetry only.\n\nTesting: new unit test in `devContainerState.test.ts` for the values the telemetry service doesn't redact (it fails without this change); the existing `devContainerState`, `devContainerAgentHostService` and `devContainerSamples` tests pass.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/350150",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "chrmarti",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "00b906dd138c9f5877e54d0825f168c95d341c78",
+    "HeadRef": "chrmarti/devcontainer-state-sanitizer",
+    "HeadSHA": "bb3418f2608c45d419dde8f84eefa62754648132",
+    "CreatedAt": "2026-11-24T14:25:51Z",
+    "UpdatedAt": "2026-11-24T14:34:15Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Create a state volume or link an existing container's user state, including recoverable Docker/configuration failures.",
+        "CriticalPath": "Connection setup awaits mount preparation and state linking. On a non-cancellation failure, sanitization runs synchronously before the existing stage report is emitted and setup continues. Successful stages do not invoke the sanitizer.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_getUserStateMountArgs/_ensureUserStateVolume/_runDocker",
+            "Operation": "Docker ps, volume ls, and volume inspect or create through spawned Docker commands.",
+            "Cardinality": "Existing-container path: one ps command. New-container path: ps plus volume ls plus one inspect or create; errors can stop the sequence earlier.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical commands, sequencing, and counts; the PR only adds redaction to the eventual error string.",
+            "CriticalPathEffect": "Awaited during mount preparation; sanitization happens after a failed operation, without retrying it."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_linkUserState/_getContainerMounts",
+            "Operation": "Inspect container mounts, query user identity/HOME, and execute the existing state-link shell script.",
+            "Cardinality": "No state mount: one mount inspection. With a mount: inspection, one user query, and one link invocation; sample/environment paths can additionally inspect metadata to choose the user-query implementation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same inspection, user query, link script, and optional metadata inspection already ran.",
+            "CriticalPathEffect": "Awaited before later startup work; a link failure is sanitized before the stage completes."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerState.ts:buildLinkDevContainerStateCommand",
+            "Operation": "The existing container-side script copies/moves state, creates links, and checks ownership.",
+            "Cardinality": "A fixed set of configured state folders; copy and recursive ownership work depend on their existing contents.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The script and its filesystem operations are unchanged.",
+            "CriticalPathEffect": "Runs inside the awaited Docker exec; no filesystem operation is performed by the new sanitizer code."
+          }
+        ],
+        "ScalingInput": "One container/source per connection attempt; one sanitizer invocation per failed stage. Sanitizer input is the error message and embedded stderr, processed by line. State-copy I/O scales with existing state contents, not telemetry fields.",
+        "EffectiveConcurrency": "DevContainerAgentHostService.connect serializes operations by source key with SequencerByKey; different sources can run concurrently. Docker steps within a preparation are awaited sequentially. The diff adds no tasks or changes to concurrency.",
+        "CacheBehavior": "Shell-environment and Docker-executable promises remain cached. An existing container requires a Docker ps check and skips state-volume creation. A new container lists volumes and either inspects the existing named volume or creates it. No sanitizer cache or retained per-error state is introduced.",
+        "MechanismConfidence": "High confidence in reachability and unchanged boundary counts from the traced callers. Added work is three regex replacements per processed error line and bounded command classification; no realistic high-confidence degradation was established.",
+        "MagnitudeUncertainty": "Actual stderr sizes and stage failure rates are unknown. No runtime duration measurements were available.",
+        "Verdict": "No reportable regression: no additional subprocess or filesystem calls, retries, retained state, or increased concurrency; ordinary failure messages receive a small number of extra redaction passes."
+      },
+      {
+        "Scenario": "Report a failed Dev Containers CLI up or run-user-commands stage for a workspace, sample, or environment.",
+        "CriticalPath": "_runDevContainerStage awaits CLI completion, parses the result, and on a reportable failure calls getDevContainerCliErrorMessage before returning or propagating failure. Sanitization therefore precedes failure presentation or further preparation, but is not added to successful CLI stages.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_runDevContainerStage/_runDevContainer/_spawnDevContainer",
+            "Operation": "Spawn the Dev Containers Node CLI and collect stdout/stderr until exit.",
+            "Cardinality": "One CLI process for each attempted up or run-user-commands stage; zero extra processes from error sanitization.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical process count, output collection, stage ordering, and error extraction.",
+            "CriticalPathEffect": "CLI completion is awaited. New regex replacements execute only afterward on the existing reporting path."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/devContainerState.ts:sanitizeDevContainerStateErrorMessage; src/vs/platform/agentHost/node/devContainerAgentHostService.ts:getDevContainerCliErrorMessage",
+            "Operation": "Transform error text into a sanitized telemetry string.",
+            "Cardinality": "Three new regex replacements per error line; command classification runs only for matched failed-command text. The existing final output limit remains 1000 characters.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The sanitizer already removed commands, ANSI escapes, CLI log entries, volume names, IDs, and user values, and processed full input before truncation. It did not perform the three new redactions.",
+            "CriticalPathEffect": "Synchronous work before the stage report. Full-error processing before final truncation already existed; this PR adds redactions rather than another parse of CLI stdout or another report."
+          }
+        ],
+        "ScalingInput": "One CLI invocation per stage and one sanitizer call per failed reported stage. Input is normally up to three error parts: description, message, and the final Docker daemon error. Without a structured result, the fallback is the complete captured stderr; additional redaction then scales with retained error-text size and line contents.",
+        "EffectiveConcurrency": "Stage commands are awaited within preparation. Connections are serialized per source key, not globally. Each sanitizer call is synchronous; no parallel regex jobs, extra CLI processes, or new retries are scheduled.",
+        "CacheBehavior": "Successful stage results bypass sanitization. Error text is not cached; each failed stage is sanitized once, as before. Existing environment resolution and subprocess setup caches are unchanged.",
+        "MechanismConfidence": "High confidence that the extra transformations occur once per failed reported stage, not per output chunk or per container row. No evidence supports a high-confidence, realistically triggered performance finding.",
+        "MagnitudeUncertainty": "Fallback stderr can be large, but prevalence and processing duration are unknown. A superlinear parenthesized-path-regex candidate would require many unmatched path openings on one long line; no realistic producer of that shape was established.",
+        "Verdict": "No reportable regression. The added scans perform the requested redaction on an existing, failure-only path; unbounded stderr capture and late truncation are pre-existing, and the new exported getFailedCommandName helper has no repository callers."
+      },
+      {
+        "Scenario": "Forward state-volume stage reports to the Agents window and submit telemetry, including normal successful connection setup.",
+        "CriticalPath": "The existing stage event is forwarded to the renderer and reportDevContainerUserState calls publicLog2. Telemetry processing may synchronously clean event fields or buffer the event, but callers do not await network delivery. The changed renderer line is a type-classification comment, not runtime work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/sessions/contrib/providers/remoteAgentHost/electron-browser/devContainerAgentHostConnector.contribution.ts:ProxyChannel service setup and onDidReportUserState handler",
+            "Operation": "Forward the existing state-stage event from the host service to the matching connection's telemetry handler.",
+            "Cardinality": "One existing event per reported stage, carrying a bounded error string only on failure; no new event or subscription is added.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same event shape, listener lifetime, stage count, and 1000-character error-message limit.",
+            "CriticalPathEffect": "Notification is issued at the existing stage boundary; the diff introduces no additional awaited IPC round trip."
+          },
+          {
+            "Kind": "other expensive boundary",
+            "Location": "src/vs/platform/telemetry/common/telemetryService.ts:_log/_doLog; src/vs/sessions/contrib/providers/remoteAgentHost/electron-browser/devContainerAgentHostConnector.contribution.ts:reportDevContainerUserState",
+            "Operation": "Clean the existing telemetry payload and hand it to configured appenders for eventual delivery.",
+            "Cardinality": "One publicLog2 call per received matching stage report; appender count and delivery behavior are unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical publicLog2 call and appender pipeline; only the contents of already-sanitized failure text change.",
+            "CriticalPathEffect": "No network delivery promise is awaited by the stage or connector. Classification prose is erased from runtime code."
+          }
+        ],
+        "ScalingInput": "One report per executed/report-enabled mount, up, link, or userCommands stage, not per persisted folder or output line. An error report contains at most 1000 sanitized error-message characters.",
+        "EffectiveConcurrency": "Existing events are handled as emitted. Local service access uses ProxyChannel over the shared-process channel; remote service forwarding filters by connection ID. Connection-store ownership of listeners is unchanged, and the PR adds no listeners or event fan-out.",
+        "CacheBehavior": "No new cache is introduced. Existing telemetry opt-out/metered-connection gates and bounded experiment-property buffering remain unchanged. Successful stage reports contain no sanitizer-generated error string.",
+        "MechanismConfidence": "High confidence: the renderer diff changes only classification documentation, existing service subscriptions and telemetry calls are unchanged, and successful paths do not call the changed sanitizer.",
+        "MagnitudeUncertainty": "Deployment-specific appender transport and remote latency were not profiled; neither is changed by the diff.",
+        "Verdict": "No reportable regression: unchanged IPC/event cardinality, bounded payload, unchanged telemetry scheduling and retention, and no new work on the successful runtime path beyond small module-level constants."
+      }
+    ],
+    "Summary": "Completed the performance-review pass across all three changed files and all diff pages against base 00b906dd138c9f5877e54d0825f168c95d341c78. Traced sanitizer callers, stage critical paths, per-source serialization, Docker process counts, state-script filesystem work, error extraction, IPC forwarding, and telemetry processing. No high-confidence diff-introduced performance regression or qualifying regression fix was found. Review was read-only and static."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-25T13:39:45.101703527Z",
+    "CompletedAt": "2026-11-25T13:41:56.746558192Z",
+    "WallClockMilliseconds": 131644,
+    "ModelCalls": 10,
+    "InputTokens": 338384,
+    "OutputTokens": 5208,
+    "TotalTokens": 343592,
+    "ReasoningTokens": 1373,
+    "CacheReadTokens": 282898,
+    "CacheWriteTokens": 55456,
+    "APIDurationMilliseconds": 103094,
+    "ToolCalls": 36,
+    "NanoAIUnits": 21906980000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 282898,
+      "cache_write": 55456,
+      "input": 30,
+      "output": 5208
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

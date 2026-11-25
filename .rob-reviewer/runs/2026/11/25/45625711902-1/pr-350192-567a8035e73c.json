@@ -1,0 +1,224 @@
+{
+  "PullRequest": {
+    "Number": 350192,
+    "Title": "Copilot code search: reuse prepared statements and stat each file once",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nCopilot's code-search index (`ExternalIngestIndex`) keeps a SQLite table of workspace files and reconciles it with the workspace when it initializes. This PR removes repeated work from that reconcile:\n\n- **Reuse prepared statements.** Every query called `this._db.prepare(...)` again on each call, once per file. Statements are now prepared once per SQL text, on the index's single database, and the cache is cleared before the database closes.\n- **Stat and look up each file once.** For a new or changed file, `reconcileDbFiles` already has its stat and existing row, but `tryAddOrUpdateFile` statted the file and looked it up again. Reconcile now upserts directly with what it has. `tryAddOrUpdateFile` keeps its behavior for the file-added and file-changed callers.\n\nPer file during reconcile:\n\n| File | Before | After |\n|---|---|---|\n| Unchanged | 1 stat, 1 statement prepared, 1 query | 1 stat, 1 query |\n| New or changed | 2 stats, 3 statements prepared, 3 queries | 1 stat, 2 queries |\n\nNo issue is associated; this came from profiling.\n\n## Measured on my machine\n\n- **In the app** (Code OSS dev build, Copilot Chat indexing a clone of this repository, 21,608 files, first index): 761 ms preparing statements, and 844 ms for the second stat.\n- **With `node:sqlite`, the same schema and SQL, 21,608 paths, median of 5:**\n\n| | Prepare each call | Reuse |\n|---|---|---|\n| First index (lookup, lookup, upsert per file) | 313 ms | 34 ms |\n| Later starts (one lookup per file) | 92 ms | 20 ms |\n\nNot re-profiled in the app after the change, because that needs a signed-in Copilot with this index enabled.\n\n## Why it is safe\n\n- `_db` is `readonly`, assigned once in the constructor, and closed only in `dispose()`, which clears the statement cache first. `openOrCreateDatabase` closes only its local database when the cache version changes, never `this._db`; it and `createFreshDatabase` use their own uncached `prepare`. So a cached statement always belongs to the open database, and a call after `dispose()` still fails with \"database is not open\", as before.\n- Cached statements are used only with `get()`, `all()` and `run()`, which finish synchronously, so no statement is in use across an `await`.\n- Reconcile now stores the stat it took itself instead of one taken a moment later. If a file changes in between, the next reconcile or `getFilesToIndexFromDb`, which stats every row again, corrects the row.\n\n## How to test\n\nThe new test, \"initialize stats each new workspace file once\", fails without the change: each file is statted twice.\n\n| Command | Result |\n|---|---|\n| `cd extensions/copilot \u0026\u0026 node_modules/.bin/vitest --run --pool=forks src/platform/workspaceChunkSearch/test/node/externalIngest.spec.ts` | passed, 22 tests |\n| `cd extensions/copilot \u0026\u0026 node_modules/.bin/tsc --noEmit --project tsconfig.json` | passed |\n| `node_modules/.bin/oxlint \u003cchanged files\u003e` | passed |\n",
+    "URL": "https://github.com/microsoft/vscode/pull/350192",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "federicobrancasi",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "0cd87f75609c475a29750f73668e0db2d84418c3",
+    "HeadRef": "fbrancasi/copilot-ingest-index-reuse-statements",
+    "HeadSHA": "567a8035e73c1488c72b646507eaaa0e1322977a",
+    "CreatedAt": "2026-11-24T16:15:32Z",
+    "UpdatedAt": "2026-11-25T10:59:56Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 752,
+      "BasePath": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts",
+      "BaseLine": 732,
+      "IntroducingPath": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts",
+      "IntroducingCommit": "094867341993c3eb5dfd97911a1dd7047a461c15",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "Repeated synchronous SQL compilation on the initialization/search critical path: N unchanged reconciled files required N identical SELECT preparations; M new/changed files additionally prepared another lookup and an upsert each. Other DB update/delete paths also compiled fixed SQL per call.",
+      "Symptom": "Avoidable synchronous CPU and native statement allocation scale with workspace file count before external-ingest initialization and first search can finish. This consequence follows statically from the serial per-file loop and DatabaseSync.prepare; no timing claim is needed.",
+      "FixedBehavior": "Reuse each SQL statement after its first preparation on the instance's database, bounding preparation to nine literal queries for the index lifetime instead of compiling per file, per file event, and per row update.",
+      "Evidence": "Base line 732 prepared the identical parameterized SELECT on every get(uri). initialize() awaits reconcileDbFiles(), which calls get for each statted candidate; previously new/changed candidates also called get again via tryAddOrUpdateFile. search() awaits doIngest(), which awaits initialization. RIGHT 752 now calls prepare(query); RIGHT 191-198 caches on the single readonly database, so SQL compilation becomes once per literal per index rather than once per file. All nine call sites use fixed SQL literals, methods complete synchronously, and dispose clears the map before closing the database.",
+      "Confidence": 0.97
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "serialization-allocation",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Cold initialization and reopening a persisted external-ingest workspace index",
+        "CriticalPath": "CodeSearchChunkSearch.initialize awaits ensureExternalIngestInitialized; ExternalIngestIndex.initialize coalesces callers with _initializePromise and awaits ignore initialization and reconcileDbFiles before installing watchers. doIngest and therefore the first external-ingest search also await this initialization.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts:572 openOrCreateDatabase/createFreshDatabase",
+            "Operation": "Check/open SQLite cache, inspect schema version, and potentially delete/recreate an incompatible database.",
+            "Cardinality": "One database per lazily created index; version/schema setup is constant per open.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical database construction, version check, schema initialization, and filesystem operations.",
+            "CriticalPathEffect": "Runs synchronously during index construction before reconciliation."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "extensions/copilot/src/platform/search/vscode/baseSearchServiceImpl.ts:18 findFiles; externalIngestIndex.ts:896 reconcileDbFiles",
+            "Operation": "Find workspace files through vscode.workspace.findFiles2 and its search provider.",
+            "Cardinality": "One main candidate search per workspace folder; existing ignore-pattern discovery may add searches for .copilotignore and .git/HEAD. The explicit very large candidate limit does not introduce widening retries.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same folder searches, patterns, limit, and await placement.",
+            "CriticalPathEffect": "Each folder search completes before its serial file-processing loop."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts:909 reconcileDbFiles, :1023 safeStat; platform/filesystem/vscode/fileSystemServiceImpl.ts:15 stat",
+            "Operation": "Stat each eligible candidate through vscode.workspace.fs.stat.",
+            "Cardinality": "N direct reconciliation stats after the change versus N+M previously: the second safeStat inside tryAddOrUpdateFile is removed for new/changed files. Ignore regex checks can independently read content as before.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every eligible file was statted once and each new/changed file was statted a second time through tryAddOrUpdateFile.",
+            "CriticalPathEffect": "Every direct reconciliation stat is awaited serially before initialization can complete."
+          },
+          {
+            "Kind": "database",
+            "Location": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts:752 get, :685 upsertFile, :1075 iterateDbFiles",
+            "Operation": "List stored paths, look up each candidate, upsert changed entries, and delete absent entries.",
+            "Cardinality": "One initial listing plus N lookups, M upserts, and D deletes; previously one listing plus N+M lookups, M upserts, and D deletes. SQL preparation now occurs once per used literal instead of once per call.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same database operations plus a redundant lookup for every new/changed visit; every call prepared its own statement.",
+            "CriticalPathEffect": "Synchronous database work sits inside the initialization loop."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/ignore/node/remoteContentExclusion.ts:177 isIgnored, :374 ensureRulesLoaded, :461 fetchRulesForBatch",
+            "Operation": "Resolve repository metadata and fetch applicable content-exclusion rules; optionally read content for regex rules.",
+            "Cardinality": "Successful cold rule fetches scale with distinct repository fetch URLs plus the non-git pseudo-repository, grouped into REPOS_PER_REQUEST batches, not with every workspace file. Warm rules and memoized verdicts avoid requests. Unknown or remote-less repository metadata and failed fetches can cause additional existing lookups/retries.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical shouldTrackFile placement and exclusion-service invocation count; the removed helper did not perform another tracking check.",
+            "CriticalPathEffect": "Tracking decisions await relevant rule loads; unrelated pending repositories are not awaited by isIgnored."
+          }
+        ],
+        "ScalingInput": "F workspace folders; N eligible, successfully statted path occurrences across their search results; M new/changed occurrences; D previously tracked files no longer seen. Overlapping folder results can revisit a URI because seen is not a processing deduplication guard. Costs below use actual visits, not an assumed unique-file count.",
+        "EffectiveConcurrency": "Folders and reconciliation path visits are processed serially. DatabaseSync operations finish synchronously. Initialization callers share one promise. Transitive exclusion-rule requests share pending repository entries and use a global batch limiter; regex-content reads have their own limiter of 10.",
+        "CacheBehavior": "Persisted unchanged rows preserve docSha and shouldIngest. New/changed rows are reset to Undetermined as before. Each of nine literal runtime SQL queries is prepared only on its first use per index instance, including absent-row lookups; cache keys cannot grow with file paths. Ignore initialization is promise-cached, local rules are in memory, repository rule successes including empty rules have TTL caching, and pending repository requests coalesce. Failed rule fetches can retry under existing middleware; the diff does not alter this behavior.",
+        "MechanismConfidence": "High: both reconciliation branches now directly upsert the already obtained stat; all SQL cache callers use fixed literals and the database is assigned only during construction.",
+        "MagnitudeUncertainty": "Workspace size, provider latency, SQLite compilation time, and enabled exclusion policies vary. No timing measurements were independently obtained.",
+        "Verdict": "No introduced performance regression. The diff removes M serial stats and M redundant lookups and avoids repeated synchronous SQL compilation; one concrete repeated-preparation fix was recorded internally with base blame provenance."
+      },
+      {
+        "Scenario": "First ingest, repeat ingest, and external-ingest search after workspace changes",
+        "CriticalPath": "search awaits doIngest, which awaits initialization, materializes eligible files, computes the checkpoint, and either reuses/skips an ingest or awaits updateIndex before issuing remote search. Thus file scanning and changed-index upload are on this search branch's critical path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "database",
+            "Location": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts:808 getFilesToIndexFromDb",
+            "Operation": "Materialize eligible rows with all(), then update ingestion verdicts/hashes or delete vanished/excluded files.",
+            "Cardinality": "One eligible-row query per ingest call and up to one state/hash write per processed row; result allocation remains O(Q). Preparation is now bounded by the fixed query set rather than row count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same rows, all() allocation, writes, scan frequency, and ordering, but each operation separately prepared its SQL.",
+            "CriticalPathEffect": "Collection and applicable row updates precede checkpoint comparison and remote search."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts:825 safeStat, :729 shouldIngestFile, :1045 computeIngestDocSha, :804 createExternalIngestFile.read",
+            "Operation": "Stat eligible rows, read files for filtering/hashing, and reread server-requested documents for upload.",
+            "Cardinality": "Q explicit scan stats; content reads for path/size-accepted Undetermined files and K missing/stale hashes; one upload read per distinct requested mapped hash per pass. The production readFile wrapper also performs a size-check stat for each content read.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical row-stat, filtering, hashing, upload-read cardinality, and read limiters.",
+            "CriticalPathEffect": "Hashing/filtering precedes checkpoint construction; requested document reads precede upload completion."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestClient.ts:176 updateIndex, :265 performIngestion, :387 uploadDocuments, :634 searchFilesets",
+            "Operation": "Create checkpoint, exchange coded symbols, page missing document hashes, upload missing documents, finalize, then search the fileset.",
+            "Cardinality": "Zero ingest requests for a matching local checkpoint. Otherwise protocol control requests plus H deduplicated document uploads per pass, not one upload per tracked row. Existing bounded conflict/finalize retries can repeat passes. One search call normally, with one additional search after a 404 and delay.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical endpoints, grouping by document hash, concurrency pool, checkpoint reuse, retries, and await placement.",
+            "CriticalPathEffect": "Changed-checkpoint ingestion finishes before search; warm matching-checkpoint searches avoid that network sequence."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestClient.ts:192 updateIndex, :485 uploadDocuments; externalIngestIndex.ts:314 computeCheckpointHash",
+            "Operation": "Build checkpoint/hash collections, coded symbols and base64 document contents for existing protocol payloads.",
+            "Cardinality": "O(eligible files) checkpoint/hash metadata and bytes proportional to requested upload content; upload allocations bounded by the existing pool and read limiters.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same metadata, contents, encoding, full-row materialization, and scheduling. Statement caching neither retains row result arrays nor adds payload work.",
+            "CriticalPathEffect": "Metadata generation precedes ingest; encoding precedes each document request."
+          }
+        ],
+        "ScalingInput": "Q database rows marked Yes or Undetermined; U Undetermined files; K already-Yes files needing a new hash; H distinct document hashes requested by the server after mapping/deduplication. No rows marked No are scanned until a file event or reconciliation resets their state.",
+        "EffectiveConcurrency": "Each getFilesToIndexFromDb invocation has a 20-task row limiter. File content reads additionally share the index-wide limiter of 20. Concurrent ingest callers can each scan rows before checkpoint coalescing, unchanged by the diff. The upload client caps in-flight documents at 64; protocol phases and batch pages are ordered. Cached SQL methods complete synchronously without holding an active operation across await.",
+        "CacheBehavior": "Unchanged Yes rows reuse stored hashes without content reads; Undetermined rows are evaluated and persisted as Yes or No. Matching checkpoints skip remote ingestion, and an in-flight ingest with the same checkpoint is reused after collection. Statement cache misses compile once, while repeat scans reuse the same fixed statements. Existing positive/negative filtering and checkpoint semantics remain intact.",
+        "MechanismConfidence": "High: traced search to doIngest, getFilesToIndexFromDb, and the real external-ingest protocol client. Changed lines only replace statement preparation and do not alter scan or upload multiplicity.",
+        "MagnitudeUncertainty": "Service cache state, requested missing-document counts, content sizes, and network retry frequency determine runtime duration; none are increased by the inspected changes.",
+        "Verdict": "No reportable regression. Existing filesystem/network/serialization work and concurrency remain unchanged, while row-update statement compilation decreases."
+      },
+      {
+        "Scenario": "Incremental file creation/change/deletion and index lifetime including diagnostics and disposal",
+        "CriticalPath": "Watchers asynchronously check tracking and stat added/changed files before synchronously updating SQLite; deletion synchronously executes exact-path and folder-prefix deletes. Diagnostics synchronously lists paths. Disposal unregisters owned watchers/limiters, clears cached statements, then closes the database; these operations are not prerequisites for a normal completed search.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts:996 onFileAdded, :1004 onFileChanged, :663 tryAddOrUpdateFile",
+            "Operation": "Stat tracked added/changed files; exclusion checks may use the existing shared ignore service.",
+            "Cardinality": "One direct stat per tracked create/change callback; unchanged from before. Tracking decisions have the same transitive rule/metadata behavior described for initialization.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same event subscriptions, tracking checks, per-event stat, and unchanged-file comparison.",
+            "CriticalPathEffect": "Stat completes before the event's database update; no extra work is moved onto the search critical path."
+          },
+          {
+            "Kind": "database",
+            "Location": "extensions/copilot/src/platform/workspaceChunkSearch/node/codeSearch/externalIngestIndex.ts:685 upsertFile, :747 delete, :1018 deleteFolder, :1075 iterateDbFiles, :178 dispose",
+            "Operation": "Look up and upsert changed files, delete exact and prefix paths, list diagnostic paths, and close the database.",
+            "Cardinality": "One lookup per successfully statted event and an upsert only for new/changed data; two deletes per delete event; one all-path query per diagnostics request. At most nine retained prepared statements across all workflows.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same queries and result allocation, with a new prepare on every execution and no retained statement map. The added retention is bounded, instance-owned, and explicitly cleared before close.",
+            "CriticalPathEffect": "Database operations execute synchronously within their existing callers; close happens during teardown."
+          }
+        ],
+        "ScalingInput": "E filesystem events during the index lifetime and R stored rows for diagnostic enumeration or folder deletion. Statement-cache cardinality is at most nine fixed SQL strings, independent of E, R, path diversity, or lifetime.",
+        "EffectiveConcurrency": "Watcher callbacks have no newly introduced event coalescing or global event limiter; existing asynchronous callbacks can overlap, but statement get/all/run calls serialize on the JavaScript thread and complete before yielding. Diagnostics all() completes synchronously. Disposal ownership remains on the lazily created index registered with CodeSearchChunkSearch.",
+        "CacheBehavior": "Each SQL literal is prepared lazily and reused across event handlers and diagnostics. Added/changed files still run tryAddOrUpdateFile, including its unchanged-file early return. Deleted paths leave no path-specific statement entries. The fixed-size map is cleared before the single database closes; startup schema/version helper statements remain uncached on their local database handles.",
+        "MechanismConfidence": "High: all nine prepare call sites are fixed literals, no statement operation spans an await, no runtime database replacement exists, and the map is cleared in dispose.",
+        "MagnitudeUncertainty": "Event burst sizes and folder-delete/diagnostics row counts vary, but the diff changes neither event frequency nor queried row cardinality. Exact native memory per retained statement was not measured.",
+        "Verdict": "No reportable retention, cleanup, concurrency, or repeated-work regression. The new cache has constant key cardinality and a matching database lifetime."
+      }
+    ],
+    "Summary": "Completed the performance-review pass across both changed files and every diff page against base 0cd87f75609c475a29750f73668e0db2d84418c3. Traced initialization, repeated ingest/search, incremental events, diagnostics, and disposal, including database, filesystem/search, exclusion-service, network, and serialization boundaries. No high-confidence diff-introduced performance regressions found. Recorded one statically established repeated-SQL-preparation fix through report_regression_fix with base blame provenance. Review was read-only and static; runtime performance magnitude is unmeasured."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-25T13:45:19.77706159Z",
+    "CompletedAt": "2026-11-25T13:48:23.704261585Z",
+    "WallClockMilliseconds": 183927,
+    "ModelCalls": 11,
+    "InputTokens": 439891,
+    "OutputTokens": 7143,
+    "TotalTokens": 447034,
+    "ReasoningTokens": 1758,
+    "CacheReadTokens": 371351,
+    "CacheWriteTokens": 68507,
+    "APIDurationMilliseconds": 125989,
+    "ToolCalls": 42,
+    "NanoAIUnits": 27989860000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 371351,
+      "cache_write": 68507,
+      "input": 33,
+      "output": 7143
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
