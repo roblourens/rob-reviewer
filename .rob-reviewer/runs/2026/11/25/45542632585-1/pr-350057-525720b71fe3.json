@@ -1,0 +1,137 @@
+{
+  "PullRequest": {
+    "Number": 350057,
+    "Title": "Fix empty session list in Agents window dropdown picker",
+    "Body": "This pull request addresses the issue of the empty session list in the \"Sessions...\" dropdown picker in the Agents window. The changes made include:\n\n- **New Picker Implementation**: Created a new `sessionReferenceContextPicker.ts` that sources eligible sessions from the Sessions catalog specifically for the Agents window, ensuring it does not interfere with the existing editor-window picker.\n- **Code Simplification**: Refactored the picker logic to improve readability and maintainability, including the introduction of helper functions for eligibility checks and session mapping.\n- **Test Coverage**: Added comprehensive tests in `sessionReferenceContextPicker.test.ts` to validate the new picker functionality, ensuring it handles filtering, ordering, and current-session exclusions correctly.\n- **Minor Edits**: Made small adjustments in `chat.contribution.ts` and `chatContext.ts` to accommodate the new picker while preserving existing functionality.\n\nThese changes ensure that the Agents window can now correctly display available sessions, resolving the previous issue of an empty picker.",
+    "URL": "https://github.com/microsoft/vscode/pull/350057",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "kieferrm",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "51ec2db5fb2946a1705beee4d439aa972c2e6845",
+    "HeadRef": "agents/fix-empty-session-list-dropdown",
+    "HeadSHA": "525720b71fe3844358e11731ae32effeec1a4f07",
+    "CreatedAt": "2026-11-24T02:53:39Z",
+    "UpdatedAt": "2026-11-24T14:42:44Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "synchronous-ui-work",
+      "repeated-work",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "serialization-allocation",
+      "eager-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Agents window startup and picker registration; editor-window registration remains unchanged",
+        "CriticalPath": "The new contribution registers one picker at AfterRestored. Its constructor only retains injected services; session enumeration and eligibility checks wait until the user chooses Sessions. SessionsManagementService was already registered eagerly before this PR.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Constant registration work; existing service initialization depends on registered providers and configured hosts, not the number of picker openings.",
+        "EffectiveConcurrency": "One contribution and one picker registration per window, with the old picker explicitly excluded in the Agents window. No new task fan-out or recurring listeners.",
+        "CacheBehavior": "The contribution creates no cache. Existing session catalogs and remote connection services retain their existing initialization, caching, and retry behavior.",
+        "MechanismConfidence": "High: inspected contribution registration, both picker constructors, eager SessionsManagementService registration, and service initialization.",
+        "MagnitudeUncertainty": "No startup timing measurements; module-load and small registration costs are not quantified.",
+        "Verdict": "No actionable startup regression: the added registration does not enumerate sessions or issue new picker-specific boundary operations."
+      },
+      {
+        "Scenario": "Open, search, reopen, and close the local Sessions attachment picker",
+        "CriticalPath": "asPicker synchronously reads the catalog, filters, sorts eligible sessions, and constructs pick descriptions before the quick pick is shown. Construction occurs once per opening, not on every search keystroke. Normal populated catalogs require no awaited boundary operation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/sessions/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_ensureSessionCache, _startSessionRefresh, _listSessions",
+            "Operation": "A genuinely uninitialized connected provider may issue connection.listSessions().",
+            "Cardinality": "At most one newly started listing per uninitialized provider/connection without an existing refresh or retry; zero on initialized reads. Never one listing per session.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The Agents picker used getChatSessionItems instead of this catalog path, but SessionsManagementService already called provider.getSessions during provider subscription, initiating the same cold listing independently of the picker.",
+            "CriticalPathEffect": "Refresh is started without awaiting it; the picker uses the currently available catalog. Existing startup subscriptions normally already initiated cache population."
+          }
+        ],
+        "ScalingInput": "N sessions across registered providers, deduplicated by SessionsManagementService; K eligible same-host sessions excluding the current session. Filtering is collection-wide and sorting is O(K log K), with K descriptions and closures.",
+        "EffectiveConcurrency": "Synchronous catalog processing on the UI thread; no per-session asynchronous operations. Any cold provider refresh is background work, coalesced per provider/connection with existing retry backoff.",
+        "CacheBehavior": "Catalog reads use provider caches seeded by the existing management-service subscription. Agent-host providers treat successful empty listings as initialized, join in-flight refreshes, and honor scheduled retry backoff. Reopening rebuilds picks but does not refresh initialized agent-host catalogs.",
+        "MechanismConfidence": "High: traced asPicker through management/provider reads and the quick-pick caller; the promise-backed picks are not recomputed on query changes.",
+        "MagnitudeUncertainty": "Production catalog sizes and formatting durations are not measured. Large catalogs incur synchronous work, but the prior picker and existing session completions already use collection sorting and per-result date formatting; no independently established actionable regression.",
+        "Verdict": "No high-confidence performance regression. The change performs demand-driven catalog processing without per-session I/O or repeated query-triggered enumeration."
+      },
+      {
+        "Scenario": "Open the Sessions picker for a remote session, including disconnected or missing-home hosts",
+        "CriticalPath": "The picker filters sessions to the current host and resolves event-log paths using in-memory connection metadata. buildHostLocalEventsPath and resolveEventsUri only construct and convert URIs; they do not stat or read event logs or establish connections.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/sessions/providers/agentHost/browser/baseAgentHostSessionsProvider.ts:_listSessions",
+            "Operation": "Existing cold catalog refresh calls connection.listSessions for a remote provider.",
+            "Cardinality": "Zero additional calls for initialized catalogs or providers with a current refresh/backoff; otherwise at most one start per cold provider/connection, not per matching session or remote path resolution.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The old Agents picker did not consult this catalog, while the existing eagerly initialized management service and sidebar already populated these provider caches through the same operation.",
+            "CriticalPathEffect": "Not awaited by asPicker; no remote round trip is required to format an already cached candidate."
+          }
+        ],
+        "ScalingInput": "N deduplicated catalog entries, K readable same-host sessions, and H configured connection entries. Remote eligibility checks involve O(KH) connection-snapshot/search work, not K remote requests; only K picks are sorted and displayed.",
+        "EffectiveConcurrency": "Synchronous processing. For each eligible remote candidate, the connections getter constructs a snapshot and find searches it. Existing provider cache refreshes remain coalesced per connection, not per session; independent cold providers can refresh concurrently as before.",
+        "CacheBehavior": "No new remote cache. Connection status and home-directory metadata come from existing services; disconnected or unavailable paths are rejected without retries from the eligibility resolver. Provider cold/warm behavior is the same as the local catalog scenario.",
+        "MechanismConfidence": "High: inspected remote connections getter, host filtering, URI resolver, and provider refresh guards.",
+        "MagnitudeUncertainty": "Host and catalog counts are unmeasured. The connection-snapshot pattern also exists in the prior picker helper; there is no evidence of a realistic new resource burst or user-visible bottleneck from this change.",
+        "Verdict": "No reportable boundary fan-out or cache regression. Remote eligibility is pure metadata work, with any actual listing grouped by provider/connection and off the picker critical path."
+      },
+      {
+        "Scenario": "Accept a session attachment and dispose the picker",
+        "CriticalPath": "Accepting a result synchronously creates one sessionReference entry and passes it to the existing attachment model. The entry contains the selected resource, title, and icon, not the session transcript. Closing disposes quick-pick subscriptions through the unchanged caller.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "K short-lived pick objects during an opening and A explicitly selected attachment resources afterward; no catalog-wide attachment serialization or transcript loading.",
+        "EffectiveConcurrency": "One entry per accepted selection; background acceptance reuses the same pick list. Attachment IDs are deduplicated by the existing model. No new asynchronous producer or listener is owned by individual pick entries.",
+        "CacheBehavior": "Picker arrays are scoped to the existing quick-pick lifecycle, with no global accumulation. The attachment model retains only selected entries and uses its existing removal/clear lifecycle.",
+        "MechanismConfidence": "High: traced asAttachment, the quick-pick acceptance/disposal path, ChatAttachmentModel, and the unchanged agent-host session-reference conversion.",
+        "MagnitudeUncertainty": "No heap profiling was performed. Downstream agent request processing remains the existing session-reference path, which already constructs a small text attachment and a trajectory resource reference.",
+        "Verdict": "No diff-introduced retention or serialization regression. The new picker feeds the existing attachment representation without eagerly reading or copying event logs."
+      }
+    ],
+    "Summary": "Completed the performance-review pass across all four changed files and every diff page against base 51ec2db5fb2946a1705beee4d439aa972c2e6845. Investigated registration, catalog enumeration, provider cold/warm caches, remote metadata resolution, quick-pick invocation frequency, attachment creation, and disposal. No high-confidence introduced performance issues or qualifying performance-regression fixes were established. Static read-only review; no runtime profiling."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-25T03:53:11.216931443Z",
+    "CompletedAt": "2026-11-25T03:55:22.059336606Z",
+    "WallClockMilliseconds": 130842,
+    "ModelCalls": 13,
+    "InputTokens": 423884,
+    "OutputTokens": 4945,
+    "TotalTokens": 428829,
+    "ReasoningTokens": 885,
+    "CacheReadTokens": 367963,
+    "CacheWriteTokens": 55882,
+    "APIDurationMilliseconds": 104798,
+    "ToolCalls": 53,
+    "NanoAIUnits": 22602930000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 367963,
+      "cache_write": 55882,
+      "input": 39,
+      "output": 4945
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
