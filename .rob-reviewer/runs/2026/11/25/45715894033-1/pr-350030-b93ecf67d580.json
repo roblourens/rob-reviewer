@@ -1,0 +1,206 @@
+{
+  "PullRequest": {
+    "Number": 350030,
+    "Title": "agentHost: don't ask minimal GitHub sign-ins for full repo access",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #348886\n\n## What's wrong\n\nSince #325725, when the Agent Host has no usable GitHub token it opens the standard **Sign in to use GitHub Copilot** dialog. That dialog signs in through `DefaultAccountProvider.signIn`, which always requests the product's default scopes (`read:user user:email repo workflow`) and then adds the Agent Host's own scopes. For Copilot, the Agent Host itself only needs `read:user user:email`.\n\nPeople who deliberately signed in with minimal scopes, for example through Settings Sync, can still use the local harness, which accepts a minimal session. Since #345901 made the Agent Host the default, those same people are asked for full access to every repository they can reach before they can use Copilot at all. The **Sign In** button of the \"GitHub Copilot needs additional permissions\" notification goes through the same dialog and has the same problem.\n\n## The fix\n\n- The Agent Host's sign-in options (`getAgentHostSignInOptions`, used by both the send-time prompt and the notification) now set `keepMinimalSignIn: true`.\n- Chat setup, the setup controller and `ChatEntitlementRequests.signIn` pass the option on to `IDefaultAccountService.signIn`, the same way they already pass `additionalScopes`.\n- `DefaultAccountProvider.signIn` replaces the default scopes with the scopes of the existing sign-in when the option is set and the provider already has a session the default account can use, but none that grants the default scopes. It uses the same session lookup the default account uses. If the lookup fails, it requests today's scopes.\n- Keeping the existing sign-in's scopes, rather than requesting `additionalScopes` alone, keeps the new session usable as the default account's session. That matters when the user authorizes a different GitHub account in the browser: sign-in makes that account the preferred one, so a session without an accepted scope set, such as `repo` alone, would clear the default account.\n\nThe dialog, its account options, cancellation and error handling are unchanged. Only the scopes requested from the provider change, and only in this situation.\n\n### Why not accept a `user:email` session in the Agent Host\n\nThat would avoid the prompt entirely, but:\n\n- If the host advertised only `user:email`, the client would forward the narrowest matching session. People with both a Settings Sync session and a full Copilot session would start sending the Settings Sync token, and the host also uses that token for GitHub requests beyond Copilot, such as the GitHub MCP server.\n- If the client forwarded a `user:email` token as a fallback, it would send it under the scopes the host advertises, claiming `read:user` it doesn't grant. That reinterprets what the host advertises, which the [Agent Host Protocol interoperability rules](https://github.com/microsoft/vscode/blob/main/.github/instructions/agent-host-interoperability.instructions.md) ask clients not to do.\n- It isn't verified that the runtime works with `user:email` alone.\n\nSo this PR keeps the host's scopes and changes only what the sign-in asks for.\n\n## Who sees what\n\n| Situation | Before | After |\n|---|---|---|\n| Signed in with minimal scopes (for example Settings Sync); the Agent Host needs Copilot | `read:user user:email repo workflow` | `read:user user:email` |\n| Same, **Sign In** on the \"needs additional permissions\" notification | `read:user user:email repo workflow` | `read:user user:email` |\n| Same, **Sign In** on a pull request artifact (optional `repo` resource) | `read:user user:email repo workflow` | `user:email repo` |\n| Same, but the user authorizes a different GitHub account in the browser | default + requested scopes; that account becomes the default account | existing sign-in's scopes + requested scopes; that account becomes the default account |\n| Signed out | default + Agent Host scopes | unchanged |\n| Already granted the default scopes, including renewal after a host challenge | default + Agent Host scopes | unchanged |\n| Minimal sign-in on github.com, then **Continue with GHE.com** in the dialog | default + Agent Host scopes | unchanged: signing in to a provider without a session is a new sign-in |\n| Every other `signIn` caller (chat setup, Accounts menu, GitHub links, GitHub API client) | unchanged | unchanged: they don't set the option |\n\nThe pull request artifact row is the only change beyond Copilot itself. A minimal-scope user who signs in there is asked for `repo`, which is what that resource declares, plus the `user:email` they already granted, rather than `repo` plus `workflow` and profile access.\n\n## Open question\n\nThis PR infers the opt-out from the sign-in itself: an account signed in without the default scopes, for example through Settings Sync, isn't asked for them by the Agent Host. The local harness accepts such a session too, but until the user chooses **Never Ask Again**, which sets `github.copilot.advanced.authPermissions` to `minimal`, it can still ask for repository access in chat. Should the Agent Host also require that setting? The trade-off is that people who never chose **Never Ask Again** would again get the full-access sign-in when the Agent Host signs them in, which is the complaint in #348886.\n\n## Validation\n\n- I wrote the tests first and ran them against the unchanged code. All 4 failed for the expected reasons: the minimal case requested `repo` and leaked the option into the session options, `ChatEntitlementRequests` dropped the option, and the Agent Host didn't set it. With the fix, all 4 pass.\n\n  ```sh\n  ./scripts/test.sh \\\n    --run src/vs/workbench/services/accounts/test/browser/defaultAccount.test.ts \\\n    --run src/vs/workbench/services/chat/test/common/chatEntitlementService.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostAuth.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts \\\n    --grep \"keeps a minimal sign-in minimal|forwards the scope options|uses the product sign-in flow|propagates interactive authentication errors for eager-created\"\n  ```\n\n  Before the fix: 0 passing, 4 failing. After: 4 passing.\n\n- Review follow-up: `keeps a default account when a minimal sign-in is authorized with another account` signs in as a different account than the existing minimal sign-in. On the first commit of this PR it failed: the sign-in requested only `repo` and no default account was left. With the fix it passes.\n\n  ```sh\n  ./scripts/test.sh --run src/vs/workbench/services/accounts/test/browser/defaultAccount.test.ts --grep \"DefaultAccountProvider sign in scopes\"\n  ```\n\n  Before the fix: 4 passing, 1 failing. After: 5 passing.\n\n- Every test file that covers these paths, in full: **1514 passing, 0 failing**.\n\n  ```sh\n  ./scripts/test.sh --reporter dot \\\n    --run src/vs/workbench/services/accounts/test/browser/defaultAccount.test.ts \\\n    --run src/vs/workbench/services/chat/test/common/chatEntitlementService.test.ts \\\n    --run src/vs/workbench/services/policies/test/browser/accountPolicyService.test.ts \\\n    --run src/vs/workbench/services/policies/test/browser/multiplexPolicyService.test.ts \\\n    --run src/vs/workbench/services/github/test/browser/githubApiClient.test.ts \\\n    --run src/vs/workbench/contrib/github/test/browser/githubLinkPresentation.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/chatSetup/chatSetup.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/chatSetup/chatSetupSignIn.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/chatSetup/chatSetupCopilotAccount.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/chatSetupController.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/agentSessions/copilotEntraAuthentication.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostSignedOutModelsNotification.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostAuth.test.ts \\\n    --run src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostChatContribution.test.ts\n  ```\n\n- `pnpm run typecheck-client`: passed.\n- `pnpm run valid-layers-check`: passed.\n- `pnpm run oxlint` on the changed files: no findings.\n\nNot run: a live GitHub sign-in, which needs an account with a minimal-scope session and the browser consent page. The manual check below covers it.\n\n## How to verify that nothing else changed\n\n1. The new behavior sits behind one option. `git grep -n keepMinimalSignIn -- src ':!**/test/**'` shows that only `getAgentHostSignInOptions` sets it and only `DefaultAccountProvider.signIn` reads it. Everything in between only declares it or passes it on.\n2. In `DefaultAccountProvider.signIn`, today's `scopes` computation is unchanged. The new branch replaces the default scopes with the existing sign-in's scopes only when the option is set and the account is signed in without the default scopes. The option is removed from the session options, so the authentication provider never receives it; the `options: {}` in the new tests asserts this.\n3. Each Agent Host snapshot test gains exactly one line: `keepMinimalSignIn: true`.\n4. Manual check:\n   1. In a fresh profile, turn on Settings Sync and sign in with GitHub, which asks only for minimal scopes. Don't sign in to Copilot.\n   2. Open the Chat view, where the Agent Host is the default, and send a message.\n   3. In **Sign in to use GitHub Copilot**, choose **Continue with GitHub**. GitHub should ask only for profile access. Before this change, it asked for full repository access.\n   4. With a profile that is signed in to Copilot normally, there's no prompt, as before. When signed out, you get the usual sign-in with the default scopes, as before.\n\n🤖 Authored with GitHub Copilot on behalf of @alexdima.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/350030",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "alexdima",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "169f56d425d95c86c41ec6ce9f09c2fd607f94f2",
+    "HeadRef": "agents/reddit-ama-reaction-help",
+    "HeadSHA": "b93ecf67d580ee71972760a615d782ac39653516",
+    "CreatedAt": "2026-11-24T00:30:41Z",
+    "UpdatedAt": "2026-11-24T23:41:10Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cache-lifecycle",
+      "missing-coalescing",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Minimal GitHub account authorizes Agent Host access from local/remote chat, the additional-permissions notification, or a protected pull-request artifact.",
+        "CriticalPath": "After the user chooses a provider, ChatSetupRunner -\u003e ChatSetupController -\u003e ChatEntitlementRequests -\u003e DefaultAccountProvider.signIn now awaits scope discovery, then the existing session creation and default-account update. Interactive chat then resolves and forwards the credential before proceeding. Notification construction itself only creates options and starts no authentication work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/accounts/browser/defaultAccount.ts:getMinimalSignInScopes -\u003e findMatchingProviderSession -\u003e getSessions; src/vs/workbench/services/authentication/browser/authenticationService.ts:getAccounts",
+            "Operation": "Read all provider sessions to enumerate accounts, then read sessions for the preferred account.",
+            "Cardinality": "Normally two additional extension-host getSessions round trips per qualifying sign-in, not per resource, account, or scope. The helper retries at most three attempts on exceptions with two 500 ms waits; each attempt reaches one or two reads.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "signIn computed the scope union locally and immediately called createSession; surrounding resource resolution and the post-sign-in account update already read provider sessions.",
+            "CriticalPathEffect": "New bounded prerequisite to createSession after provider selection."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/github-authentication/src/github.ts:getSessions, stillGood, restore, renewNow; extensions/github-authentication/src/entraTokenExchange.ts:exchange, verifyAccount",
+            "Operation": "Conditionally restore missing Microsoft-linked credentials or renew expiring transient credentials; exchange a Microsoft token and verify GitHub identity.",
+            "Cardinality": "Zero for warm persisted OAuth sessions. Cold restoration scales with missing linked accounts; renewal scales with stale transient sessions. Restores and renewals use existing per-key in-flight joining, and failed restores have a negative cache. Enterprise providers fan out across configured hosts only when no host is selected.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same renewal/restoration mechanisms were already reachable from surrounding session discovery, but were not invoked directly before createSession by DefaultAccountProvider.signIn.",
+            "CriticalPathEffect": "The new scope lookup can await existing provider maintenance. These mechanisms also run during pre-prompt resource resolution, provider initialization, and post-sign-in account refresh; no new unconditional per-session network validation was found."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/api/browser/mainThreadAuthentication.ts:MainThreadAuthenticationProvider.createSession; extensions/github-authentication/src/github.ts:createSession, tokenToSession",
+            "Operation": "Create the requested authentication session through the extension host, complete OAuth or Microsoft sign-in, and resolve account identity.",
+            "Cardinality": "One createSession invocation per setup attempt; normal OAuth has one successful login flow and one account-information lookup. Alternative login flows remain failure/user-retry dependent.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same session creation, browser/provider interaction and account lookup, with default scopes plus additional scopes.",
+            "CriticalPathEffect": "Existing awaited interactive sign-in; only the requested scopes change."
+          },
+          {
+            "Kind": "serialization/filesystem",
+            "Location": "extensions/github-authentication/src/github.ts:createSession, storeSessions",
+            "Operation": "Serialize persisted OAuth sessions and write secret storage; Microsoft-brokered sessions remain transient.",
+            "Cardinality": "One existing storeSessions call per successful ordinary OAuth login, serializing the provider's session collection. No new retained collection or storage write loop is added.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "OAuth session creation already serialized and persisted sessions; the PR changes the authorized scope combination, not storage scheduling.",
+            "CriticalPathEffect": "Existing prerequisite before successful session creation completes."
+          },
+          {
+            "Kind": "IPC/filesystem/network",
+            "Location": "src/vs/workbench/services/accounts/browser/defaultAccount.ts:updateDefaultAccount, initializeManagedSettingsSources, getDefaultAccountFromAuthenticatedSessions, request",
+            "Operation": "Refresh the default account and its entitlement/policy data, waiting for existing native/file managed-settings initialization.",
+            "Cardinality": "Existing account refresh normally issues two session reads plus up to four enabled, uncached endpoint requests on successful first-token responses. Authentication failures may try additional context-matching sessions; rate-limit backoff suppresses requests. Managed-settings initialization shares existing snapshots/barriers rather than rereading the file per sign-in.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same post-sign-in update, policy initialization, endpoint grouping, fallback and timestamp caches.",
+            "CriticalPathEffect": "Already awaited after session creation; entitlement resolution remains followed by parallel token/settings work and optional registry lookup."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostAuth.ts:forwardAuthenticationToken",
+            "Operation": "Forward the credential to the local or remote Agent Host.",
+            "Cardinality": "Zero or one call for the selected resource after existing token-cache deduplication.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same token forwarding and deduplication.",
+            "CriticalPathEffect": "Existing final authentication prerequisite for interactive chat; absent from mere notification creation."
+          }
+        ],
+        "ScalingInput": "One selected provider and one sign-in per setup run; usually a small number of account sessions and three configured accepted scope sets. resolveAuthenticationInteractively returns after handling the first protected resource, rather than prompting once for every resource or scope.",
+        "EffectiveConcurrency": "ChatSetupRunner.pendingRun joins overlapping setup requests. Extension-host authentication operations are sequenced by provider. The new getAccounts and getSessions calls are sequential. Account updates retain their existing throttler; token-entitlement and managed-settings requests may run in parallel after entitlement resolution.",
+        "CacheBehavior": "The added lookup has no separate result cache. Provider sessions are held in persisted-session promises and transient-session maps; ordinary warm OAuth reads do not perform network validation. Microsoft-backed restore attempts are negatively cached by account/scopes and coalesced in flight; renewals are coalesced by session. Existing Agent Host token/rejection caches still govern forwarding. Resource resolution normally reads existing sessions before prompting, warming this state.",
+        "MechanismConfidence": "High confidence in the bounded two-read addition, option propagation, provider sequencing, existing cache behavior and unchanged downstream work, based on the implementations and callers. No independent high-confidence harmful scaling mechanism was established.",
+        "MagnitudeUncertainty": "Live provider/network durations and the frequency of cold Microsoft-backed or multi-enterprise-host accounts are unknown; this was a static review.",
+        "Verdict": "No reportable regression. The change adds bounded authoritative session discovery during an explicit sign-in, without multiplying work per protected resource or scope, bypassing existing coalescing, or adding long-lived retained state."
+      },
+      {
+        "Scenario": "Agent Host sign-in while signed out, renewing a full-scope account after a challenge, or switching to an enterprise provider without an existing session.",
+        "CriticalPath": "The same shared setup run performs the new conditional lookup when additionalScopes is nonempty, then falls back to the original default-scope union and existing session creation/update. Empty additionalScopes skips the lookup entirely.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/accounts/browser/defaultAccount.ts:signIn, getMinimalSignInScopes, getSessions",
+            "Operation": "Discover whether the selected provider already has an accepted session without default scopes.",
+            "Cardinality": "Normally two additional session reads, including empty successful reads; at most three helper attempts on exceptions. Not one call per configured accepted scope set.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No pre-createSession discovery inside signIn; default scopes were chosen directly.",
+            "CriticalPathEffect": "New pre-sign-in prerequisite even when discovery ultimately preserves default scopes."
+          },
+          {
+            "Kind": "network",
+            "Location": "extensions/github-authentication/src/githubEnterprise.ts:getSessions; extensions/github-authentication/src/github.ts:getSessions, createSession",
+            "Operation": "Read host session engines and conditionally restore/renew credentials, then perform the existing selected-provider login.",
+            "Cardinality": "Warm empty or persisted-session reads cause no token exchange. Cold missing Microsoft links and stale transient tokens use the existing account/session-keyed restore/renew mechanisms. One interactive createSession remains, with enterprise host choice occurring inside that existing operation.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The login and provider maintenance mechanisms existed, but signIn did not add its own preliminary discovery invocation.",
+            "CriticalPathEffect": "Potential maintenance latency precedes interactive login; successful reads are normally warmed by startup or prior authentication resolution."
+          },
+          {
+            "Kind": "IPC/filesystem/network",
+            "Location": "src/vs/workbench/services/accounts/browser/defaultAccount.ts:signIn, updateDefaultAccount; extensions/github-authentication/src/github.ts:storeSessions",
+            "Operation": "Create/persist the session and refresh account metadata after authorization.",
+            "Cardinality": "Same one session creation and account-update path as before. Warm account-specific caches suppress metadata requests; a new account uses the existing cold refresh path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical default-scope request, persistence, refresh scheduling and cache behavior in these fallback cases.",
+            "CriticalPathEffect": "Existing awaited successful sign-in work."
+          }
+        ],
+        "ScalingInput": "One selected provider per coalesced setup run, its existing sessions, and any configured enterprise hosts; not workspace files or chat history.",
+        "EffectiveConcurrency": "One joined setup run, sequential provider reads and per-provider extension-host queueing. Enterprise host enumeration can use the existing Promise.all across configured hosts; no new provider-wide concurrency loop is added.",
+        "CacheBehavior": "No matching session and lookup exceptions fall back without adding cached state. Provider registration/activation, persisted sessions, Microsoft restoration negative caches, and post-sign-in account metadata caches are unchanged. The existing session helper allows three exception attempts rather than an unbounded retry.",
+        "MechanismConfidence": "High confidence that the additional discovery is bounded and downstream scheduling is preserved. No evidence that this diff creates a realistic unbounded burst or repeated automatic sign-in loop.",
+        "MagnitudeUncertainty": "Provider activation, exceptional lookup retries and enterprise-host prevalence are unmeasured.",
+        "Verdict": "No high-confidence actionable performance regression; an intentional authoritative scope check adds bounded work to an already interactive operation."
+      },
+      {
+        "Scenario": "Normal startup, already-authorized chat sends, ordinary chat setup, Accounts-menu sign-in and other callers that do not request keepMinimalSignIn.",
+        "CriticalPath": "Existing startup/account initialization and noninteractive credential resolution remain unchanged. Other signIn callers retain the original local scope computation followed by createSession and account refresh.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostAuth.ts:resolveSessionForProtectedResource, resolveAuthenticationInteractively",
+            "Operation": "Resolve and forward an already usable protected-resource credential.",
+            "Cardinality": "Existing provider/server-based session resolution and zero or one deduplicated forwarding operation for the selected interactive resource; the new setup option is not consumed when no sign-in occurs.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same session resolution and forwarding call path.",
+            "CriticalPathEffect": "No additional prerequisite or boundary call introduced on a normal authorized send."
+          },
+          {
+            "Kind": "IPC/filesystem/network",
+            "Location": "src/vs/workbench/services/accounts/browser/defaultAccount.ts:signIn, fetchDefaultAccount; src/vs/workbench/services/chat/common/chatEntitlementService.ts:signIn",
+            "Operation": "Ordinary session creation, account refresh and initial policy/account loading.",
+            "Cardinality": "Unchanged call counts: the new lookup is gated off for other callers. Forwarding an undefined option adds no provider operation and the option is stripped before createSession.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same default-scope union, session creation, storage and account refresh boundaries.",
+            "CriticalPathEffect": "No changed startup or ordinary-sign-in critical path."
+          }
+        ],
+        "ScalingInput": "Existing startup/account events and protected-resource groups; the new branch is not entered without keepMinimalSignIn and nonempty additionalScopes.",
+        "EffectiveConcurrency": "Existing setup pendingRun coalescing, provider-keyed operation queues, account-update throttling and token forwarding deduplication remain unchanged.",
+        "CacheBehavior": "No new cache keys or retained objects. Existing session and account metadata caches, negative restoration cache and authentication-token cache are not changed.",
+        "MechanismConfidence": "High confidence from the sole production setter, the conditional branch, and traced propagation/callers.",
+        "MagnitudeUncertainty": "No runtime measurements; no changed performance mechanism identified in these workflows.",
+        "Verdict": "No performance regression or concrete performance-regression fix found on these unchanged paths."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over all 10 changed files and every diff page against base 169f56d425d95c86c41ec6ce9f09c2fd607f94f2. Traced added scope discovery through authentication IPC, provider sequencing, renewal/restoration caches, OAuth persistence, account-policy refresh and Agent Host forwarding. The only substantive new work is bounded session discovery during opt-in interactive sign-in. No high-confidence performance finding or qualifying regression-fix provenance signal was established."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-25T22:46:10.732722496Z",
+    "CompletedAt": "2026-11-25T22:48:42.072421504Z",
+    "WallClockMilliseconds": 151339,
+    "ModelCalls": 11,
+    "InputTokens": 554067,
+    "OutputTokens": 6412,
+    "TotalTokens": 560479,
+    "ReasoningTokens": 1093,
+    "CacheReadTokens": 466683,
+    "CacheWriteTokens": 87351,
+    "APIDurationMilliseconds": 119806,
+    "ToolCalls": 62,
+    "NanoAIUnits": 32923180000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 466683,
+      "cache_write": 87351,
+      "input": 33,
+      "output": 6412
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
