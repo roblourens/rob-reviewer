@@ -1,0 +1,252 @@
+{
+  "PullRequest": {
+    "Number": 350184,
+    "Title": "agentHost: report Dev Container connect failure stages and up error causes",
+    "Body": "Improves the Dev Container connection telemetry so that failed connections can be attributed to a stage and cause, and compared between users with and without the state volume (`chat.agentHost.devContainer.persistUserState`).\n\n- **Connect failure stage**: the `devContainer/connect` event gets a fixed `failureStage` (readConfig, prepare, mount, up, link, userCommands, agentHostStart, connect, timeout or other). The shared process reports it through a new `onDidFailConnect` event. Like the user state reports, that event is unbuffered on the IPC channel, so it arrives before the rejected `connect` call. Remote hosts relay it through the agent host extension protocol; hosts without it report `other`.\n- **Up and lifecycle stages in both arms**: the `devContainer/stateVolume` event now reports the `up` and `userCommands` stage outcomes with the state volume setting on and off (`enabled` tells them apart), so failures can be compared. With the setting off, only fixed fields are reported (outcome, reason, exit code, `errorCause`, `lifecycleInUp`), never `errorMessage`. With it on, reports are unchanged.\n- **Error cause**: failed `up` and `userCommands` stages get a fixed `errorCause` for causes that the failed command alone doesn't identify: duplicateMount, volume, mount, daemon (Docker not running), config, lifecycle (a lifecycle command failed), feature or other. It is classified from the CLI's error result and stderr; no free text is added.\n- **Lifecycle commands**: `up` reports get `lifecycleInUp`. Without the state volume, `up` runs the lifecycle commands; with it, they run later in `userCommands` (samples always run them there). The same failing `postCreateCommand` is therefore `up`/`lifecycle` with `lifecycleInUp` in one arm and `userCommands`/`lifecycle` in the other, so lifecycle failures can be excluded from the startup comparison or compared separately.\n- **Unreadable configuration**: when the configuration cannot be read for the state volume mount, the mount stage is now reported as `skipped` with reason `configUnreadable` instead of `failed`. The error is left to the Dev Container CLI, which reports it when starting the container.\n\n`devContainerState.ts` gets `getDevContainerUpErrorCause` and `isDevContainerDuplicateMountError` at the end of the file, to keep it in sync with the Dev Containers extension's copy.\n\nReporting the failed command (`getFailedCommandName`) for up failures is left for after #350150 merges, which adds it to `devContainerState.ts`.\n\nTested with the agentHost devContainer unit tests and the Dev Container connector Electron tests.",
+    "URL": "https://github.com/microsoft/vscode/pull/350184",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "chrmarti",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "65981f4eedef74b083aed10517abc27290fcce8f",
+    "HeadRef": "chrmarti/state-volume-mount-up",
+    "HeadSHA": "5d9144f0062732a429ba3c9f4738470429b8f370",
+    "CreatedAt": "2026-11-24T15:40:57Z",
+    "UpdatedAt": "2026-11-25T12:01:15Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-93BE142E5DC8",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/devContainerState.ts",
+      "Side": "RIGHT",
+      "Line": 737,
+      "Severity": "medium",
+      "Confidence": 0.92,
+      "ConfidenceRationale": "The caller passes the uncapped stderr accumulated by _runDevContainer, and the new helper explicitly materializes the whole log before classification. The disabled-setting before/after difference is visible in the diff. This is static evidence; how large typical failing build logs are and the resulting pause duration are not measured. Lifecycle/config descriptions return early and are excluded from this trigger.",
+      "PerformanceCategory": "memory",
+      "MechanismFamily": "serialization-allocation",
+      "PerformanceResource": "Whole-log derived strings, multiple arrays of log lines, and one RegExp object per retained line, in addition to the already captured stderr.",
+      "PerformanceScaling": "For each non-lifecycle/non-config failed stage, extra allocation grows with total stderr bytes B and retained line count L: O(B+L) auxiliary memory and O(L) temporary RegExp objects. Same-source attempts are serialized, but independent sources share the host event loop; no cache or grouping reduces this per-failure log processing.",
+      "PerformanceOutcome": "Increased transient heap usage and GC pressure, with synchronous failure-path latency and host event-loop blocking.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "With persistUserState=false, _runDevContainerStage parsed the existing stdout result and returned without any failure-telemetry normalization of stderr. With persistence enabled, getDevContainerCliErrorMessage scanned stderr for a daemon line but, when the CLI supplied its normal error result, sanitized only description/message and that selected daemon line rather than rebuilding all stderr.",
+      "ChangedBehavior": "An unsuccessful up now synchronously normalizes the complete captured debug stderr into a second log-sized string, with several line arrays and a RegExp object per retained line, merely to select one of five fixed categories. This runs even when state persistence is disabled.",
+      "CausalDiffEvidence": "The added devContainerState.ts:737-740 concatenates description/message with all output, strips ANSI, splits, filters, maps, and rejoins it. The changed _runDevContainerStage at devContainerAgentHostService.ts:908 newly invokes this with result.stderr on every unsuccessful stage, including persistUserState=false; previously the report flag excluded all failure-telemetry processing in that arm.",
+      "Title": "Classify failed CLI output without rebuilding the entire log",
+      "Impact": "A workspace Dev Container whose verbose image build fails after producing a large debug log incurs an additional heap/GC spike and delayed failure reporting in the shared process or standalone remote host. Other work on that host's event loop is also delayed. This occurs once per failed stage, not once per container, volume, or output chunk.",
+      "Evidence": "_connect runs up with DEV_CONTAINER_LOG_ARGS=['--log-level','debug'] (service.ts:63,378-387). _runDevContainer accumulates every stderr chunk without a size limit (1221-1266). On failure, _runDevContainerStage calls getDevContainerUpErrorCause(parseDevContainerErrorResult(result.stdout), result.stderr) before returning (908). Unless a lifecycle/config description matches, the added helper creates a concatenated/normalized whole-log string, split/filter/map arrays, per-line RegExp objects, and a joined whole-log string (state.ts:737-740), then scans that string with the category patterns. The connection cannot reject or release its per-source sequencer until this synchronous work finishes.",
+      "Recommendation": "Classify the existing output incrementally, processing one line or bounded chunk at a time and retaining only the highest-priority matching category. Reuse the failed-command RegExp instead of constructing it per line; preserve lifecycle/config precedence and command-log exclusion without split/filter/map/join materialization of the complete log."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "serialization-allocation",
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "cache-lifecycle",
+      "repeated-work",
+      "concurrency-burst"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Connect a workspace Dev Container locally or on an SSH/Tunnel/WSL host, with user-state persistence enabled or disabled.",
+        "CriticalPath": "Configuration, optional sandbox/state mount preparation, devcontainer up, state linking when a mount exists, deferred lifecycle commands when persistence is enabled, agent-host installation/discovery, and relay connection must finish before the session can proceed. New stage-map updates and successful-stage reporting are synchronous but bounded. Telemetry delivery does not await network completion.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_readDevContainerConfiguration, _connect, _runDevContainer, _runDocker",
+            "Operation": "Spawn Dev Containers CLI for read-configuration and up, and Docker commands for container inspection, state volume preparation, and linking.",
+            "Cardinality": "One read-configuration and one up per workspace attempt. Persistence adds one filtered ps and one volume ls plus a create or targeted inspect when appropriate. Linking uses a mount query and, only for a found state mount, user lookup/link exec calls. No per-volume fan-out is added.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same CLI/Docker operations, ordering, shared configuration promise, and state-persistence gating existed before this PR.",
+            "CriticalPathEffect": "These operations block connection progress in both revisions."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_connect; src/vs/platform/agentHost/node/devContainerSandbox.ts:prepareDevContainerSandboxConfiguration",
+            "Operation": "Create and write optional sandbox override configuration, read configuration/Compose inputs, and remove temporary override directory on disposal.",
+            "Cardinality": "Only sandbox-enabled attempts; a bounded set of reads/writes per configuration, not per telemetry event.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical optional preparation and cleanup existed before the stage labels were added.",
+            "CriticalPathEffect": "Preparation is awaited; temporary-directory removal is asynchronous on disposal."
+          },
+          {
+            "Kind": "subprocess/network",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_startShell, _createRelay, _configureCaches; src/vs/platform/agentHost/node/remoteAgentHostCliInstaller.ts:ensurePinnedCliInstalled; src/vs/platform/agentHost/node/sshRemoteAgentHostHelpers.ts:filterLiveAgentHostEndpoints, waitForNewStandaloneEndpoint",
+            "Operation": "Run serialized setup commands over a persistent container shell; reuse/install CLI; probe distinct endpoint PIDs; poll registration; spawn relay and establish WebSocket over its stream. Up may pull images/build dependencies.",
+            "Cardinality": "One startup shell and one relay per successful attempt; fixed setup commands, one probe per distinct PID, and deadline-bounded registration polling. CLI download occurs only on cache/install miss; image/build network work depends on workspace configuration and Docker cache.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same warm reuse, cold downloads, PID deduplication, persistent-shell serialization, polling, and relay path.",
+            "CriticalPathEffect": "Required installation, discovery, and relay establishment are awaited. Long-lived agent-host spawn is detached, but registration is awaited."
+          },
+          {
+            "Kind": "IPC/serialization",
+            "Location": "src/vs/platform/agentHost/common/devContainerAgentHostIpc.ts:createDevContainerAgentHostChannel; src/vs/platform/agentHost/node/devContainerAgentHostProtocol.ts:_forward; src/vs/sessions/contrib/providers/remoteAgentHost/electron-browser/devContainerAgentHostConnector.contribution.ts:reportDevContainerUserState",
+            "Operation": "Forward fixed stage outcome fields to the connector and submit state-volume telemetry.",
+            "Cardinality": "The disabled-persistence workspace arm newly reports one up outcome. Enabled-persistence mount/up/link/userCommands report counts are unchanged, with two small optional fields added. Remote notifications route to the owning connection, not every listed container.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The disabled arm omitted up reporting; enabled-arm reporting and the IPC/remote routing infrastructure already existed.",
+            "CriticalPathEffect": "Event emission/validation and small serialization occur before stage completion; transport/network upload is not awaited."
+          }
+        ],
+        "ScalingInput": "One selected workspace/source per connection. Configuration is read once and its promise shared by cache, sandbox, and state-mount preparation. Volume listing serves the whole engine; state-volume creation/inspection concerns the selected source, not each listed volume. Endpoint liveness probes use distinct PIDs, not all endpoint entries.",
+        "EffectiveConcurrency": "The service queues full connection operations by source key using SequencerByKey; independent sources are not globally limited. Commands through the persistent DevContainerShell are serialized, including the three platform probes supplied via Promise.all. The diff does not change subprocess concurrency.",
+        "CacheBehavior": "Shell environment, Docker executable, and certificate setup promises are shared for the host lifetime. Container mounts/volumes and installed CLI/shared cache control warm reuse. Configuration is fresh per connection. Existing containers and already-installed CLI avoid creation/download work. These positive/negative cache and grouping behaviors are unchanged.",
+        "MechanismConfidence": "High confidence in critical-path reachability, per-source serialization, shell serialization, and unchanged boundary counts from the inspected service, IPC, protocol, installer, and helper implementations.",
+        "MagnitudeUncertainty": "CLI startup/build/download durations vary greatly, but they are pre-existing. New successful-stage telemetry is a constant-sized event per stage; no material successful-startup regression was established.",
+        "Verdict": "No finding for successful connection or boundary fan-out. New stage metadata and bounded outcome notifications do not add subprocesses or collection-scaled I/O."
+      },
+      {
+        "Scenario": "Prepare and connect a Dev Container sample or named environment, including cold and warm workspace/state volumes.",
+        "CriticalPath": "Sample source/configuration preparation or environment volume lookup/create precedes up; samples then ensure checkout, refresh override configuration, link user state, and run lifecycle commands. Environments prepare workspace ownership, link state, and run separate lifecycle commands only with persistence enabled. Agent-host setup follows. Stage changes do not alter this ordering.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem/network",
+            "Location": "src/vs/platform/agentHost/node/devContainerSamples.ts:prepareDevContainerSample, writeAtomic; src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_prepareSample.readSource",
+            "Operation": "Read persisted sample source; on miss resolve GitHub HEAD and fetch configuration; atomically write source/override files; ensure or clone checkout through Docker exec.",
+            "Cardinality": "One source-cache read per sample attempt; two GitHub SDK reads only on cold source miss, subject to the existing SDK's own caching; clone only when checkout is absent. A fixed number of atomic configuration writes per sample attempt.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same cache hit/miss behavior, GitHub reads, conditional clone, and configuration writes.",
+            "CriticalPathEffect": "Cold fetch/clone and file preparation must finish before usable sample startup."
+          },
+          {
+            "Kind": "subprocess/filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerEnvironments.ts:prepareDevContainerEnvironment; src/vs/platform/agentHost/node/devContainerSamples.ts:prepareDevContainerSample",
+            "Operation": "List/inspect/create owned workspace and state volumes, ensure workspace folders, write override configuration, run up, apply ownership/linking, and run required lifecycle commands.",
+            "Cardinality": "Grouped volume listings plus targeted calls for the chosen source. One up per attempt. Samples always run one separate lifecycle stage; environments run it separately only when persistence is enabled. Creation/ownership calls are conditional on existing resources. No new per-volume calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same commands and gating; PR only adds stage tracking around them.",
+            "CriticalPathEffect": "Preparation, up, ownership, and lifecycle completion are awaited."
+          },
+          {
+            "Kind": "IPC/serialization",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_prepareSample, _prepareEnvironment, _reportPreparedUserStateMount, _runDevContainerStage",
+            "Operation": "Report stage outcomes in both persistence arms and attach failure-stage metadata.",
+            "Cardinality": "Disabled-arm samples newly report up and userCommands; disabled-arm environments newly report up. Mount/link reports retain their prior eligibility. At most one connect-failure event per failed attempt.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The same preparation stages ran, but up/userCommands telemetry was suppressed with persistence disabled.",
+            "CriticalPathEffect": "Small events are emitted during the existing awaited operation, without another preparation or CLI invocation."
+          }
+        ],
+        "ScalingInput": "One selected sample/environment. Samples list all volume names once; environments perform one all-volume list and one label-filtered lookup. Typical creation selects one free name; the pre-existing environment collision loop can try up to 1000 names, issuing create/inspect only for candidates not already known taken.",
+        "EffectiveConcurrency": "The full preparation/startup operation is serialized by sample/environment source key. Independent environments can prepare concurrently as before. Docker and configuration operations within one preparation largely await one another.",
+        "CacheBehavior": "Samples read persisted source.json first; only a cold source-cache miss calls GitHub. Existing checkout skips cloning. Existing Docker volumes and images avoid creation/pulls; existing CLI/state caches remain reusable. Environment override configuration is written per attempt, unchanged.",
+        "MechanismConfidence": "High: inspected preparation implementations establish grouped volume cardinality, source.json reuse, conditional clone, and unchanged lifecycle scheduling.",
+        "MagnitudeUncertainty": "Cold network and Docker costs dominate and vary with image/cache state; none are introduced. New fixed events remain constant per selected source.",
+        "Verdict": "No separate regression for samples/environments. State-stage reporting does not add expensive preparation boundaries."
+      },
+      {
+        "Scenario": "A workspace up/build fails after producing a large debug log, with a non-lifecycle/non-config error description.",
+        "CriticalPath": "After the CLI exits, _runDevContainerStage now parses its error result and synchronously classifies all captured stderr before it can return, reject connect, dispose resources, or release the source sequencer. The resulting fixed telemetry fields then follow the normal failure-notification path.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_runDevContainer, _connect",
+            "Operation": "Execute devcontainer up with debug logging and capture every stderr chunk.",
+            "Cardinality": "One up process and one accumulated stderr string per failed workspace attempt; underlying build commands depend on workspace configuration.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same CLI process and uncapped raw stderr capture.",
+            "CriticalPathEffect": "CLI completion was already awaited; new processing is inserted after completion and before failure propagation."
+          },
+          {
+            "Kind": "serialization/allocation",
+            "Location": "src/vs/platform/agentHost/node/devContainerState.ts:getDevContainerUpErrorCause:737-741; src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_runDevContainerStage:908",
+            "Operation": "Concatenate, ANSI-normalize, split/filter/map/rejoin the entire error output and scan it to choose a fixed category.",
+            "Cardinality": "One whole-log transformation per non-lifecycle/non-config failed stage; O(B+L) extra memory and O(L) transient RegExp objects. No grouping reduces the log's effective cardinality.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Persistence-disabled stages performed no failure-telemetry stderr normalization. Persistence-enabled stages scanned stderr for a daemon error but, for normal CLI JSON error results, sanitized the description/message and selected daemon line rather than reconstructing the full stderr log.",
+            "CriticalPathEffect": "Synchronous on the shared-process/standalone-host event loop before connect can reject."
+          },
+          {
+            "Kind": "IPC/network",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_connect.catch; src/vs/platform/agentHost/node/devContainerAgentHostProtocol.ts:_forward; src/vs/platform/telemetry/common/telemetryIpc.ts:TelemetryAppenderClient.log; src/vs/platform/telemetry/common/1dsAppender.ts:AbstractOneDataSystemAppender.log",
+            "Operation": "Emit failed-stage and connect-failure facts, relay them to the owning connector, and enqueue telemetry through the existing appender/SDK.",
+            "Cardinality": "One failed-stage report and at most one connect-failure notification per failed attempt. Enabled-arm failure-stage reporting already existed; disabled-arm reporting and connect-failure notification are new. SDK track submissions are not one awaited HTTP request per event.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Connect result telemetry and enabled-arm failure telemetry already used the same appender; no failure-stage notification and no disabled-arm up report.",
+            "CriticalPathEffect": "Bounded event handling/serialization occurs before rejection; telemetry upload is fire-and-forget and not awaited."
+          }
+        ],
+        "ScalingInput": "Total failed-command stderr bytes B and retained output lines L. A verbose failed Docker/image build is the realistic large-log trigger. Lifecycle/config description matches return early and are not included.",
+        "EffectiveConcurrency": "One classification per failed stage; not per output chunk or volume. Same-source attempts remain serialized. Different sources can have CLI processes active concurrently, but classification executes synchronously on their shared host event loop.",
+        "CacheBehavior": "No classification cache, cap, chunking, or coalescing exists. Warm Docker caches may reduce logs, but each verbose unsuccessful attempt processes its full captured output again. Raw stderr capture predates this PR.",
+        "MechanismConfidence": "High: uncapped stderr capture, caller arguments, early-return exclusions, full materialization, per-line RegExp creation, and placement before failure propagation are explicit in code and diff.",
+        "MagnitudeUncertainty": "No profiling was performed. Frequency of very large failing logs and exact allocation/pause duration are uncertain; this limits severity, not confidence in the added log-sized allocation mechanism.",
+        "Verdict": "Submitted one medium-severity serialization-allocation finding, anchored to the added full-log materialization line."
+      },
+      {
+        "Scenario": "Reconnect, cancellation, timeout, failed preparation, and unreadable configuration; release failure telemetry state/listeners.",
+        "CriticalPath": "Reconnect repeats the existing source connection operation. Cancellation kills/cancels existing processes. Timeout reports failure before existing cleanup. Unreadable configuration still falls back to CLI up; the PR changes mount telemetry to skipped rather than failed. Sample preparation failure still stops an already-started sample before rejecting.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC/subprocess/filesystem",
+            "Location": "src/vs/sessions/contrib/providers/remoteAgentHost/electron-browser/devContainerAgentHostConnector.contribution.ts:createConnection.establish, RemoteDevContainerService.disconnect; src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_connect.catch, _disconnect, _getUserStateMountArgs",
+            "Operation": "Reconnect RPC, local workspace-existence check, existing cancellation/disconnect/kill, optional sample-stop cleanup, and CLI fallback on unreadable configuration.",
+            "Cardinality": "One reconnect request per transport reconnect; one workspace existence check for an eligible local workspace; cleanup targets the selected connection/sample. Configuration failure does not add another up or read-configuration invocation.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same reconnect, filesystem check, fallback-to-up, cancellation, and cleanup boundaries.",
+            "CriticalPathEffect": "Reconnect/exists and sample-stop cleanup are awaited as before; cancellation and temporary cleanup retain existing ownership."
+          },
+          {
+            "Kind": "IPC/serialization",
+            "Location": "src/vs/platform/agentHost/common/devContainerAgentHostIpc.ts:createDevContainerAgentHostChannel; src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_connect.catch/finally; src/vs/sessions/contrib/providers/remoteAgentHost/electron-browser/devContainerAgentHostConnector.contribution.ts:RemoteDevContainerService.connect, createConnection.connect",
+            "Operation": "Send one unbuffered failure-stage notification, store it until connect result telemetry, and dispose scoped listeners/maps.",
+            "Cardinality": "At most one new notification per uncancelled failed attempt. One stage entry per active service attempt; connector failure entries deleted on success/failure. Listener/filter cost scales with active connections, not accumulated retries.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No connect-failure stage notification/map; the same connection stores and disposal paths owned other telemetry/relay listeners.",
+            "CriticalPathEffect": "Notification precedes rejected connect; no network acknowledgment or additional CLI operation is awaited."
+          }
+        ],
+        "ScalingInput": "Active connection attempts and bounded stage reports per attempt. New service _connectStages entries exist only during _connect; connector failureStages entries are removed in connect's finally. Remote event listeners are scoped to the existing connection store, not accumulated per failure.",
+        "EffectiveConcurrency": "Source operations remain sequenced; shell commands remain serialized. Failure emitters are synchronous and unbuffered across the service IPC channel. Transport notification routing uses connection-ID lookup/filtering; no extra remote host resolution or reconnect is scheduled by the new event.",
+        "CacheBehavior": "Reconnect rereads the persistence setting and configuration while reusing host shell/Docker/certificate and Docker/CLI caches as before. Failure-stage maps are not history caches. No new negative-cache retry behavior is introduced.",
+        "MechanismConfidence": "High: inspected finally blocks, store disposal, protocol connection lookup, IPC unbuffered semantics, reconnect cleanup, and unchanged configuration-fallback path.",
+        "MagnitudeUncertainty": "Actual active-connection counts vary. The new bounded state and low-frequency event do not establish meaningful retained-memory or concurrency amplification.",
+        "Verdict": "No cleanup/cache-lifecycle finding. Added maps and listeners have explicit bounded lifetimes; cancelled attempts do not emit connect failure. Removed configuration-error sanitization alone is not established as a concrete prior performance regression fix."
+      }
+    ],
+    "Summary": "Completed the distinct performance-review pass over all 15 changed files and all diff pages against base 65981f4eedef74b083aed10517abc27290fcce8f. Traced local/remote connection, sample/environment preparation, failure classification, and reconnect/cleanup scenarios, including grouping, cache behavior, effective concurrency, and transitive expensive boundaries. Submitted one medium-severity whole-log allocation regression. No high-confidence regression-fix provenance signal was established. Static, read-only review; no runtime duration claims."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-26T04:30:47.710406935Z",
+    "CompletedAt": "2026-11-26T04:34:15.998415562Z",
+    "WallClockMilliseconds": 208288,
+    "ModelCalls": 12,
+    "InputTokens": 812932,
+    "OutputTokens": 9280,
+    "TotalTokens": 822212,
+    "ReasoningTokens": 2235,
+    "CacheReadTokens": 708178,
+    "CacheWriteTokens": 104718,
+    "APIDurationMilliseconds": 181157,
+    "ToolCalls": 57,
+    "NanoAIUnits": 42548480000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 708178,
+      "cache_write": 104718,
+      "input": 36,
+      "output": 9280
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
