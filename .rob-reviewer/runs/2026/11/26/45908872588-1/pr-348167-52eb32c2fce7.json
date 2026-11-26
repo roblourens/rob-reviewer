@@ -1,0 +1,385 @@
+{
+  "PullRequest": {
+    "Number": 348167,
+    "Title": "agentHost: stop one Git refresh from recomputing every worktree of a session",
+    "Body": "One Git state refresh of a single chat recomputed the Branch changes of every worktree of its session, several times over, each time opening session databases and running git. On a session with ~16 chats in distinct worktrees this was ~1,100 git commands and ~900 session-database opens in about a minute, `git status` timeouts, and agent host CPU and lag.\n\n## Root cause\n\nAll under `src/vs/platform/agentHost/node/`. Builds on #343275, which already limited the Branch summary to the folders of chats in use and skipped git for missing folders.\n\n1. `AgentHostGitStateService._refreshSessionGitState` fired `onDidRefreshSessionGitState` on every refresh, even when nothing changed. Its only protection was a 5 s throttle per chat key.\n2. `AgentHostChangesetCoordinator.onDidRunSessionGitStateRefresh` reacted by reconciling the branch summary of **all** sources (each `_ensureBranchSummarySubscription` unconditionally refreshed its Branch changeset), then recomputing every owner again, then recomputing every subscription of the session again, including Session Changes, which open the session and every peer chat database. Cost was O(N²) across chats.\n3. A Branch recompute opened a session database and ran git (`show-ref`, `merge-base`, `status`, diff, plus the reviewed-paths overlay) with no check whether anything had changed.\n4. Other triggers repeated this: `onChatAvailable` reconciled the whole session once per chat (also for archived chats), and the file monitor refreshed git for any change under a watched root, including build output and `node_modules`. The GitHub pull request artifact probed the checkout (`git branch --show-current` and more) on every host event.\n\n## Changes\n\n- **Git state refresh event** (`agentHostGitStateService.ts`): `onDidRefreshSessionGitState` fires only when the refresh observed a change (Git or GitHub state), was the first for its key, or was forced with the new `refreshSessionGitState(..., { force: true })`. The file monitor and the changeset operation registry (commit, checkout, merge, sync, discard, pull request) force it, since the checkout changed in ways the state does not describe. The force flag is kept per key, so it survives `ThrottlerByKey` coalescing. Chats refreshing the same folder at the same time share one read of its Git state, unless one was forced.\n- **Scoped recompute** (`agentHostChangesetCoordinator.ts`): a refresh recomputes the Branch changes of the folder of the refreshed chat (or the session's folder) and that key's subscribed Uncommitted Changes. It no longer recomputes Session, Working Set and turn changesets, which come from tracked edits and do not read Git, and no longer touches other chats' folders, which have their own refreshes.\n- **Reconcile only what changed**: a summary source's Branch changeset is refreshed only when it starts being observed, observes another folder, or its folder is reported changed. `onChatAvailable` coalesces the whole-session reconcile per tick, and archived chats are not refreshed until unarchived.\n- **Change guard** (`agentHostChangesetService.ts`, `agentHostGitService.getBranchDiffFingerprint`): a Branch recompute is skipped when HEAD, the merge base and `git status` paths with their size and modification time equal those of the last successful compute for that owner, without announcing it as recomputing. Any failure, a missing fingerprint, or `refreshBranchChangeset(owner, { force: true })` (used when a file is marked reviewed, race-safe against a compute already running) recomputes. The Branch computation no longer opens the session database, which it never used.\n- **File monitor**: `node_modules` is excluded from the watch, and the monitor now reports which resources changed, so the coordinator can skip the refresh when `git check-ignore` says they are all ignored (build output). Tracked files in directories such as `dist/` still refresh. Edits inside a committed `node_modules` are not observed.\n- **Operations**: a Branch recompute skipped as current still refreshes the changeset's operations, since Sync, Create Pull Request and Merge follow Git state (commits ahead of the upstream) that the fingerprint does not cover.\n- **Failed operations**: a failed changeset operation refreshes the Git state of its owner (it may have changed the checkout part way, and its Error status used to be cleared by the next announced refresh). On Session, Working Set and Turn changesets a failed operation keeps its Error status until that changeset is published again.\n- **Multi-folder Branch changes**: the diff of each repository is reused while its fingerprint is unchanged, so one edit diffs one repository instead of all of them.\n- **GitHub integration**: the pull request artifact probes the checkout again only when its inputs (chat, folders, head ref/sha, repository) changed, a Git state refresh of the session was announced, or 30 s passed.\n\n## Measured effect\n\n**Live, against the real agent host process** (mock agent, 16 git worktrees as chat folders of one multi-root session, a `git` wrapper on `PATH` that logs every spawn; `main` at d53200b67b0 versus this branch; two runs each, so the range is run-to-run variation on a loaded machine):\n\n| Phase | `main` git spawns | This PR |\n| --- | --- | --- |\n| Session subscribed | 343 | 251 |\n| 15 chats created and subscribed | 621-622 | 525 |\n| Idle 10 s | 0 | 0 |\n| One edit in each of the 16 worktrees, 3 s apart | 4,162-6,821 | 1,118-1,202 |\n| 60 rewrites of files in a git-ignored `out/` per worktree | 1,158-2,570 | 48-92 |\n\nCreating a worktree's state costs the same git work either way, so the setup phases barely move; the savings are in what changes after: about 3.5-5.7x fewer git spawns per edit, and build output in ignored directories no longer costs a refresh. What remains per edit is the git state read (7 spawns), the change guard's fingerprint for every folder of a multi-folder owner (5 each) and one real diff, which is inherent to knowing whether something changed. Session database opens were not counted live.\n\n**Unit level** (a session with a default chat, 15 chats in their own worktrees and 24 archived chats, run against `main` and this branch): 16 refreshes of active chats recomputed Branch changes 256 times, now 16; 40 chats becoming available 1,280 times, now 16; 41 unchanged refreshes of one Branch changeset ran 41 diffs and 41 database opens, now 1 and 0; 12 chats of one folder refreshing together read its Git state 12 times, now once.\n\nReal git processes, temporary repository: the fingerprint is 5 spawns, a Branch diff 7 (4 without untracked files), and the reviewed-paths overlay adds roughly as many again.\n\n## Tests\n\n- `agentHostChangesetCoordinator.test.ts`: scale scenarios above, scoped recompute for chat and session refreshes, unchanged reconcile, unarchive refresh, watch excludes, forced refresh from the file monitor, ignored build output.\n- `agentHostGitStateService.test.ts`: announce only on change / first / forced (also behind a coalesced unforced refresh), shared reads.\n- `agentHostChangesetService.test.ts`: unchanged inputs recompute nothing and open no database, invalidation on tree/commit/base/force, no fingerprint or failed compute always recomputes, force arriving during a running compute.\n- `agentHostFileMonitorService.test.ts`, `githubPullRequestArtifactIntegration.test.ts`: reported changes and probe memoization.\n- `agentHostGitService.integrationTest.ts` (real git): `getBranchDiffFingerprint` changes with edits to an already modified file, commits and base branch; `hasUnignoredPaths`.\n- Updated expectations in `agentService.test.ts` (the session and its default chat now share one Git read) and removed the `databaseUnavailable` case for Branch changes, which no longer open the database.\n\n```\nnode test/unit/node/index.js --runGlob \"**/platform/agentHost/test/node/**/*.test.js\"   # 15,463 passing, 75 pending\nnode test/unit/node/index.js --run src/vs/platform/agentHost/test/node/agentHostGitService.integrationTest.ts   # 117 passing\npnpm run typecheck-client   # passed\n```\n\nA reviewer on a different model (claude harness) reviewed the change in three rounds against the full matrix and approved 9daa3b53082; the last commit (2590271f659) adds a probe reset on turn end it suggested as optional.\n",
+    "URL": "https://github.com/microsoft/vscode/pull/348167",
+    "State": "closed",
+    "Draft": false,
+    "AuthorLogin": "sandy081",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "580745c3ba2151ca0108e613cebf90041942c0da",
+    "HeadRef": "agents/fix-vscode-agent-git-refresh-inefficiencies",
+    "HeadSHA": "52eb32c2fce779a165fd4a44f36afd29b8be0a6c",
+    "CreatedAt": "2026-11-13T14:46:03Z",
+    "UpdatedAt": "2026-11-13T22:48:23Z",
+    "MergedAt": "2026-11-13T22:46:25Z",
+    "Labels": []
+  },
+  "Findings": [
+    {
+      "ID": "PERF-3AA7FF6FCF3B",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostChangesetService.ts",
+      "Side": "RIGHT",
+      "Line": 2087,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "Static call-flow establishes deduplication, the newly unlimited Promise.all, the three parallel command chains per fingerprint, and direct subprocess spawning. Exact overlap duration and affected workspace prevalence are unmeasured.",
+      "PerformanceCategory": "subprocess",
+      "MechanismFamily": "concurrency-burst",
+      "PerformanceResource": "Concurrent Git subprocesses, repository-wide status scans and associated CPU/disk I/O.",
+      "PerformanceScaling": "For R distinct repositories in one owner's effective folders, the new fingerprint pass can issue about 3R Git subprocesses concurrently, rather than processing at most 5 repository diffs at a time. Multiple folders inside one repository count only once.",
+      "PerformanceOutcome": "CPU and disk contention during Branch refreshes, reducing agent-host responsiveness and increasing refresh latency on many-repository workspaces.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "A Branch refresh for one multi-folder owner resolved roots with a limiter of 5, then computed repository diffs with MAX_DIFF_REPOSITORY_CONCURRENCY=5. Each repository's diff issued its Git commands sequentially.",
+      "ChangedBehavior": "Before that limited diff pass, the new guard starts a fingerprint for every unique repository simultaneously. Each fingerprint starts merge-base resolution, HEAD resolution and a full Git status probe in parallel.",
+      "CausalDiffEvidence": "The added Promise.all(directories.map(...getBranchDiffFingerprint...)) at line 2087 has no limiter; _doComputeStaticChangeset now awaits this pass at line 2162 before reaching _computeMultiFolderBranchDiffs' existing limiter.",
+      "Title": "Limit the repository fingerprint fan-out",
+      "Impact": "Opening Branch Changes or refreshing a subscribed chat spanning, for example, 16 distinct repositories can start roughly 48 Git probes together before the Branch result can progress. Warm repository-root caching does not prevent this burst; unchanged diffs still require the fingerprint pass.",
+      "Evidence": "resolveSessionRepositories deduplicates roots and limits resolution to 5 (agentHostSessionRepositories.ts:60-94). getBranchDiffFingerprint (agentHostGitService.ts:796-800) starts three independent Git command chains per root. _runGit (1499-1506) directly calls cp.execFile without a shared limiter. The old and retained diff fan-out is limited to 5 at agentHostChangesetService.ts:1472-1476.",
+      "Recommendation": "Queue repository fingerprints through MAX_DIFF_REPOSITORY_CONCURRENCY, disposing the limiter after settlement, while preserving repository order and the unchanged-result guard."
+    },
+    {
+      "ID": "PERF-CDB8BC9657A3",
+      "Focus": "performance-review",
+      "Path": "src/vs/platform/agentHost/node/agentHostChangesetService.ts",
+      "Side": "RIGHT",
+      "Line": 2089,
+      "Severity": "medium",
+      "Confidence": 0.99,
+      "ConfidenceRationale": "The cap, all-or-nothing return, optional-map propagation and second probe are explicit in the traced code. The scenario uses deduplicated repositories, not per-chat fan-out; runtime duration is unmeasured.",
+      "PerformanceCategory": "io",
+      "MechanismFamily": "repeated-work",
+      "PerformanceResource": "Repeated Git subprocesses and full working-tree status scans; repeated lstat operations for repositories whose first fingerprint succeeded.",
+      "PerformanceScaling": "One repository above the 2,000-path cap causes two fingerprints per unique repository on every refresh. With a usable merge base, each fingerprint adds four Git invocations. If both roots of a two-repository owner exceed the cap, the new path adds sixteen probe invocations and four full status scans before the same diffs the base performed.",
+      "PerformanceOutcome": "Excessive repository I/O and subprocess work delay Branch Changes publication, especially for large dirty working trees.",
+      "ChangeCausality": "introduced",
+      "PreviousBehavior": "A refresh of a single subscribed multi-folder Branch owner computed one diff per unique repository, with no fingerprint probes. With a usable base and only tracked modifications, each repository's diff performed one merge-base resolution, one status scan and one diff.",
+      "ChangedBehavior": "The guard fingerprints all repositories, but discards all results when any fingerprint is undefined. The following multi-folder diff pass receives no map and fingerprints every repository again before computing or reusing its diff.",
+      "CausalDiffEvidence": "The added early return at 2088-2089 discards the complete first-pass fingerprint array. The added nullish fallback at 1478 then calls getBranchDiffFingerprint again for every repository because repositoryFingerprints is undefined.",
+      "Title": "Preserve inconclusive fingerprints for the diff pass",
+      "Impact": "A chat subscribed to Branch Changes across multiple repositories, with a bulk tracked-file rewrite exceeding 2,000 paths in any root, repeats the guard for all roots. The cap deterministically fails again for the large root, so this duplicated work cannot enable reuse there and recurs even with warm caches.",
+      "Evidence": "_doComputeStaticChangeset:2162-2164 passes fingerprinted?.repositories to _computeMultiFolderBranchDiffs:2240. getBranchDiffFingerprint:796-807 has already completed its Git probes before returning undefined for more than 2,000 changed paths. _computeMultiFolderBranchDiffs:1478 repeats that probe. Repository-root caching only caches root lookup; fingerprints and status scans are not cached or coalesced.",
+      "Recommendation": "Return the per-repository results even when the aggregate fingerprint is unavailable, preserving explicit undefined results. In the diff pass, distinguish an already attempted inconclusive fingerprint from an unprobed repository so each root is fingerprinted at most once per refresh."
+    }
+  ],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "boundary-fanout",
+      "concurrency-burst",
+      "missing-coalescing",
+      "cache-lifecycle",
+      "cleanup-lifecycle",
+      "serialization-allocation",
+      "unbounded-retention"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Open or refresh Branch Changes for one chat whose effective folders span many distinct repositories.",
+        "CriticalPath": "Root resolution and the complete fingerprint pass must finish before cached Branch results can be accepted or real diffs computed and published. Work runs in the agent host, not synchronously in the renderer, but competes with host requests.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostSessionRepositories.ts:resolveSessionRepositories; agentHostGitService.ts:getRepositoryRoot",
+            "Operation": "Discover repository roots with git rev-parse --show-toplevel.",
+            "Cardinality": "One successful discovery per uncached distinct directory, limited to 5; cached roots suppress subsequent subprocesses.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same limited root discovery already preceded multi-folder diffs; the new guard adds a second root-resolution call whose successful lookups are normally cached.",
+            "CriticalPathEffect": "Root discovery precedes the fingerprint and diff passes."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts:2087; agentHostGitService.ts:getBranchDiffFingerprint",
+            "Operation": "Probe merge base, HEAD and complete porcelain Git status.",
+            "Cardinality": "One fingerprint per unique root on the normal path; four Git commands with a usable named base/merge base, with additional fallback probes possible. Three command chains begin concurrently per root.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No fingerprint pass existed. Repository diffs performed their Git commands sequentially with at most 5 repositories being processed.",
+            "CriticalPathEffect": "All fingerprints must settle before the Branch guard can accept cached data or proceed to real diffs."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:getBranchDiffFingerprint",
+            "Operation": "lstat changed paths for file sizes and nanosecond modification times.",
+            "Cardinality": "Up to 2,000 paths per root, limited to 16 queued tasks per fingerprint; no stats are issued when the cap is exceeded.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No separate file-stat fingerprint pass existed.",
+            "CriticalPathEffect": "All stats participate in the fingerprint awaited by Branch refresh."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts:_computeMultiFolderBranchDiffs; agentHostGitService.ts:computeSessionFileDiffs",
+            "Operation": "Compute repository Branch diffs, including optional temporary-index staging for untracked files.",
+            "Cardinality": "Cold computation diffs R roots; subsequent computation diffs only roots with changed or unavailable fingerprints. Repository concurrency remains 5.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "All roots were diffed on each computation, still limited to 5 repositories.",
+            "CriticalPathEffect": "Requested diffs finish before Branch publication."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts:_resolveBranchBaseBranch; agentHostSessionStateStore.ts:load",
+            "Operation": "Load authoritative persisted session settings used to resolve the base branch.",
+            "Cardinality": "New guard adds one load call per owner computation; warm state-store records avoid database reads, with sequencing per containing session. Cold load reads catalog and session state.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "The diff and reviewed-path lookup already loaded this state; the new guard adds a call, generally against an already loaded record. The unused direct session-database open for Branch computation is removed.",
+            "CriticalPathEffect": "Base-branch resolution precedes fingerprinting."
+          }
+        ],
+        "ScalingInput": "R unique repository roots after case-biased deduplication of effective folders; a realistic many-repository workspace can have 16 roots. Multiple folders within one repository count once.",
+        "EffectiveConcurrency": "Static requests serialize and coalesce per owner/kind, not globally. Root discovery and real multi-repository diffs limit repository concurrency to 5. The added aggregate fingerprint Promise.all has no limiter; each root starts three Git command chains, permitting roughly 3R simultaneous subprocesses. lstat tasks have a per-fingerprint limiter of 16 and additionally depend on the shared filesystem worker pool.",
+        "CacheBehavior": "Root lookup uses a 100-entry LRU and per-directory sequencing, including negative root results. Cold root discovery is limited to 5. Warm roots avoid rev-parse discovery but not fingerprints. Fingerprints run on every Branch request; unchanged aggregate results skip diffs, while changed repositories use per-owner cached repository diffs. No fingerprint in-flight sharing exists.",
+        "MechanismConfidence": "High: deduplication, per-owner serialization, existing limiters, newly unlimited fingerprint fan-out and direct cp.execFile calls were traced.",
+        "MagnitudeUncertainty": "Exact Git process overlap, status duration and prevalence of many-repository workspaces are unmeasured.",
+        "Verdict": "Reported the new fingerprint concurrency burst; normal diff reuse and removal of the unused Branch database open are improvements."
+      },
+      {
+        "Scenario": "Refresh a subscribed multi-repository Branch owner after a bulk rewrite exceeds 2,000 changed paths in at least one root.",
+        "CriticalPath": "The first fingerprint pass finishes, returns no aggregate result, then the second per-repository fingerprint and necessary diffs must finish before publication.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts:2088-2089,1478; agentHostGitService.ts:796-807",
+            "Operation": "Repeat merge-base, HEAD and full status probes after discarding the first pass.",
+            "Cardinality": "Two fingerprints per unique repository. With usable named base/merge base, this is eight probe commands per root before any real diff; in the two-large-root case sixteen probe commands are added to the base diff work.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No fingerprint probes; each root computed its diff once, including its own status scan.",
+            "CriticalPathEffect": "Both passes are awaited before the same required diffs can publish."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:getBranchDiffFingerprint",
+            "Operation": "Repeat changed-path stats for roots whose first fingerprint was successful.",
+            "Cardinality": "Twice the up-to-2,000 stats for each successful root when any sibling root is inconclusive. Over-cap roots skip stats but repeat Git probes.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No fingerprint-related stats.",
+            "CriticalPathEffect": "Both sets of successful-root stats are awaited."
+          }
+        ],
+        "ScalingInput": "R deduplicated roots, with at least one above the 2,000-path fingerprint cap. A concrete two-root case with over 2,000 tracked modifications in each root permits no diff reuse.",
+        "EffectiveConcurrency": "The first fingerprint pass is unlimited across roots; the second runs inside the existing 5-repository diff limiter. Owner/kind computations serialize and coalesce, but these two passes occur within each computation.",
+        "CacheBehavior": "Root caches remain warm. An undefined fingerprint is not preserved as an attempted result. One undefined result discards successful fingerprints from all other roots; the second pass can reuse cached diffs for unchanged successful roots but still repeats their probes and stats.",
+        "MechanismConfidence": "High: traced cap return, all-or-nothing aggregate return, optional-map propagation and nullish reprobe in the diff pass.",
+        "MagnitudeUncertainty": "Bulk-edit size and filesystem speed vary; command duplication and cap-triggered fallback are deterministic.",
+        "Verdict": "Reported repeated fingerprint work. Preserve attempted inconclusive results and successful partial results to avoid the second probe."
+      },
+      {
+        "Scenario": "Incremental edit or Git refresh in one chat of a session with many chats in different worktrees.",
+        "CriticalPath": "The changed key reads Git state, optionally updates persisted state and associates a PR, then announces a refresh. The coordinator schedules only its relevant Branch owner and subscribed Uncommitted Changes; unrelated worktree diffs are no longer prerequisites for this update.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitStateService.ts:_readGitState; agentHostGitService.ts:_computeSessionGitState",
+            "Operation": "Read status, remotes, default branch and conditional branch divergence/head-owner state.",
+            "Cardinality": "One Git state read per overlapping folder/base group rather than per chat; three initial command chains plus conditional probes. Distinct worktrees remain independent.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Each chat independently read its Git state, even when another chat was reading the same folder.",
+            "CriticalPathEffect": "Read and any branch-change PR association precede announcement."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetCoordinator.ts:onDidRunSessionGitStateRefresh",
+            "Operation": "Schedule Branch diffs and subscribed uncommitted diffs after the announced refresh.",
+            "Cardinality": "Only the refreshed key's deduplicated Branch owners and its subscribed Uncommitted Changes, not every session owner.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Whole-session summary reconciliation refreshed all sources, followed by additional subscribed recomputations. Across N distinct-worktree chats this generated collection-wide repeated work.",
+            "CriticalPathEffect": "These asynchronous computations publish the affected changesets."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetService.ts:_doComputeStaticChangeset; agentHostGitStateService.ts:_setChatGitState/_setSessionGitState",
+            "Operation": "Read/write authoritative state and formerly open tracked session databases for Branch computation.",
+            "Cardinality": "Changed Git metadata still persists; unchanged values avoid saves. Branch computation now opens no tracked session database. Session/turn tracked-edit recomputations are no longer triggered by the Git refresh.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every Branch computation opened an unused session database; refreshes also scheduled unrelated tracked-edit changesets and their database work.",
+            "CriticalPathEffect": "Changed metadata persistence can precede Git announcement; removed tracked-edit computations no longer contend with the refresh."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitStateService.ts:_queuePullRequestLookup/_queueFolderPullRequestLookup; agentHostPullRequestAssociationResolver.ts:resolveForCheckout",
+            "Operation": "Find an automatically associated GitHub PR by head branch, with commit-based fallback.",
+            "Cardinality": "Only eligible branch changes or association reconciliation; list-by-head returns one item by default, with a list-for-commit fallback on no match. This is not a request per changeset or per folder-summary source.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same guarded PR association and per-session/folder sequencing existed; the diff does not increase network request cardinality.",
+            "CriticalPathEffect": "Branch-change association is awaited before announcement, as before."
+          }
+        ],
+        "ScalingInput": "N active chats and D distinct folder-set owners, plus archived chats. One key refresh normally touches one owner; N separately completed refreshes no longer request every D owner on every event.",
+        "EffectiveConcurrency": "Git refreshes use per-key throttling with a 5-second pause. Same-folder/base overlapping reads share a promise; independent worktrees remain concurrent. Branch requests serialize/coalesce per owner/kind. Related operation updates coalesce per microtask and read existing state without Git probes.",
+        "CacheBehavior": "In-flight Git state reads share by working-directory URI and base branch; forced reads share only another fresh read. First/changed/forced refreshes announce; warm unchanged refreshes do not. Branch fingerprints and repository-diff caches suppress unchanged computations. Metadata saves occur only when changed.",
+        "MechanismConfidence": "High: before/after coordinator paths, shared read implementation, cache cleanup and scale tests inspected.",
+        "MagnitudeUncertainty": "Realistic numbers of chats and exact saved Git/database latency vary; no independent timing measurements were made.",
+        "Verdict": "The scoped refresh and reconciliation guard fix a concrete repeated-work regression. Introducing commit was resolved by blame, but report_regression_fix failed twice; no new finding for the removed mechanism."
+      },
+      {
+        "Scenario": "Ignored build output or normal source edits under watched repository roots.",
+        "CriticalPath": "Synchronous file-event collection precedes a 750ms quiet-period debounce. A root-level ignore probe then decides whether to initiate forced Git refresh. Ignored-only batches stop before refresh; relevant batches proceed through the Git/changeset paths.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostFileMonitorService.ts:_createEntry",
+            "Operation": "Acquire recursive repository watchers with exclusions.",
+            "Cardinality": "One entry per canonical folder/excludes/debounce combination; coordinator shares one root watch across interested owners.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Recursive watches already existed; node_modules exclusions are added.",
+            "CriticalPathEffect": "Background observation, not a synchronous user-action filesystem read."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/platform/agentHost/node/agentHostFileMonitorService.ts:_collectRelevantRawChanges; agentHostGitService.ts:hasUnignoredPaths",
+            "Operation": "Collect deduplicated URIs and serialize filesystem paths into NUL-separated stdin.",
+            "Cardinality": "Up to 20,000 retained distinct resources per notification; one joined batch for ignore checking.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only tested for a relevant raw change, without retaining or transmitting resources.",
+            "CriticalPathEffect": "Collection is synchronous in the host; stdin construction precedes the ignore subprocess."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetFileMonitorCoordinator.ts:_onRootChanged; agentHostGitService.ts:hasUnignoredPaths",
+            "Operation": "Run git check-ignore -z --stdin for the root's batch.",
+            "Cardinality": "One batched command per bounded nonempty root notification, not per file; .git resources short-circuit to relevant and overflow skips checking.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Every relevant watcher notification immediately requested Git refresh, even for ignored build output.",
+            "CriticalPathEffect": "Awaited before relevant events start Git refresh."
+          }
+        ],
+        "ScalingInput": "Distinct changed resources per root/notification, capped at 20,000 retained resources. Roots and notification resources are shared across callbacks; dependency directories are excluded.",
+        "EffectiveConcurrency": "One debounce per watcher entry, shared root watcher in the coordinator. Ignore checks are async and not explicitly sequenced; downstream Git refreshes retain per-key throttling and shared in-flight reads. Active roots suspend watchers.",
+        "CacheBehavior": "Watcher entries share by canonical folder, sorted excludes and debounce interval. Resource maps deduplicate changes and clear on notification. Overflow reports unknown resources. Ignore results are not cached; unknown/failing checks conservatively refresh. Root lookup is cached.",
+        "MechanismConfidence": "High confidence in debounce, deduplication, cap and one-command batching.",
+        "MagnitudeUncertainty": "Event batch sizes and ignore-probe durations are workload-dependent. Full event collection adds CPU work, but bounded retention and batched filtering establish no additional high-confidence actionable finding here.",
+        "Verdict": "Ignored output now avoids much larger downstream work; no separate qualifying finding in monitoring. Overflow/lifecycle and tracked-file handling were considered without reporting correctness-only concerns."
+      },
+      {
+        "Scenario": "Restore chats, observe session summaries, archive/unarchive chats, or change effective folders.",
+        "CriticalPath": "Static registration and summary-source reconciliation establish observed Branch owners; newly observed or changed owners schedule Branch refreshes. Chat availability reconciliation is queued to a microtask; asynchronous Git work follows.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetCoordinator.ts:onChatAvailable,_ensureBranchSummarySubscription,onChatArchivedChanged",
+            "Operation": "Request Git-state refresh and Branch computation for newly available or observed active folders.",
+            "Cardinality": "Refresh only active/non-subagent chat keys and new/changed observations; repeated retained-source reconciliation adds no Git work.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Chat availability reconciled the whole session repeatedly and refreshed archived chats; retained sources unconditionally scheduled Branch work.",
+            "CriticalPathEffect": "New owner results are needed for their summary contribution, while unrelated retained owners remain current."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetFileMonitorCoordinator.ts:trackSessionChanges,_releaseSessionRoots",
+            "Operation": "Acquire/release shared root watchers as owners join, leave or change folders.",
+            "Cardinality": "Shared per root; unchanged effective directory signatures avoid repeated root resolution.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same watcher lifecycle; the diff reduces unnecessary reconciliation-triggered computation.",
+            "CriticalPathEffect": "Background observation lifecycle, not a requirement for immediate summary publication."
+          }
+        ],
+        "ScalingInput": "Active summary sources collapse to distinct folder-set owners. Archived chats are excluded from automatic availability refresh; bursts of chat availability share one reconciliation per session/tick.",
+        "EffectiveConcurrency": "Microtask coalescing per session for chat availability, per-owner changeset sequencing and existing repository diff limiters. Independent owners may still compute concurrently, as before.",
+        "CacheBehavior": "Retained subscriptions do not refresh merely because reconciliation repeats. Owner removal clears Branch aggregate fingerprints, force generations and repository-diff caches, and releases monitor interest. Reobserved owners recompute if caches were cleared.",
+        "MechanismConfidence": "High: availability scheduling, archive guard, owner cleanup and shared watch signatures inspected.",
+        "MagnitudeUncertainty": "Restore tick grouping depends on caller scheduling, but unchanged-observation gating independently prevents full repeated Git work.",
+        "Verdict": "No additional performance regression; the change reduces unnecessary restore and archive-related work."
+      },
+      {
+        "Scenario": "Commit/checkout/merge/sync/discard/PR operations, failed operations, and marking Branch files reviewed.",
+        "CriticalPath": "Existing operation handlers execute their mutations and request Git refresh. Refresh announcement drives scoped changeset updates. Failure-triggered refresh is fire-and-forget and does not delay returning the original failure. Mark-reviewed forces recomputation so the reviewed overlay is not skipped.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostChangesetOperationService.ts:_refreshGitState,invokeChangesetOperation",
+            "Operation": "Read Git state after mutations or partially failed operations.",
+            "Cardinality": "At most two logical source/session reads per owner operation, coalesced to one overlapping read when folder/base match. Failure now requests the same bounded refresh path.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Success refreshes already occurred without a force option; failed operations did not request this recovery refresh.",
+            "CriticalPathEffect": "Success handlers may await refresh as previously; added failure refresh is off the error-return critical path."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/agentHostReviewService.ts:_getReviewedPaths,_resolveContext; agentHostChangesetService.ts:_computeReviewedInfo",
+            "Operation": "Resolve baseline/review refs, optionally capture working tree into a temporary index/tree, and compare reviewed paths.",
+            "Cardinality": "One overlay lookup for the primary repository of an actual Branch recomputation; cached unchanged Branch computations now skip it. Forced mark-reviewed computation still runs it.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same overlay ran on every Branch computation, even when unchanged.",
+            "CriticalPathEffect": "Overlay is awaited before publishing reviewed state."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/agentHostGitService.ts:_runWithTempIndex,_stageChangedPaths",
+            "Operation": "Create/write/remove temporary index/pathspec files when working-tree capture or untracked diffs require staging.",
+            "Cardinality": "Per actual temporary-index capture; no new per-path subprocesses introduced.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same staging and cleanup path; unchanged Branch reuse reduces its frequency.",
+            "CriticalPathEffect": "Required only for the already existing capture/diff semantics."
+          }
+        ],
+        "ScalingInput": "One operation owner resolves to one source and, when distinct, its containing session. Same folder/base reads may share; different source/session folders need separate reads. Reviewed overlay uses only the first repository of a multi-folder owner, as before.",
+        "EffectiveConcurrency": "Source and optional containing-session Git refreshes run in Promise.all with per-key throttling/shared folder reads. Changeset computation serializes per owner/kind. Operation updates coalesce in a microtask.",
+        "CacheBehavior": "Forced Git requests survive per-key throttler coalescing. Forced Branch refresh clears aggregate and per-repository caches and advances a generation, preventing an already running compute from recording a satisfying fingerprint. Unchanged Branch reuse still updates operation metadata without Git.",
+        "MechanismConfidence": "High: source/session grouping, forced-generation invalidation and reviewed overlay calls inspected.",
+        "MagnitudeUncertainty": "Mutation and failure frequency vary. The new bounded failure refresh is intentional recovery work, not an independently established regression.",
+        "Verdict": "No separate finding; fingerprint concurrency and duplicate fallback findings already cover the multi-repository Branch work reached after these operations."
+      },
+      {
+        "Scenario": "Maintain GitHub pull-request artifact checkout readiness during host events and turn ends.",
+        "CriticalPath": "A 50ms scheduler invokes checkout verification; repository branch/remote/HEAD/status probes must finish before workspace readiness and dependent automation can progress. The cached-input guard now avoids verification on unchanged events.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/artifactIntegrations/githubPullRequestArtifactIntegration.ts:checkout,refreshWorkspaces",
+            "Operation": "Check repository roots and branches; for a matching branch inspect remotes, HEAD, working-tree status and branch again.",
+            "Cardinality": "Warm nonmatching candidates need a branch probe each; matching candidate adds remote/HEAD/status/recheck. Now once per conclusive unchanged key/30-second window rather than once per host event, plus invalidations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every scheduled host event could probe all candidate directories again, without input or in-flight memoization.",
+            "CriticalPathEffect": "Readiness publication awaits probes; unchanged cached events return without Git."
+          }
+        ],
+        "ScalingInput": "One recording/default chat per artifact binding, with D effective directories scanned sequentially until a matching checkout is found. Different directories inside the same root are not newly deduplicated; that existing behavior is not reported.",
+        "EffectiveConcurrency": "Directory probes within checkout run sequentially. Scheduler coalesces events over 50ms; identical in-flight probe keys do not overlap. Changed keys can supersede old work, as previously.",
+        "CacheBehavior": "Conclusive ready or missing checkout results cache for 30 seconds by chat, folders, PR head/repository inputs and Git-refresh generation. Same in-flight input coalesces. Failures remain inconclusive and can retry. Git refresh/turn end invalidate the generation; closing resets probe state. Action-time checkout verification remains direct.",
+        "MechanismConfidence": "High: sequential checkout loop, cache key, TTL, in-flight marker and invalidation/disposal inspected.",
+        "MagnitudeUncertainty": "Artifact event frequency and directory counts determine savings; retry duration on transient failures was not measured.",
+        "Verdict": "No high-confidence new regression; checkout memoization reduces existing Git work. No network boundary is added by the changed refreshWorkspaces path."
+      }
+    ],
+    "Summary": "Completed the performance-review pass over the full 20-file inventory and all diff pages, with targeted caller, cache, ownership and expensive-boundary tracing. Submitted two high-confidence medium-severity findings: unlimited multi-repository fingerprint concurrency and duplicate fingerprint passes after inconclusive aggregate results. Confirmed a concrete removed repeated-work mechanism and its introducing commit; the internal report_regression_fix tool failed on both attempts. Static review; runtime magnitude is unmeasured."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-26T23:15:21.938793313Z",
+    "CompletedAt": "2026-11-26T23:20:26.514624157Z",
+    "WallClockMilliseconds": 304575,
+    "ModelCalls": 13,
+    "InputTokens": 1067461,
+    "OutputTokens": 12993,
+    "TotalTokens": 1080454,
+    "ReasoningTokens": 3100,
+    "CacheReadTokens": 941009,
+    "CacheWriteTokens": 126413,
+    "APIDurationMilliseconds": 226174,
+    "ToolCalls": 76,
+    "NanoAIUnits": 54014140000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 941009,
+      "cache_write": 126413,
+      "input": 39,
+      "output": 12993
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
