@@ -1,0 +1,250 @@
+{
+  "PullRequest": {
+    "Number": 350531,
+    "Title": "agentHost: remove links to untrusted Dev Container state and keep a copy of folders that restored state replaces",
+    "Body": "Follow-up to #350176 for the root script that links Dev Container user state to the state volume.\r\n\r\n## Changes\r\n\r\n**Remove links to untrusted state.** When linking is skipped because the state folder is not owned by root (`stateNotRootOwned`) or because another user could change or replace it (`untrustedState`), the container user's earlier links to the state are removed. Until now they stayed, so the user kept using the state the check had just refused, e.g., a root user kept running hooks from a `~/.copilot` another user could write to. Their folders now start fresh.\r\n- A non-root user keeps their links when the state folder is theirs and no other user owns the volume root, because only they can change that state.\r\n- Only symlinks whose target is exactly the link this script creates (`/vscode-state/\u003cfolder\u003e`) are removed. The state, its contents and `/vscode-state` stay in place.\r\n\r\n**Keep a copy of folders that restored state replaces.** Restoring the volume's state replaces the container's own folder. Until now a copy was kept only for folders marked while the container was running. A folder that started fresh after a skipped link (see above) or after a failed link was deleted without a copy once the state was restored. The script now creates `/.vscode-state-connected` the first time it runs in a container. When it finds the marker, any folder that restored state replaces is copied to `\u003cfolder\u003e.deferred.\u003crandom\u003e` on the volume first. New containers still replace the image's folders without a copy, so rebuilds don't accumulate copies.\r\n- A container marker instead of a flag from the client: it needs no plumbing through the connection paths and stays inside the shared script. A container linked before this change gets its marker on its first link with this version, so a restore during that link keeps a copy only of marked folders, as before.\r\n- Created with `mkdir`, which doesn't follow a symlink at that path. The marker is written only after the capability and read-only rootfs checks, which can't change without a new container.\r\n\r\n## Threat model\r\n\r\nThe script runs as root and must not follow symlinks the container user controls.\r\n- **Removing links:** the container may already be running (`keepExistingFolders`), so the user could replace a parent folder in their home with a symlink while the script runs. `unlink_folder` runs in a subshell. It `cd -P`s into the home folder and then into one path component at a time. It stops if a component is a symlink or if `pwd -P` isn't the expected child of the previous folder. Finally it checks and removes the link relative to the folder it entered, so swapping a parent afterwards doesn't redirect the `rm`. The worst a racing user can do is make root remove an entry of the same name in their own folder.\r\n- **Copying:** unchanged. The copy goes to a new `mktemp -d` folder inside the root-owned state folder, as for running containers before. It requires CAP_FOWNER for non-root users (`need_fowner`), so a container without it now skips with `missingCapabilities` before replacing anything, where before the folder was deleted without a copy.\r\n\r\n## Tests\r\n\r\nDocker cases in the extension's test suite on Debian and Alpine (dash and BusyBox ash):\r\n- a root user's links are removed on `stateNotRootOwned`, and the next restore keeps a copy of the fresh folder without a marker;\r\n- a non-root user's links are removed on `untrustedState`, but not through a parent folder that's a symlink;\r\n- a non-root user keeps their links to state they own.\r\n\r\nThe existing restore cases still pass unchanged, including a new container replacing the image's folder without a copy.\r\n",
+    "URL": "https://github.com/microsoft/vscode/pull/350531",
+    "State": "open",
+    "Draft": true,
+    "AuthorLogin": "chrmarti",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "bc522471d8917c856b63c4b0c71a70b53cd2f6a1",
+    "HeadRef": "chrmarti/state-link-followups",
+    "HeadSHA": "47680af60177569125deb3d32347b04e528033c9",
+    "CreatedAt": "2026-11-26T10:19:29Z",
+    "UpdatedAt": "2026-11-26T10:28:55Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": null,
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "boundary-fanout",
+      "repeated-work",
+      "cleanup-lifecycle",
+      "unbounded-retention",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "serialization-allocation"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First connection or rebuild of a workspace Dev Container with a state volume",
+        "CriticalPath": "Container up completes, then _linkUserState finishes before lifecycle commands, the persistent shell, and Agent Host startup. The new container marker is created during that existing awaited link command.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_getUserStateMountArgs, _ensureUserStateVolume, _connect",
+            "Operation": "Docker ps, volume ls plus create or inspect, and Dev Containers CLI up",
+            "Cardinality": "One container-state lookup and one volume list plus one volume create/inspect for a new container, followed by one CLI up; no operation per state file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical mount discovery, volume preparation, and CLI up calls.",
+            "CriticalPathEffect": "Required before linking and startup."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_getContainerMounts and _linkUserState",
+            "Operation": "Inspect all mounts once, query uid/gid/HOME once using docker exec or devcontainer exec, then run one root docker exec containing the complete link script",
+            "Cardinality": "Three boundary calls for a mounted workspace container, irrespective of state-file count; user query uses the slower CLI only when remoteEnv may set HOME.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same three grouped calls and conditional user-query implementation.",
+            "CriticalPathEffect": "All awaited before lifecycle commands and server startup."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerState.ts:buildLinkDevContainerStateCommand, marker and link_state",
+            "Operation": "Check/create a constant-size container marker; inspect mounts and folder metadata; scan restored state for trusted ownership; move initial local state or replace image folders",
+            "Cardinality": "One added marker check/create per container; four selected-product folders, up to four for each other used known product, plus .copilot: at most 9 folders for a known product or 13 for a custom product. Existing find/copy/remove costs scale with files and bytes in eligible folders.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No connected marker. Otherwise the same cold scans, initial moves, and image-folder replacement; only per-folder deferred markers enabled backups.",
+            "CriticalPathEffect": "Filesystem work remains inside the awaited root script. A genuinely new container has connected_before empty, so the diff does not add backups of image folders."
+          }
+        ],
+        "ScalingInput": "Fixed deduplicated product-folder set, mount count, and total files/bytes in eligible persisted folders. State operations are grouped into one Docker exec, not one exec per folder or file.",
+        "EffectiveConcurrency": "Connections are sequenced by source key; different sources may overlap. The script processes folders serially and acquires a state-directory flock when available, unchanged from base.",
+        "CacheBehavior": "Shell environment and Docker executable resolution are promise-cached per service. Mount inspection is not cached. New containers lack the marker; rebuilt containers likewise start without it. Existing volume reuse does not imply new per-file boundary calls.",
+        "MechanismConfidence": "High: complete diff, marker placement, restore guards, caller awaits, and integration-test expectations establish the execution path and counts.",
+        "MagnitudeUncertainty": "No timing measurements; filesystem and Docker transport speed and state size vary. The added marker is constant-size work.",
+        "Verdict": "No reportable regression: new-container replacement and existing heavy operations retain their prior behavior; only a constant marker operation is added."
+      },
+      {
+        "Scenario": "Warm reconnect to a successfully linked container, or reconnect while local folders are in use",
+        "CriticalPath": "The grouped link script still completes before lifecycle commands and Agent Host startup. Running-container local directories return through the existing keep_existing guard instead of being replaced.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_linkUserState",
+            "Operation": "Mount inspect, one user query, and one root link-script docker exec",
+            "Cardinality": "Three calls for a mounted workspace container on each connection, as before; no per-file Docker calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same boundary count and placement.",
+            "CriticalPathEffect": "Awaited on reconnect."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerState.ts:link_state, lines 442-502",
+            "Operation": "Check marker, folder parents, existing link target and destination owner; skip in-use local directories; otherwise retain existing links",
+            "Cardinality": "Bounded folder set of at most 9 or 13. With matching source links and destination owner, the existing guard avoids recursive untrusted_files scanning. No backup copies on this successful warm path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same link and ownership fast path and running-folder skip. The diff adds a constant marker existence check, not recursive work.",
+            "CriticalPathEffect": "Small metadata checks inside awaited script; keep_existing avoids copy/remove while directories are in use."
+          }
+        ],
+        "ScalingInput": "Connections and fixed folder set; warm successful reconnect does not scale scans or copies with state-file count.",
+        "EffectiveConcurrency": "Per-source service sequencer and optional per-volume flock; folder work is serial. Independent containers may connect concurrently, unchanged.",
+        "CacheBehavior": "The container marker is sticky but does not defeat link_state's symlink fast path. Existing correct links are authoritative warm state. Kept local folders remain deferred until an eligible later restore.",
+        "MechanismConfidence": "High: the new connected_before condition is nested beneath !-L src and existing-directory checks, and the keep_existing return precedes it.",
+        "MagnitudeUncertainty": "Reconnect prevalence and metadata latency are unmeasured; no new scaling work is present on the ordinary warm path.",
+        "Verdict": "No reportable regression: a previous connection does not cause a backup on every reconnect or bypass the existing recursive-scan optimization."
+      },
+      {
+        "Scenario": "Connection rejected because state ownership or volume trust changed",
+        "CriticalPath": "The root script performs trust checks, removes only its own earlier user-folder symlinks when required, and exits before subsequent startup proceeds.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_linkUserState",
+            "Operation": "Existing mount inspect, user query, and root script execution",
+            "Cardinality": "Same three grouped calls for a mounted workspace container; unlink helpers execute within that one root script.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same grouped calls, but the root script exited immediately after the failing ownership/trust check.",
+            "CriticalPathEffect": "Awaited before startup."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerState.ts:unlink_folder and unlink_state, lines 286-319",
+            "Operation": "Walk parent components without following symlinks, read exact link targets, and remove matching links",
+            "Cardinality": "At most 9 unlink_folder invocations for a known product or 13 for a custom product, including unused products. Parent depth is fixed at at most three traversed components, and at most one readlink/rm per actual matching link. No recursive state-tree traversal or deletion.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No user-link cleanup on stateNotRootOwned or top-level untrustedState. A non-root user with safely owned state still keeps its links after the change.",
+            "CriticalPathEffect": "Adds bounded cleanup before the existing early exit."
+          }
+        ],
+        "ScalingInput": "Fixed known/selected product folders and reconnect frequency, not number of sessions, files, or state bytes.",
+        "EffectiveConcurrency": "One serial shell loop. This early-exit path precedes the existing flock, but parent walks and exact-link removals remain fixed-size; no added async fan-out.",
+        "CacheBehavior": "No trust-result cache. Once links are removed, repeated rejected connections perform bounded checks without repeatedly removing them. Capability and read-only-rootfs exits precede marker creation and this cleanup.",
+        "MechanismConfidence": "High: all added unlink loops and early exits were inspected; their effective cardinality is explicit.",
+        "MagnitudeUncertainty": "Actual syscall latency and frequency of trust rejection are unmeasured.",
+        "Verdict": "No reportable regression: bounded, necessary unlink cleanup does not create collection-scaling subprocess fan-out or recursive work. Removing untrusted links is not itself a performance bug."
+      },
+      {
+        "Scenario": "Restore trusted volume state after a skipped or failed link in the same container",
+        "CriticalPath": "On an eligible restore, trust validation and preservation of the local directory finish before local removal and link publication; the entire root script precedes lifecycle/server startup.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_linkUserState",
+            "Operation": "Same grouped inspect/query/root-exec sequence",
+            "Cardinality": "Three workspace-container calls, independent of backup size; an existing failure-telemetry HostConfig inspect may occur once if the script fails.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same root-exec placement and conditional failure inspection.",
+            "CriticalPathEffect": "Root exec completion is awaited; failure telemetry is likewise on the existing awaited path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerState.ts:link_state, lines 447-491",
+            "Operation": "Validate destination files, mktemp a safe backup directory, cp -a the local contents, remove the local directory, and publish its volume link",
+            "Cardinality": "One backup per eligible real local directory per successful restoration, at most 9 or 13 fixed candidate folders. Cost scales with the files and bytes being preserved. Copies remain on the state volume; ordinary later reconnects do not recopy because src is then a symlink.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "Only folders with dst.deferred were copied. Previously connected containers with unmarked fresh folders deleted those folders without a copy; this diff extends the existing preservation path to them.",
+            "CriticalPathEffect": "Copy is intentionally before deletion and link publication to preserve local data. Existing flock serializes it with links to the same state directory when supported."
+          }
+        ],
+        "ScalingInput": "Files and bytes in actual local directories superseded by existing trusted state, after symlink, mount, running-container, and trust guards; not all persisted state on every connection.",
+        "EffectiveConcurrency": "Sequential copies within one script; per-source sequencer and optional state-directory flock. Different state volumes may restore concurrently, as before.",
+        "CacheBehavior": "connected_before records container lifetime, while successful source symlinks suppress future backup work. A new container remains exempt. Existing per-folder deferred markers continue to support older containers. Interrupted-copy retry handling is the existing backup implementation, not a newly scheduled retry loop.",
+        "MechanismConfidence": "High that the diff adds synchronous copying for this specific preservation case and that successful restoration bounds repeat work. No evidence of new routine repeated-copy behavior was found.",
+        "MagnitudeUncertainty": "Large local folders can make this intentional copy expensive and retain substantial disk space; no measured sizes or timings. The complete local data must be preserved under the changed semantics.",
+        "Verdict": "No actionable performance defect established: additional I/O and retained backup bytes directly implement required preservation before destructive replacement. Deferring or omitting the copy would violate that behavior; generic backup optimization or a new retention policy would expand scope."
+      },
+      {
+        "Scenario": "Sample/environment container preparation and eventual environment deletion",
+        "CriticalPath": "Preparation performs existing volume/configuration/checkout operations, awaits the same user-state link script, then runs lifecycle commands and starts the Agent Host. Environment deletion removes containers and state volumes under the existing source sequencer.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/agentHost/node/devContainerAgentHostService.ts:_prepareSample readSource; src/vs/platform/agentHost/node/devContainerSamples.ts:prepareDevContainerSample",
+            "Operation": "Resolve sample repository HEAD and read devcontainer configuration through GitHub; cold sample checkout uses git clone in docker exec",
+            "Cardinality": "One resolveRef plus one raw-file read when readSource is invoked; one git clone only when the workspace lacks .git. Existing checkout path checks instead of recloning.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same source requests, checkout guards, and ordering.",
+            "CriticalPathEffect": "Sample preparation must finish before state linking and lifecycle commands; entirely unchanged by the diff."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerEnvironments.ts:prepareDevContainerEnvironment; src/vs/platform/agentHost/node/devContainerSamples.ts:prepareDevContainerSample",
+            "Operation": "List/create/inspect relevant volumes, query container states, run CLI up, perform existing ownership/checkout/config reads, query image metadata if required, then execute grouped state linking",
+            "Cardinality": "State-volume preparation uses one create or identity inspection for its volume, not one per state file. State linking uses the same three calls as workspace containers plus up to one metadata inspect to decide HOME resolution. Existing preparatory calls remain unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical grouping and conditional calls; only the shared root script gains the marker, unlink cleanup, and eligible preservation behavior described above.",
+            "CriticalPathEffect": "All existing preparation calls precede lifecycle/server startup."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/platform/agentHost/node/devContainerSamples.ts:prepareDevContainerSample; src/vs/platform/agentHost/node/devContainerEnvironments.ts:prepareDevContainerEnvironment and removeDevContainerEnvironment",
+            "Operation": "Write atomic override/source configuration; create workspace directory for a new environment; execute shared state script; remove cached environment configuration on deletion",
+            "Cardinality": "Constant configuration writes and one cold workspace setup per environment; shared state-script costs follow the same fixed folder set and eligible-file counts as other scenarios.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same configuration/workspace/cache operations and deletion path.",
+            "CriticalPathEffect": "Preparation writes are awaited before startup; removal is on the deletion path, not startup."
+          },
+          {
+            "Kind": "subprocess",
+            "Location": "src/vs/platform/agentHost/node/devContainerEnvironments.ts:removeDevContainerEnvironment",
+            "Operation": "Discover labeled volumes and containers, remove containers in one grouped Docker call, then remove identified volumes in one grouped Docker volume rm",
+            "Cardinality": "Grouped by environment; newly retained backup directories are contained in the state volume and do not add per-backup Docker calls.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same volume ownership/discovery and grouped removal.",
+            "CriticalPathEffect": "User-requested deletion completion waits for the existing removal operations."
+          }
+        ],
+        "ScalingInput": "One selected sample/environment, its checkout files on a cold clone, and eligible local state files on restoration. Separate environments can overlap; backup directory count does not increase Docker deletion call count.",
+        "EffectiveConcurrency": "Per-source sequencing in the service; preparatory operations and shared-script folder processing are awaited serially. Independent source keys may run concurrently. Deletion groups resources into existing Docker calls.",
+        "CacheBehavior": "Sample checkout is reused when .git exists; existing volumes are reused after identity validation. Shell environment and executable promises are cached. The shared marker resets with a new container, not with a retained state volume.",
+        "MechanismConfidence": "High: sample/environment callbacks and preparation/deletion implementations establish all boundaries and shared-script reachability.",
+        "MagnitudeUncertainty": "External extension copy of this shared file and Docker integration cases described in PR metadata were not inspectable here. No profiling was performed; network, checkout, and storage duration vary.",
+        "Verdict": "No separate regression: transitive network/configuration/container operations are unchanged, and state-script behavior has the same bounded and intentional characteristics as the workspace scenarios."
+      }
+    ],
+    "Summary": "Completed the distinct performance-review pass against base bc522471d8917c856b63c4b0c71a70b53cd2f6a1. Inspected the complete one-file inventory and all six diff hunks, surrounding shell logic, service callers, sample/environment preparation and cleanup, cache/concurrency implementations, and relevant test expectations. No high-confidence actionable performance regressions found. Added unlink work is fixed-size; expanded backups preserve otherwise-deleted data and do not repeat on ordinary successful reconnects. No concrete performance regression fix requiring blame provenance was established. Static review only; external synchronized extension implementation and runtime performance measurements were unavailable."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-27T04:58:52.845348853Z",
+    "CompletedAt": "2026-11-27T05:01:11.530174658Z",
+    "WallClockMilliseconds": 138684,
+    "ModelCalls": 9,
+    "InputTokens": 329791,
+    "OutputTokens": 5681,
+    "TotalTokens": 335472,
+    "ReasoningTokens": 971,
+    "CacheReadTokens": 269173,
+    "CacheWriteTokens": 60591,
+    "APIDurationMilliseconds": 111177,
+    "ToolCalls": 30,
+    "NanoAIUnits": 23525880000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 269173,
+      "cache_write": 60591,
+      "input": 27,
+      "output": 5681
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
