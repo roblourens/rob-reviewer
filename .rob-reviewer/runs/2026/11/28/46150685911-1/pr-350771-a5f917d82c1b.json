@@ -1,0 +1,175 @@
+{
+  "PullRequest": {
+    "Number": 350771,
+    "Title": "settings: reuse the search index instead of rebuilding it on every search",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #350720\n\n**Before:** Every search in the Settings editor rebuilt a search index over the text of all ~1,550 settings, used it once to find related settings, and threw it away. The settings hadn't changed, so each search repeated the same work on the UI thread. The issue measured 85–175 ms of it per search on a slower Linux machine.\n\nhttps://github.com/user-attachments/assets/b1a5d956-a20e-4831-81e6-7a6583fc5bf2\n\n**After:** The index is built on the first search after the Settings editor opens, and later searches reuse it. Measured locally in Code OSS built from source, alternating the two builds in the same window: the related-settings part of a repeat search went from ~18 ms to ~1.4 ms (median of 16 searches each). The first search does the same work as before.\n\nhttps://github.com/user-attachments/assets/98314f09-cd39-4ead-8509-4605041d0dc5\n\nThe panel in the videos shows live timings from the running window. Each video is the median of 3 recorded takes. Single runs vary on this machine, which is why the first search reads 15.5 ms in one video and 20.0 ms in the other.\n\n\u003cdetails\u003e\n\u003csummary\u003eDetails\u003c/summary\u003e\n\n- **Cause:** `TfIdfSearchProvider.getTfIdfItems` created a new `TfIdfCalculator` and called `updateDocuments` for every query. That re-tokenizes every setting (`splitTerms`, `countMapFrom`). The documents were already cached for each settings model; the calculator built from them was not.\n- **Fix:** build the calculator where the documents are built, when the settings model changes, and call `calculateScores` on it for each query. `calculateScores` only reads the index.\n- **Results unchanged:** 16 queries returned identical related settings and scores before and after the fix. These included multi-word queries and a query that matches nothing.\n- **CPU profile** of 6 searches without closing Settings (100 µs sampling): `getTfIdfItems` went from 101.6 ms to 6.1 ms total, and `updateDocuments` no longer appears.\n- **First search:** this cost didn't change. Median of the related-settings step after reopening Settings: 26.4 ms before, 28.4 ms after, a difference within noise (permutation test p ≈ 0.5). In isolation, building the index while the previous one is still referenced took 12.6–13.0 ms, against 12.9–15.6 ms without it (240 builds, interleaved).\n- **Memory:** the cached index retains about 1.5 MiB (heap snapshot). The `PreferencesSearchService` singleton holds it, next to the settings record it already cached. Opening the Settings editor creates a new settings model, so the index is built once per opening.\n- **Not changed:** the two chained 200 ms debounces mentioned in the issue. Like the cached documents before this change, the index refreshes when the settings model object changes, not when settings are added to the existing model.\n- **Tests:** a new unit test checks that the index is built once per settings model, and that results update for a new model. It fails without the fix (3 builds instead of 2).\n\nValidation:\n\n- `./scripts/test.sh --run src/vs/workbench/contrib/preferences/test/browser/preferencesSearch.test.ts`: passed\n- `./scripts/test.sh --runGlob \"**/contrib/preferences/test/**/*.test.js\"`: 137 passing\n- `./scripts/test.sh --run src/vs/base/test/common/tfIdf.test.ts`: 11 passing\n- `pnpm run typecheck-client`: passed\n- `pnpm run oxlint` on the two changed files: passed\n\n\u003c/details\u003e\n",
+    "URL": "https://github.com/microsoft/vscode/pull/350771",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "d7885d3da4a36d9ce6e51a1ee2d4710883450396",
+    "HeadRef": "agents/debugging-vscode-issue-350720-b2805b9f",
+    "HeadSHA": "a5f917d82c1b99dd776773add29d27b710c8b911",
+    "CreatedAt": "2026-11-27T17:01:27Z",
+    "UpdatedAt": "2026-11-27T17:23:43Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/preferences/browser/preferencesSearch.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 507,
+      "BasePath": "src/vs/workbench/contrib/preferences/browser/preferencesSearch.ts",
+      "BaseLine": 518,
+      "IntroducingPath": "src/vs/workbench/contrib/preferences/browser/preferencesSearch.ts",
+      "IntroducingCommit": "8e11b537e3b091a8b52c7179fb623ecdeecaf4ea",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "latency",
+      "Mechanism": "Every debounced nonexact Settings search rebuilt the complete TF-IDF corpus synchronously on the renderer thread, despite cached documents and an unchanged settings model. With Q searches and T total setting text/terms, this repeated O(Q*T) corpus tokenization and term-frequency/occurrence-map allocation before calculating rankings.",
+      "Symptom": "Repeated related-settings searches incurred renderer-thread blocking and allocation proportional to the entire settings corpus before final search results could be rendered. This consequence is statically established by the synchronous updateDocuments implementation and awaited editor call path; timings from PR metadata were not independently verified.",
+      "FixedBehavior": "Build and retain a single TF-IDF index on the first nonempty related-settings search for the current settings-model identity; reuse it for subsequent queries and replace it when the model changes. Corpus-wide tokenization and term-map allocation no longer repeat for warm searches.",
+      "Evidence": "The deleted base line 518 called updateDocuments(this._documents) unconditionally inside getTfIdfItems for every nonempty TF-IDF search. settingsEditor2.ts triggerFilterPreferences awaits doRemoteSearch after local matching unless there is an exact match; doRemoteSearch -\u003e searchWithProvider -\u003e RemoteSearchProvider.searchModel -\u003e TfIdfSearchProvider.searchModel -\u003e getTfIdfItems. TfIdfCalculator.updateDocuments (tfIdf.ts:118-149) synchronously tokenizes every document chunk, builds per-document term-frequency maps, and updates corpus occurrence maps. The new line 507 builds the calculator only under the existing model-identity check, while the added calculateScores line reuses it. The added test explicitly expects two builds for three searches across two models. Blame of base line 518 attributes the unconditional build to the returned introducing commit.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "cache-lifecycle",
+      "unbounded-retention",
+      "eager-work",
+      "synchronous-ui-work",
+      "serialization-allocation",
+      "cleanup-lifecycle",
+      "boundary-fanout",
+      "concurrency-burst",
+      "missing-coalescing"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "First and subsequent nonexact Settings searches on the same settings model, with natural-language search enabled",
+        "CriticalPath": "settingsEditor2.triggerFilterPreferences runs after the existing search debounce, awaits local matching, and then awaits doRemoteSearch/searchWithProvider/RemoteSearchProvider/TfIdfSearchProvider before final result rendering. Cold index construction and every ranking calculation run synchronously on the renderer thread. Existing local results may be rendered before related results finish. Telemetry delivery is not awaited.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/preferences/browser/settingsEditor2.ts:searchWithProvider/logSearchPerformance -\u003e src/vs/platform/telemetry/common/telemetryIpc.ts:TelemetryAppenderClient.log",
+            "Operation": "Send a small search-performance event to the shared-process telemetry appender on desktop when telemetry is enabled.",
+            "Cardinality": "At most one performance event per completed provider search with nonempty filterMatches, not per setting or indexed term; local and TF-IDF searches can each emit one. Opt-out, metered-connection gating, and bounded startup buffering can suppress or defer delivery.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same performance event and asynchronous IPC submission existed before; the PR changes measured search work, not telemetry payload size or event cardinality.",
+            "CriticalPathEffect": "The event is submitted after matching; IPC completion is not awaited and is off the search critical path."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/telemetry/browser/telemetryService.ts:initializeService -\u003e src/vs/platform/telemetry/common/1dsAppender.ts:AbstractOneDataSystemAppender.log",
+            "Operation": "On web, pass the existing small telemetry event to the SDK transport, or route it through the existing remote telemetry provider.",
+            "Cardinality": "One SDK track submission per eligible event, not one HTTP request per setting; actual HTTP grouping is owned by the SDK. SDK initialization is coalesced by _asyncAiCore. The web appender's health-check fetch occurs at appender creation, not on each search.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same telemetry routing, SDK submission, and appender initialization applied before the PR.",
+            "CriticalPathEffect": "Transport delivery and asynchronous SDK initialization are not awaited by the Settings search."
+          }
+        ],
+        "ScalingInput": "Q debounced nonexact queries over D setting entries in non-mostCommonlyUsed groups, including registered core and extension settings; T total corpus text/terms. Scoring visits U unique document keys (normally U equals D) and the query terms. The result limit of five does not bound corpus construction or scoring.",
+        "EffectiveConcurrency": "Corpus construction and scoring are synchronous, with no await during index replacement, so asynchronous caller overlap cannot create parallel index builds on the renderer thread. Existing debouncing and cancellation remain unchanged. Local and related searches are sequential; optional AI work is separately launched in the background.",
+        "CacheBehavior": "Before: document strings and settings records were cached by model identity, but a new calculator tokenized the whole corpus on every query. After: one index is built on the first nonempty search for a model identity and reused, including after empty-result queries; scores, query embeddings, and per-query IDF caches remain local. calculateScores only reads the retained index. No per-query index growth or newly added negative-cache retry loop was found.",
+        "MechanismConfidence": "High: both diff pages, the editor's awaited call path, and TfIdfCalculator tokenization and read-only scoring were inspected. The added test explicitly expects two builds for three searches across two models.",
+        "MagnitudeUncertainty": "Corpus size, machine speed, and exact renderer blocking duration were not measured in this read-only review. PR timing claims were not treated as independent measurements.",
+        "Verdict": "No introduced regression. Cold construction performs the same corpus work as before; warm queries remove repeated full-corpus tokenization and term-map allocation. A concrete regression fix was recorded with base-line blame provenance."
+      },
+      {
+        "Scenario": "Closing and reopening Settings, or searching a replacement settings model",
+        "CriticalPath": "SettingsEditor2Input creates a new Settings2EditorModel; the first eligible related search on that identity replaces the cached index synchronously before scoring. Merely creating/opening the model does not build the index. Input disposal disposes the model; the service already retained its last searched model and settings record before this PR.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "The current model's D document entries and T text/terms, plus the prior model's index during replacement. Retention is bounded by the last indexed model, not the number of searches or editor openings.",
+        "EffectiveConcurrency": "Replacement is one synchronous build for the newly encountered identity. The old index remains referenced while the replacement is constructed, producing bounded old-plus-new peak retention rather than accumulation across openings.",
+        "CacheBehavior": "A different model identity replaces the calculator rather than updating or appending to its existing document map. The old index becomes unreachable after assignment. One index remains retained in the delayed PreferencesSearchService singleton alongside the already-retained model/settings record; original document wrapper arrays are no longer persistently retained. Same-object schema changes do not invalidate the index, matching the pre-existing document-cache policy; no performance issue was established from that policy.",
+        "MechanismConfidence": "High: model construction/disposal, registry-backed DefaultSettings initialization, service singleton ownership, calculator document storage, and replacement assignment were inspected. The reached model and index construction use in-memory registry data, not filesystem, database, network, IPC, or subprocess operations.",
+        "MagnitudeUncertainty": "Additional steady-state term-map memory and replacement peak memory were not measured. They scale with the corpus, but the cache is intentionally bounded to one model and trades retention for eliminating repeated allocation.",
+        "Verdict": "No actionable lifecycle regression. The index retains additional bounded corpus state, but there is no new accumulation, lost live external resource, eager corpus build on opening, or introduced expensive external boundary."
+      },
+      {
+        "Scenario": "Exact setting-key searches, empty searches, or natural-language search disabled",
+        "CriticalPath": "Exact local matches skip doRemoteSearch. Disabled natural-language search returns undefined before constructing the remote provider. Empty filters return before index construction. Existing local filtering and rendering remain the work needed for progress.",
+        "ExpensiveBoundaries": [],
+        "ScalingInput": "Local matching can still scan the settings collection; the PR adds no collection-sized work in these gated cases.",
+        "EffectiveConcurrency": "Existing input/search debouncing and cancellation are unchanged; no new background index scheduling or external operations are introduced.",
+        "CacheBehavior": "The retained index is neither built nor extended by excluded queries. Creating the remote provider allocates only an empty calculator and empty maps until an eligible model search occurs.",
+        "MechanismConfidence": "High: the configuration gate, exact-match branch, both empty-filter guards, and calculator field initialization were inspected. Unchanged local-search telemetry is accounted for in the general search scenario; the excluded TF-IDF path crosses no expensive external boundary.",
+        "MagnitudeUncertainty": "No timing measurements were made; allocation of the empty calculator is constant-sized and gated by existing provider creation.",
+        "Verdict": "No eager-work or scheduling regression. Corpus construction remains lazy and excluded from these searches."
+      },
+      {
+        "Scenario": "Settings search with an optional AI provider and AI-results toggle available",
+        "CriticalPath": "After local and TF-IDF work completes, triggerFilterPreferences starts a cancelable AI search without awaiting it. Embedding results are awaited inside that background task, followed by LLM-ranked results; ordinary search completion does not await either. Results cross back from the extension host through progress reports.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/services/aiSettingsSearch/common/aiSettingsSearchService.ts:startSearch -\u003e src/vs/workbench/api/browser/mainThreadAiSettingsSearch.ts:$registerAiSettingsSearchProvider/searchSettings -\u003e ExtHostAiSettingsSearch.$startSearch",
+            "Operation": "Send one AI settings-search request to each registered extension-host provider.",
+            "Cardinality": "P outbound requests per issued AI query; no per-setting fan-out and no new cache-miss requests introduced by the diff.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same P requests were launched in the same background phase after TF-IDF search before this change.",
+            "CriticalPathEffect": "Off the ordinary Settings search critical path; provider results gate availability of optional AI results."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostAiSettingsSearch.ts:$startSearch/progressReporter -\u003e src/vs/workbench/api/browser/mainThreadAiSettingsSearch.ts:$handleSearchResult",
+            "Operation": "Convert provider-reported setting keys and send AI progress/results back to the renderer-side service.",
+            "Cardinality": "One result IPC per provider progress report; the report count is provider-controlled, not determined by the TF-IDF corpus or cache.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical progress conversion and result IPC existed before the PR.",
+            "CriticalPathEffect": "Required for optional AI-result availability, not for normal local/related results to render."
+          }
+        ],
+        "ScalingInput": "P registered AI providers per issued debounced query, not D indexed settings. The request specifies limit five; the embeddings UI separately caps picks at ten. Incoming progress-report count is provider-controlled and unchanged.",
+        "EffectiveConcurrency": "The service invokes all P providers without a new global limiter; provider operations may run concurrently. A subsequent search cancels the prior AI task through the existing token path. Within one background task, embeddings are consumed before LLM results. None of this concurrency or request frequency changes in the PR.",
+        "CacheBehavior": "AiSettingsSearchService.startSearch deletes the current query's previous promises, then issues one request to each registered provider. Embedding/LLM readers join or consume query-keyed deferred promises, including results parked before a reader arrives. This existing query-state lifecycle is untouched by index caching.",
+        "MechanismConfidence": "High for repository call cardinality, background scheduling, promise behavior, and extension-host IPC; provider-internal costs are not claimed.",
+        "MagnitudeUncertainty": "Provider implementation latency, external network behavior, and progress frequency are outside this repository path. The inspected interface delegates to provider.provideSettingsSearchResults; no newly introduced network/subprocess/filesystem/database call was found in the reviewed code.",
+        "Verdict": "No boundary-fan-out or concurrency regression. Faster warm TF-IDF completion lets the same background AI phase start sooner, without adding requests, changing grouping, or increasing provider concurrency."
+      }
+    ],
+    "Summary": "Completed the distinct performance-review pass over the entire two-file inventory and both complete diff pages. Traced cold/warm indexing, synchronous renderer execution, model replacement and ownership, configuration/exact/empty gates, ancillary telemetry, and optional AI IPC. No high-confidence diff-introduced performance findings qualified. Recorded the demonstrated repeated-index-build regression fix using base line 518 and introducing commit 8e11b537e3b091a8b52c7179fb623ecdeecaf4ea. Static read-only review; no repository scripts or measurements were run."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-28T13:56:52.574527706Z",
+    "CompletedAt": "2026-11-28T14:00:13.781268918Z",
+    "WallClockMilliseconds": 201206,
+    "ModelCalls": 11,
+    "InputTokens": 351699,
+    "OutputTokens": 6933,
+    "TotalTokens": 358632,
+    "ReasoningTokens": 2291,
+    "CacheReadTokens": 301356,
+    "CacheWriteTokens": 50310,
+    "APIDurationMilliseconds": 146620,
+    "ToolCalls": 43,
+    "NanoAIUnits": 22530660000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 301356,
+      "cache_write": 50310,
+      "input": 33,
+      "output": 6933
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}

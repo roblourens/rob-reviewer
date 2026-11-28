@@ -1,0 +1,246 @@
+{
+  "PullRequest": {
+    "Number": 350764,
+    "Title": "snippets: only scan for snippet anchors as far as the longest prefix",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #350738\n\n**Before:** Typing in a file with one very long line, such as a minified bundle, froze the window on every letter typed near the end of the line. The freeze grew with how far along the line the cursor was: about 0.5–0.8 s per key at the end of a 100 KB line and about 4.5 s at the end of a 1 MB line. To find where a snippet could start, snippet suggestions checked every position from the start of the line up to the cursor, on every keystroke, in every language. Turning off `editor.snippetSuggestions` made the freeze go away.\n\nhttps://github.com/user-attachments/assets/480331d5-300b-47e0-9e6a-b29008ca00a0\n\n**After:** Snippet suggestions only check the positions a snippet could actually start from: no farther back from the cursor than the longest snippet prefix (20 characters for JavaScript). Typing on long lines no longer freezes the window, and the same snippets are suggested as before. Measured locally (Code OSS dev build, Apple Silicon Mac, cursor at the end of the line): time spent in snippet suggestions per keystroke went from 0.5–0.8 s to under 2 ms on a 100 KB line, and from about 4.5 s to 1–5 ms on a 1 MB line, with no more long tasks.\n\nhttps://github.com/user-attachments/assets/fc209a42-924b-477d-9576-c5f3dfbd3ceb\n\n\u003cdetails\u003e\n\u003csummary\u003eDetails\u003c/summary\u003e\n\n### Root cause\n\n`SnippetCompletionProvider._computeSnippetPositions` walked every column from 1 to the start of the current word and called `model.getWordAtPosition` for each one (a word regex over a window of up to 1000 characters). On minified code most characters are punctuation, so almost every column became an anchor: 62,092 anchors at the end of a 100 KB line and 620,628 at the end of a 1 MB line, per keystroke. Every anchor was then tested against every snippet of the language. In a CPU profile of one keystroke, nearly all of the time was in `_findRegexMatchEnclosingPosition` under `_computeSnippetPositions`. The per-column loop came in with #200976.\n\n### Fix\n\n- A snippet is matched to the first anchor for which `isPatternInWord(anchor.prefixLow, snippet.prefixLow)` holds. That requires the text from the anchor to the end of the current word to be a subsequence of the snippet prefix, so it can't be longer than the prefix. Anchors farther away than the longest prefix can never match.\n- The provider now awaits `getSnippets` before computing the anchors, takes the longest `prefixLow`, and starts the scan at column `max(1, wordEndColumn - maxPrefixLength)`. The word at the cursor and the line content are still read before the await, as before. A `model.isDisposed()` check after the await avoids an error if the editor closed while snippet files were loading.\n- A scan from column 1 only ever stopped at word starts, but a bounded scan can start inside a word. That first column is therefore only an anchor when it isn't inside a word; the anchor right after the word is still added. Without this, for example, the `oo.b` snippet on the line `xzoo.b` would replace from the second `o` instead of from the `.`.\n- When the text up to the end of the current word is shorter than the longest prefix, the scan starts at column 1, exactly as before. Snippets without a prefix are already filtered out by the snippets service, so the bound is never 0 when there are snippets.\n\n### Measurements\n\nSnippet provider time is the provider's own `StopWatch`, read with conditional breakpoints in the renderer, plus a `PerformanceObserver` for long tasks. Both builds ran back to back in the same window, with no extensions and default settings. The cursor was placed after a `,` so that typing a letter triggers quick suggestions.\n\n| 1 MB line, cursor column | Before | After |\n|---|---|---|\n| 10,027 | 105 ms (6,584 anchors) | 2.4 ms (14 anchors) |\n| 100,035 | 607 ms (62,090 anchors) | 2.6 ms (13 anchors) |\n| 300,028 | 1,538 ms (183,530 anchors) | 1.5 ms (13 anchors) |\n| 600,036 | 2,702 ms (358,078 anchors) | 1.4 ms (12 anchors) |\n| 1,056,284 (end) | 4,540 ms (620,628 anchors) | 1.2–5.1 ms (12 anchors) |\n\nOn the issue's 100 KB repro, typing `a b c d` at the end of the line took 533 / 775 / 659 / 609 ms in the provider before, and 0.7–2 ms after (31 ms for the first request right after a window reload, which includes loading the snippet files). The number of matched snippets was the same at every measured position.\n\n### How to test\n\n1. Create a single-line file: `node -e \"let s='var data=[';for(let i=0;i\u003c2822;i++)s+=JSON.stringify({id:i,name:'item'+i,v:i*7%13})+',';s+='];';require('fs').writeFileSync('bundle.min.js',s)\"`\n2. Open it, press Ctrl+End (Cmd+End on macOS) and type a few letters. The window should not freeze, and snippets such as `async function` are suggested after typing `a`.\n3. On a normal line, check that snippets still match, including prefixes with non-word characters, for example `#reg` suggests `#region` in a JavaScript file.\n\n### Validation\n\n- `./scripts/test.sh --run src/vs/workbench/contrib/snippets/test/browser/snippetsService.test.ts`: passed (34 passing, 1 pending, an existing skipped test). Two new tests:\n  - *Typing on a very long line does not look up the word at every column*: on an 80,004-character line, the suggestions after a word and after a non-word character are unchanged, and `getWordAtPosition` is called fewer than 10 times. The original loop calls it 120,004 times, so the test fails without the fix.\n  - *Skipping anchors beyond the longest snippet prefix does not change suggestions*: at every column of eight lines, for prefixes with non-word characters (`oo.b`, `\u003c\u003c`, `p-a`, `-a-bug`, `#region`, ` leading`, `{}`) and both the default and a CSS-like word pattern, the bounded scan returns the same ranges as a scan from column 1. It fails without the mid-word check.\n- A temporary, uncommitted test compared the original provider from `main` with the fixed one. It covered every column of 374 lines taken from TypeScript, CSS and Markdown files in the repository plus edge cases, with 38 snippet prefixes, two word patterns, and the Invoke and `#` trigger-character contexts. There were 0 differences in label or range across 74,560 positions.\n- `pnpm run typecheck-client`: passed.\n- `pnpm run eslint src/vs/workbench/contrib/snippets/browser/snippetCompletionProvider.ts src/vs/workbench/contrib/snippets/test/browser/snippetsService.test.ts`: passed.\n- `pnpm run valid-layers-check`: passed.\n\n### Other per-keystroke paths checked (unchanged)\n\n- The provider still lowercases the whole line once per request. That is part of the 1–5 ms that remain.\n- On an explicit Ctrl+Space right after whitespace, the provider runs `indexOf(prefix, cursor)` per snippet over the rest of the line. It doesn't run on quick suggestions; a `startsWith` check would be equivalent if it ever matters.\n- Word-based suggestions run in the editor worker. `LineContext`, `getWordUntilPosition` and `shouldAutoTrigger` do one word lookup per request. The locality bonus is off by default.\n\n\u003c/details\u003e\n",
+    "URL": "https://github.com/microsoft/vscode/pull/350764",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "fe444ae00bd0ab083135f2e5f2340adf1314b69d",
+    "HeadRef": "agents/debugging-snippetcompletion-performance",
+    "HeadSHA": "ced17d336dbf2b9b7652f549fdbc3d0d3dd29884",
+    "CreatedAt": "2026-11-27T16:23:53Z",
+    "UpdatedAt": "2026-11-28T00:38:02Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/contrib/snippets/browser/snippetCompletionProvider.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 224,
+      "BasePath": "src/vs/workbench/contrib/snippets/browser/snippetCompletionProvider.ts",
+      "BaseLine": 209,
+      "IntroducingPath": "src/vs/workbench/contrib/snippets/browser/snippetCompletionProvider.ts",
+      "IntroducingCommit": "a5698e8857e8a7a934c5b285bcc138f95e83abf1",
+      "MechanismFamily": "repeated-work",
+      "PerformanceCategory": "cpu",
+      "Mechanism": "Fresh snippet-completion requests scan word starts and non-word columns from the beginning of the line to the cursor. Minified, punctuation-heavy lines produce O(cursor-column) repeated word-regex searches and anchor objects, followed by nested matching against available snippets, all synchronously on the renderer thread.",
+      "Symptom": "Strong static evidence of typing/completion latency and renderer stalls that grow with cursor distance on long minified lines: the pre-fix hot path performs line-length-proportional repeated regex work before yielding. The added call-count test directly targets this mechanism; no timing measurements were performed in this review.",
+      "FixedBehavior": "Retrieve the same snippets as before, find their maximum prefix length in one lightweight pass, and generate anchors only within that distance of the current word end. Word-regex lookup count and anchor allocation/matching multiplicity are bounded by snippet-prefix length rather than cursor distance along the line. No additional snippet-file reads are introduced.",
+      "Evidence": "The deleted base line 209 starts the anchor loop at column 1. On punctuation-heavy lines it performs a word lookup and creates an anchor at a substantial fraction of columns before the current word, then provideCompletionItems tests these anchors inside its loop over snippets. TextModel.getWordAtPosition delegates to TokenizationTextModelPart.getWordAtPosition and getWordAtText, which repeatedly executes the word regex in a window capped at 1000 characters. SuggestModel's typing/trigger paths call provideSuggestionItems; that invokes this provider in the renderer and awaits its result before returning completion items. The added firstColumn at head line 222 and changed loop at 224 bound this repeated synchronous work by the maximum snippet prefix length. isPatternInWord at filters.ts:631-643 requires exhausting the anchor string, so longer anchors cannot match. The new 80,004-character-line test at snippetsService.test.ts:573-592 explicitly asserts fewer than 10 total word lookups across two requests. Blame of the old loop returns commit a5698e8857e8a7a934c5b285bcc138f95e83abf1 and the same origin path.",
+      "Confidence": 0.99
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "repeated-work",
+      "synchronous-ui-work",
+      "serialization-allocation",
+      "boundary-fanout",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "cleanup-lifecycle"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Fresh quick-suggestion requests while typing near the end of a long punctuation-heavy/minified line, including languages with no applicable snippets.",
+        "CriticalPath": "SuggestModel's delayed typing or trigger path calls provideSuggestionItems. Snippet completion runs alongside other completion providers, but provideSuggestionItems awaits it before returning results. The provider still reads and lowercases the line before awaiting getSnippets; it now computes bounded anchors after that await. Regex lookup and matching remain synchronous renderer work.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/snippets/browser/snippetsFile.ts: SnippetFile.load/_load",
+            "Operation": "Load snippet-file contents through IFileService or the extension-resource loader.",
+            "Cardinality": "Zero content reads on a warm request: each unique SnippetFile retains its load promise. getSnippets still traverses registered files and attaches promise continuations.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same cached getSnippets call and zero warm content reads occurred after the unbounded anchor scan.",
+            "CriticalPathEffect": "Warm promise selection/filtering must finish before anchor computation and result delivery; no new I/O delay."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/extensionResourceLoader/browser/extensionResourceLoaderService.ts: readExtensionResource",
+            "Operation": "Fetch network-backed extension snippet resources when their SnippetFile is cold.",
+            "Cardinality": "Zero fetches on the warm typing path because SnippetFile.load caches the promise.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Also zero warm fetches with the same per-file promise cache.",
+            "CriticalPathEffect": "No warm network operation; the remaining snippet-selection promises still participate in completion readiness."
+          }
+        ],
+        "ScalingInput": "Let C be the current word-end column, L the whole line length, S the number of distinct applicable snippet objects after the provider's Set deduplication, and P their longest lowercase prefix. Previously punctuation-heavy text generated O(C) word lookups/anchors and nested matching across S snippets. The new scan examines at most a P-sized column window, plus terminal anchors, and adds one O(S) prefix-length pass. Whole-line lowercasing remains O(L), unchanged. With S=0 the new anchor loop does no word lookups.",
+        "EffectiveConcurrency": "Quick suggestions are delayed/coalesced by the existing scheduler; retriggers cancel the previous request token. The snippet provider still does not observe cancellation internally. Each fresh request runs its bounded CPU scan serially on the renderer, parallel in scheduling with other completion providers; no additional per-file boundary calls are created by overlapping requests.",
+        "CacheBehavior": "SnippetFile caches successful, empty, in-flight, and rejected loads until reset or replacement; the diff neither changes keys nor adds a cache. Provider-level item reuse can bypass this path entirely. Prefix lengths are already eagerly stored strings, so reading their lengths does not parse snippet bodies.",
+        "MechanismConfidence": "High: the changed scan start, old full-line loop, renderer caller, regex implementation, subsequence matching requirement, and added call-count assertion establish removal of repeated work independently of timing claims in the PR description.",
+        "MagnitudeUncertainty": "Actual prefix counts, maximum prefix lengths, line sizes, and request frequency vary. No timings were measured. Very long user-defined prefixes can still permit a large scan, but cannot establish a newly expanded scan relative to the previous full-line algorithm.",
+        "Verdict": "No introduced regression. This removes a concrete repeated-work regression; its introducing commit was resolved and submitted through report_regression_fix. Remaining whole-line transformations and snippet-selection costs predate the PR."
+      },
+      {
+        "Scenario": "First snippet completion after startup, or completion after user/workspace/extension snippet files are replaced, with local, remote, or web-backed resources.",
+        "CriticalPath": "getSnippets first joins tracked initialization/discovery work, invokes load on registered unique snippet files, awaits all load/select promises, then filters/sorts snippets. The new bounded anchor scan follows this same await. Completion already depended on these loads before the diff; initiating them earlier removes the preceding full-line scan rather than adding a prerequisite.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/snippets/browser/snippetsService.ts: _initWorkspaceFolderSnippets, _initUserSnippets, _initFolderSnippets",
+            "Operation": "Check workspace snippet folders, create the user snippet folder, resolve directory entries, and install filesystem watchers.",
+            "Cardinality": "Folder-level operations scale with W workspace folders plus the user folder and folder-change events, not individual prefixes. Only tracked pending work is joined by getSnippets.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same initialization, discovery, watcher ownership, and pending-work joins; the old anchor scan ran before initiating the completion's getSnippets await.",
+            "CriticalPathEffect": "Pending tracked discovery can delay the first result; the placement of these operations and joins is unchanged."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/snippets/browser/snippetsFile.ts: _load; src/vs/platform/files/common/fileService.ts: readFile/doReadFileStream",
+            "Operation": "Read each cold filesystem-backed snippet file and validate its metadata, then decode and parse its JSON.",
+            "Cardinality": "One logical content read per cold unique file; the normal file-service path validates metadata alongside the content read. Concurrent requests share the same file load promise. Warm/empty/rejected cached files cause no new content reads until replacement/reset.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Exactly the same per-file loads, metadata validation, decoding/parsing, and await-all dependency.",
+            "CriticalPathEffect": "All load/select promises are awaited before completion delivery, as before. Metadata and content reads can overlap within a file."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/platform/files/common/diskFileSystemProviderClient.ts: stat/readFile",
+            "Operation": "For disk/remote-channel-backed providers, send file metadata and content requests through the provider channel.",
+            "Cardinality": "Underlying transport for the filesystem operations, not additional per-snippet fan-out: ordinarily one stat and one readFile channel call per cold channel-backed file on the inspected unbuffered path.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same provider routing and channel-call cardinality for cold files.",
+            "CriticalPathEffect": "Transport latency is part of the pre-existing awaited file load; no new channel operation or serialization is added."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/platform/extensionResourceLoader/browser/extensionResourceLoaderService.ts: readExtensionResource; src/vs/platform/extensionResourceLoader/common/extensionResourceLoaderService.ts: readExtensionResource",
+            "Operation": "Fetch HTTP-backed extension resources, or request gallery resources through IRequestService.",
+            "Cardinality": "One resource fetch/request per cold unique network-backed extension snippet URI, coalesced by SnippetFile.load. Loader initialization and machine-ID work use shared promises; the diff does not change those helpers.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same network resources, request count, loader initialization, and awaited dependency.",
+            "CriticalPathEffect": "Resource content must arrive before its snippet-file load completes. Requests for distinct files can run concurrently, unchanged."
+          },
+          {
+            "Kind": "database",
+            "Location": "src/vs/platform/files/browser/indexedDBFileSystemProvider.ts: readFile",
+            "Operation": "For IndexedDB-backed file providers, retrieve snippet-file bytes with a readonly object-store transaction.",
+            "Cardinality": "One content transaction per cold unique file using this provider; metadata/file-tree initialization is provider-owned. This is an alternative backing for file reads, not an extra operation per prefix.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same provider transaction and per-file caching.",
+            "CriticalPathEffect": "Transaction completion participates in the same awaited file load."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/contrib/snippets/browser/snippetsFile.ts: load; src/vs/platform/files/common/fileService.ts: doReadFile",
+            "Operation": "Buffer/decode complete snippet-file content and parse JSON into snippet objects.",
+            "Cardinality": "Once per loaded file version, proportional to that version's bytes and snippets; not repeated by the new prefix-length loop.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same whole-file buffering, decoding, JSON parsing, and snippet construction.",
+            "CriticalPathEffect": "Parsing finishes before load/select completion, unchanged."
+          }
+        ],
+        "ScalingInput": "F is the number of unique registered snippet-file URIs across all languages, not the number of matching snippet prefixes. getSnippets loads all F for a registered language before selecting applicable snippets. W workspace folders and one user-snippet folder control initialization/discovery operations. Only currently cold/replaced files cross content-read boundaries; S matching distinct snippets controls the new lightweight maximum-prefix pass.",
+        "EffectiveConcurrency": "getSnippets schedules loads for distinct files and awaits Promise.all; no new global limiter or queue is added or removed. Per-file in-flight coalescing prevents concurrent completions from multiplying content reads. Existing atomic provider reads may serialize per resource; ordinary inspected file-service reads overlap metadata/content work. No subprocess was found on this snippet-loading path.",
+        "CacheBehavior": "ResourceMap groups contributions by URI. SnippetFile._loadPromise coalesces in-flight requests and retains results, including failures and empty success. User/workspace discovery replacement and extension contribution replacement supply new file objects; reset clears cached data/promise. No cache invalidation or negative-cache semantics are changed.",
+        "MechanismConfidence": "High: inspected getSnippets, file promise ownership, initialization, filesystem routing, IPC client, network loaders, and IndexedDB provider establish unchanged expensive-boundary counts and dependencies.",
+        "MagnitudeUncertainty": "Cold I/O duration and F/W depend on installed extensions, workspace size, backing providers, and connectivity. These affect pre-existing first-completion latency, not diff causality.",
+        "Verdict": "No introduced boundary fan-out, concurrency burst, or new cold-load critical-path delay. The same unavoidable loads start before, rather than after, the formerly unbounded CPU scan."
+      },
+      {
+        "Scenario": "Explicit Ctrl+Space after whitespace or on an empty line, trigger-character requests, and ordinary matching inside words or around snippet punctuation/autoclosing pairs.",
+        "CriticalPath": "The provider gets the same applicable snippet set, bounds anchor generation, matches snippets, calculates insertion/replacement ranges, adds remaining snippets on whitespace/empty lines, and sorts labels. provideSuggestionItems awaits this result; SuggestModel may then read the clipboard before constructing the completion model if a returned snippet needs it.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "other",
+            "Location": "src/vs/editor/contrib/suggest/browser/suggestModel.ts: trigger clipboard read; src/vs/platform/clipboard/browser/clipboardService.ts: readText; src/vs/workbench/services/clipboard/electron-browser/clipboardService.ts: readText",
+            "Operation": "Read the browser/native clipboard when completion items contain a CLIPBOARD-dependent snippet and no clipboard text is already supplied.",
+            "Cardinality": "At most one clipboard read for a completion result requiring it, not one read per snippet. No read when no returned item requires clipboard data or supplied/reused text is present.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same conditional shared clipboard read for the same returned snippets; the changed prefix bound does not independently add a clipboard call.",
+            "CriticalPathEffect": "The existing SuggestModel path awaits clipboard data before constructing/showing its completion model."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/contrib/snippets/browser/snippetsFile.ts: load/_load",
+            "Operation": "Obtain cached snippet resources, or load cold files using the boundaries enumerated in the first-use scenario.",
+            "Cardinality": "Zero content reads when warm; one load per cold unique file, not per anchor or matching prefix.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same warm/cold per-file call counts and completion dependency.",
+            "CriticalPathEffect": "Same getSnippets await before returning completion items."
+          }
+        ],
+        "ScalingInput": "S distinct applicable snippets and P longest prefix bound anchor work. Trigger-character filtering occurs inside the existing per-snippet loop; the maximum-prefix pass includes all S, adding only O(S) length reads. On whitespace, the unchanged indexOf fallback can scan the suffix of a long line once per remaining snippet. Suggestion objects and body insight access still scale with returned matches, not with skipped anchors.",
+        "EffectiveConcurrency": "Anchor generation, nested matching, range calculations, fallback matching, and sorting execute synchronously within one provider invocation. Clipboard access is shared at result level. Other providers remain scheduled in parallel; trigger filtering and provider-item reuse still control whether the snippet provider runs.",
+        "CacheBehavior": "Existing file promises and completion-item reuse are unchanged. Snippet.prefixLow is a stored string. Snippet body insights remain lazy/idle and are accessed by the existing SnippetCompletion constructor for returned suggestions, not by the new maximum-prefix pass.",
+        "MechanismConfidence": "High: full provider control flow, stored prefix implementation, subsequence matcher, caller result handling, and differential range tests support the bound without new per-match external work.",
+        "MagnitudeUncertainty": "Large snippet sets or unusually long prefixes determine residual CPU cost. The explicit whitespace suffix search is potentially expensive but unchanged and cannot be attributed to this diff.",
+        "Verdict": "No actionable performance regression. The added O(S) maximum computation does not introduce a new scaling class or expensive operation. Existing whitespace scans, matched-body parsing, and clipboard access remain out of scope as pre-existing costs."
+      },
+      {
+        "Scenario": "Inline quick suggestions with reusable completion results, rapid retriggers, and closing the editor while snippet files are loading.",
+        "CriticalPath": "SuggestInlineCompletions either refilters a reusable result without invoking the provider or awaits provideSuggestionItems for a fresh result. Fresh requests follow the same snippet-loading path and now perform the bounded scan after loading; the new disposed-model guard returns before that work when the model is closed.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/editor/contrib/suggest/browser/suggestInlineCompletions.ts: provideInlineCompletions; src/vs/workbench/contrib/snippets/browser/snippetsFile.ts: load",
+            "Operation": "On a fresh inline request, retrieve snippets through the same shared file-load path.",
+            "Cardinality": "No provider/file call for successful completion-model reuse. Across R simultaneous fresh requests, at most one load per cold unique SnippetFile rather than R loads per file.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same reuse branch and per-file load coalescing; fresh requests previously allocated/scanned all preceding anchors before awaiting files.",
+            "CriticalPathEffect": "Fresh inline results await the existing file loads; reused results do not."
+          },
+          {
+            "Kind": "other",
+            "Location": "src/vs/editor/contrib/suggest/browser/suggestInlineCompletions.ts: provideInlineCompletions clipboard read",
+            "Operation": "Read clipboard text for a fresh completion result that needs it.",
+            "Cardinality": "At most one read per fresh result requiring clipboard data; zero additional reads from the reusable-result branch.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same conditional clipboard read and result dependency.",
+            "CriticalPathEffect": "Existing await before constructing the inline completion model."
+          }
+        ],
+        "ScalingInput": "Reuse requires compatible model/line/word context. Fresh requests scale with S/P for anchors and F unique cold files for loading. R overlapping requests can each have request-local strings and continuations, but share file load promises; the new version no longer retains full-line anchor arrays across the loading await.",
+        "EffectiveConcurrency": "Existing request cancellation does not cancel snippet service loads internally; overlapping requests share I/O and later run CPU continuations serially on the renderer. The diff neither introduces a new source of requests nor increases per-request anchor cardinality. Result disposal/acquire/release remains unchanged.",
+        "CacheBehavior": "Inline completion-model reuse and result acquire/release lifecycle are unchanged. File loads remain positively/negatively/in-flight cached per file. The disposed-model check adds no retained state; request-local anchor arrays are now created only after file loading and not created for a disposed model.",
+        "MechanismConfidence": "High: inspected inline reuse/fresh-request branches, SuggestModel cancellation, provider await placement and disposal guard, and SnippetFile promise ownership establish the scheduling and ownership comparison.",
+        "MagnitudeUncertainty": "Overlap depends on typing speed and cold-load latency. Lack of internal cancellation already existed; reduced pre-await allocations and bounded post-await work do not provide evidence of materially amplified retention or cancellation cost.",
+        "Verdict": "No introduced cleanup, cache-lifecycle, or concurrency regression. The diff reduces suspended-request anchor retention and skips scanning disposed models."
+      }
+    ],
+    "Summary": "Completed the distinct performance-review pass across the entire two-file inventory and all diff pages. No high-confidence diff-introduced performance findings qualified. Submitted one concrete regression-fix learning signal for the removed full-line anchor scan, with base-line blame identifying a5698e8857e8a7a934c5b285bcc138f95e83abf1. Reviewed typing, cold loads/invalidation, explicit/trigger completions, inline reuse, overlap, and disposal, including transitive filesystem, IPC, network, database, serialization, and clipboard boundaries. Static read-only analysis; no timings were measured. The supporting guide read tool exposed only a preview because of its output-size limit; the learned-regressions document was available in full."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-28T13:48:59.259543243Z",
+    "CompletedAt": "2026-11-28T13:52:23.610349188Z",
+    "WallClockMilliseconds": 204350,
+    "ModelCalls": 10,
+    "InputTokens": 378575,
+    "OutputTokens": 9144,
+    "TotalTokens": 387719,
+    "ReasoningTokens": 3259,
+    "CacheReadTokens": 314745,
+    "CacheWriteTokens": 63800,
+    "APIDurationMilliseconds": 180354,
+    "ToolCalls": 45,
+    "NanoAIUnits": 28247450000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 314745,
+      "cache_write": 63800,
+      "input": 30,
+      "output": 9144
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
