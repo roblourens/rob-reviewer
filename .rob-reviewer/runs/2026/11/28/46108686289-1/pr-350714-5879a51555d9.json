@@ -1,0 +1,277 @@
+{
+  "PullRequest": {
+    "Number": 350714,
+    "Title": "terminal: only send shell execution output to extensions that read it",
+    "Body": "\u003c!-- Thank you for submitting a Pull Request. Please:\n* Read our Pull Request guidelines:\n  https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests\n* Associate an issue with the Pull Request.\n* Ensure that the code is up-to-date with the `main` branch.\n* Include a description of the proposed changes and how to test them.\n--\u003e\n\nFixes #350677\n\n**Before:** While a command ran in a terminal with shell integration (on by default), VS Code sent all of its output to the extension host (the process that runs extensions), even when no extension read it. The extension host then threw it away. VS Code also waited for a pause in the output before sending anything. When a command printed without pausing, the output piled up in the window's memory and went out as one huge message, and extensions that did read the output got it seconds late.\n\nhttps://github.com/user-attachments/assets/83deae23-d6bb-4868-bd30-faf3e0e777f7\n\n**After:** VS Code sends a command's output only while an extension reads it, in batches no more than 50 ms after it's printed. Measured locally in Code OSS on macOS with bash, with a test extension that reads the output of some commands:\n\n- 8 seconds of `yes`, no extension reading: 12 messages with 21.6 MB of output → nothing sent.\n- A line printed every 20 ms, read by an extension: worst delay between printing a line and the extension receiving it went from 3.4 s to about 0.1 s.\n- 8 seconds of `yes`, read by an extension: the largest single message went from 24 MB to under 1 MB.\n\nhttps://github.com/user-attachments/assets/fc7fab1a-9c7d-4256-a0de-02a82fb82878\n\n\u003cdetails\u003e\n\u003csummary\u003eDetails\u003c/summary\u003e\n\n**Root cause**\n\n- `MainThreadTerminalShellIntegration` subscribed to each running command's `onData` with `Event.accumulate(…, 50)`. That's a debounce: every chunk restarts the 50 ms timer and there's no maximum wait or size, so continuous output stayed in an array until the first pause and was then joined into one string.\n- On the extension host, `InternalTerminalShellExecution.emitData` drops data unless `execution.read()` created a data stream, so without a reader all of it was serialized, sent and dropped.\n\n**How it works now**\n\n- `ShellExecutionDataForwarder` replaces the accumulator. It sends a batch 50 ms after the batch's first chunk (a throttle, not a debounce) or as soon as the batch reaches 1M characters, and flushes on dispose.\n- `$shellExecutionStart` now returns whether the execution has a reader. The renderer keeps forwarding until the reply arrives, so readers created in `onDidStartTerminalShellExecution` or right after `executeCommand` still get all of the output. If the reply is `false`, the forwarder pauses and drops what it hasn't sent.\n- When `read()` is first called on an execution that is already running, the extension host calls the new `$startSendingExecutionData(terminalId, commandId)`. Output written during that round trip isn't delivered, which matches the API docs (call `read()` right away to not miss data).\n- Each start carries a per-command ID, so a late resume request for the previous command can't turn forwarding back on for the next one. A resume that arrives before the `false` reply takes precedence.\n- When a command is replaced without a finish event, its remaining data is now flushed before the next command's start message instead of after it.\n- Executions release their callback into the shell integration once it's used or the execution ends, so an extension that keeps a finished execution doesn't keep the shell integration alive.\n\n**Testing**\n\n- New unit tests in `mainThreadTerminalShellIntegration.test.ts` and `extHostTerminalShellIntegration.test.ts`: no reader, late reader, stale resume for a previous command, resume racing the reply, periodic and size-based flushing, the start result, and a single data request per execution. Five of them were confirmed to fail without the fix.\n- `./scripts/test.sh --run src/vs/workbench/api/test/browser/mainThreadTerminalShellIntegration.test.ts --run src/vs/workbench/api/test/common/extHostTerminalShellIntegration.test.ts`: 22 passing.\n- `pnpm run typecheck-client`: passed. `pnpm run oxlint` on the changed files: passed.\n- Manually in Code OSS (macOS, bash), before and after, each in a fresh window: counted `$shellExecutionData` messages and sizes with a conditional breakpoint in the extension host, and measured the delay with a test extension that reads commands marked `# read` and compares the timestamps the command prints. Also checked that a terminal restored after a window reload still delivers output to a reader.\n- CPU profile of the renderer during 8 seconds of `yes` with a reader: the new forwarder used about 11 ms of self time.\n\n\u003c/details\u003e\n",
+    "URL": "https://github.com/microsoft/vscode/pull/350714",
+    "State": "open",
+    "Draft": false,
+    "AuthorLogin": "benibenj",
+    "AuthorAssociation": "MEMBER",
+    "BaseRef": "main",
+    "BaseSHA": "ef5ca45a6e545e4767e0117905ee9d6120b86e11",
+    "HeadRef": "agents/investigate-bug-fix-and-documentation",
+    "HeadSHA": "5879a51555d9f0d9ad866b2f08868f3cdb6b7fe7",
+    "CreatedAt": "2026-11-27T14:01:23Z",
+    "UpdatedAt": "2026-11-27T14:15:38Z",
+    "MergedAt": null,
+    "Labels": []
+  },
+  "Findings": [],
+  "RegressionFixes": [
+    {
+      "FixedPath": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 92,
+      "BasePath": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts",
+      "BaseLine": 87,
+      "IntroducingPath": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts",
+      "IntroducingCommit": "e380facb66e760f7702e995d8efd65a2ea09e07a",
+      "MechanismFamily": "eager-work",
+      "PerformanceCategory": "ipc",
+      "Mechanism": "Eagerly serialize and transfer every running command's output to every extension host even when that host has no execution reader and immediately drops the data. Cost scales with total output bytes multiplied by uninterested extension hosts.",
+      "Symptom": "Unnecessary renderer JSON encoding, IPC/remote-network traffic, and extension-host decoding for high-output shell-integrated commands with no readers.",
+      "FixedBehavior": "After the existing start RPC reports no reader, unsubscribe from output and discard the pending batch. Forwarding can resume once for a late reader with a matching command ID. Filtering is per terminal and extension host, not per extension; hosts with no readers no longer serialize or transmit ongoing command output.",
+      "Evidence": "The deleted base lines 86-87 install Event.accumulate on each command's terminal.onData and unconditionally join/send its output via $shellExecutionData. TerminalInstance._writeProcessData fires onData after xterm parsing; RPCProtocol._remoteCall synchronously JSON-serializes these strings and sends them across the extension-host transport. InternalTerminalShellExecution.emitData only delivers to an existing _dataStream, so output is discarded if read() was never called. Added main-thread lines 88-94 pause the forwarder on a false start result, and pause() removes the listener and clears unsent data. The new no-reader test asserts no data messages and no remaining onData listener. Blame of the original join/send line returns e380facb66e760f7702e995d8efd65a2ea09e07a.",
+      "Confidence": 0.97
+    },
+    {
+      "FixedPath": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts",
+      "FixedSide": "RIGHT",
+      "FixedLine": 208,
+      "BasePath": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts",
+      "BaseLine": 87,
+      "IntroducingPath": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts",
+      "IntroducingCommit": "e380facb66e760f7702e995d8efd65a2ea09e07a",
+      "MechanismFamily": "unbounded-retention",
+      "PerformanceCategory": "memory",
+      "Mechanism": "A sliding debounce retains all parsed output chunks throughout uninterrupted command output, then allocates and serializes one joined string covering the entire interval.",
+      "Symptom": "Renderer output-buffer growth proportional to the uninterrupted output duration, large eventual serialization bursts, and delayed extension stream delivery until output pauses. These consequences are established statically by the timer reset and accumulation call path, not measured in this review.",
+      "FixedBehavior": "Flush after 50 ms from the first chunk without resetting the deadline, or immediately when accumulated character count reaches 1 Mi. Release each batch before sending, and flush on command replacement/end/disposal. A single source chunk can exceed the threshold; the bound does not imply a hard IPC-byte cap or transport backpressure.",
+      "Evidence": "Deleted base lines 86-87 accumulate terminal.onData with a 50 ms debounce then join the entire accumulated array for $shellExecutionData. Event.accumulate delegates to Event.debounce, which pushes every chunk and clears/restarts its timeout on every event (event.ts:279-303,347-354). Parsed terminal output can arrive continuously or every 20 ms, so no flush occurs until a pause or disposal; retained data and the eventual string/serialization scale with the complete uninterrupted output interval. Added forwarder lines 205-209 flush at 1 Mi characters or schedule only when no timer is already scheduled, and lines 223-227 clear the batch before sending. The new periodic-output test covers ten chunks 20 ms apart and an immediate size-triggered send. Blame on the original full-accumulation join/send line returns e380facb66e760f7702e995d8efd65a2ea09e07a.",
+      "Confidence": 0.95
+    }
+  ],
+  "Analysis": {
+    "RelevantIssueFamilies": [
+      "eager-work",
+      "unbounded-retention",
+      "serialization-allocation",
+      "missing-coalescing",
+      "boundary-fanout",
+      "cleanup-lifecycle",
+      "cache-lifecycle",
+      "concurrency-burst",
+      "synchronous-ui-work",
+      "repeated-work"
+    ],
+    "Scenarios": [
+      {
+        "Scenario": "Run a shell-integrated command with no extension reading its output, including terminals shared with multiple extension hosts.",
+        "CriticalPath": "Command output reaches TerminalInstance._writeProcessData, is parsed by xterm, and is acknowledged to the PTY before onData fires. The renderer sends the execution-start RPC without awaiting its result on the rendering path. A false result pauses forwarding; output can still be sent while that reply is pending or when a short command finishes first.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts:84-94 and src/vs/workbench/services/extensions/common/rpcProtocol.ts:_remoteCall/_receiveRequest",
+            "Operation": "Send execution start, receive the reader boolean, and temporarily send output batches until an uninterested host's forwarder pauses.",
+            "Cardinality": "One start request per distinct detected command per host, with the existing acknowledgement/reply exchange. Zero ongoing output messages to that host after its false reply; pre-reply output remains possible.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same RPC infrastructure already replied even to void methods. Start now returns a boolean rather than an empty reply; previously all hosts continued receiving the entire output regardless of readers.",
+            "CriticalPathEffect": "The reader reply controls stopping output forwarding, not terminal parsing or PTY acknowledgement."
+          },
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/services/extensions/common/rpcProtocol.ts:731-796 and src/vs/workbench/api/common/extHostTerminalShellIntegration.ts:emitData",
+            "Operation": "JSON stringify/encode the output request and decode it at the extension host.",
+            "Cardinality": "Previously proportional to all command output bytes times H; now restricted to output forwarded before each uninterested host's reply.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Every accumulated output string was encoded, transmitted and decoded, then discarded because InternalTerminalShellExecution had no _dataStream.",
+            "CriticalPathEffect": "Encoding is synchronous on the renderer; decoding consumes extension-host CPU. Both cease for ongoing unread output after pausing."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/extensions/common/remoteExtensionHost.ts:130-177 and extensionHostManager.ts:_createExtensionHostCustomers",
+            "Operation": "Carry the same RPC messages over the existing remote extension-host PersistentProtocol when that host is remote.",
+            "Cardinality": "Same application-message cardinality as the per-host RPC path; no per-extension duplication within a host.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The same remote transport carried all unread output indefinitely during each command; the PR stops ongoing forwarding after the reader check.",
+            "CriticalPathEffect": "Remote latency delays the pause reply and can extend optimistic forwarding, but does not block terminal rendering."
+          }
+        ],
+        "ScalingInput": "Parsed output bytes and chunks per command, command count, and H instantiated extension hosts. One forwarder exists per terminal per host, not per extension.",
+        "EffectiveConcurrency": "Independent terminal/host forwarders and asynchronous RPC replies; no newly awaited global operation. Existing transport queues and xterm/PTY flow control remain unchanged.",
+        "CacheBehavior": "Reader state is execution-scoped, not a cross-command cache. False removes the listener and drops its pending batch; a matching late-reader request can resume it. Each host independently checks its own readers.",
+        "MechanismConfidence": "High: traced parsed-output emission, unconditional prior RPC encoding, downstream dropping, and the new pause test/state transition.",
+        "MagnitudeUncertainty": "Actual pre-reply volume depends on output rate and extension-host responsiveness. No durations or throughput were measured in this static review.",
+        "Verdict": "No introduced performance regression. The change removes eager output transfer to uninterested hosts; recorded a regression-fix signal."
+      },
+      {
+        "Scenario": "Consume continuous or high-volume execution output through one or more extension readers, locally or remotely.",
+        "CriticalPath": "After xterm parsing, the new forwarder sends when its first-chunk timer expires or accumulated length reaches 1 Mi characters. Extension progress then depends on RPC delivery and its async iterable. Size-triggered joining occurs synchronously in the onData callback, but joins one batch rather than an entire uninterrupted command interval.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "serialization",
+            "Location": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts:201-227 and src/vs/workbench/services/extensions/common/rpcProtocol.ts:731-796",
+            "Operation": "Join each output batch, JSON stringify it, encode request buffers, and decode at the destination.",
+            "Cardinality": "Approximately O(R * (D/50ms + B/1Mi-character-threshold + final flushes)) batches for sustained output, limited by source chunk count. A single source chunk can exceed the threshold. All required output bytes are still transferred.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The existing sliding 50 ms debounce restarted on every chunk and joined/serialized the whole uninterrupted interval only on a pause or disposal.",
+            "CriticalPathEffect": "Renderer encoding precedes delivery; periodic flushing bounds intentional batching delay but does not guarantee total end-to-end latency."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts:_flush/_send and src/vs/workbench/api/common/extHostTerminalShellIntegration.ts:ShellExecutionDataStream.emitData",
+            "Operation": "Deliver one output request per batch per reading host, then fan out in-process to that execution's iterables.",
+            "Cardinality": "One IPC batch per terminal per reading host, not per reader. N readers add N in-process iterable emissions without N separate IPC requests.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same output IPC and reader fan-out, with potentially enormous messages delayed until a pause.",
+            "CriticalPathEffect": "Extension stream consumers wait for batch delivery; the old debounce could withhold output throughout a continuously printing command."
+          },
+          {
+            "Kind": "network",
+            "Location": "src/vs/workbench/services/extensions/common/remoteExtensionHost.ts:_protocol",
+            "Operation": "Transmit output RPC batches to remote reading hosts over their existing connection.",
+            "Cardinality": "One transmission per output batch for each remote reading host; bytes remain proportional to consumed output rather than reader count.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical transport, but output arrived in pause-triggered, potentially unbounded bursts.",
+            "CriticalPathEffect": "Existing network latency and queueing remain in the stream delivery path."
+          }
+        ],
+        "ScalingInput": "Output bytes B, uninterrupted duration D, parsed chunk sizes, active reading hosts R, and readers within each host.",
+        "EffectiveConcurrency": "Timers and size thresholds operate independently per terminal/host. No global limiter or reader backpressure is added. Periodic delivery is an intentional streaming tradeoff, not evidence of an independently harmful burst.",
+        "CacheBehavior": "An execution creates its data stream lazily on first read. hasReader reuses that stream; additional readers do not add main-thread listeners. AsyncIterableObject retains delivered history as before; the PR does not introduce that ownership model.",
+        "MechanismConfidence": "High: Event.accumulate's timer-reset implementation, RunOnceScheduler behavior, new threshold/scheduling code, and periodic/large-data test establish before/after behavior.",
+        "MagnitudeUncertainty": "Extra batch/message overhead versus large prior bursts depends on chunk rate, source chunk size, host count and consumers. No evidence establishes a harmful magnitude for the bounded scheduling change.",
+        "Verdict": "No high-confidence introduced regression. Removes unbounded renderer accumulation and stream withholding; recorded a regression-fix signal. Existing iterable history retention is out of scope."
+      },
+      {
+        "Scenario": "Execute commands through the extension API, add a reader later, or track a multi-line command across subexecutions.",
+        "CriticalPath": "executeCommand sends its existing RPC and returns a pending execution. TerminalInstance.runCommand waits for prompt readiness when needed, then sends text to the existing PTY. On command detection the start result reports already-created readers. A late reader issues a matching resume request before future output can reach it.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostTerminalShellIntegration.ts:executeCommand/onDidRequestShellExecution and src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts:$executeCommand",
+            "Operation": "Request execution of a command in an existing terminal.",
+            "Cardinality": "One execute-command request per API call, unchanged.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same execute RPC, pending-execution matching and prompt-readiness path.",
+            "CriticalPathEffect": "Command initiation depends on that request and existing terminal/prompt readiness; the new reader handshake is not awaited before command execution."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/contrib/terminal/browser/terminalInstance.ts:runCommand/sendText; terminalProcessManager.ts:write; electron-browser/localPty.ts:input; browser/remotePty.ts:input",
+            "Operation": "Write command text, and optionally ETX, to the existing local PTY proxy or remote terminal channel.",
+            "Cardinality": "One command-text input call, plus the existing optional ETX input when clearing a prompt. No new shell subprocess is created by the changed forwarding code.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical PTY input boundaries, readiness waits and optional interrupt behavior.",
+            "CriticalPathEffect": "Existing ptyProcessReady and remote start barrier must resolve before the write; optional ETX retains its existing 100 ms wait."
+          },
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/common/extHostTerminalShellIntegration.ts:96,342-346,453-454 and src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts:119-124",
+            "Operation": "Request resumed output forwarding when the first reader is added after an execution starts.",
+            "Cardinality": "At most one added resume request per logical execution per host, not per read() call. Underlying multi-line command starts still have their existing individual start notifications.",
+            "IntroducedByDiff": true,
+            "PreviousBehavior": "No resume request was necessary because output was always forwarded, including before a reader existed.",
+            "CriticalPathEffect": "Round-trip latency delays forwarding for a late reader, but not terminal execution. Stale command IDs cannot resume a subsequent command."
+          }
+        ],
+        "ScalingInput": "API execution count, underlying shell subcommand count, command-line length, and the hosts whose extensions request output. Multiple reads of the same execution do not multiply resume requests.",
+        "EffectiveConcurrency": "Existing pending-execution matching and multi-line grouping remain unchanged. Start notifications and resume requests use the same per-host RPC transport; there is no per-reader fan-out or new command-execution await.",
+        "CacheBehavior": "Pending executions with an early data stream report true when matched at start. The first stream-created callback is cleared after use, and _isSendingData coalesces requests. Per-command IDs reject stale resumes; no persistent negative cache or failure retry loop is introduced.",
+        "MechanismConfidence": "High: traced executeCommand through prompt readiness and PTY input, plus early/late reader tests and command-ID/race guards.",
+        "MagnitudeUncertainty": "Late-reader latency is transport-dependent; prevalence of multi-line commands and pending requests is unknown. The new control request carries only terminal and command IDs.",
+        "Verdict": "No reportable performance regression. The new boundary is a coalesced, small control request enabling demand-driven output, rather than collection-scaled expensive work."
+      },
+      {
+        "Scenario": "Finish or replace a command, close a terminal, or dispose the shell-integration customer while an execution is active.",
+        "CriticalPath": "The main thread disposes the current forwarder, flushes its remaining batch, and then sends end/close or the next start. Extension-host end processing opens the stream barrier and asynchronously flushes iterables before publishing its end event. Terminal close releases stream-created callbacks.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts:83,98-111 and ShellExecutionDataForwarder.dispose",
+            "Operation": "Flush a remaining data batch before the existing execution-end, next-start, or terminal-close message.",
+            "Cardinality": "At most one remaining-batch data request per disposed active forwarder, followed by existing lifecycle messages. Empty/paused forwarders emit no data.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "The accumulator also flushed on listener removal at finish/close/disposal; replacement flushed after sending the new start. The prior pending batch could cover an arbitrarily long uninterrupted interval.",
+            "CriticalPathEffect": "Final renderer encoding occurs before the lifecycle message; extension-host flushing remains asynchronous. Replacement now sends old data before the new start."
+          }
+        ],
+        "ScalingInput": "Active terminals times instantiated extension hosts, remaining batch lengths, pending execution count on close, and iterables created per execution.",
+        "EffectiveConcurrency": "Cleanup executes per event; final output encoding is synchronous, while iterable flush uses the existing Promise.all across readers. No additional cleanup IPC per reader or new teardown subprocess is introduced.",
+        "CacheBehavior": "DisposableMap entries are removed on replacement, finish and close, and all entries are disposed with the customer. Listener and timer disposal prevent future scheduled sends. Execution callbacks are cleared after first read, at end, and for current/pending executions when the integration closes.",
+        "MechanismConfidence": "High: lifecycle call sites, DisposableMap ownership, pause/resume guards and execution release code are explicit; tests cover finish, replacement, terminal/customer disposal, and retained-execution callback release.",
+        "MagnitudeUncertainty": "Close cost grows with pending executions and reader count; those collections pre-exist. Added callback clearing is constant work per execution and prevents retention rather than introducing expensive cleanup.",
+        "Verdict": "No new leak or cleanup amplification found. The callback is new but its last handles are explicitly cleared; prior full-output disposal bursts become bounded batches."
+      },
+      {
+        "Scenario": "Initialize shell integration for existing/restored terminals or newly detected shell capabilities.",
+        "CriticalPath": "Each extension-host manager instantiates its own main-thread customer. Existing terminals with command detection trigger the unchanged shell-integration activation and state notifications. Activation is not awaited by this constructor or command-output path; extension code loading must finish only for that extension's activation.",
+        "ExpensiveBoundaries": [
+          {
+            "Kind": "IPC",
+            "Location": "src/vs/workbench/api/browser/mainThreadTerminalShellIntegration.ts:_enableShellIntegration and src/vs/workbench/services/extensions/common/extensionHostManager.ts:328-356",
+            "Operation": "Send shell-integration/cwd state and activate interested extensions for wildcard and shell-specific activation events.",
+            "Cardinality": "State notifications remain O(T*H). Activation RPCs are at most once per relevant event per host manager lifetime after cache coalescing; absent events do not activate extensions.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Identical initial-terminal loop, capability listeners, activation events and state notifications.",
+            "CriticalPathEffect": "State messages are asynchronous; activation is off the terminal-rendering critical path."
+          },
+          {
+            "Kind": "filesystem",
+            "Location": "src/vs/workbench/api/common/extHostExtensionService.ts:479-495 and src/vs/workbench/api/node/extHostExtensionService.ts:189-224",
+            "Operation": "Load each activated extension's CommonJS/ESM entry module through require/import, with existing localization/context initialization.",
+            "Cardinality": "Once per distinct extension activation operation, with dependency and event coalescing in extHostExtensionActivator.ts:217-252; not one module load per terminal.",
+            "IntroducedByDiff": false,
+            "PreviousBehavior": "Same activation/module-loading path and multiplicity; the PR does not move it earlier or add new activation requests.",
+            "CriticalPathEffect": "Code loading gates extension activation, not command execution or xterm parsing."
+          }
+        ],
+        "ScalingInput": "T terminals, H extension hosts, S distinct shell types and the distinct interested extensions plus dependencies. Activation work is grouped by event and extension identity rather than repeated per terminal.",
+        "EffectiveConcurrency": "Existing activation fan-out uses Promise.all across host managers/extensions, with event and extension-operation coalescing. Each customer has separate terminal forwarding state; no additional host creation or startup await is introduced.",
+        "CacheBehavior": "ExtensionHostManager caches the activation promise by event, including empty/failing results for that manager lifetime. Extension activator also joins existing operations by extension ID. Internal terminal shell integrations remain cached by terminal ID and removed at close; execution data streams are still lazy.",
+        "MechanismConfidence": "High: verified customer instantiation per host, unchanged initialization calls, activation caches, operation deduplication and module-load boundary.",
+        "MagnitudeUncertainty": "Cold extension activation can be expensive and remote transport can be slow, but neither frequency nor placement changes here. Extension-specific activation internals are outside the selected diff.",
+        "Verdict": "No startup or restoration performance regression. Added forwarding state is small and per active execution; heavyweight stream construction remains reader-triggered."
+      }
+    ],
+    "Summary": "Completed the distinct performance-review pass over all five changed files and every diff page against base ef5ca45a6e545e4767e0117905ee9d6120b86e11. Traced terminal output, RPC serialization/transport, per-host grouping, reader creation, command initiation, activation caches and cleanup. No high-confidence diff-introduced performance findings; recorded two concrete regression-fix signals with blame provenance. Analysis is static; no benchmark results are claimed."
+  },
+  "Stats": {
+    "Model": "gpt-6.1-sol",
+    "ActualModels": [
+      "gpt-6.1-sol"
+    ],
+    "ReasoningEffort": "high",
+    "ActualReasoningEfforts": [
+      "high"
+    ],
+    "APIEndpoints": [
+      "ws:/responses"
+    ],
+    "StartedAt": "2026-11-28T04:47:28.290820756Z",
+    "CompletedAt": "2026-11-28T04:51:12.425513439Z",
+    "WallClockMilliseconds": 224134,
+    "ModelCalls": 12,
+    "InputTokens": 565496,
+    "OutputTokens": 10362,
+    "TotalTokens": 575858,
+    "ReasoningTokens": 3463,
+    "CacheReadTokens": 493725,
+    "CacheWriteTokens": 71735,
+    "APIDurationMilliseconds": 186170,
+    "ToolCalls": 58,
+    "NanoAIUnits": 33240200000,
+    "ModelBillingMultipliers": [
+      1
+    ],
+    "BillingTokensByType": {
+      "cache_read": 493725,
+      "cache_write": 71735,
+      "input": 36,
+      "output": 10362
+    },
+    "USDollars": null,
+    "CostNote": "Copilot SDK reports nano-AI units and model billing multipliers; it does not provide a USD conversion."
+  }
+}
